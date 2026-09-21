@@ -8,11 +8,13 @@ rust-version.workspace = true
 description = "Daemon: a Linux-native interview copilot (terminal MVP)"
 
 [[bin]]
-name = "dmn-cli"
+name = "dmn"
 path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+dmn-core = { path = "../../crates/dmn-core" }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
