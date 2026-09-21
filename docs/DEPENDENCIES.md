@@ -11,8 +11,8 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `directories` | `dmn-core` | XDG config / data / cache / state paths without hand-rolled env logic |
 | `tracing` | all crates | Structured events; the only logging API in the workspace |
 | `tracing-subscriber` (json, env-filter) | `dmn-core` | JSON lines to the log file; `DMN_LOG` filter |
-| `serde_json` | `dmn-core` (dev), later `dmn-llm` | Assert log lines are JSON; LLM request/response bodies |
-| `tempfile` (dev) | tests | Isolated config / log directories so tests never touch `~` |
+| `serde_json` | `dmn-core` (dev), `dmn-cli`, later `dmn-llm` | Assert log lines are JSON; parse Ollama `/api/tags` in `dmn doctor`; LLM request/response bodies |
+| `tempfile` (dev) | `dmn-core`, `dmn-cli`, `dmn-audio` tests | Isolated config / log / WAV directories so tests never touch `~` |
 | `hound` | `dmn-audio` | Read fixture / replay WAVs of any rate, channel count and sample format |
 | `rubato` | `dmn-audio` | FFT resampler from the file's rate to 16 kHz; PipeWire resamples live audio itself |
 | `ringbuf` | `dmn-audio` | Lock-free SPSC ring from the capture thread to the VAD thread; the RT callback only pushes |

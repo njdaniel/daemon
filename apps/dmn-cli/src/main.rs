@@ -1,7 +1,12 @@
 //! `dmn`: the Daemon command-line entry point.
 //!
-//! Subcommands arrive with their issues. Now: `doctor --init` and `config show` (#2).
-//! Later: `run`, `devices`, `sources`, `replay`, `bench`, the full `doctor`.
+//! Subcommands arrive with their issues. Now: `doctor` (#2, #6) and `config show` (#2).
+//! Later: `run`, `devices`, `sources`, `replay`, `bench`, `doctor --probe` (#5), `--fetch` (#8).
+
+// CLAUDE.md: no unwrap/expect outside tests and main.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod doctor;
 
 use std::process::ExitCode;
 
@@ -73,20 +78,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(path = %paths.config_file.display(), "wrote config template");
                 println!("wrote {}", paths.config_file.display());
             } else {
-                // Full checks land with issue #6.
                 let cfg = Config::load(&paths.config_file)?;
-                println!("config:   {}", paths.config_file.display());
-                println!("log:      {}", paths.log_file.display());
-                println!(
-                    "provider: {:?} ({})",
-                    cfg.llm.provider,
-                    if cfg.llm.provider.is_remote() {
-                        "transcript text leaves this machine"
-                    } else {
-                        "nothing leaves this machine"
-                    }
-                );
-                println!("(full checks arrive with issue #6)");
+                let report = doctor::run_all(&cfg, &paths, &doctor::SystemRunner, &doctor::StdHttp);
+                print!("{}", report.render());
+                let failed = report.failed_required();
+                tracing::info!(failed, "doctor");
+                if failed > 0 {
+                    return Err(format!("{failed} required check(s) failed").into());
+                }
             }
             Ok(())
         }
