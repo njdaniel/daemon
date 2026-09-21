@@ -355,7 +355,7 @@ sensitivity = "balanced"             # eager | balanced | strict
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic
-model = "llama3.1:8b"
+model = "qwen3.6:35b-a3b"           # measured 2026-09-21 on the dev 4090; see CLAUDE.md
 base_url = "http://localhost:11434"
 api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
@@ -379,11 +379,11 @@ keep_transcripts = true
         let again = Config::from_toml(&parsed.to_toml().unwrap(), "again").unwrap();
         assert_eq!(parsed, again, "serialise → parse must be lossless");
 
-        // Every key in the spec example is a default, except the model, which CLAUDE.md pins to
-        // the measured winner on the dev machine.
-        let mut expected = Config::default();
-        expected.llm.model = "llama3.1:8b".into();
-        assert_eq!(parsed, expected);
+        assert_eq!(
+            parsed,
+            Config::default(),
+            "every key in the spec example is a default"
+        );
     }
 
     #[test]

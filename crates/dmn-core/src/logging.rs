@@ -52,7 +52,6 @@ impl RotatingFile {
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
         let old = self.path.with_extension("log.1");
-        // A failed rename must not lose the current file; fall through and keep appending.
         std::fs::rename(&self.path, &old)?;
         self.file = OpenOptions::new()
             .create(true)
@@ -65,8 +64,10 @@ impl RotatingFile {
 
 impl Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.len >= self.rotate_at {
-            self.rotate()?;
+        if self.len >= self.rotate_at && self.rotate().is_err() {
+            // Losing rotation is better than losing the log: keep appending to the current
+            // file and never retry (a retry on every write would fail the same way).
+            self.rotate_at = u64::MAX;
         }
         let n = self.file.write(buf)?;
         self.len += n as u64;
@@ -152,6 +153,22 @@ mod tests {
         );
         assert!(cur < 100, "current file restarted: {cur}");
         assert_eq!(cur + old, 5 * 41, "no bytes lost");
+    }
+
+    #[test]
+    fn failed_rotation_keeps_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dmn.log");
+        let mut w = LogWriter::open_with_limit(&path, 10).unwrap();
+        w.write_all(b"0123456789ab\n").unwrap();
+        // Make the rename impossible: the rotated name is an existing directory with content.
+        let blocker = path.with_extension("log.1");
+        std::fs::create_dir_all(blocker.join("child")).unwrap();
+        w.write_all(b"second\n").unwrap();
+        w.write_all(b"third\n").unwrap();
+        w.flush().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with("second\nthird\n"), "{text:?}");
     }
 
     #[test]
