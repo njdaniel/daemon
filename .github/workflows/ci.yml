@@ -15,13 +15,30 @@ jobs:
       - name: System deps (PipeWire headers, clang, cmake)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev clang libclang-dev cmake
+          sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev clang libclang-dev cmake pipewire-bin
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # whisper.cpp is compiled by whisper-rs's build script (issue #8) under
+      # target/*/build/whisper-rs-sys-*/. rust-cache drops build-script outputs for changed
+      # crates only, but a cold cache still rebuilds whisper.cpp (~5 min). Key on the lock file
+      # and the stt crate manifest so the C build survives Rust-only changes elsewhere.
+      - name: Cache whisper.cpp build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/build/whisper-rs-sys-*
+            target/release/build/whisper-rs-sys-*
+          key: whisper-cpp-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/dmn-stt/Cargo.toml') }}
+          restore-keys: |
+            whisper-cpp-${{ runner.os }}-
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo run -p dmn-cli -- --version
+      # No PipeWire server, no Ollama, no whisper model on the runner: doctor fails by design.
+      # Its output stays in the log so a broken check is visible without failing CI.
+      - name: dmn doctor (informational)
+        run: cargo run -p dmn-cli -- doctor || true

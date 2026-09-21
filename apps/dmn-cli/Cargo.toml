@@ -11,10 +11,20 @@ description = "Daemon: a Linux-native interview copilot (terminal MVP)"
 name = "dmn"
 path = "src/main.rs"
 
+[features]
+# GPU whisper backends. Forwarded to dmn-stt once it exists (#8); today they only change what
+# `dmn doctor` reports.
+cuda = []
+vulkan = []
+
 [dependencies]
 clap = { workspace = true }
 dmn-core = { path = "../../crates/dmn-core" }
+serde_json = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

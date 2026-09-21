@@ -153,6 +153,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dmn-core",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 
