@@ -59,13 +59,23 @@ $diff"
 out="$RUNS/review-$pr-$(date +%Y%m%d-%H%M%S).md"
 echo "reviewing PR #$pr (issue #$n, size $size) via $via/$model -> $out"
 cd "$ROOT"
+# The prompt (diff + SPEC) exceeds the argv limit, so it always travels over stdin.
+pf=$(mktemp "$RUNS/prompt-$pr-XXXX.md"); printf '%s' "$prompt" > "$pf"
 case "$via" in
-  claude) claude -p "$prompt" --model "$model" --permission-mode dontAsk --allowedTools "Read,Glob,Grep" \
-            --output-format text > "$out" 2>&1 || true ;;
-  agy)    agy -p "$prompt" --model "$model" --mode plan --print-timeout 15m \
-            --output-format text > "$out" 2>&1 || true ;;
+  claude) claude -p --model "$model" --permission-mode dontAsk --allowedTools "Read,Glob,Grep" \
+            --output-format text < "$pf" > "$out" 2>&1 || true ;;
+  agy)    python3 -c 'import json,sys; print(json.dumps({"event":"user","message":{"role":"user","content":sys.stdin.read()}}))' < "$pf" \
+            | agy --model "$model" --mode plan --print-timeout 15m --input-format stream-json --output-format stream-json -p='' 2>"$out.err" \
+            | python3 -c 'import json,sys
+for line in sys.stdin:
+    try: ev=json.loads(line)
+    except ValueError: continue
+    if ev.get("event")=="result":
+        r=ev["result"]; print(r.get("response") or "(no response; status %s: %s)" % (r.get("status"), r.get("error")))' > "$out" || true
+          [ -s "$out" ] || cat "$out.err" >> "$out" ;;
 esac
+rm -f "$pf"
 cat "$out"
 if [ "$post" = 1 ]; then gh pr comment "$pr" --body-file "$out"; fi
-tail -1 "$out" | grep -qE '^BLOCKING: 0 findings' && exit 0
+grep -E '^BLOCKING: [0-9]+ findings' "$out" | tail -1 | grep -qE '^BLOCKING: 0 findings' && exit 0
 exit 1

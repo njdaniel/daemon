@@ -19,6 +19,7 @@ vulkan = []
 
 [dependencies]
 clap = { workspace = true }
+dmn-audio = { path = "../../crates/dmn-audio" }
 dmn-core = { path = "../../crates/dmn-core" }
 serde_json = { workspace = true }
 tracing = { workspace = true }

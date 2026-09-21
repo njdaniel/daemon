@@ -8,16 +8,22 @@
 //! Shape (issue #3): an [`AudioSource`] is started with a [`FrameSink`] and pushes 20 ms frames
 //! ([`FRAME_LEN`] samples at [`SAMPLE_RATE`]) into an SPSC ring; the consumer drains them through
 //! [`Frames`] on its own thread. [`WavSource`] is the file-backed implementation every later
-//! stage is tested against; `PipeWireSource` arrives with issues #4 and #5.
+//! stage is tested against. [`PipeWireContext`] (issue #4) runs the PipeWire loop thread and
+//! keeps the live [`NodeTable`] of mics and app streams; `PipeWireSource` arrives with #5.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod frames;
+mod pipewire;
 mod source;
 mod wav;
 
 pub use frames::{FrameSink, Frames, frame_channel};
+pub use pipewire::{
+    AppStream, CaptureNode, NodeTable, PipeWireContext, PipeWireError, RegistryEvent,
+    parse_default_name,
+};
 pub use source::{AudioError, AudioSource, Source};
 pub use wav::{Speed, WavSource};
 
