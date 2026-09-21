@@ -91,6 +91,18 @@ impl OllamaProvider {
         body
     }
 
+    /// The `warm_up` request body: empty messages load the model and apply `keep_alive` without
+    /// generating. Carries `think: false` like every other request. Public so tests can assert it.
+    pub fn build_warm_up_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "messages": [],
+            "stream": false,
+            "think": false,
+            "keep_alive": self.keep_alive,
+        })
+    }
+
     fn unreachable(&self, e: &reqwest::Error) -> LlmError {
         LlmError::Unreachable {
             provider: NAME,
@@ -246,12 +258,7 @@ impl Provider for OllamaProvider {
     /// Bounded by [`WARM_UP_TIMEOUT`]; loading a 20 GB model can take several seconds.
     fn warm_up<'a>(&'a self) -> BoxFuture<'a, Result<(), LlmError>> {
         Box::pin(async move {
-            let body = serde_json::json!({
-                "model": self.model,
-                "messages": [],
-                "stream": false,
-                "keep_alive": self.keep_alive,
-            });
+            let body = self.build_warm_up_body();
             let deadline = Instant::now() + WARM_UP_TIMEOUT;
             let send = self.client.post(self.url("/api/chat")).json(&body).send();
             let resp = self
@@ -302,6 +309,16 @@ mod tests {
         assert!((temperature - 0.7).abs() < 1e-6, "{temperature}");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "u");
+    }
+
+    #[test]
+    fn warm_up_body_carries_think_false() {
+        let body = provider().with_keep_alive("2h").build_warm_up_body();
+        assert_eq!(body["think"], serde_json::json!(false));
+        assert_eq!(body["stream"], serde_json::json!(false));
+        assert_eq!(body["messages"], serde_json::json!([]));
+        assert_eq!(body["keep_alive"], "2h");
+        assert_eq!(body["model"], "test-model");
     }
 
     #[test]
