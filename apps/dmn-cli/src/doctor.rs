@@ -128,16 +128,18 @@ impl Http for StdHttp {
         .map_err(|e| e.to_string())?;
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
-        let text = String::from_utf8_lossy(&raw);
-        parse_http_response(&text)
+        parse_http_response(&raw)
     }
 }
 
 /// Split status line, headers and body; decode chunked bodies. Returns the body on 2xx.
-fn parse_http_response(text: &str) -> Result<String, String> {
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_owned())?;
+///
+/// Works on bytes throughout: chunk sizes are byte counts and a chunk boundary may fall inside
+/// a multi-byte UTF-8 character, so the body is only converted to text once reassembled.
+fn parse_http_response(raw: &[u8]) -> Result<String, String> {
+    let split = find(raw, b"\r\n\r\n").ok_or_else(|| "malformed HTTP response".to_owned())?;
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let body = &raw[split + 4..];
     let status = head.lines().next().unwrap_or_default();
     let code: u16 = status
         .split_whitespace()
@@ -150,23 +152,31 @@ fn parse_http_response(text: &str) -> Result<String, String> {
     let chunked = head
         .lines()
         .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.contains("chunked"));
-    if chunked {
-        return Ok(decode_chunked(body));
-    }
-    Ok(body.to_owned())
+    let body = if chunked {
+        decode_chunked(body)
+    } else {
+        body.to_vec()
+    };
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-fn decode_chunked(body: &str) -> String {
-    let mut out = String::new();
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn decode_chunked(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut rest = body;
-    while let Some((size_line, after)) = rest.split_once("\r\n") {
+    while let Some(eol) = find(rest, b"\r\n") {
+        let size_line = String::from_utf8_lossy(&rest[..eol]);
         let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("0").trim(), 16)
             .unwrap_or(0);
+        let after = &rest[eol + 2..];
         if size == 0 || after.len() < size {
             break;
         }
-        out.push_str(&after[..size]);
-        rest = after[size..].strip_prefix("\r\n").unwrap_or("");
+        out.extend_from_slice(&after[..size]);
+        rest = after[size..].strip_prefix(b"\r\n").unwrap_or(&[]);
     }
     out
 }
@@ -612,15 +622,39 @@ mod tests {
 
     #[test]
     fn http_response_parsing_handles_content_length_and_chunked() {
-        let plain = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+        let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
         assert_eq!(parse_http_response(plain).unwrap(), "{}");
-        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n{\"a\r\n2\r\n\"}\r\n0\r\n\r\n";
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n{\"a\r\n2\r\n\"}\r\n0\r\n\r\n";
         assert_eq!(parse_http_response(chunked).unwrap(), "{\"a\"}");
         assert_eq!(
-            parse_http_response("HTTP/1.1 404 Not Found\r\n\r\n").unwrap_err(),
+            parse_http_response(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap_err(),
             "HTTP 404"
         );
-        assert!(parse_http_response("garbage").is_err());
+        assert!(parse_http_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn chunked_body_split_inside_multibyte_char_decodes_intact() {
+        // "🎤" is 4 bytes; the first chunk ends after its second byte. The old str-based
+        // decoder panicked slicing at a non-char boundary (review finding on PR #18).
+        let mic = "🎤".as_bytes();
+        let json_tail = r#"","name":"café"}"#.as_bytes();
+        let mut chunk1 = br#"{"model":""#.to_vec();
+        chunk1.extend_from_slice(&mic[..2]);
+        let mut chunk2 = mic[2..].to_vec();
+        chunk2.extend_from_slice(json_tail);
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for chunk in [&chunk1, &chunk2] {
+            raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            raw.extend_from_slice(chunk);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        let body = parse_http_response(&raw).unwrap();
+        assert_eq!(body, r#"{"model":"🎤","name":"café"}"#);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "🎤");
+        assert_eq!(v["name"], "café");
     }
 
     /// Needs a live Ollama; run with `cargo test -p dmn-cli -- --ignored` on the dev machine.
