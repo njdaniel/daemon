@@ -10,12 +10,12 @@ An issue gets exactly one size. The size sets the model, the budget and the revi
 
 | Size | Fits when | Model | Max turns | Budget (USD) | Reviewed by |
 | --- | --- | --- | --- | --- | --- |
-| S | One file or module, known crates, no threads, no FFI, tests trivial or already present | Sonnet | 30 | [YOUR CAP] | Opus |
-| M | One crate of pure Rust with new tests on fixtures, or one async client | Opus | 45 | [YOUR CAP] | Opus, fresh session |
-| L | FFI, `unsafe`, real-time or threading constraints, or one unfamiliar C-backed API | Fable | 60, two runs planned | [YOUR CAP] | Fable |
+| S | One file or module, known crates, no threads, no FFI, tests trivial or already present | Sonnet | 30 | 5 | Opus |
+| M | One crate of pure Rust with new tests on fixtures, or one async client | Opus | 45 | 15 | Opus, fresh session |
+| L | FFI, `unsafe`, real-time or threading constraints, or one unfamiliar C-backed API | Fable | 60, two runs planned | 40 | Fable |
 | XL | Anything larger | not allowed — split it | — | — | — |
 
-Set each cap after the first run of that size lands (measured cost × 1.5) and record it here. Until a cap is recorded, `just agent` refuses to start a run of that size without an explicit `--budget`.
+The caps above are provisional (set 2026-09-21 before any run); replace each with measured cost × 1.5 after the first run of that size lands. Until a cap is recorded, `just agent` refuses to start a run of that size without an explicit `--budget`.
 
 ## 2. Breaking work down
 
