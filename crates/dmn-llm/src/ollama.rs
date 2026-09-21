@@ -2,19 +2,23 @@
 //! `keep_alive` so the model stays loaded for the session. SPEC § Context and LLM, Providers.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::ndjson::NdjsonParser;
-use crate::provider::{ChatRequest, Delta, DeltaStream, LlmError, Provider, Usage, guard};
+use crate::provider::{ChatRequest, Delta, DeltaStream, LlmError, Provider, Usage, guard_until};
 
 const NAME: &str = "ollama";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_KEEP_ALIVE: &str = "30m";
+/// Upper bound on `warm_up`: loading the model from disk, not generation.
+pub const WARM_UP_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -94,6 +98,23 @@ impl OllamaProvider {
             detail: e.to_string(),
         }
     }
+
+    /// Drive `send` (connect, request, response headers) under the same cancellation token and
+    /// absolute deadline the body stream will use, so no part of a request is unguarded.
+    async fn send_within(
+        &self,
+        send: impl Future<Output = Result<reqwest::Response, reqwest::Error>>,
+        cancel: &CancellationToken,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, LlmError> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(LlmError::Cancelled),
+            () = tokio::time::sleep_until(deadline) => Err(LlmError::Timeout(timeout)),
+            r = send => r.map_err(|e| self.unreachable(&e)),
+        }
+    }
 }
 
 /// One NDJSON line from `/api/chat`.
@@ -156,14 +177,13 @@ impl Provider for OllamaProvider {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<DeltaStream<'a>, LlmError>> {
         Box::pin(async move {
+            // One budget for the whole request: connect + headers here, the body in `guard_until`.
+            let deadline = Instant::now() + req.timeout;
             let body = self.build_body(&req);
+            let send = self.client.post(self.url("/api/chat")).json(&body).send();
             let resp = self
-                .client
-                .post(self.url("/api/chat"))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| self.unreachable(&e))?;
+                .send_within(send, &cancel, deadline, req.timeout)
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
@@ -218,11 +238,12 @@ impl Provider for OllamaProvider {
                     }
                 }
             });
-            Ok(guard(deltas, cancel, req.timeout))
+            Ok(guard_until(deltas, cancel, deadline, req.timeout))
         })
     }
 
     /// An empty-messages chat loads the model and applies `keep_alive` without generating.
+    /// Bounded by [`WARM_UP_TIMEOUT`]; loading a 20 GB model can take several seconds.
     fn warm_up<'a>(&'a self) -> BoxFuture<'a, Result<(), LlmError>> {
         Box::pin(async move {
             let body = serde_json::json!({
@@ -231,13 +252,11 @@ impl Provider for OllamaProvider {
                 "stream": false,
                 "keep_alive": self.keep_alive,
             });
+            let deadline = Instant::now() + WARM_UP_TIMEOUT;
+            let send = self.client.post(self.url("/api/chat")).json(&body).send();
             let resp = self
-                .client
-                .post(self.url("/api/chat"))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| self.unreachable(&e))?;
+                .send_within(send, &CancellationToken::new(), deadline, WARM_UP_TIMEOUT)
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 let text = resp.text().await.unwrap_or_default();
@@ -333,6 +352,66 @@ mod tests {
         assert!(matches!(err, LlmError::Unreachable { .. }), "{err}");
         let err = p.warm_up().await.expect_err("must fail");
         assert!(matches!(err, LlmError::Unreachable { .. }), "{err}");
+    }
+
+    /// A server that accepts connections and never answers, so `send()` stalls waiting for headers.
+    fn stalled_server() -> (OllamaProvider, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            // Hold the socket open until the test process exits; never read or write.
+            if let Ok((stream, _)) = listener.accept() {
+                std::mem::forget(stream);
+            }
+        });
+        (
+            OllamaProvider::new(format!("http://127.0.0.1:{port}"), "m").unwrap(),
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_headers_returns_cancelled_promptly() {
+        let (p, _server) = stalled_server();
+        let cancel = CancellationToken::new();
+        let req = ChatRequest::new(vec![]).with_timeout(Duration::from_secs(30));
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c.cancel();
+        });
+        let started = std::time::Instant::now();
+        let err = p
+            .chat(req, cancel)
+            .await
+            .map(|_| ())
+            .expect_err("must fail");
+        assert!(matches!(err, LlmError::Cancelled), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancel not prompt: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_server_times_out_at_the_phase_deadline() {
+        let (p, _server) = stalled_server();
+        let timeout = Duration::from_millis(120);
+        let req = ChatRequest::new(vec![]).with_timeout(timeout);
+        let started = std::time::Instant::now();
+        let err = p
+            .chat(req, CancellationToken::new())
+            .await
+            .map(|_| ())
+            .expect_err("must fail");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, LlmError::Timeout(t) if t == timeout), "{err}");
+        assert!(elapsed >= timeout, "too early: {elapsed:?}");
+        assert!(
+            elapsed < timeout + Duration::from_millis(300),
+            "deadline extended: {elapsed:?}"
+        );
     }
 
     /// Needs Ollama on localhost with `qwen3.6:35b-a3b` pulled: `cargo test -p dmn-llm -- --ignored`.

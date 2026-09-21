@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures_util::Stream;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
+use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 #[derive(Debug, thiserror::Error)]
@@ -180,11 +181,26 @@ pub fn guard<'a, S>(inner: S, cancel: CancellationToken, timeout: Duration) -> D
 where
     S: Stream<Item = Result<Delta, LlmError>> + Send + 'a,
 {
+    guard_until(inner, cancel, Instant::now() + timeout, timeout)
+}
+
+/// [`guard`] with an absolute deadline, so a provider that spent part of the phase budget on
+/// connecting and waiting for headers hands the *remaining* budget to the stream. `timeout` is
+/// the whole phase budget, reported in [`LlmError::Timeout`].
+pub fn guard_until<'a, S>(
+    inner: S,
+    cancel: CancellationToken,
+    deadline: Instant,
+    timeout: Duration,
+) -> DeltaStream<'a>
+where
+    S: Stream<Item = Result<Delta, LlmError>> + Send + 'a,
+{
     Box::pin(Guarded {
         inner: Some(Box::pin(inner)),
         cancelled: Box::pin(cancel.cancelled_owned()),
         timeout,
-        deadline: Box::pin(tokio::time::sleep(timeout)),
+        deadline: Box::pin(tokio::time::sleep_until(deadline)),
     })
 }
 

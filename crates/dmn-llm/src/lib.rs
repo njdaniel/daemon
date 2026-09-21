@@ -29,6 +29,6 @@ pub use futures_util::stream::BoxStream;
 pub use mock::MockProvider;
 pub use ollama::OllamaProvider;
 pub use provider::{
-    ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard,
+    ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard, guard_until,
 };
 pub use tokio_util::sync::CancellationToken;
