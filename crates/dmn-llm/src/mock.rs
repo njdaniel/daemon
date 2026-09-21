@@ -36,13 +36,16 @@ impl MockProvider {
         }
     }
 
-    /// Reply with `value` serialised as JSON, streamed in small chunks, then `Done`.
+    /// Reply with `value` serialised as JSON, streamed in chunks of a few characters, then `Done`.
+    /// Chunks are cut on `char` boundaries, so every delta is valid UTF-8 and the concatenation
+    /// is byte-exact.
     pub fn json(value: &serde_json::Value) -> Self {
+        const CHARS_PER_CHUNK: usize = 7;
         let text = value.to_string();
-        let mut script: Vec<Step> = text
-            .as_bytes()
-            .chunks(7)
-            .map(|c| Step::Text(String::from_utf8_lossy(c).into_owned()))
+        let chars: Vec<char> = text.chars().collect();
+        let mut script: Vec<Step> = chars
+            .chunks(CHARS_PER_CHUNK)
+            .map(|c| Step::Text(c.iter().collect()))
             .collect();
         script.push(Step::Done);
         Self::new(script)
@@ -129,6 +132,36 @@ mod tests {
             value
         );
         assert_eq!(mock.requests(), vec![req]);
+    }
+
+    #[tokio::test]
+    async fn json_with_multibyte_chars_replays_byte_exact_across_several_deltas() {
+        let value = serde_json::json!({
+            "question": "caf\u{e9} \u{1F3A4} na\u{ef}ve r\u{e9}sum\u{e9} \u{1F3A4}\u{1F3A4}",
+            "approach": ["\u{1F3A4}", "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"]
+        });
+        let expected = value.to_string();
+        let mock = MockProvider::json(&value);
+        let mut s = mock
+            .chat(ChatRequest::new(vec![]), CancellationToken::new())
+            .await
+            .unwrap();
+        let mut deltas = 0;
+        let mut text = String::new();
+        while let Some(item) = s.next().await {
+            let d = item.unwrap();
+            if !d.done {
+                deltas += 1;
+                text.push_str(&d.text);
+            }
+        }
+        assert!(deltas > 1, "consumers must still see a multi-delta stream");
+        assert_eq!(text, expected, "concatenation is byte-exact");
+        assert!(!text.contains('\u{FFFD}'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            value
+        );
     }
 
     #[tokio::test]
