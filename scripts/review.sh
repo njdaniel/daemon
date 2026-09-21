@@ -77,5 +77,5 @@ esac
 rm -f "$pf"
 cat "$out"
 if [ "$post" = 1 ]; then gh pr comment "$pr" --body-file "$out"; fi
-tail -1 "$out" | grep -qE '^BLOCKING: 0 findings' && exit 0
+grep -E '^BLOCKING: [0-9]+ findings' "$out" | tail -1 | grep -qE '^BLOCKING: 0 findings' && exit 0
 exit 1
