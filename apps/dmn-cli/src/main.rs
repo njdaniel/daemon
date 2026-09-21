@@ -1,11 +1,13 @@
 //! `dmn`: the Daemon command-line entry point.
 //!
-//! Subcommands arrive with their issues. Now: `doctor` (#2, #6) and `config show` (#2).
-//! Later: `run`, `devices`, `sources`, `replay`, `bench`, `doctor --probe` (#5), `--fetch` (#8).
+//! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `config show` (#2),
+//! `devices` (#4). Later: `run`, `sources`, `replay`, `bench`, `doctor --probe` (#5),
+//! `--fetch` (#8).
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod devices;
 mod doctor;
 
 use std::process::ExitCode;
@@ -37,6 +39,8 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// List PipeWire capture sources and application output streams
+    Devices,
 }
 
 #[derive(Subcommand, Debug)]
@@ -95,6 +99,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let cfg = Config::load(&paths.config_file)?;
             tracing::debug!(provider = ?cfg.llm.provider, "config show");
             print!("{}", cfg.to_toml()?);
+            Ok(())
+        }
+        Some(Command::Devices) => {
+            let cfg = Config::load(&paths.config_file)?;
+            print!("{}", devices::run(&cfg)?);
             Ok(())
         }
     }

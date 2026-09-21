@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 hound = "3.5"
+pipewire = "0.10"
 ringbuf = "0.5"
 rubato = "5"
 thiserror = { workspace = true }
