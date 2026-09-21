@@ -16,5 +16,6 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `hound` | `dmn-audio` | Read fixture / replay WAVs of any rate, channel count and sample format |
 | `rubato` | `dmn-audio` | FFT resampler from the file's rate to 16 kHz; PipeWire resamples live audio itself |
 | `ringbuf` | `dmn-audio` | Lock-free SPSC ring from the capture thread to the VAD thread; the RT callback only pushes |
+| `pipewire` (0.10, official pipewire-rs) | `dmn-audio` | Main loop, registry discovery and, from #5, capture streams with `target.object`; the `Rc` API needs no `unsafe` for discovery |
 
-Planned by the spec (add the line when the issue lands): `pipewire` (#4); `crossbeam-channel`, `whisper-rs` (#8); `reqwest`, `tokio`, `tokio-util` (#11); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+Planned by the spec (add the line when the issue lands): `crossbeam-channel`, `whisper-rs` (#8); `reqwest`, `tokio`, `tokio-util` (#11); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
