@@ -80,6 +80,7 @@ If the spec and the issue disagree, the issue wins; say so in the PR.
 
 - Blocking findings go back as one fix run of the original issue with the review appended to the prompt. A second failure escalates to a human.
 - Reviewer assignment: Opus reviews Sonnet and Opus PRs; Fable reviews every L PR regardless of author.
+- Alternative reviewer: `just review <pr> --via agy` sends the same prompt through the `agy` CLI (Gemini 3.1 Pro by default, `--model` to change), a different model family that spends no Claude usage. Either backend's `BLOCKING: 0 findings` satisfies § 6.2; when a PR was implemented interactively on Fable, prefer `--via agy` so the reviewer is not the author's model.
 
 ## 6. Merge
 

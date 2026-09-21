@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# just review <pr> [--post]
+# just review <pr> [--post] [--via claude|agy] [--model <id>]
 # Fresh session of the reviewing model per docs/PROCESS.md § 5. Exits 0 only on "BLOCKING: 0 findings".
+# --via agy runs the same prompt through the agy CLI (Gemini by default: a different model family).
 source "$(dirname "$0")/lib.sh"
 
-pr=""; post=0
-while [ $# -gt 0 ]; do case "$1" in --post) post=1; shift ;; -*) die "unknown flag $1" ;; *) pr="$1"; shift ;; esac; done
-[ -n "$pr" ] || die "usage: review.sh <pr-number> [--post]"
+pr=""; post=0; via="${DMN_REVIEWER:-claude}"; model_override=""
+while [ $# -gt 0 ]; do case "$1" in
+  --post) post=1; shift ;;
+  --via) via="$2"; shift 2 ;;
+  --model) model_override="$2"; shift 2 ;;
+  -*) die "unknown flag $1" ;;
+  *) pr="$1"; shift ;;
+esac; done
+[ -n "$pr" ] || die "usage: review.sh <pr-number> [--post] [--via claude|agy] [--model <id>]"
 
 prj=$(gh pr view "$pr" --json number,title,body,labels,headRefName)
 size=$(label "$prj" "size:")
@@ -15,7 +22,12 @@ n=$(jq -r .body <<<"$prj" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-
 [ -n "$size" ] || size=$(gh issue view "$n" --json labels | jq -r '.labels[].name | select(startswith("size:")) | sub("size:";"")')
 [ -n "$size" ] || die "no size label on PR #$pr or issue #$n"
 read -r _ _ _ reviewer <<<"$(size_row "$size")"
-model=$(model_id "$(tr '[:upper:]' '[:lower:]' <<<"$reviewer" | grep -oE 'sonnet|opus|fable' | head -1)")
+case "$via" in
+  claude) model=$(model_id "$(tr '[:upper:]' '[:lower:]' <<<"$reviewer" | grep -oE 'sonnet|opus|fable' | head -1)") ;;
+  agy)    need agy; model="gemini-3.1-pro-high" ;;
+  *) die "unknown reviewer backend '$via' (claude|agy)" ;;
+esac
+[ -n "$model_override" ] && model="$model_override"
 
 issue=$(gh issue view "$n" --json title,body)
 diff=$(gh pr diff "$pr")
@@ -43,10 +55,14 @@ $(cat "$ROOT/docs/SPEC.md")
 $diff"
 
 out="$RUNS/review-$pr-$(date +%Y%m%d-%H%M%S).md"
-echo "reviewing PR #$pr (issue #$n, size $size) with $model -> $out"
+echo "reviewing PR #$pr (issue #$n, size $size) via $via/$model -> $out"
 cd "$ROOT"
-claude -p "$prompt" --model "$model" --permission-mode dontAsk --allowedTools "Read,Glob,Grep" \
-  --output-format text > "$out" 2>&1 || true
+case "$via" in
+  claude) claude -p "$prompt" --model "$model" --permission-mode dontAsk --allowedTools "Read,Glob,Grep" \
+            --output-format text > "$out" 2>&1 || true ;;
+  agy)    agy -p "$prompt" --model "$model" --mode plan --print-timeout 15m \
+            --output-format text > "$out" 2>&1 || true ;;
+esac
 cat "$out"
 if [ "$post" = 1 ]; then gh pr comment "$pr" --body-file "$out"; fi
 tail -1 "$out" | grep -qE '^BLOCKING: 0 findings' && exit 0
