@@ -22,9 +22,10 @@ pub struct FrameSink {
 impl FrameSink {
     /// Push one 20 ms frame. Returns `false` and counts an overrun when the ring is full.
     ///
-    /// A full ring drops this frame. The producer cannot discard the consumer's oldest frame
-    /// without a lock (SPSC gives each side one index), and the capture callback must not lock,
-    /// so the incoming frame is the one lost; the audio dropped is one 20 ms frame either way.
+    /// docs/SPEC.md § Threading rules: a full buffer drops the *incoming* 20 ms frame and
+    /// increments the overrun counter. The lock-free producer never touches the consumer's read
+    /// index (SPSC gives each side one index) and the capture callback must not lock, so the
+    /// consumer's backlog is never discarded from this side; one 20 ms frame is lost per overrun.
     /// Frames shorter than [`FRAME_LEN`] are zero-padded; longer ones are truncated.
     pub fn push_frame(&mut self, frame: &[f32]) -> bool {
         if self.prod.vacant_len() < FRAME_LEN {

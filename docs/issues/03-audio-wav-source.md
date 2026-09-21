@@ -13,7 +13,7 @@ Out of scope: everything else, including later issues.
 #2
 ## Acceptance
 - [ ] A 48 kHz stereo WAV is delivered as 16 kHz mono f32 within 0.1 dB of a reference downmix
-- [ ] Ring buffer overrun drops the oldest 20 ms and increments the counter; never blocks the producer
+- [ ] Ring buffer overrun drops the incoming 20 ms frame and increments the counter; never blocks the producer
 - [ ] `WavSource` can run at 1× wall-clock or as fast as possible
 - [ ] `just check`, `just test` and `just lint` green
 ## Verify
