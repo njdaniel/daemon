@@ -88,7 +88,7 @@ Audio enters as two labelled streams, so speaker attribution is a property of th
 **Threading rules**
 
 - The PipeWire main loop owns one OS thread; its process callback only copies samples into a lock-free `ringbuf` producer and returns. No allocation, no logging, no locks in the callback.
-- VAD runs on its own thread per source, draining the ring buffer in 20 ms frames; a full buffer drops the oldest 20 ms and increments a counter the status bar reads.
+- VAD runs on its own thread per source, draining the ring buffer in 20 ms frames; a full buffer drops the incoming 20 ms frame (the lock-free producer never touches the consumer's read index) and increments a counter the status bar reads.
 - One `whisper-rs` `WhisperState` per source on a dedicated worker thread; inference is serialised per state. Workers receive `Utterance`s over a bounded `crossbeam` channel and publish `Segment`s to the transcript bus.
 - The detector, context assembler and LLM stage run as tokio tasks. The LLM task holds a `CancellationToken` per request and cancels the in-flight one when a newer unpinned question arrives.
 - `Session` lives behind a `tokio::sync::watch`; the Tauri bridge coalesces emits to at most 30 per second; transcript text arrives as deltas, suggestions as whole objects.
