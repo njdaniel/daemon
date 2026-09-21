@@ -16,5 +16,9 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `hound` | `dmn-audio` | Read fixture / replay WAVs of any rate, channel count and sample format |
 | `rubato` | `dmn-audio` | FFT resampler from the file's rate to 16 kHz; PipeWire resamples live audio itself |
 | `ringbuf` | `dmn-audio` | Lock-free SPSC ring from the capture thread to the VAD thread; the RT callback only pushes |
+| `tokio` (rt-multi-thread, macros, time, sync) | `dmn-llm`, later `dmn-core` | Async runtime for HTTP, SQLite access and UI events; never on the audio path |
+| `tokio-util` | `dmn-llm` | `CancellationToken`: a newer unpinned question cancels the in-flight LLM request |
+| `reqwest` (json, stream; rustls by default) | `dmn-llm` | HTTP client for Ollama, OpenAI-compatible and Anthropic endpoints; streaming bodies |
+| `futures-util` | `dmn-llm` | `BoxStream` / `BoxFuture` so `Provider` is object-safe without a macro crate |
 
-Planned by the spec (add the line when the issue lands): `pipewire` (#4); `crossbeam-channel`, `whisper-rs` (#8); `reqwest`, `tokio`, `tokio-util` (#11); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+Planned by the spec (add the line when the issue lands): `pipewire` (#4); `crossbeam-channel`, `whisper-rs` (#8); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
