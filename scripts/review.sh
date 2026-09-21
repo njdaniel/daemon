@@ -31,7 +31,9 @@ esac
 
 issue=$(gh issue view "$n" --json title,body)
 diff=$(gh pr diff "$pr")
-prompt="You are reviewing PR #$pr for issue #$n of the Daemon repo. You may read files in the repo but must not edit anything.
+ro="You may read files in the repo but must not edit anything."
+[ "$via" = agy ] && ro="Everything you need is in this prompt. Do not run shell commands or tools (they are denied in this mode); reading the diff and documents below is sufficient. Do not edit anything."
+prompt="You are reviewing PR #$pr for issue #$n of the Daemon repo. $ro
 
 List every acceptance criterion from the issue and state whether the diff meets it, with evidence from the diff.
 List blocking findings: correctness, safety (unsafe, RT callback rules, audio on disk), spec violations.
