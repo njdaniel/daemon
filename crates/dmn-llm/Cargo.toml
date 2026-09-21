@@ -15,7 +15,6 @@ tokio-util = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
-dmn-core = { path = "../dmn-core" }
 
 [lints]
 workspace = true

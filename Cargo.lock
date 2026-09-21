@@ -453,7 +453,6 @@ dependencies = [
 name = "dmn-llm"
 version = "0.1.0"
 dependencies = [
- "dmn-core",
  "futures-util",
  "reqwest",
  "serde",

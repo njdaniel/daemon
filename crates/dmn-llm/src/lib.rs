@@ -27,7 +27,7 @@ mod provider;
 pub use futures_util::future::BoxFuture;
 pub use futures_util::stream::BoxStream;
 pub use mock::MockProvider;
-pub use ollama::OllamaProvider;
+pub use ollama::{OllamaProvider, OllamaSettings};
 pub use provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard, guard_until,
 };

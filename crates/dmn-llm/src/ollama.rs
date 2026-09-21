@@ -19,6 +19,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_KEEP_ALIVE: &str = "30m";
 /// Upper bound on `warm_up`: loading the model from disk, not generation.
 pub const WARM_UP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How much of a non-2xx response body is read for the error message.
+const ERROR_BODY_CAP: usize = 4096;
+
+/// Everything the Ollama provider needs from configuration. Built from `[llm]` in the wiring
+/// crate (wired in `dmn-core`, #13); this crate only defines the shape and its defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OllamaSettings {
+    /// Like `http://localhost:11434`; a trailing slash is tolerated.
+    pub base_url: String,
+    pub model: String,
+    /// Ollama `keep_alive` duration string ("30m", "1h", "-1" for forever).
+    pub keep_alive: String,
+}
+
+impl Default for OllamaSettings {
+    fn default() -> Self {
+        Self {
+            base_url: "http://localhost:11434".to_owned(),
+            model: "qwen3.6:35b-a3b".to_owned(),
+            keep_alive: DEFAULT_KEEP_ALIVE.to_owned(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -48,10 +71,14 @@ impl OllamaProvider {
         })
     }
 
-    /// From `[llm]` in config. `keep_alive` is not a config key (SPEC), so it stays a builder
-    /// argument; see [`OllamaProvider::with_keep_alive`].
-    pub fn from_config(llm: &dmn_core::config::Llm) -> Result<Self, LlmError> {
-        Self::new(llm.base_url.clone(), llm.model.clone())
+    /// From [`OllamaSettings`]. The wiring crate converts `[llm]` config into these settings;
+    /// `dmn-llm` must not depend on `dmn-core` (SPEC § Architecture: `dmn-core` depends on every
+    /// stage, so the reverse edge would be a cycle).
+    pub fn from_settings(settings: &OllamaSettings) -> Result<Self, LlmError> {
+        Ok(
+            Self::new(settings.base_url.clone(), settings.model.clone())?
+                .with_keep_alive(settings.keep_alive.clone()),
+        )
     }
 
     /// Ollama `keep_alive` duration string ("30m", "1h", "-1" for forever). Default "30m".
@@ -109,6 +136,34 @@ impl OllamaProvider {
             url: self.base_url.clone(),
             detail: e.to_string(),
         }
+    }
+
+    /// Read up to [`ERROR_BODY_CAP`] bytes of a non-2xx body under the same token and deadline
+    /// as the rest of the request. Whatever arrived before cancel / deadline is returned, so a
+    /// stalled error response still surfaces as `HttpStatus` within the phase budget.
+    async fn error_body_within(
+        resp: reqwest::Response,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> String {
+        let mut body: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        let read = async {
+            while let Some(Ok(chunk)) = stream.next().await {
+                body.extend_from_slice(&chunk);
+                if body.len() >= ERROR_BODY_CAP {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {}
+            () = tokio::time::sleep_until(deadline) => {}
+            () = read => {}
+        }
+        body.truncate(ERROR_BODY_CAP);
+        String::from_utf8_lossy(&body).chars().take(300).collect()
     }
 
     /// Drive `send` (connect, request, response headers) under the same cancellation token and
@@ -198,11 +253,11 @@ impl Provider for OllamaProvider {
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
+                let body = Self::error_body_within(resp, &cancel, deadline).await;
                 return Err(LlmError::HttpStatus {
                     provider: NAME,
                     status: status.as_u16(),
-                    body: text.chars().take(300).collect(),
+                    body,
                 });
             }
             tracing::debug!(model = %self.model, "ollama stream open");
@@ -260,17 +315,18 @@ impl Provider for OllamaProvider {
         Box::pin(async move {
             let body = self.build_warm_up_body();
             let deadline = Instant::now() + WARM_UP_TIMEOUT;
+            let cancel = CancellationToken::new();
             let send = self.client.post(self.url("/api/chat")).json(&body).send();
             let resp = self
-                .send_within(send, &CancellationToken::new(), deadline, WARM_UP_TIMEOUT)
+                .send_within(send, &cancel, deadline, WARM_UP_TIMEOUT)
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
+                let body = Self::error_body_within(resp, &cancel, deadline).await;
                 return Err(LlmError::HttpStatus {
                     provider: NAME,
                     status: status.as_u16(),
-                    body: text.chars().take(300).collect(),
+                    body,
                 });
             }
             tracing::info!(model = %self.model, keep_alive = %self.keep_alive, "ollama warm");
@@ -429,6 +485,72 @@ mod tests {
             elapsed < timeout + Duration::from_millis(300),
             "deadline extended: {elapsed:?}"
         );
+    }
+
+    /// A server that answers `500` with headers promising a long body, then stalls: `send()`
+    /// returns, but reading the error body never completes.
+    fn stalled_error_server() -> (OllamaProvider, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Consume the request head so the client is not blocked on its own write.
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut sink = [0u8; 4096];
+                let _ = stream.read(&mut sink);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n\r\npartial",
+                );
+                let _ = stream.flush();
+                std::mem::forget(stream);
+            }
+        });
+        (
+            OllamaProvider::new(format!("http://127.0.0.1:{port}"), "m").unwrap(),
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn stalled_error_body_still_returns_http_status_within_the_deadline() {
+        let (p, _server) = stalled_error_server();
+        let timeout = Duration::from_millis(200);
+        let req = ChatRequest::new(vec![]).with_timeout(timeout);
+        let started = std::time::Instant::now();
+        let err = p
+            .chat(req, CancellationToken::new())
+            .await
+            .map(|_| ())
+            .expect_err("must fail");
+        let elapsed = started.elapsed();
+        match &err {
+            LlmError::HttpStatus { status, body, .. } => {
+                assert_eq!(*status, 500);
+                assert!(body.is_empty() || body.starts_with("partial"), "{body:?}");
+            }
+            other => panic!("expected HttpStatus, got {other}"),
+        }
+        assert!(
+            elapsed < timeout + Duration::from_millis(300),
+            "error body read escaped the deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn settings_default_and_from_settings_round_trip() {
+        let s = OllamaSettings::default();
+        assert_eq!(s.base_url, "http://localhost:11434");
+        assert_eq!(s.keep_alive, DEFAULT_KEEP_ALIVE);
+        let custom = OllamaSettings {
+            base_url: "http://10.0.0.2:11434/".into(),
+            model: "other".into(),
+            keep_alive: "1h".into(),
+        };
+        let p = OllamaProvider::from_settings(&custom).unwrap();
+        assert_eq!(p.model(), "other");
+        assert_eq!(p.base_url, "http://10.0.0.2:11434");
+        assert_eq!(p.build_warm_up_body()["keep_alive"], "1h");
     }
 
     /// Needs Ollama on localhost with `qwen3.6:35b-a3b` pulled: `cargo test -p dmn-llm -- --ignored`.
