@@ -13,5 +13,8 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `tracing-subscriber` (json, env-filter) | `dmn-core` | JSON lines to the log file; `DMN_LOG` filter |
 | `serde_json` | `dmn-core` (dev), later `dmn-llm` | Assert log lines are JSON; LLM request/response bodies |
 | `tempfile` (dev) | tests | Isolated config / log directories so tests never touch `~` |
+| `hound` | `dmn-audio` | Read fixture / replay WAVs of any rate, channel count and sample format |
+| `rubato` | `dmn-audio` | FFT resampler from the file's rate to 16 kHz; PipeWire resamples live audio itself |
+| `ringbuf` | `dmn-audio` | Lock-free SPSC ring from the capture thread to the VAD thread; the RT callback only pushes |
 
-Planned by the spec (add the line when the issue lands): `hound`, `ringbuf`, `rubato` (#3); `pipewire` (#4); `crossbeam-channel`, `whisper-rs` (#8); `reqwest`, `tokio`, `tokio-util` (#11); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+Planned by the spec (add the line when the issue lands): `pipewire` (#4); `crossbeam-channel`, `whisper-rs` (#8); `reqwest`, `tokio`, `tokio-util` (#11); `rusqlite` (#13); `ratatui`, `crossterm` (#14).

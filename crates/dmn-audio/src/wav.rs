@@ -1,0 +1,580 @@
+//! `WavSource`: a file standing in for a capture stream. Any rate and channel count in; 16 kHz
+//! mono frames out, paced at 1× wall-clock for demos and live-like tests, or as fast as the
+//! disk allows for the eval harness.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use hound::{SampleFormat, WavReader, WavSpec};
+use rubato::audioadapter::Adapter;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
+
+use crate::frames::FrameSink;
+use crate::source::{AudioError, AudioSource, Source};
+use crate::{FRAME_LEN, FRAME_MS, SAMPLE_RATE};
+
+/// How fast a `WavSource` plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speed {
+    /// One second of audio per second of wall-clock, like a live call.
+    RealTime,
+    /// No pacing: frames are pushed as soon as they are decoded.
+    Fast,
+}
+
+/// Input frames handed to the resampler per call. Large enough to amortise the FFT, small
+/// enough (about 21 ms at 48 kHz) that the first frame is not delayed noticeably.
+const RESAMPLE_CHUNK: usize = 1024;
+
+pub struct WavSource {
+    path: PathBuf,
+    source: Source,
+    speed: Speed,
+    spec: WavSpec,
+    duration: Duration,
+    stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<(), AudioError>>>,
+}
+
+impl WavSource {
+    /// Open and validate the file. Nothing is read until `start`.
+    pub fn open(path: impl AsRef<Path>, source: Source, speed: Speed) -> Result<Self, AudioError> {
+        let path = path.as_ref().to_path_buf();
+        let reader = WavReader::open(&path).map_err(|source| AudioError::Open {
+            path: path.clone(),
+            source,
+        })?;
+        let spec = reader.spec();
+        if spec.channels == 0 || spec.sample_rate == 0 {
+            return Err(AudioError::Unsupported {
+                path,
+                detail: format!("{} channels at {} Hz", spec.channels, spec.sample_rate),
+            });
+        }
+        match (spec.sample_format, spec.bits_per_sample) {
+            (SampleFormat::Float, 32) | (SampleFormat::Int, 8 | 16 | 24 | 32) => {}
+            (f, b) => {
+                return Err(AudioError::Unsupported {
+                    path,
+                    detail: format!("{f:?} {b}-bit samples"),
+                });
+            }
+        }
+        let frames = u64::from(reader.duration());
+        let duration = Duration::from_secs_f64(frames as f64 / f64::from(spec.sample_rate));
+        Ok(Self {
+            path,
+            source,
+            speed,
+            spec,
+            duration,
+            stop: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        })
+    }
+
+    /// Length of the file.
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Sample rate and channel count of the file (before conversion).
+    pub fn input_format(&self) -> (u32, u16) {
+        (self.spec.sample_rate, self.spec.channels)
+    }
+
+    /// Block until the file has been delivered in full (or `stop` was called), then return the
+    /// thread's result. Tests and `dmn replay` use this; a live pipeline uses `stop`.
+    pub fn wait(&mut self) -> Result<(), AudioError> {
+        match self.thread.take() {
+            Some(handle) => handle.join().map_err(|_| AudioError::ThreadPanicked)?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl AudioSource for WavSource {
+    fn source(&self) -> Source {
+        self.source
+    }
+
+    fn start(&mut self, sink: FrameSink) -> Result<(), AudioError> {
+        if self.thread.is_some() {
+            return Err(AudioError::AlreadyStarted);
+        }
+        let job = Job {
+            path: self.path.clone(),
+            spec: self.spec,
+            speed: self.speed,
+            stop: Arc::clone(&self.stop),
+            finished: Arc::clone(&self.finished),
+        };
+        let name = format!("dmn-wav-{}", self.source.label().to_lowercase());
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || job.run(sink))
+            .map_err(|_| AudioError::ThreadPanicked)?;
+        self.thread = Some(handle);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), AudioError> {
+        self.stop.store(true, Ordering::Release);
+        self.wait()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for WavSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Everything the reader thread needs; lives on that thread.
+struct Job {
+    path: PathBuf,
+    spec: WavSpec,
+    speed: Speed,
+    stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Job {
+    fn run(self, mut sink: FrameSink) -> Result<(), AudioError> {
+        let reader = WavReader::open(&self.path).map_err(|source| AudioError::Open {
+            path: self.path.clone(),
+            source,
+        })?;
+        let channels = usize::from(self.spec.channels);
+        let mut samples = MonoReader::new(reader, self.spec, self.path.clone());
+        let mut converter = RateConverter::new(self.spec.sample_rate)?;
+        let mut pacer = Pacer::new(self.speed);
+        let mut pending: Vec<f32> = Vec::with_capacity(4 * FRAME_LEN);
+        let mut block = vec![0.0f32; converter.input_len().max(1)];
+
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let want = converter.input_len().max(1);
+            block.resize(want, 0.0);
+            let got = samples.read_mono(&mut block, channels)?;
+            if got == 0 {
+                break;
+            }
+            converter.convert(&block, got, &mut pending)?;
+            self.emit_full_frames(&mut pending, &mut pacer, &mut sink);
+        }
+
+        converter.flush(&mut pending)?;
+        self.emit_full_frames(&mut pending, &mut pacer, &mut sink);
+        if !pending.is_empty() && !self.stop.load(Ordering::Acquire) {
+            pending.resize(FRAME_LEN, 0.0);
+            pacer.wait_for_next();
+            sink.push_frame(&pending);
+        }
+        self.finished.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn emit_full_frames(&self, pending: &mut Vec<f32>, pacer: &mut Pacer, sink: &mut FrameSink) {
+        let mut offset = 0;
+        while pending.len() - offset >= FRAME_LEN {
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            pacer.wait_for_next();
+            sink.push_frame(&pending[offset..offset + FRAME_LEN]);
+            offset += FRAME_LEN;
+        }
+        pending.drain(..offset);
+    }
+}
+
+/// Reads interleaved samples of any supported format as f32 in [-1, 1] and downmixes to mono
+/// by averaging channels.
+struct MonoReader {
+    iter: Box<dyn Iterator<Item = Result<f32, hound::Error>> + Send>,
+    path_for_errors: PathBuf,
+}
+
+impl MonoReader {
+    fn new(
+        reader: WavReader<std::io::BufReader<std::fs::File>>,
+        spec: WavSpec,
+        path: PathBuf,
+    ) -> Self {
+        let iter: Box<dyn Iterator<Item = Result<f32, hound::Error>> + Send> =
+            match (spec.sample_format, spec.bits_per_sample) {
+                (SampleFormat::Float, _) => Box::new(reader.into_samples::<f32>()),
+                (SampleFormat::Int, bits) => {
+                    // Full scale for a `bits`-bit signed integer; `open` validated 8 ≤ bits ≤ 32.
+                    let scale = 1.0 / (1u64 << (bits.clamp(8, 32) - 1)) as f32;
+                    Box::new(
+                        reader
+                            .into_samples::<i32>()
+                            .map(move |s| s.map(|v| v as f32 * scale)),
+                    )
+                }
+            };
+        Self {
+            iter,
+            path_for_errors: path,
+        }
+    }
+
+    /// Fill `out` with mono samples; returns how many were produced (fewer at end of file).
+    fn read_mono(&mut self, out: &mut [f32], channels: usize) -> Result<usize, AudioError> {
+        let mut produced = 0;
+        'frames: for slot in out.iter_mut() {
+            let mut acc = 0.0f32;
+            for c in 0..channels {
+                match self.iter.next() {
+                    Some(Ok(v)) => acc += v,
+                    Some(Err(source)) => {
+                        return Err(AudioError::Read {
+                            path: self.path_for_errors.clone(),
+                            source,
+                        });
+                    }
+                    None => {
+                        // A truncated final frame (c > 0) is dropped rather than half-averaged.
+                        let _ = c;
+                        break 'frames;
+                    }
+                }
+            }
+            *slot = acc / channels as f32;
+            produced += 1;
+        }
+        Ok(produced)
+    }
+}
+
+/// Converts mono input at any rate to `SAMPLE_RATE`. Identity when the rate already matches.
+enum RateConverter {
+    Identity,
+    Fft {
+        resampler: Box<Fft<f32>>,
+        /// Output samples still to discard: the filter's startup delay.
+        skip: usize,
+    },
+}
+
+impl RateConverter {
+    fn new(rate_in: u32) -> Result<Self, AudioError> {
+        if rate_in == SAMPLE_RATE {
+            return Ok(Self::Identity);
+        }
+        let resampler = Fft::<f32>::new(
+            rate_in as usize,
+            SAMPLE_RATE as usize,
+            RESAMPLE_CHUNK,
+            1,
+            FixedSync::Input,
+        )
+        .map_err(|e| AudioError::Resampler(e.to_string()))?;
+        let skip = resampler.output_delay();
+        Ok(Self::Fft {
+            resampler: Box::new(resampler),
+            skip,
+        })
+    }
+
+    /// Input samples the next `convert` call wants.
+    fn input_len(&self) -> usize {
+        match self {
+            Self::Identity => FRAME_LEN * 4,
+            Self::Fft { resampler, .. } => resampler.input_frames_next(),
+        }
+    }
+
+    /// Convert `block[..got]` and append the output to `out`.
+    fn convert(&mut self, block: &[f32], got: usize, out: &mut Vec<f32>) -> Result<(), AudioError> {
+        match self {
+            Self::Identity => {
+                out.extend_from_slice(&block[..got]);
+                Ok(())
+            }
+            Self::Fft { resampler, skip } => {
+                let input = InterleavedSlice::new(block, 1, block.len())
+                    .map_err(|e| AudioError::Resampler(e.to_string()))?;
+                let indexing = Indexing {
+                    input_offset: 0,
+                    output_offset: 0,
+                    partial_len: (got < block.len()).then_some(got),
+                    active_channels_mask: None,
+                };
+                let produced = resampler
+                    .process(&input, Some(&indexing))
+                    .map_err(|e| AudioError::Resampler(e.to_string()))?;
+                let frames = produced.frames();
+                let data = produced.take_data();
+                let data = &data[..frames];
+                let drop = (*skip).min(data.len());
+                *skip -= drop;
+                out.extend_from_slice(&data[drop..]);
+                Ok(())
+            }
+        }
+    }
+
+    /// Push silence through the filter so the last real samples come out.
+    fn flush(&mut self, out: &mut Vec<f32>) -> Result<(), AudioError> {
+        match self {
+            Self::Identity => Ok(()),
+            Self::Fft { resampler, .. } => {
+                let delay_in = resampler.output_delay() * resampler.input_frames_next()
+                    / resampler.output_frames_next().max(1);
+                let zeros = vec![0.0f32; resampler.input_frames_next()];
+                let mut fed = 0;
+                let mut tail = Vec::new();
+                while fed < delay_in + 1 {
+                    self.convert(&zeros, zeros.len(), &mut tail)?;
+                    fed += zeros.len();
+                }
+                // Only the part of the tail that corresponds to real input is wanted; the rest
+                // is silence the filter produced from our zeros. Keep exactly the delay's worth.
+                let keep = match self {
+                    Self::Fft { resampler, .. } => resampler.output_delay(),
+                    Self::Identity => 0,
+                };
+                tail.truncate(keep);
+                out.extend_from_slice(&tail);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Holds each frame until its wall-clock slot in `RealTime` mode; a no-op in `Fast` mode.
+struct Pacer {
+    speed: Speed,
+    start: Instant,
+    emitted: u64,
+}
+
+impl Pacer {
+    fn new(speed: Speed) -> Self {
+        Self {
+            speed,
+            start: Instant::now(),
+            emitted: 0,
+        }
+    }
+
+    fn wait_for_next(&mut self) {
+        if self.speed == Speed::RealTime {
+            let due = self.start + Duration::from_millis(self.emitted * u64::from(FRAME_MS));
+            let now = Instant::now();
+            if due > now {
+                std::thread::sleep(due - now);
+            }
+        }
+        self.emitted += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frames::{Frames, frame_channel};
+    use std::f32::consts::TAU;
+
+    /// Write a WAV whose channel `c` holds `amps[c] * sin(2π f t)`.
+    fn write_sine(path: &Path, rate: u32, amps: &[f32], hz: f32, secs: f32) {
+        let spec = WavSpec {
+            channels: amps.len() as u16,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        let n = (rate as f32 * secs) as usize;
+        for i in 0..n {
+            let t = i as f32 / rate as f32;
+            for &a in amps {
+                let v = (a * (TAU * hz * t).sin() * i16::MAX as f32) as i16;
+                w.write_sample(v).unwrap();
+            }
+        }
+        w.finalize().unwrap();
+    }
+
+    fn drain(frames: &mut Frames) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut buf = [0.0; FRAME_LEN];
+        while frames.pop_frame(&mut buf) {
+            out.extend_from_slice(&buf);
+        }
+        out
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn stereo_48k_becomes_16k_mono_within_0_1_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stereo48.wav");
+        write_sine(&path, 48_000, &[0.5, 0.3], 440.0, 1.0);
+
+        let mut src = WavSource::open(&path, Source::Interviewer, Speed::Fast).unwrap();
+        assert_eq!(src.input_format(), (48_000, 2));
+        assert_eq!(src.duration(), Duration::from_secs(1));
+        let (sink, mut frames) = frame_channel(Source::Interviewer, 200);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        assert!(src.is_finished());
+
+        let out = drain(&mut frames);
+        assert_eq!(frames.overruns(), 0);
+        let expected = SAMPLE_RATE as usize;
+        assert!(
+            (out.len() as i64 - expected as i64).unsigned_abs() as usize <= FRAME_LEN,
+            "got {} samples, expected about {expected}",
+            out.len()
+        );
+
+        // Reference downmix: (0.5 + 0.3) / 2 = 0.4 amplitude sine → RMS 0.4 / √2.
+        let ref_rms = 0.4 / 2f32.sqrt();
+        let body = &out[1600..14_400]; // 100 ms .. 900 ms, clear of edges
+        let db = 20.0 * (rms(body) / ref_rms).log10();
+        eprintln!("downmix level error: {db:.4} dB");
+        assert!(db.abs() < 0.1, "level off by {db} dB");
+
+        // Pitch survived: 440 Hz has 880 zero crossings per second.
+        let crossings = body
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
+        let per_sec = crossings as f32 / (body.len() as f32 / SAMPLE_RATE as f32);
+        assert!(
+            (per_sec - 880.0).abs() < 10.0,
+            "zero crossings/s = {per_sec}"
+        );
+    }
+
+    #[test]
+    fn sixteen_k_mono_passes_through_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mono16.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: SAMPLE_RATE,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let input: Vec<f32> = (0..FRAME_LEN * 3 + 7).map(|i| i as f32 / 1000.0).collect();
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for &v in &input {
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut src = WavSource::open(&path, Source::You, Speed::Fast).unwrap();
+        let (sink, mut frames) = frame_channel(Source::You, 8);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        let out = drain(&mut frames);
+        assert_eq!(
+            out.len(),
+            FRAME_LEN * 4,
+            "last partial frame is zero-padded"
+        );
+        assert_eq!(&out[..input.len()], &input[..]);
+        assert!(out[input.len()..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn fast_finishes_quickly_and_realtime_paces_at_one_x() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.wav");
+        write_sine(&path, 44_100, &[0.2], 300.0, 0.5);
+
+        let t = Instant::now();
+        let mut fast = WavSource::open(&path, Source::You, Speed::Fast).unwrap();
+        let (sink, mut frames) = frame_channel(Source::You, 100);
+        fast.start(sink).unwrap();
+        fast.wait().unwrap();
+        let fast_elapsed = t.elapsed();
+        let n_fast = drain(&mut frames).len();
+
+        let t = Instant::now();
+        let mut rt = WavSource::open(&path, Source::You, Speed::RealTime).unwrap();
+        let (sink, mut frames) = frame_channel(Source::You, 100);
+        rt.start(sink).unwrap();
+        rt.wait().unwrap();
+        let rt_elapsed = t.elapsed();
+        let n_rt = drain(&mut frames).len();
+
+        assert_eq!(n_fast, n_rt);
+        assert!(
+            fast_elapsed < Duration::from_millis(150),
+            "fast took {fast_elapsed:?}"
+        );
+        assert!(
+            rt_elapsed >= Duration::from_millis(450) && rt_elapsed < Duration::from_millis(900),
+            "real-time took {rt_elapsed:?} for 0.5 s of audio"
+        );
+    }
+
+    #[test]
+    fn stop_ends_a_realtime_source_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 5.0);
+        let mut src = WavSource::open(&path, Source::You, Speed::RealTime).unwrap();
+        let (sink, frames) = frame_channel(Source::You, 100);
+        src.start(sink).unwrap();
+        assert!(matches!(
+            src.start(frame_channel(Source::You, 1).0),
+            Err(AudioError::AlreadyStarted)
+        ));
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        src.stop().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "stop joined promptly"
+        );
+        assert!(!src.is_finished());
+        assert!(frames.queued_frames() >= 3 && frames.queued_frames() < 20);
+    }
+
+    #[test]
+    fn small_ring_overruns_but_the_producer_never_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 1.0);
+        let mut src = WavSource::open(&path, Source::You, Speed::Fast).unwrap();
+        let (sink, frames) = frame_channel(Source::You, 2);
+        let t = Instant::now();
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        assert!(t.elapsed() < Duration::from_millis(200));
+        assert_eq!(frames.queued_frames(), 2);
+        assert_eq!(frames.overruns(), 50 - 2, "1 s = 50 frames, 2 kept");
+    }
+
+    #[test]
+    fn unsupported_and_missing_files_are_typed_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = WavSource::open(dir.path().join("nope.wav"), Source::You, Speed::Fast);
+        assert!(matches!(missing, Err(AudioError::Open { .. })));
+    }
+}
