@@ -1,0 +1,76 @@
+{
+  "v": 3,
+  "attachments": {},
+  "boards": {
+    "Behavioral.dc.html": {
+      "h": 760,
+      "title": "Live — behavioral (STAR)",
+      "w": 440,
+      "x": 520,
+      "y": 0
+    },
+    "Collapsed.dc.html": {
+      "h": 92,
+      "title": "Collapsed pill (⌥H)",
+      "w": 440,
+      "x": 0,
+      "y": 880
+    },
+    "Context.dc.html": {
+      "h": 760,
+      "title": "Context & sources",
+      "w": 440,
+      "x": 1040,
+      "y": 0
+    },
+    "Main.dc.html": {
+      "h": 760,
+      "is_interactive": true,
+      "title": "Live — system design",
+      "w": 440,
+      "x": 0,
+      "y": 0
+    },
+    "Settings.dc.html": {
+      "h": 760,
+      "title": "Settings — audio & model",
+      "w": 440,
+      "x": 1560,
+      "y": 0
+    }
+  },
+  "createdOnFiles": {
+    "at": "2026-09-21T15:00:00Z",
+    "v": 1
+  },
+  "designSystems": [],
+  "launch": {
+    "view": "canvas"
+  },
+  "notes": {
+    "s1": {
+      "fill": "gray",
+      "text": "Main window is interactive: click Pin, and click any section row to expand it. Only one section opens at a time so the window never grows past what fits in ~5 seconds of reading. Accent color is a Tweak.",
+      "w": 440,
+      "x": 520,
+      "y": 880
+    },
+    "t1": {
+      "kind": "title1",
+      "maxW": 2000,
+      "text": "Daemon — Linux interview copilot",
+      "w": 240,
+      "x": 0,
+      "y": -300
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "Behavioral.dc.html",
+    "Context.dc.html",
+    "Settings.dc.html",
+    "Collapsed.dc.html"
+  ],
+  "pages": [],
+  "title": "Daemon"
+}

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Daemon — Behavioral question (STAR)</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#0b0c0f}
+a{color:#5fd3a6}a:hover{color:#8ae3c1}
+button{font-family:inherit}
+</style>
+</helmet>
+<div style="width: 440px; height: 760px; box-sizing: border-box; display: flex; flex-direction: column; background: #121417; color: #e8eaed; font-family: 'Instrument Sans', system-ui, sans-serif; font-size: 13px; line-height: 1.45; border: 1px solid #2a2f37; border-radius: 12px; overflow: hidden; box-shadow: 0 24px 60px rgba(0,0,0,0.55);">
+
+  <div style="display: flex; align-items: center; justify-content: space-between; height: 36px; padding: 0 10px 0 12px; border-bottom: 1px solid #22262d; background: #15181c; flex-shrink: 0;">
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="{{accent}}" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M3 12h2l2-6 3 12 3-9 2 6 2-3h4"/></svg>
+      <span style="font-size: 12px; font-weight: 600; color: #c6ccd3;">Daemon</span>
+    </div>
+    <div style="display: flex; align-items: center; gap: 6px;">
+      <div style="display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 999px; background: #1c2924; border: 1px solid #244a3c;">
+        <span style="width: 6px; height: 6px; border-radius: 999px; background: {{accent}};"></span>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; color: {{accent}};">LIVE 00:27:08</span>
+      </div>
+      <button aria-label="Always on top" style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: 0; border-radius: 6px; color: #9aa3ad; cursor: pointer;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 9h16"/></svg></button>
+      <button aria-label="Minimize" style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: 0; border-radius: 6px; color: #9aa3ad; cursor: pointer;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"/></svg></button>
+      <button aria-label="Close" style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; background: transparent; border: 0; border-radius: 6px; color: #9aa3ad; cursor: pointer;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 8px; padding: 14px 16px; border-bottom: 1px solid #22262d; background: #15181c; flex-shrink: 0;">
+    <div style="display: flex; align-items: center; justify-content: space-between;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.08em; color: #e8b04f;">PINNED QUESTION</span>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #6f7883;">27:02</span>
+        <span style="font-size: 10.5px; padding: 1px 6px; border-radius: 4px; background: #1f2329; color: #9aa3ad; border: 1px solid #2a2f37;">Behavioral</span>
+      </div>
+      <button style="display: flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px; border-radius: 6px; font-size: 11.5px; font-weight: 500; cursor: pointer; background: #2f2712; color: #e8b04f; border: 1px solid #5a4a1d;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5M8 3h8l-1 7 3 3H6l3-3z"/></svg>
+        <span>Pinned</span>
+      </button>
+    </div>
+    <p style="margin: 0; font-size: 17px; font-weight: 500; line-height: 1.35; letter-spacing: -0.005em; color: #f3f4f6;">Tell me about a time you disagreed with a technical decision and how you handled it.</p>
+    <p style="margin: 0; font-size: 12.5px; color: #9aa3ad;"><span style="color: #c6ccd3; font-weight: 500;">Focus:</span> conflict handling, influence without authority, outcome. Keep it under 2 minutes.</p>
+  </div>
+
+  <div style="display: flex; flex-direction: column; flex-grow: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 8px 16px; gap: 10px;">
+    <div style="display: flex; align-items: center; justify-content: space-between;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.08em; color: #9aa3ad;">STAR</span>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #6f7883;">matched story · stories/[YOUR STORY].md</span>
+      </div>
+      <button aria-label="Pick a different story" style="display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 7px; background: transparent; border: 1px solid #2a2f37; border-radius: 6px; color: #9aa3ad; font-size: 11px; cursor: pointer;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h6"/></svg><span>Swap</span></button>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 6px;">
+      <div style="display: flex; gap: 12px; padding: 10px 12px; border: 1px solid #22262d; border-radius: 8px; background: #15181c;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; color: {{accent}}; width: 14px; flex-shrink: 0; line-height: 1.2;">S</span>
+        <div style="display: flex; flex-direction: column; gap: 2px;"><span style="font-size: 10.5px; letter-spacing: 0.06em; color: #6f7883; font-family: 'JetBrains Mono', monospace;">SITUATION</span><span style="font-size: 13px; color: #e8eaed;">[Team / system / timeframe — one sentence]</span></div>
+      </div>
+      <div style="display: flex; gap: 12px; padding: 10px 12px; border: 1px solid #22262d; border-radius: 8px; background: #15181c;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; color: {{accent}}; width: 14px; flex-shrink: 0; line-height: 1.2;">T</span>
+        <div style="display: flex; flex-direction: column; gap: 2px;"><span style="font-size: 10.5px; letter-spacing: 0.06em; color: #6f7883; font-family: 'JetBrains Mono', monospace;">TASK</span><span style="font-size: 13px; color: #e8eaed;">[The decision you disagreed with and what was at stake]</span></div>
+      </div>
+      <div style="display: flex; gap: 12px; padding: 10px 12px; border: 1px solid #2f4a3f; border-radius: 8px; background: #15201c;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; color: {{accent}}; width: 14px; flex-shrink: 0; line-height: 1.2;">A</span>
+        <div style="display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 10.5px; letter-spacing: 0.06em; color: #6f7883; font-family: 'JetBrains Mono', monospace;">ACTION · spend most time here</span><span style="font-size: 13px; color: #e8eaed;">[What you did: gathered data, proposed alternative, ran a spike, brought it to the lead]</span><span style="font-size: 12px; color: #9aa3ad;">Say "I" not "we". Name the tradeoff you conceded.</span></div>
+      </div>
+      <div style="display: flex; gap: 12px; padding: 10px 12px; border: 1px solid #22262d; border-radius: 8px; background: #15181c;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 500; color: {{accent}}; width: 14px; flex-shrink: 0; line-height: 1.2;">R</span>
+        <div style="display: flex; flex-direction: column; gap: 2px;"><span style="font-size: 10.5px; letter-spacing: 0.06em; color: #6f7883; font-family: 'JetBrains Mono', monospace;">RESULT</span><span style="font-size: 13px; color: #e8eaed;">[Measurable outcome + what you'd do differently]</span></div>
+      </div>
+    </div>
+
+    <div style="display: flex; flex-direction: column; border: 1px solid #22262d; border-radius: 8px; overflow: hidden;">
+      <div style="display: flex; align-items: center; justify-content: space-between; height: 34px; padding: 0 10px 0 12px; border-bottom: 1px solid #22262d; color: #e8eaed; font-size: 12.5px; font-weight: 500;">
+        <span style="display: flex; align-items: center; gap: 8px;"><span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #6f7883;">⌥5</span><span>Things I Should Mention</span></span>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#6f7883" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 15l-6-6-6 6"/></svg>
+      </div>
+      <ul style="margin: 0; padding: 10px 12px 12px 26px; display: flex; flex-direction: column; gap: 5px; background: #15181c; font-size: 12.5px; color: #c6ccd3;">
+        <li>The job description asks for "disagree and commit" — use the phrase.</li>
+        <li>Close with what the relationship looked like afterwards.</li>
+      </ul>
+      <button style="display: flex; align-items: center; justify-content: space-between; height: 34px; padding: 0 10px 0 12px; background: transparent; border: 0; border-top: 1px solid #22262d; color: #e8eaed; font-size: 12.5px; font-weight: 500; cursor: pointer; text-align: left;">
+        <span style="display: flex; align-items: center; gap: 8px;"><span style="font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #6f7883;">⌥2</span><span>Likely Follow-ups</span></span>
+        <span style="display: flex; align-items: center; gap: 8px; color: #6f7883;"><span style="font-size: 11px;">3</span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></span>
+      </button>
+    </div>
+  </div>
+
+  <div style="display: flex; flex-direction: column; border-top: 1px solid #22262d; background: #15181c; flex-shrink: 0;">
+    <div style="display: flex; flex-direction: column; gap: 4px; padding: 10px 16px 8px 16px;">
+      <div style="display: flex; align-items: center; justify-content: space-between;">
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; letter-spacing: 0.08em; color: #9aa3ad;">TRANSCRIPT</span>
+        <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #e8b04f;">answering · 1:12</span>
+      </div>
+      <div style="display: flex; gap: 8px; font-size: 12px; color: #9aa3ad;"><span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; width: 76px; flex-shrink: 0; color: {{accent}};">Interviewer</span><span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">…and how you handled it.</span></div>
+      <div style="display: flex; gap: 8px; font-size: 12px; color: #c6ccd3;"><span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; width: 76px; flex-shrink: 0; color: #6f7883;">You</span><span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Sure. So last year our team was deciding whether to</span></div>
+    </div>
+    <div style="display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 12px 0 16px; border-top: 1px solid #22262d; background: #111316;">
+      <div style="display: flex; align-items: center; gap: 10px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #9aa3ad;">
+        <span style="display: flex; align-items: center; gap: 5px;"><span style="width: 5px; height: 5px; border-radius: 999px; background: {{accent}};"></span>mic</span>
+        <span style="display: flex; align-items: center; gap: 5px;"><span style="width: 5px; height: 5px; border-radius: 999px; background: {{accent}};"></span>pipewire · Zoom</span>
+        <span style="display: flex; align-items: center; gap: 5px;"><span style="width: 5px; height: 5px; border-radius: 999px; background: {{accent}};"></span>ollama</span>
+      </div>
+      <span style="font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #6f7883;">⌥Space unpin · ⌥H hide</span>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#5fd3a6","options":["#5fd3a6","#7aa2ff","#e8b04f"]},"$preview":{"width":440,"height":760}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#5fd3a6' };
+  }
+}
+</script>
+</body>
+</html>
