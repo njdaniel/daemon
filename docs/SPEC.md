@@ -36,7 +36,7 @@ Rust is the language: one binary, one process, native PipeWire and whisper.cpp b
 | STT | `whisper-rs` (whisper.cpp via cmake; features `vulkan`, `cuda`, `openblas`); `ggml-small.en` default, `base.en` on weak CPUs, `large-v3-turbo` with GPU | Same engine as before, first-class Rust API, GPU backends by feature flag | `whisper-server` sidecar (chunk-per-request loses context); faster-whisper sidecar (Python; kept as an optional `stt.engine` if GPU throughput matters) |
 | VAD | M1: energy + silence-gap VAD in Rust. M2: Silero via `ort` (ONNX Runtime) | Enough to segment utterances for the first model | Silero from day 1 (adds ORT to M1) |
 | Async & threads | tokio for HTTP, SQLite access and UI events; `std::thread` for the PipeWire loop and each whisper worker; `ringbuf` SPSC ring buffers from capture to VAD; `tokio::sync::broadcast` for session state | Real-time capture never touches the async runtime | async-std; a single-threaded design |
-| LLM | `Provider` trait (async, streaming) with three implementations: Ollama (`/api/chat`, NDJSON stream, JSON-schema `format`), OpenAI-compatible (`/v1/chat/completions`, SSE), Anthropic Messages API. Default: Ollama, model from config (baseline `llama3.1:8b`). `reqwest` + `serde` | Local by default; remote is one config change; structured output keeps the UI deterministic | Framework crates (wrong layer) |
+| LLM | `Provider` trait (async, streaming) with three implementations: Ollama (`/api/chat`, NDJSON stream, JSON-schema `format`), OpenAI-compatible (`/v1/chat/completions`, SSE), Anthropic Messages API. Default: Ollama, model from config (`qwen3.6:35b-a3b`, chosen 2026-09-21 by measurement over `llama3.1:8b` and `qwen3.6:27b`). `reqwest` + `serde` | Local by default; remote is one config change; structured output keeps the UI deterministic | Framework crates (wrong layer) |
 | Storage | `rusqlite` (`bundled`) with a small migration runner; `serde_json` for exports | Session memory needs queries; bundled SQLite avoids distro version drift | sqlx (async, but overkill); JSONL only |
 | Config & CLI | TOML via `serde` + `toml` at `~/.config/dmn/config.toml` (`directories` crate); binary `dmn` via `clap` with `run`, `doctor`, `devices`, `sources add`, `replay`, `bench` | Fits terminal-first use; `doctor`, `replay` and `bench` make Claude Code's work testable without a live call | GUI-only settings |
 | Packaging | M1: `cargo tauri build` (AppImage + deb from Tauri's bundler). M3: Flatpak (needs the PipeWire socket permission) | AppImage carries WebKitGTK cleanly | Snap (no) |
@@ -299,7 +299,7 @@ sensitivity = "balanced"             # eager | balanced | strict
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic
-model = "llama3.1:8b"
+model = "qwen3.6:35b-a3b"           # measured 2026-09-21 on the dev 4090; see CLAUDE.md
 base_url = "http://localhost:11434"
 api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
@@ -465,7 +465,7 @@ The two decisions most likely to change are the `pipewire` crate's low-level API
 **Open questions**
 
 - [ ] Target hardware for the latency numbers: which laptop, CPU-only or GPU (Vulkan/CUDA)? Sets the default model.
-- [ ] Default local model: `llama3.1:8b` as the baseline, or a newer 8B-class instruct model already pulled on the machine?
+- [x] Default local model: `qwen3.6:35b-a3b` (fast phase 0.95 s on the dev 4090; `llama3.1:8b` misclassified question kind; `qwen3.6:27b` took 3.0 s). Decided 2026-09-21.
 - [ ] Does the app need to work for in-person interviews (single mic, no system audio) in v1, which pulls diarization from M3 into M2?
 - [ ] Coding-interview mode: show worked solutions in Deeper Answer at all, or only hints and complexity notes?
 - [ ] Session recording (WAVs) off by default is the current call; confirm.

@@ -4,3 +4,6 @@
 //! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer).
 //! Owns: the PipeWire main-loop thread and one lock-free `ringbuf` producer per capture stream.
 //! The process callback allocates nothing, locks nothing, logs nothing.
+
+// CLAUDE.md: no unwrap/expect outside tests and main.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
