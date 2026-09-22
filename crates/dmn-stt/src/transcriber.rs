@@ -206,13 +206,23 @@ impl Transcriber {
                 }
             }
         }
-        let avg_logprob = if n == 0 { 0.0 } else { sum / n as f32 };
-        Ok(Transcript {
-            text: text.trim().to_owned(),
-            avg_logprob,
-            low_confidence: n > 0 && avg_logprob < LOW_CONFIDENCE_LOGPROB,
-            n_tokens: n,
-        })
+        Ok(transcript_from(&text, sum, n))
+    }
+}
+
+/// Assemble a [`Transcript`] from whisper's text and token log-probability sum. Split out so the
+/// scoring rule is testable without running inference.
+fn transcript_from(text: &str, logprob_sum: f32, n_tokens: usize) -> Transcript {
+    let avg_logprob = if n_tokens == 0 {
+        0.0
+    } else {
+        logprob_sum / n_tokens as f32
+    };
+    Transcript {
+        text: text.trim().to_owned(),
+        avg_logprob,
+        low_confidence: n_tokens > 0 && avg_logprob < LOW_CONFIDENCE_LOGPROB,
+        n_tokens,
     }
 }
 
@@ -244,9 +254,34 @@ mod tests {
     }
 
     #[test]
-    fn cpu_is_the_default_backend() {
+    #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
+    fn cpu_is_the_default_backend_without_gpu_features() {
         assert_eq!(Backend::compiled(), Backend::Cpu);
         let c = SttConfig::default();
         assert!(!c.use_gpu && c.trim_audio_ctx && c.threads == 4);
+    }
+
+    #[test]
+    #[cfg(any(feature = "cuda", feature = "vulkan"))]
+    fn gpu_features_default_to_the_gpu() {
+        assert_ne!(Backend::compiled(), Backend::Cpu);
+        assert!(SttConfig::default().use_gpu);
+    }
+
+    #[test]
+    fn low_confidence_follows_the_mean_token_logprob() {
+        // Clean speech: well above the threshold.
+        let good = transcript_from("  how would you design it  ", -1.2, 6);
+        assert_eq!(good.text, "how would you design it");
+        assert!((good.avg_logprob - -0.2).abs() < 1e-6);
+        assert!(!good.low_confidence && good.n_tokens == 6);
+        // Mean below -1.0: flagged.
+        let bad = transcript_from("mumble", -4.5, 3);
+        assert!((bad.avg_logprob - -1.5).abs() < 1e-6);
+        assert!(bad.low_confidence);
+        // Exactly at the threshold is not flagged; no tokens is not flagged either.
+        assert!(!transcript_from("x", -2.0, 2).low_confidence);
+        let empty = transcript_from("", 0.0, 0);
+        assert!(!empty.low_confidence && empty.avg_logprob == 0.0);
     }
 }
