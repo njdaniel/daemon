@@ -30,7 +30,21 @@ esac
 [ -n "$model_override" ] && model="$model_override"
 
 issue=$(gh issue view "$n" --json title,body)
-diff=$(gh pr diff "$pr")
+# Lockfiles and generated fixture data are summarised, not inlined: they bury the code under
+# hundreds of KB and reviewers start missing files at the end of the diff.
+diff=$(gh pr diff "$pr" | python3 -c '
+import re, sys
+skip = re.compile(r"(^|/)(Cargo\.lock|uv\.lock|package-lock\.json)$|^testdata/.*\.(json|md)$")
+out, cur, keep, n = [], None, True, 0
+def flush():
+    if cur and not keep: out.append(f"[{cur}: {n} changed lines omitted from review: lockfile or generated fixture data]\n")
+for line in sys.stdin:
+    m = re.match(r"diff --git a/(\S+) b/", line)
+    if m:
+        flush(); cur, n = m.group(1), 0; keep = not skip.search(cur)
+    if keep: out.append(line)
+    elif line[:1] in "+-" and not line.startswith(("+++", "---")): n += 1
+flush(); sys.stdout.write("".join(out))')
 ro="You may read files in the repo but must not edit anything."
 [ "$via" = agy ] && ro="Everything you need is in this prompt. Do not run shell commands or tools (they are denied in this mode); reading the diff and documents below is sufficient. Do not edit anything."
 prompt="You are reviewing PR #$pr for issue #$n of the Daemon repo. $ro
