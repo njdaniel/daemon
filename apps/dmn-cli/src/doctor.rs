@@ -172,9 +172,12 @@ fn parse_http_response(raw: &[u8]) -> Result<String, String> {
     if !(200..300).contains(&code) {
         return Err(format!("HTTP {code}"));
     }
-    let chunked = head
-        .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.contains("chunked"));
+    // Header names and transfer-coding values are both case-insensitive: "Transfer-Encoding:
+    // Chunked" is as valid as the lowercase spelling (Copilot on PR #18).
+    let chunked = head.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
     let body = if chunked {
         decode_chunked(body)
     } else {
@@ -279,7 +282,15 @@ pub fn ollama(h: &dyn Http, base_url: &str, model: &str) -> Vec<Check> {
             )];
         }
     };
-    let names = ollama_model_names(&body);
+    // A 2xx body we cannot parse is not an empty model list: it is a proxy, a captive portal or
+    // the wrong endpoint, and `ollama pull` would not fix it (Copilot on PR #18).
+    let Some(names) = ollama_model_names(&body) else {
+        return vec![Check::fail(
+            "ollama",
+            format!("unexpected response from {url}: not the JSON /api/tags returns"),
+            format!("check that {base_url} is an Ollama server (curl {url}) and not a proxy"),
+        )];
+    };
     let mut out = vec![Check::pass(
         "ollama",
         format!("{base_url} reachable, {} model(s)", names.len()),
@@ -299,19 +310,17 @@ pub fn ollama(h: &dyn Http, base_url: &str, model: &str) -> Vec<Check> {
     out
 }
 
-fn ollama_model_names(body: &str) -> Vec<String> {
-    let v: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    v["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Model names from an `/api/tags` body, or `None` when the body is not that shape at all
+/// (unparsable JSON, or no `models` array). An Ollama with nothing pulled answers
+/// `{"models":[]}`, which is `Some(vec![])` and a different situation.
+fn ollama_model_names(body: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let arr = v.get("models")?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|m| m["name"].as_str().map(str::to_owned))
+            .collect(),
+    )
 }
 
 /// For remote providers the key must be present in the named env var.
@@ -825,6 +834,64 @@ mod tests {
     }
 
     #[test]
+    fn transfer_encoding_value_is_case_insensitive() {
+        // Copilot on PR #18: only the header name was lowercased, so "Chunked" was not decoded
+        // and the raw chunk framing reached the JSON parser.
+        for header in [
+            "Transfer-Encoding: Chunked",
+            "transfer-encoding: chunked",
+            "Transfer-Encoding: CHUNKED",
+        ] {
+            let raw = format!("HTTP/1.1 200 OK\r\n{header}\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n");
+            assert_eq!(
+                parse_http_response(raw.as_bytes()).unwrap(),
+                "{}",
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_2xx_that_is_not_api_tags_is_not_a_missing_model() {
+        // Copilot on PR #18: unparsable JSON became an empty model list, so a proxy or the
+        // wrong port was misdiagnosed as "model not pulled" with an `ollama pull` fix.
+        assert_eq!(ollama_model_names(r#"{"models":[]}"#), Some(vec![]));
+        assert_eq!(ollama_model_names("<html>hello</html>"), None);
+        assert_eq!(ollama_model_names(r#"{"error":"nope"}"#), None);
+
+        let checks = ollama(
+            &FakeHttp(Ok("<html>proxy</html>".into())),
+            "http://localhost:11434",
+            "qwen3.6:35b-a3b",
+        );
+        assert_eq!(checks.len(), 1, "no model check on an unusable response");
+        assert!(!checks[0].ok);
+        assert!(
+            checks[0].detail.contains("unexpected response"),
+            "{}",
+            checks[0].detail
+        );
+        let fix = checks[0].fix.as_deref().unwrap_or_default();
+        assert!(!fix.contains("ollama pull"), "{fix}");
+
+        // An Ollama with nothing pulled is still an Ollama: that one does say `ollama pull`.
+        let empty = ollama(
+            &FakeHttp(Ok(r#"{"models":[]}"#.into())),
+            "http://localhost:11434",
+            "qwen3.6:35b-a3b",
+        );
+        assert_eq!(empty.len(), 2);
+        assert!(empty[0].ok, "reachable");
+        assert!(
+            empty[1]
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ollama pull")
+        );
+    }
+
+    #[test]
     fn chunked_body_split_inside_multibyte_char_decodes_intact() {
         // "🎤" is 4 bytes; the first chunk ends after its second byte. The old str-based
         // decoder panicked slicing at a non-char boundary (review finding on PR #18).
@@ -853,6 +920,10 @@ mod tests {
     #[ignore]
     fn live_ollama_tags() {
         let body = StdHttp.get("http://localhost:11434/api/tags").unwrap();
-        assert!(!ollama_model_names(&body).is_empty());
+        assert!(
+            !ollama_model_names(&body)
+                .expect("an /api/tags body")
+                .is_empty()
+        );
     }
 }
