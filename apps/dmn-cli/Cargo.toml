@@ -12,15 +12,15 @@ name = "dmn"
 path = "src/main.rs"
 
 [features]
-# GPU whisper backends. Forwarded to dmn-stt once it exists (#8); today they only change what
-# `dmn doctor` reports.
-cuda = []
-vulkan = []
+# GPU whisper backends, forwarded to dmn-stt. `dmn doctor` reports which one is compiled in.
+cuda = ["dmn-stt/cuda"]
+vulkan = ["dmn-stt/vulkan"]
 
 [dependencies]
 clap = { workspace = true }
 dmn-audio = { path = "../../crates/dmn-audio" }
 dmn-core = { path = "../../crates/dmn-core" }
+dmn-stt = { path = "../../crates/dmn-stt" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
