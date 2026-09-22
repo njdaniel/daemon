@@ -78,6 +78,7 @@ If the spec and the issue disagree, the issue wins; say so in the PR.
   End with exactly one line: BLOCKING: <n> findings.
   ```
 
+- GitHub Copilot also reviews every PR. `just review` waits up to 10 minutes for its review, puts every Copilot finding (overview and inline, marked still-anchored or outdated) into the reviewer prompt, and the reviewer must mark each one VALID, FIXED or FALSE with evidence. A VALID finding about correctness, safety or a CLAUDE.md / SPEC rule counts as blocking. The script refuses to pass a PR with no Copilot review (exit 3) unless run with `--no-copilot`, which the PR must then explain. Added 2026-09-22 after Copilot findings on PRs #17–#25 were merged untriaged (cleanup in #30).
 - Blocking findings go back as one fix run of the original issue with the review appended to the prompt. A second failure escalates to a human.
 - Reviewer assignment: Opus reviews Sonnet and Opus PRs; Fable reviews every L PR regardless of author.
 - Alternative reviewer: `just review <pr> --via agy` sends the same prompt through the `agy` CLI (Gemini 3.1 Pro by default, `--model` to change), a different model family that spends no Claude usage. Either backend's `BLOCKING: 0 findings` satisfies § 6.2; when a PR was implemented interactively on Fable, prefer `--via agy` so the reviewer is not the author's model.
@@ -87,7 +88,7 @@ If the spec and the issue disagree, the issue wins; say so in the PR.
 A PR merges when all of these hold:
 
 1. CI green.
-2. Review ends with `BLOCKING: 0 findings`.
+2. Review ends with `BLOCKING: 0 findings`, and its `COPILOT:` line shows every Copilot finding triaged (§ 5).
 3. Human approval at the checkpoint issues (#5, #10, #14, #16) — see §8.
 4. Squash-merge; commit title `#<n>: <issue title>`.
 
