@@ -6,25 +6,18 @@
 
 use crate::transcriber::LOW_CONFIDENCE_LOGPROB;
 
-/// Phrases whisper emits when handed silence or noise. The SPEC names the first two; the rest
-/// are the well-known ones from whisper's training data (subtitle and podcast outros), which
-/// show up in whisper.cpp bug reports about silent input. Match is case- and
-/// punctuation-insensitive and only applies below [`FilterConfig::max_words`], so a real
-/// sentence containing "thank you" is never dropped.
+/// Phrases whisper emits when handed silence or noise, and which nobody says in an interview.
+/// docs/SPEC.md names "Thank you." and "Thanks for watching."; the rest are subtitle and podcast
+/// outros from whisper's training data, plus the bracketed markers it emits for non-speech.
+/// Matching is case- and punctuation-insensitive and only applies below
+/// [`FilterConfig::max_words`], so a sentence containing "thank you" is never dropped.
 pub const HALLUCINATION_PHRASES: &[&str] = &[
     "thank you",
     "thank you very much",
     "thanks for watching",
-    "thanks for watching!",
     "thank you for watching",
     "please subscribe",
     "like and subscribe",
-    "you",
-    "bye",
-    "bye bye",
-    "okay",
-    "so",
-    "the end",
     "silence",
     "blank audio",
     "music",
@@ -34,12 +27,21 @@ pub const HALLUCINATION_PHRASES: &[&str] = &[
     "transcription by castingwords",
 ];
 
+/// Whisper's other stock fillers on silence. These are also things a candidate really says
+/// ("Okay.", "So…", "Bye."), so text alone cannot tell them apart and dropping them outright
+/// would delete real replies. They go only when whisper was also unsure
+/// ([`FilterConfig::ambiguous_min_logprob`]): a clearly-heard "Okay." stays in the transcript.
+pub const AMBIGUOUS_PHRASES: &[&str] = &["you", "okay", "so", "bye", "bye bye", "the end", "yeah"];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterConfig {
     /// Drop below this mean token log-probability.
     pub min_logprob: f32,
-    /// Only segments with at most this many words are matched against the phrase list.
+    /// Only segments with at most this many words are matched against the phrase lists.
     pub max_words: usize,
+    /// An [`AMBIGUOUS_PHRASES`] match is dropped only below this. Well above `min_logprob`:
+    /// whisper is very sure of a real "Okay." and much less sure of one it invented.
+    pub ambiguous_min_logprob: f32,
 }
 
 impl Default for FilterConfig {
@@ -47,6 +49,7 @@ impl Default for FilterConfig {
         Self {
             min_logprob: LOW_CONFIDENCE_LOGPROB,
             max_words: 3,
+            ambiguous_min_logprob: -0.5,
         }
     }
 }
@@ -102,8 +105,16 @@ pub fn should_drop(
         return Some(Dropped::LowConfidence);
     }
     let words = fp.split_whitespace().count();
-    if words <= cfg.max_words && HALLUCINATION_PHRASES.contains(&fp.as_str()) {
-        return Some(Dropped::Phrase);
+    if words <= cfg.max_words {
+        if HALLUCINATION_PHRASES.contains(&fp.as_str()) {
+            return Some(Dropped::Phrase);
+        }
+        if AMBIGUOUS_PHRASES.contains(&fp.as_str())
+            && n_tokens > 0
+            && avg_logprob < cfg.ambiguous_min_logprob
+        {
+            return Some(Dropped::Phrase);
+        }
     }
     None
 }
@@ -126,6 +137,27 @@ mod tests {
     }
 
     #[test]
+    fn a_short_real_reply_survives_even_when_whisper_also_hallucinates_it() {
+        let cfg = FilterConfig::default();
+        // Clearly heard: these are things candidates really say.
+        for text in ["Okay.", "So,", "Bye.", "Yeah.", "You?"] {
+            assert_eq!(
+                should_drop(text, -0.15, 2, &cfg),
+                None,
+                "{text:?} was heard clearly and must stay"
+            );
+        }
+        // The same words, with whisper unsure, are its stock filler on silence.
+        for text in ["Okay.", "So,", "Bye.", "you"] {
+            assert_eq!(
+                should_drop(text, -0.8, 2, &cfg),
+                Some(Dropped::Phrase),
+                "{text:?} with low confidence is a hallucination"
+            );
+        }
+    }
+
+    #[test]
     fn stock_phrases_on_silence_are_dropped_however_they_are_punctuated() {
         let cfg = FilterConfig::default();
         for text in [
@@ -134,8 +166,6 @@ mod tests {
             "Thanks for watching!",
             "[BLANK_AUDIO]",
             "(applause)",
-            "you",
-            "Bye.",
         ] {
             assert_eq!(
                 should_drop(text, OK, 2, &cfg),

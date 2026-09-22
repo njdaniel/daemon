@@ -256,6 +256,16 @@ impl Job {
                 source = %u.source, start = ?u.start, reason = why.label(), text = %text,
                 "dropped segment"
             );
+            // Say the utterance closed anyway, with no text: otherwise its partials would sit
+            // on screen for ever, since only a final clears them.
+            (self.publish)(Segment {
+                source: u.source,
+                start: u.start,
+                end: u.end,
+                text: String::new(),
+                is_final: true,
+                avg_logprob: t.avg_logprob,
+            });
             return;
         }
         self.counters.finals.fetch_add(1, Ordering::Relaxed);
@@ -399,11 +409,16 @@ mod tests {
     /// Samples handed to each call, and the prompt it carried.
     type Calls = Arc<Mutex<Vec<(usize, Option<String>)>>>;
 
-    /// A stand-in for whisper: returns the next scripted text, records prompts, and can be slow.
+    /// A stand-in for whisper: returns the next scripted text and records prompts. With a gate
+    /// it announces each call and waits to be released, so a test can hold an inference open and
+    /// queue events behind it without sleeping on the scheduler.
     struct Fake {
         texts: Vec<(String, f32, usize)>,
         calls: Calls,
-        delay: Duration,
+        gate: Option<(
+            crossbeam_channel::Sender<usize>,
+            crossbeam_channel::Receiver<()>,
+        )>,
     }
 
     impl Speech for Fake {
@@ -412,7 +427,11 @@ mod tests {
             samples: &[f32],
             prompt: Option<&str>,
         ) -> Result<Transcript, SttError> {
-            std::thread::sleep(self.delay);
+            if let Some((started, release)) = &self.gate {
+                let n = self.calls.lock().unwrap().len();
+                let _ = started.send(n);
+                let _ = release.recv();
+            }
             let mut calls = self.calls.lock().unwrap();
             let i = calls.len();
             calls.push((samples.len(), prompt.map(str::to_owned)));
@@ -455,17 +474,57 @@ mod tests {
         tx: crossbeam_channel::Sender<VadEvent>,
         out: Arc<Mutex<Vec<Segment>>>,
         calls: Calls,
+        /// Set when the harness was built with a gate: `started` yields one message per
+        /// inference as it begins, `release` lets that inference finish.
+        started: Option<crossbeam_channel::Receiver<usize>>,
+        release: Option<crossbeam_channel::Sender<()>>,
     }
 
-    fn harness(texts: &[(&str, f32, usize)], delay: Duration) -> Harness {
+    impl Harness {
+        /// Wait for the next inference to begin, then let it run.
+        fn step(&self) {
+            self.started
+                .as_ref()
+                .expect("gated harness")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an inference started");
+            self.release
+                .as_ref()
+                .expect("gated harness")
+                .send(())
+                .expect("release it");
+        }
+
+        /// Wait for the next inference to begin and leave it blocked.
+        fn hold(&self) {
+            self.started
+                .as_ref()
+                .expect("gated harness")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("an inference started");
+        }
+
+        /// Let a held inference finish.
+        fn resume(&self) {
+            self.release
+                .as_ref()
+                .expect("gated harness")
+                .send(())
+                .expect("release it");
+        }
+    }
+
+    fn harness(texts: &[(&str, f32, usize)], gated: bool) -> Harness {
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
         let fake = Fake {
             texts: texts
                 .iter()
                 .map(|(t, l, n)| ((*t).to_owned(), *l, *n))
                 .collect(),
             calls: Arc::clone(&calls),
-            delay,
+            gate: gated.then_some((started_tx, release_rx)),
         };
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&out);
@@ -483,12 +542,14 @@ mod tests {
             tx,
             out,
             calls,
+            started: gated.then_some(started_rx),
+            release: gated.then_some(release_tx),
         }
     }
 
     #[test]
     fn a_closed_utterance_becomes_one_final_segment() {
-        let h = harness(&[("  How would you design it? ", -0.2, 7)], Duration::ZERO);
+        let h = harness(&[("  How would you design it? ", -0.2, 7)], false);
         h.tx.send(utterance(1_000, 4_000)).unwrap();
         drop(h.tx);
         let stats = h.worker.finish();
@@ -506,7 +567,7 @@ mod tests {
     fn the_previous_final_is_the_next_prompt() {
         let h = harness(
             &[("First question.", -0.2, 3), ("Second question.", -0.2, 3)],
-            Duration::ZERO,
+            false,
         );
         h.tx.send(utterance(0, 2_000)).unwrap();
         h.tx.send(utterance(3_000, 5_000)).unwrap();
@@ -524,14 +585,12 @@ mod tests {
                 ("How would you", -0.2, 4),
                 ("How would you design a rate limiter?", -0.2, 9),
             ],
-            Duration::ZERO,
+            true,
         );
         h.tx.send(partial(1_000, 2_000)).unwrap();
-        // Send the final only once the partial has been consumed, so they are not coalesced.
-        while h.out.lock().unwrap().is_empty() {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        h.step(); // the partial is transcribed before the final is even queued
         h.tx.send(utterance(1_000, 4_000)).unwrap();
+        h.step();
         drop(h.tx);
         let stats = h.worker.finish();
         let out = h.out.lock().unwrap();
@@ -547,15 +606,15 @@ mod tests {
 
     #[test]
     fn only_the_newest_partial_of_an_utterance_is_transcribed() {
-        // Slow inference: everything else queues up behind the first call.
-        let h = harness(&[("one", -0.2, 2); 6], Duration::from_millis(80));
-        for (i, at) in [2_000u64, 3_000, 4_000, 5_000].iter().enumerate() {
-            h.tx.send(partial(1_000, *at)).unwrap();
-            if i == 0 {
-                // Let the worker pick up the first one so the rest land in one batch.
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        let h = harness(&[("one", -0.2, 2); 6], true);
+        h.tx.send(partial(1_000, 2_000)).unwrap();
+        // Hold that inference open and queue three more partials of the same utterance behind it.
+        h.hold();
+        for at in [3_000u64, 4_000, 5_000] {
+            h.tx.send(partial(1_000, at)).unwrap();
         }
+        h.resume();
+        h.step(); // only one more inference runs: the newest of the three
         drop(h.tx);
         let stats = h.worker.finish();
         let out = h.out.lock().unwrap();
@@ -566,17 +625,20 @@ mod tests {
 
     #[test]
     fn a_partial_is_skipped_when_its_final_is_already_queued() {
-        let h = harness(&[("done", -0.2, 2); 4], Duration::from_millis(60));
+        let h = harness(&[("done", -0.2, 2); 4], true);
         h.tx.send(partial(0, 1_000)).unwrap();
-        std::thread::sleep(Duration::from_millis(15));
+        h.hold();
+        // While the first partial is in flight, both a newer partial and its final arrive.
         h.tx.send(partial(0, 2_000)).unwrap();
         h.tx.send(utterance(0, 3_000)).unwrap();
+        h.resume();
+        h.step(); // the final, not the superseded partial
         drop(h.tx);
         let stats = h.worker.finish();
         let out = h.out.lock().unwrap();
         assert_eq!(out.len(), 2, "first partial, then the final: {out:?}");
         assert!(out[1].is_final);
-        assert!(stats.superseded >= 1);
+        assert_eq!(stats.superseded, 1, "the queued partial was never run");
     }
 
     #[test]
@@ -588,18 +650,27 @@ mod tests {
                 ("   ", -0.2, 1),
                 ("A real question?", -0.3, 4),
             ],
-            Duration::ZERO,
+            false,
         );
+        // Finals are never coalesced, so they keep their order however they are batched.
         for i in 0..4 {
             h.tx.send(utterance(i * 2_000, i * 2_000 + 1_000)).unwrap();
-            // One at a time: finals are never coalesced, but this keeps the order obvious.
-            std::thread::sleep(Duration::from_millis(5));
         }
         drop(h.tx);
         let stats = h.worker.finish();
         let out = h.out.lock().unwrap();
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].text, "A real question?");
+        assert_eq!(
+            out.len(),
+            4,
+            "every utterance closes, three of them with empty text"
+        );
+        let spoken: Vec<&Segment> = out.iter().filter(|s| !s.text.is_empty()).collect();
+        assert_eq!(spoken.len(), 1);
+        assert_eq!(spoken[0].text, "A real question?");
+        assert!(
+            out.iter().all(|s| s.is_final),
+            "a dropped utterance still closes so its partials cannot linger"
+        );
         assert_eq!(stats.dropped_phrase, 1);
         assert_eq!(stats.dropped_low_confidence, 1);
         assert_eq!(stats.dropped_empty, 1);
@@ -610,10 +681,9 @@ mod tests {
     fn a_dropped_final_does_not_become_the_next_prompt() {
         let h = harness(
             &[("Thank you.", -0.2, 3), ("Real question?", -0.2, 3)],
-            Duration::ZERO,
+            false,
         );
         h.tx.send(utterance(0, 1_000)).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
         h.tx.send(utterance(2_000, 3_000)).unwrap();
         drop(h.tx);
         h.worker.finish();
@@ -623,7 +693,7 @@ mod tests {
 
     #[test]
     fn stop_ends_a_worker_whose_sender_is_still_open() {
-        let h = harness(&[("x", -0.2, 1)], Duration::ZERO);
+        let h = harness(&[("x", -0.2, 1)], false);
         let t = Instant::now();
         let _stats = h.worker.stop();
         assert!(t.elapsed() < Duration::from_millis(500));

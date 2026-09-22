@@ -88,6 +88,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         )
         .into());
     }
+    if !args.speed.is_finite() || args.speed <= 0.0 {
+        return Err(format!("--speed must be a positive number, not {}", args.speed).into());
+    }
     let stt_cfg = SttConfig {
         threads: args.threads.unwrap_or(usize::from(cfg.stt.threads)),
         ..SttConfig::default()
@@ -134,17 +137,36 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         let done = Arc::clone(&done);
         std::thread::spawn(move || {
             let mut stats = Vec::new();
+            let mut failures = Vec::new();
             for mut lane in lanes {
                 // The file is delivered; the VAD then flushes and closes its channel, which ends
-                // the whisper worker once it has drained everything.
-                let _ = lane.wav.wait();
-                let _ = lane.wav.stop();
-                let vad = lane.vad.finish().unwrap_or_default();
+                // the whisper worker once it has drained everything. A truncated WAV or a dead
+                // source thread must fail the command, not quietly shorten the transcript.
+                let label = lane.source.label();
+                if let Err(e) = lane.wav.wait() {
+                    failures.push(format!("{label} audio: {e}"));
+                }
+                if let Err(e) = lane.wav.stop() {
+                    failures.push(format!("{label} audio: {e}"));
+                }
+                let vad = match lane.vad.finish() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        failures.push(format!("{label} VAD: {e}"));
+                        WorkerStats::default()
+                    }
+                };
                 let stt = lane.stt.finish();
+                if stt.errors > 0 {
+                    failures.push(format!(
+                        "{label} whisper: {} inference(s) failed",
+                        stt.errors
+                    ));
+                }
                 stats.push((lane.source, vad, stt));
             }
             done.store(true, Ordering::Release);
-            stats
+            (stats, failures)
         })
     };
 
@@ -152,14 +174,18 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     loop {
         match segments.recv_timeout(Duration::from_millis(50)) {
             Ok(seg) => {
-                println!("{}", seg.render());
+                // An empty final is dmn-stt saying "this utterance was dropped"; it closes the
+                // partial in the log and has nothing to print.
+                if !seg.text.is_empty() {
+                    println!("{}", seg.render());
+                }
                 log.apply(seg);
             }
             Err(_) if done.load(Ordering::Acquire) && segments.is_empty() => break,
             Err(_) => {}
         }
     }
-    let stats = finisher.join().map_err(|_| "replay thread panicked")?;
+    let (stats, failures) = finisher.join().map_err(|_| "replay thread panicked")?;
     let wall = started.elapsed();
 
     if args.transcript {
@@ -179,6 +205,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         );
     }
     print_summary(&stats, &log, audio, wall, bus.dropped());
+    if !failures.is_empty() {
+        return Err(failures.join("; ").into());
+    }
     Ok(())
 }
 
