@@ -1,6 +1,6 @@
 //! `WavSource`: a file standing in for a capture stream. Any rate and channel count in; 16 kHz
-//! mono frames out, paced at 1× wall-clock for demos and live-like tests, or as fast as the
-//! disk allows for the eval harness.
+//! mono frames out, paced at an arbitrary multiple of wall-clock for demos and live-like tests,
+//! or as fast as the disk allows for the eval harness.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,12 +18,16 @@ use crate::source::{AudioError, AudioSource, Source};
 use crate::{FRAME_LEN, FRAME_MS, SAMPLE_RATE};
 
 /// How fast a `WavSource` plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Speed {
-    /// One second of audio per second of wall-clock, like a live call.
+    /// One second of audio per second of wall-clock, like a live call. Equivalent to
+    /// `Factor(1.0)`, kept as its own variant since it is the common case.
     RealTime,
     /// No pacing: frames are pushed as soon as they are decoded.
     Fast,
+    /// `factor`× wall-clock; the caller (`dmn replay`) validates that it is positive and
+    /// finite before constructing this.
+    Factor(f32),
 }
 
 /// Input frames handed to the resampler per call. Large enough to amortise the FFT, small
@@ -360,25 +364,36 @@ impl RateConverter {
     }
 }
 
-/// Holds each frame until its wall-clock slot in `RealTime` mode; a no-op in `Fast` mode.
+/// Holds each frame until its wall-clock slot for `RealTime` and `Factor`; a no-op in `Fast`
+/// mode. The deadline for frame `n` is always `start + n * frame_interval`, computed fresh from
+/// the fixed start instant rather than accumulated from previous sleeps, so pacing cannot drift
+/// over a long file.
 struct Pacer {
     speed: Speed,
+    /// Wall-clock seconds per 20 ms frame at this speed; unused when `speed` is `Fast`.
+    frame_secs: f64,
     start: Instant,
     emitted: u64,
 }
 
 impl Pacer {
     fn new(speed: Speed) -> Self {
+        let factor = match speed {
+            Speed::Factor(f) => f64::from(f),
+            Speed::RealTime | Speed::Fast => 1.0,
+        };
+        let frame_secs = f64::from(FRAME_MS) / 1000.0 / factor;
         Self {
             speed,
+            frame_secs,
             start: Instant::now(),
             emitted: 0,
         }
     }
 
     fn wait_for_next(&mut self) {
-        if self.speed == Speed::RealTime {
-            let due = self.start + Duration::from_millis(self.emitted * u64::from(FRAME_MS));
+        if !matches!(self.speed, Speed::Fast) {
+            let due = self.start + Duration::from_secs_f64(self.emitted as f64 * self.frame_secs);
             let now = Instant::now();
             if due > now {
                 std::thread::sleep(due - now);
@@ -530,6 +545,50 @@ mod tests {
         assert!(
             rt_elapsed >= Duration::from_millis(450) && rt_elapsed < Duration::from_millis(900),
             "real-time took {rt_elapsed:?} for 0.5 s of audio"
+        );
+    }
+
+    #[test]
+    fn factor_paces_at_n_times_real_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 1.0);
+
+        // 4× a 1 s file should land near 250 ms, not the ~1 s of RealTime or the near-0 of Fast.
+        let t = Instant::now();
+        let mut src = WavSource::open(&path, Source::You, Speed::Factor(4.0)).unwrap();
+        let (sink, mut frames) = frame_channel(Source::You, 100);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(drain(&mut frames).len(), SAMPLE_RATE as usize);
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(400),
+            "4× took {elapsed:?} for 1 s of audio"
+        );
+    }
+
+    #[test]
+    fn factor_stays_drift_free_over_many_frames() {
+        // A deadline computed as `start + n * interval` for every frame, rather than
+        // accumulated from each sleep, so a long file does not creep behind schedule.
+        // 8× on a 4 s file is 500 ms of wall clock over 200 frames: a naive per-sleep
+        // accumulation (each sleep rounded up by the OS scheduler) would drift well past the
+        // tolerance below by the last frame.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 4.0);
+
+        let t = Instant::now();
+        let mut src = WavSource::open(&path, Source::You, Speed::Factor(8.0)).unwrap();
+        let (sink, frames) = frame_channel(Source::You, 300);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(frames.overruns(), 0);
+        assert!(
+            elapsed >= Duration::from_millis(450) && elapsed < Duration::from_millis(650),
+            "8× took {elapsed:?} for 4 s of audio, expected about 500 ms"
         );
     }
 

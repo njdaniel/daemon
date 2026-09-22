@@ -106,7 +106,7 @@ enum Command {
         interviewer: std::path::PathBuf,
         /// Your audio
         candidate: std::path::PathBuf,
-        /// 1 plays at wall-clock speed like a live call; any other value runs unpaced
+        /// Paces delivery at N× wall-clock; 1 is a live call. Must be positive and finite
         #[arg(long, default_value_t = 1.0)]
         speed: f32,
         /// Model name; default is [stt].model from the config
@@ -115,7 +115,7 @@ enum Command {
         /// Decoder threads; default is [stt].threads from the config
         #[arg(long)]
         threads: Option<usize>,
-        /// Transcribe the 1 s partials of an open utterance: on at 1×, off when unpaced
+        /// Transcribe the 1 s partials of an open utterance: on, since --speed always paces
         #[arg(long, value_enum, default_value_t = replay::Partials::Auto)]
         partials: replay::Partials,
         /// Print the merged transcript and the last 60 s window at the end
