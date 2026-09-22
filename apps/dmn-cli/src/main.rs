@@ -1,12 +1,13 @@
 //! `dmn`: the Daemon command-line entry point.
 //!
 //! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
-//! `config show` (#2), `devices` (#4). Later: `run`, `sources`, `replay`, `bench`,
-//! `doctor --fetch` (#8).
+//! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4). Later: `run`,
+//! `sources`, `replay`.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod bench;
 mod devices;
 mod doctor;
 mod probe;
@@ -38,6 +39,31 @@ enum Command {
         /// monitor and pw-record (about 3 s of sound through the default output)
         #[arg(long, conflicts_with = "init")]
         probe: bool,
+        /// Download a whisper model (tiny.en, base.en, small.en, medium.en, large-v3-turbo)
+        /// into ~/.cache/dmn/models/, then run the checks
+        #[arg(long, value_name = "MODEL", conflicts_with = "init")]
+        fetch: Option<String>,
+    },
+    /// Measure whisper speed and accuracy on fixture interviewer turns
+    Bench {
+        /// Model name; default is [stt].model from the config
+        #[arg(long)]
+        model: Option<String>,
+        /// Fixture under testdata/ (sysdesign, behavioral, mixed)
+        #[arg(long, default_value = "sysdesign")]
+        fixture: String,
+        /// Decoder threads; default is [stt].threads from the config
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Number of interviewer turns to transcribe
+        #[arg(long, default_value_t = 5)]
+        turns: usize,
+        /// Use whisper's fixed 30 s encoder window instead of trimming it to each utterance
+        #[arg(long)]
+        full_window: bool,
+        /// Directory holding the fixtures
+        #[arg(long, default_value = "testdata")]
+        testdata: std::path::PathBuf,
     },
     /// Inspect configuration
     Config {
@@ -81,7 +107,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
-        Some(Command::Doctor { init, force, probe }) => {
+        Some(Command::Doctor {
+            init,
+            force,
+            probe,
+            fetch,
+        }) => {
+            if let Some(name) = fetch {
+                fetch_model(&paths, &name)?;
+            }
             if init {
                 Config::write_template(&paths.config_file, force)?;
                 tracing::info!(path = %paths.config_file.display(), "wrote config template");
@@ -110,10 +144,59 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", cfg.to_toml()?);
             Ok(())
         }
+        Some(Command::Bench {
+            model,
+            fixture,
+            threads,
+            turns,
+            full_window,
+            testdata,
+        }) => {
+            let cfg = Config::load(&paths.config_file)?;
+            let args = bench::BenchArgs {
+                model: model.unwrap_or_else(|| cfg.stt.model.clone()),
+                fixture,
+                threads: threads.unwrap_or(usize::from(cfg.stt.threads)),
+                turns,
+                trim_audio_ctx: !full_window,
+                testdata,
+                models_dir: paths.models_dir.clone(),
+            };
+            print!("{}", bench::run(&args)?);
+            Ok(())
+        }
         Some(Command::Devices) => {
             let cfg = Config::load(&paths.config_file)?;
             print!("{}", devices::run(&cfg)?);
             Ok(())
         }
     }
+}
+
+/// `dmn doctor --fetch <model>`: download with a progress line on stderr.
+fn fetch_model(paths: &Paths, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let model = dmn_stt::Model::from_name(name)?;
+    let total_mb = model.size_bytes() as f64 / 1e6;
+    eprintln!(
+        "fetching {} ({total_mb:.0} MB) from {}",
+        model.file_name(),
+        dmn_stt::model::BASE_URL
+    );
+    let mut last_pct = u64::MAX;
+    let path = dmn_stt::download_model(
+        &paths.models_dir,
+        model,
+        dmn_stt::model::BASE_URL,
+        |done, total| {
+            let pct = done * 100 / total.max(1);
+            if pct != last_pct && pct % 10 == 0 {
+                eprintln!("  {pct:>3} %");
+                last_pct = pct;
+            }
+        },
+    )?;
+    let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(path = %path.display(), bytes = len, "whisper model ready");
+    println!("model:    {} ({len} bytes)", path.display());
+    Ok(())
 }
