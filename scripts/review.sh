@@ -1,20 +1,28 @@
 #!/usr/bin/env bash
-# just review <pr> [--post] [--via claude|agy] [--model <id>]
+# just review <pr> [--post] [--via claude|agy] [--model <id>] [--no-copilot] [--copilot-wait <s>] [--prompt-only]
 # Fresh session of the reviewing model per docs/PROCESS.md § 5. Exits 0 only on "BLOCKING: 0 findings".
 # --via agy runs the same prompt through the agy CLI (Gemini by default: a different model family).
+# GitHub Copilot's review of the PR is fetched and every finding must be triaged by the reviewer;
+# the script waits up to --copilot-wait seconds (default 600) for Copilot to post, and without
+# --no-copilot it refuses to pass a PR that has no Copilot review (exit 3).
 source "$(dirname "$0")/lib.sh"
 
-pr=""; post=0; via="${DMN_REVIEWER:-claude}"; model_override=""
+pr=""; post=0; via="${DMN_REVIEWER:-claude}"; model_override=""; copilot=1; copilot_wait=600; prompt_only=0
 while [ $# -gt 0 ]; do case "$1" in
   --post) post=1; shift ;;
   --via) via="$2"; shift 2 ;;
   --model) model_override="$2"; shift 2 ;;
+  --no-copilot) copilot=0; shift ;;
+  --prompt-only) prompt_only=1; shift ;;
+  --copilot-wait) copilot_wait="$2"; shift 2 ;;
   -*) die "unknown flag $1" ;;
   *) pr="$1"; shift ;;
 esac; done
 [ -n "$pr" ] || die "usage: review.sh <pr-number> [--post] [--via claude|agy] [--model <id>]"
 
-prj=$(gh pr view "$pr" --json number,title,body,labels,headRefName)
+prj=$(gh pr view "$pr" --json number,title,body,labels,headRefName,headRefOid)
+head_sha=$(jq -r .headRefOid <<<"$prj")
+repo=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 size=$(label "$prj" "size:")
 n=$(jq -r .body <<<"$prj" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
 [ -n "$n" ] || n=$(jq -r .headRefName <<<"$prj" | grep -oE '^issue/[0-9]+' | grep -oE '[0-9]+' || true)
@@ -45,12 +53,30 @@ for line in sys.stdin:
     if keep: out.append(line)
     elif line[:1] in "+-" and not line.startswith(("+++", "---")): n += 1
 flush(); sys.stdout.write("".join(out))')
+# GitHub Copilot's review: overview + inline comments, each tagged with the commit it was made on.
+copilot_md=""; copilot_n=0
+if [ "$copilot" = 1 ]; then
+  has_review() { [ "$(gh api "repos/$repo/pulls/$pr/reviews" --paginate -q '[.[] | select(.user.login | test("copilot"; "i"))] | length' | awk '{s+=$1} END {print s+0}')" -gt 0 ]; }
+  waited=0
+  until has_review; do
+    [ "$waited" -ge "$copilot_wait" ] && break
+    [ "$waited" = 0 ] && echo "waiting up to ${copilot_wait}s for a Copilot review on PR #$pr ..."
+    sleep 20; waited=$((waited + 20))
+  done
+  has_review || { echo "error: no Copilot review on PR #$pr after ${copilot_wait}s; rerun later, request one in the PR, or pass --no-copilot" >&2; exit 3; }
+  copilot_md=$( { gh api "repos/$repo/pulls/$pr/reviews" --paginate -q '.[] | select(.user.login | test("copilot"; "i")) | {kind: "review", commit: .commit_id, body: .body} | @json'
+                  gh api "repos/$repo/pulls/$pr/comments" --paginate -q '.[] | select(.user.login | test("copilot"; "i")) | {kind: "inline", commit: .commit_id, path: .path, line: (.line // .original_line), body: .body} | @json'; } \
+    | python3 "$ROOT/scripts/copilot_findings.py" "$head_sha")
+  copilot_n=$(grep -oE 'copilot-inline-count [0-9]+' <<<"$copilot_md" | grep -oE '[0-9]+$')
+fi
+
 ro="You may read files in the repo but must not edit anything."
 [ "$via" = agy ] && ro="Everything you need is in this prompt. Do not run shell commands or tools (they are denied in this mode); reading the diff and documents below is sufficient. Do not edit anything."
 prompt="You are reviewing PR #$pr for issue #$n of the Daemon repo. $ro
 
 List every acceptance criterion from the issue and state whether the diff meets it, with evidence from the diff.
 List blocking findings: correctness, safety (unsafe, RT callback rules, audio on disk), spec violations.
+$( [ "$copilot" = 1 ] && printf '%s' "GitHub Copilot has reviewed this PR; its $copilot_n inline findings (C1..C$copilot_n) are at the end of this prompt. For EACH one, give a verdict with evidence from the diff: VALID (still present at the PR head), FIXED (the head no longer has it), or FALSE (Copilot is wrong; say why). A VALID finding about correctness, safety or a CLAUDE.md / SPEC rule is a blocking finding and must be counted below; a VALID low-impact nit may be listed as non-blocking with a reason. Then add one line: COPILOT: <valid> valid, <fixed> fixed, <false> false." )
 Do not restyle, do not suggest scope beyond the issue.
 End with exactly one line: BLOCKING: <n> findings.
 
@@ -68,10 +94,13 @@ $(cat "$ROOT/docs/SPEC.md")
 
 ---
 # Diff
-$diff"
+$diff
+$( [ "$copilot" = 1 ] && printf '\n---\n# GitHub Copilot review of this PR\n\n%s' "$copilot_md" )"
+
+if [ "$prompt_only" = 1 ]; then printf '%s\n' "$prompt"; exit 0; fi
 
 out="$RUNS/review-$pr-$(date +%Y%m%d-%H%M%S).md"
-echo "reviewing PR #$pr (issue #$n, size $size) via $via/$model -> $out"
+echo "reviewing PR #$pr (issue #$n, size $size) via $via/$model, copilot findings: $( [ "$copilot" = 1 ] && echo "$copilot_n" || echo skipped ) -> $out"
 cd "$ROOT"
 # The prompt (diff + SPEC) exceeds the argv limit, so it always travels over stdin.
 pf=$(mktemp "$RUNS/prompt-$pr-XXXX.md"); printf '%s' "$prompt" > "$pf"
