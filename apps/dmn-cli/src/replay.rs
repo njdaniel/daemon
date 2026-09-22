@@ -55,7 +55,8 @@ pub struct Args {
 /// Whether to transcribe the 1 s partials of an open utterance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Partials {
-    /// On at 1×, off when unpaced.
+    /// On for any paced speed (`RealTime` or `Factor`, which is every `--speed` this command
+    /// accepts); off only for an unpaced source, which `--speed` itself never produces.
     Auto,
     On,
     Off,
