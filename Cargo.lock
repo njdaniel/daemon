@@ -427,6 +427,7 @@ dependencies = [
  "dmn-core",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 

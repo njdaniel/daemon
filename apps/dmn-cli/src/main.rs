@@ -14,7 +14,26 @@ mod probe;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use dmn_core::config::ConfigError;
+use dmn_core::logging::LogError;
 use dmn_core::{Config, Paths};
+
+/// Everything `dmn` can fail with. One enum per crate, like every other crate here
+/// (CLAUDE.md); `main` prints it and exits 1.
+#[derive(Debug, thiserror::Error)]
+enum CliError {
+    #[error("no home directory: cannot resolve XDG paths")]
+    NoHome,
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Log(#[from] LogError),
+    /// `dmn devices` could not talk to PipeWire.
+    #[error("{0}")]
+    Devices(String),
+    #[error("{failed} required check(s) failed")]
+    ChecksFailed { failed: usize },
+}
 
 /// Daemon: a Linux-native interview copilot.
 #[derive(Parser, Debug)]
@@ -65,8 +84,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = Paths::from_xdg().ok_or("no home directory: cannot resolve XDG paths")?;
+fn run(cli: Cli) -> Result<(), CliError> {
+    let paths = Paths::from_xdg().ok_or(CliError::NoHome)?;
     if let Err(e) = dmn_core::logging::init(&paths.log_file) {
         // Logging is best-effort for CLI commands; the file is the only sink during a call.
         eprintln!("dmn: logging disabled: {e}");
@@ -102,7 +121,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let failed = report.failed_required();
                 tracing::info!(failed, "doctor");
                 if failed > 0 {
-                    return Err(format!("{failed} required check(s) failed").into());
+                    return Err(CliError::ChecksFailed { failed });
                 }
             }
             Ok(())
@@ -117,7 +136,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Devices) => {
             let cfg = Config::load(&paths.config_file)?;
-            print!("{}", devices::run(&cfg)?);
+            print!("{}", devices::run(&cfg).map_err(CliError::Devices)?);
             Ok(())
         }
     }
