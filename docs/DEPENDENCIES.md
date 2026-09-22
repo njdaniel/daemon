@@ -24,3 +24,15 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `crossbeam-channel` | `dmn-vad`, later `dmn-stt` | Bounded channel from each VAD thread to the STT worker; `try_send` lets the drain count and drop instead of blocking when the consumer stalls |
 
 Planned by the spec (add the line when the issue lands): `whisper-rs` (#8); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+
+## Developer tooling (`tools/`, Python)
+
+Offline only: these run when a human regenerates the fixtures. Nothing here is on the audio path, ships in a binary, or is needed to build, test or run `dmn`; `tools/uv.lock` pins them and `just fixtures` is the only entry point.
+
+| Package | Used by | Why |
+| --- | --- | --- |
+| `piper-tts` | `tools/fixtures/generate.py` | Local neural TTS for the two mock-interview voices; keeps the fixtures redistributable (public-domain voices) and reproducible offline |
+| `onnxruntime` | `tools/fixtures/generate.py` | Imported directly to seed Piper's in-graph noise, so two runs produce byte-identical WAVs |
+| `numpy` | `tools/fixtures/{generate,verify}.py` | Resampling, level measurement and WAV assembly on the shared timeline |
+
+Python floor is 3.11: the locked `onnxruntime` publishes cp311–cp314 wheels and no source distribution.
