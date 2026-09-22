@@ -14,6 +14,10 @@ openblas = ["whisper-rs/openblas"]
 
 [dependencies]
 thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+dmn-audio = { path = "../dmn-audio" }
+dmn-transcript = { path = "../dmn-transcript" }
+dmn-vad = { path = "../dmn-vad" }
 tracing = { workspace = true }
 whisper-rs = { version = "=0.16.0", features = ["tracing_backend"] }
 # Blocking client for model downloads: `dmn doctor --fetch` is a one-shot CLI step with no
@@ -22,6 +26,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

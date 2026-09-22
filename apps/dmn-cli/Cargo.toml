@@ -21,6 +21,8 @@ clap = { workspace = true }
 dmn-audio = { path = "../../crates/dmn-audio" }
 dmn-core = { path = "../../crates/dmn-core" }
 dmn-stt = { path = "../../crates/dmn-stt" }
+dmn-transcript = { path = "../../crates/dmn-transcript" }
+dmn-vad = { path = "../../crates/dmn-vad" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 

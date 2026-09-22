@@ -428,6 +428,8 @@ dependencies = [
  "dmn-audio",
  "dmn-core",
  "dmn-stt",
+ "dmn-transcript",
+ "dmn-vad",
  "serde_json",
  "tempfile",
  "tracing",
@@ -493,7 +495,12 @@ dependencies = [
 name = "dmn-stt"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
+ "dmn-audio",
+ "dmn-transcript",
+ "dmn-vad",
  "reqwest",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",

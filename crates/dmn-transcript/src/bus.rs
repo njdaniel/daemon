@@ -120,7 +120,11 @@ mod tests {
             bus.publish(seg(&i.to_string()));
         }
         assert_eq!(slow.try_iter().count(), 2);
-        assert_eq!(fast.try_iter().count(), 5, "one slow reader hurts nobody else");
+        assert_eq!(
+            fast.try_iter().count(),
+            5,
+            "one slow reader hurts nobody else"
+        );
         assert_eq!(bus.dropped(), 3);
     }
 

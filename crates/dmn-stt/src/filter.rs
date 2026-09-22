@@ -88,7 +88,12 @@ fn fingerprint(text: &str) -> String {
 }
 
 /// `Some(reason)` when this segment should not reach the transcript.
-pub fn should_drop(text: &str, avg_logprob: f32, n_tokens: usize, cfg: &FilterConfig) -> Option<Dropped> {
+pub fn should_drop(
+    text: &str,
+    avg_logprob: f32,
+    n_tokens: usize,
+    cfg: &FilterConfig,
+) -> Option<Dropped> {
     let fp = fingerprint(text);
     if fp.is_empty() {
         return Some(Dropped::Empty);
@@ -144,10 +149,18 @@ mod tests {
     fn a_long_sentence_containing_a_stock_phrase_is_kept() {
         let cfg = FilterConfig::default();
         assert_eq!(
-            should_drop("Thank you, that covers my questions on caching.", OK, 12, &cfg),
+            should_drop(
+                "Thank you, that covers my questions on caching.",
+                OK,
+                12,
+                &cfg
+            ),
             None
         );
-        assert_eq!(should_drop("So, tell me about yourself.", OK, 7, &cfg), None);
+        assert_eq!(
+            should_drop("So, tell me about yourself.", OK, 7, &cfg),
+            None
+        );
     }
 
     #[test]

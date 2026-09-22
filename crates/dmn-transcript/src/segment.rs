@@ -42,7 +42,12 @@ impl Segment {
 /// `mm:ss.t` from the start of the session.
 pub fn timestamp(t: Duration) -> String {
     let tenths = t.as_millis() / 100;
-    format!("{:02}:{:02}.{}", tenths / 600, (tenths / 10) % 60, tenths % 10)
+    format!(
+        "{:02}:{:02}.{}",
+        tenths / 600,
+        (tenths / 10) % 60,
+        tenths % 10
+    )
 }
 
 /// Tidy one piece of whisper output: trim, collapse runs of whitespace, and drop the leading
@@ -130,7 +135,10 @@ mod tests {
 
     #[test]
     fn normalise_trims_collapses_and_drops_a_leading_dash() {
-        assert_eq!(normalise("  How   would you\n design it? "), "How would you design it?");
+        assert_eq!(
+            normalise("  How   would you\n design it? "),
+            "How would you design it?"
+        );
         assert_eq!(normalise("- Tell me about a time"), "Tell me about a time");
         assert_eq!(normalise("   "), "");
         assert_eq!(normalise("—"), "");
@@ -169,7 +177,10 @@ mod tests {
 
     #[test]
     fn a_long_gap_or_another_speaker_never_merges() {
-        let gap = merge_adjacent(&[seg(0, 1_000, "and then"), seg(2_000, 3_000, "we shipped it")]);
+        let gap = merge_adjacent(&[
+            seg(0, 1_000, "and then"),
+            seg(2_000, 3_000, "we shipped it"),
+        ]);
         assert_eq!(gap.len(), 2, "1 s gap is a new line");
 
         let mut other = seg(1_100, 2_000, "yes exactly");

@@ -38,10 +38,7 @@ impl TranscriptLog {
     /// holds both (docs/SPEC.md § STT worker: "the final pass replaces all partials").
     pub fn apply(&mut self, segment: Segment) -> Applied {
         if !segment.is_final {
-            let first = self
-                .partials
-                .insert(segment.source, segment)
-                .is_none();
+            let first = self.partials.insert(segment.source, segment).is_none();
             return if first {
                 Applied::OpenedPartial
             } else {
@@ -61,9 +58,9 @@ impl TranscriptLog {
             }
             None => false,
         };
-        let at = self
-            .finals
-            .partition_point(|s| (s.start, s.source.label()) <= (segment.start, segment.source.label()));
+        let at = self.finals.partition_point(|s| {
+            (s.start, s.source.label()) <= (segment.start, segment.source.label())
+        });
         self.finals.insert(at, segment);
         Applied::Finalised { replaced_partial }
     }
@@ -138,7 +135,13 @@ mod tests {
             Applied::OpenedPartial
         );
         assert_eq!(
-            log.apply(seg(Source::Interviewer, 1_000, 3_000, "how would you design", false)),
+            log.apply(seg(
+                Source::Interviewer,
+                1_000,
+                3_000,
+                "how would you design",
+                false
+            )),
             Applied::UpdatedPartial
         );
         assert_eq!(log.open_partials().len(), 1, "one open utterance, not two");
@@ -165,7 +168,13 @@ mod tests {
         log.apply(seg(Source::Interviewer, 0, 1_000, "and how", false));
         log.apply(seg(Source::You, 500, 1_500, "so the first", false));
         assert_eq!(log.open_partials().len(), 2);
-        log.apply(seg(Source::Interviewer, 0, 2_000, "And how would you test it?", true));
+        log.apply(seg(
+            Source::Interviewer,
+            0,
+            2_000,
+            "And how would you test it?",
+            true,
+        ));
         let open = log.open_partials();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].source, Source::You);
@@ -189,9 +198,27 @@ mod tests {
     fn the_window_keeps_the_last_sixty_seconds_and_merges_splits() {
         let mut log = TranscriptLog::new();
         log.apply(seg(Source::Interviewer, 0, 2_000, "Old question?", true));
-        log.apply(seg(Source::You, 70_000, 82_000, "so I would start by", true));
-        log.apply(seg(Source::You, 82_020, 90_000, "sharding the counters.", true));
-        log.apply(seg(Source::Interviewer, 91_000, 93_000, "And if Redis dies?", true));
+        log.apply(seg(
+            Source::You,
+            70_000,
+            82_000,
+            "so I would start by",
+            true,
+        ));
+        log.apply(seg(
+            Source::You,
+            82_020,
+            90_000,
+            "sharding the counters.",
+            true,
+        ));
+        log.apply(seg(
+            Source::Interviewer,
+            91_000,
+            93_000,
+            "And if Redis dies?",
+            true,
+        ));
 
         let w = log.window(DEFAULT_WINDOW);
         assert_eq!(w.len(), 2, "the 0 s question is outside the window: {w:?}");

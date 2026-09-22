@@ -1,7 +1,7 @@
 //! One whisper worker thread per source.
 //!
 //! It owns a [`Transcriber`] (one `WhisperState`, so inference is serialised per source), reads
-//! [`VadEvent`]s from that source's bounded channel, and publishes [`Segment`]s: a partial每
+//! [`VadEvent`]s from that source's bounded channel, and publishes [`Segment`]s: a partial every
 //! second while an utterance is open, then the final pass over the closed utterance.
 //!
 //! Keeping up: whisper is slower than the 1 s partial cadence on a busy CPU, so before each
@@ -302,7 +302,11 @@ impl Job {
         });
     }
 
-    fn run_inference(&mut self, samples: &[f32], prompt: Option<&str>) -> Option<crate::Transcript> {
+    fn run_inference(
+        &mut self,
+        samples: &[f32],
+        prompt: Option<&str>,
+    ) -> Option<crate::Transcript> {
         let t0 = Instant::now();
         let r = self.speech.transcribe(samples, prompt);
         self.counters.timed(t0.elapsed().as_millis() as u64);
@@ -392,10 +396,13 @@ mod tests {
     use super::*;
     use crate::Transcript;
 
+    /// Samples handed to each call, and the prompt it carried.
+    type Calls = Arc<Mutex<Vec<(usize, Option<String>)>>>;
+
     /// A stand-in for whisper: returns the next scripted text, records prompts, and can be slow.
     struct Fake {
         texts: Vec<(String, f32, usize)>,
-        calls: Arc<Mutex<Vec<(usize, Option<String>)>>>,
+        calls: Calls,
         delay: Duration,
     }
 
@@ -447,7 +454,7 @@ mod tests {
         worker: SttWorker,
         tx: crossbeam_channel::Sender<VadEvent>,
         out: Arc<Mutex<Vec<Segment>>>,
-        calls: Arc<Mutex<Vec<(usize, Option<String>)>>>,
+        calls: Calls,
     }
 
     fn harness(texts: &[(&str, f32, usize)], delay: Duration) -> Harness {
@@ -530,7 +537,10 @@ mod tests {
         let out = h.out.lock().unwrap();
         assert_eq!(out.len(), 2);
         assert!(!out[0].is_final && out[1].is_final);
-        assert_eq!(out[0].start, out[1].start, "same key, so the log replaces it");
+        assert_eq!(
+            out[0].start, out[1].start,
+            "same key, so the log replaces it"
+        );
         assert_eq!(out[0].end, Duration::from_millis(2_000));
         assert_eq!((stats.partials, stats.finals), (1, 1));
     }
