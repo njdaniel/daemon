@@ -12,7 +12,7 @@ Out of scope: everything else, including later issues.
 ## Depends on
 #3
 ## Acceptance
-- [ ] On the fixtures, utterance boundaries land within 200 ms of the scripted ones for ≥ 90 % of utterances
+- [ ] On the fixtures, utterance boundaries land within 200 ms of each turn's voiced bounds (first/last sample ≥ −40 dBFS) for ≥ 90 % of turns; the scripted-bound score is reported alongside (amended by #27)
 - [ ] Per-source VAD thread drains the ring buffer without falling behind at 1× (overrun counter stays 0)
 - [ ] `just check`, `just test` and `just lint` green
 ## Verify
