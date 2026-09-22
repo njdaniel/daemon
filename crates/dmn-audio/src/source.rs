@@ -50,6 +50,13 @@ pub enum AudioError {
     AlreadyStarted,
     #[error("source thread panicked")]
     ThreadPanicked,
+    #[error(transparent)]
+    PipeWire(#[from] crate::pipewire::PipeWireError),
+    /// The `pw-record` fallback could not be started or read.
+    #[error("pw-record: {0}")]
+    Subprocess(String),
+    #[error("cannot spawn a thread: {0}")]
+    Spawn(String),
 }
 
 /// A labelled producer of 16 kHz mono frames. `start` hands the source its ring producer and

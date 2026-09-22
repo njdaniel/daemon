@@ -2,7 +2,7 @@
 //!
 //! Every check is a pure function over injected inputs ([`Runner`] for commands and PATH,
 //! [`Http`] for the Ollama endpoint) so the unit tests run without PipeWire or Ollama, which
-//! CI does not have. `--probe` (play a tone and capture it back) is issue #5.
+//! CI does not have. `--probe` (play a tone and capture it back, issue #5) lives in `probe.rs`.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -26,7 +26,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn pass(name: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn pass(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             name,
             ok: true,
@@ -35,7 +35,11 @@ impl Check {
             fix: None,
         }
     }
-    fn fail(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+    pub(crate) fn fail(
+        name: &'static str,
+        detail: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
         Self {
             name,
             ok: false,
@@ -44,7 +48,7 @@ impl Check {
             fix: Some(fix.into()),
         }
     }
-    fn optional(mut self) -> Self {
+    pub(crate) fn optional(mut self) -> Self {
         self.required = false;
         self
     }
