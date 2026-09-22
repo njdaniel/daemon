@@ -116,6 +116,17 @@ impl CaptureState {
             _ => CaptureState::Idle,
         }
     }
+
+    /// Short name for error messages and status lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureState::Idle => "idle",
+            CaptureState::Connecting => "connecting",
+            CaptureState::Streaming => "streaming",
+            CaptureState::Disconnected => "disconnected",
+            CaptureState::Error => "in error",
+        }
+    }
 }
 
 impl CaptureMode {
@@ -443,6 +454,26 @@ fn process(stream: &pw::stream::Stream, acc: &mut Accum) {
         let end = offset.saturating_add(size).min(bytes.len());
         let start = offset.min(end);
         acc.push_le_bytes(&bytes[start..end]);
+    }
+}
+
+/// What `PipeWireSource::stop` returns: a panicked supervisor first, then a stream that never
+/// reached `Idle` inside the timeout (its real-time callback may still be running).
+/// `final_state` is `None` when no Close was sent, i.e. there was nothing to wait for.
+fn stop_result(
+    panicked: bool,
+    final_state: Option<CaptureState>,
+    timeout: Duration,
+) -> Result<(), AudioError> {
+    if panicked {
+        return Err(AudioError::ThreadPanicked);
+    }
+    match final_state {
+        Some(state) if state != CaptureState::Idle => Err(AudioError::StopTimeout {
+            state: state.label(),
+            ms: timeout.as_millis() as u64,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -794,6 +825,7 @@ impl AudioSource for PipeWireSource {
             .take()
             .map(|h| h.join().is_err())
             .unwrap_or(false);
+        let mut timed_out = None;
         if let Some(key) = self.key.take()
             && self.ctx.send(Command::Close { key }).is_ok()
         {
@@ -804,12 +836,11 @@ impl AudioSource for PipeWireSource {
             while self.status.state() != CaptureState::Idle && t.elapsed() < STOP_TIMEOUT {
                 std::thread::sleep(Duration::from_millis(2));
             }
+            // Never claim a clean stop we did not get: the caller may be about to drop the
+            // ring the callback writes into.
+            timed_out = Some(self.status.state());
         }
-        if panicked {
-            Err(AudioError::ThreadPanicked)
-        } else {
-            Ok(())
-        }
+        stop_result(panicked, timed_out, STOP_TIMEOUT)
     }
 
     fn is_finished(&self) -> bool {
@@ -1044,6 +1075,34 @@ mod tests {
         acc.push_samples(&vec![0.0; FRAME_LEN / 2]);
         assert!(frames.pop_frame(&mut out));
         assert_eq!(out[0], (3 * FRAME_LEN) as f32);
+    }
+
+    #[test]
+    fn stop_reports_a_stream_that_never_went_idle() {
+        // Copilot on PR #25: stop() returned Ok(()) after the timeout, so a caller could drop
+        // the ring while the real-time callback was still writing into it.
+        let t = Duration::from_millis(1000);
+        assert!(stop_result(false, Some(CaptureState::Idle), t).is_ok());
+        assert!(stop_result(false, None, t).is_ok(), "nothing to wait for");
+
+        for state in [
+            CaptureState::Streaming,
+            CaptureState::Connecting,
+            CaptureState::Error,
+            CaptureState::Disconnected,
+        ] {
+            let err = stop_result(false, Some(state), t).unwrap_err();
+            assert!(
+                matches!(err, AudioError::StopTimeout { ms: 1000, .. }),
+                "{state:?} -> {err}"
+            );
+            assert!(err.to_string().contains(state.label()), "{err}");
+        }
+        // A panicked supervisor still wins: it is the more serious failure.
+        assert!(matches!(
+            stop_result(true, Some(CaptureState::Streaming), t).unwrap_err(),
+            AudioError::ThreadPanicked
+        ));
     }
 
     #[test]
