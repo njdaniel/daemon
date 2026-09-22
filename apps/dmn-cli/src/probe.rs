@@ -6,14 +6,14 @@
 //! 3. through the `pw-record` emergency fallback (informational).
 //!
 //! Each capture is judged by level and by how strongly 440 Hz dominates its neighbours
-//! (Goertzel), so other audio playing at the same time does not produce a false pass. The tone
-//! file lives in the temp dir for the few seconds the probe runs and is deleted after; nothing
-//! captured is written anywhere.
+//! (Goertzel), so other audio playing at the same time does not produce a false pass. No audio
+//! touches disk (CLAUDE.md): the tone is generated in memory and piped to `pw-play` on stdin as
+//! raw 16 kHz mono F32LE, and captured samples stay in memory.
 
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dmn_audio::{
@@ -94,62 +94,77 @@ pub fn analyse(samples: &[f32]) -> Tone {
         )
 }
 
-/// A 16-bit mono 48 kHz WAV of the probe tone at -6 dBFS.
-pub fn tone_wav_bytes(secs: f32) -> Vec<u8> {
-    const RATE: u32 = 48_000;
-    let n = (RATE as f32 * secs) as u32;
-    let data_len = n * 2;
-    let mut out = Vec::with_capacity(44 + data_len as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len).to_le_bytes());
-    out.extend_from_slice(b"WAVEfmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&RATE.to_le_bytes());
-    out.extend_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
-    out.extend_from_slice(&2u16.to_le_bytes()); // block align
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
+/// The probe tone as raw little-endian f32 at [`SAMPLE_RATE`], mono, -6 dBFS: exactly what
+/// `pw-play --raw --rate 16000 --channels 1 --format f32 -` reads from stdin.
+pub fn tone_f32le(secs: f32) -> Vec<u8> {
+    let n = (SAMPLE_RATE as f32 * secs) as usize;
+    let mut out = Vec::with_capacity(n * 4);
     for i in 0..n {
-        let v = (2.0 * std::f32::consts::PI * TONE_HZ * i as f32 / RATE as f32).sin();
-        out.extend_from_slice(&((v * 0.5 * i16::MAX as f32) as i16).to_le_bytes());
+        let v = (2.0 * std::f32::consts::PI * TONE_HZ * i as f32 / SAMPLE_RATE as f32).sin();
+        out.extend_from_slice(&(0.5 * v).to_le_bytes());
     }
     out
 }
 
-/// Kills `pw-play` and removes the tone file however the probe ends.
+/// Kills `pw-play` and joins the stdin writer however the probe ends.
 struct Player {
     child: Child,
-    wav: PathBuf,
+    writer: Option<JoinHandle<()>>,
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.wav);
+        // The writer sees EPIPE once pw-play is gone and returns.
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
     }
 }
 
 fn start_tone() -> Result<Player, String> {
-    let wav = std::env::temp_dir().join(format!("dmn-probe-{}.wav", std::process::id()));
-    std::fs::File::create(&wav)
-        .and_then(|mut f| f.write_all(&tone_wav_bytes(TONE_SECS)))
-        .map_err(|e| format!("cannot write {}: {e}", wav.display()))?;
-    let child = Command::new("pw-play")
-        .args(["--volume", "0.15", "-P"])
+    let mut child = Command::new("pw-play")
+        .args(["--raw", "--rate", &SAMPLE_RATE.to_string()])
+        .args([
+            "--channels",
+            "1",
+            "--format",
+            "f32",
+            "--volume",
+            "0.15",
+            "-P",
+        ])
         .arg(format!(
             "{{ application.name = \"{PROBE_APP}\" media.name = \"dmn probe tone\" }}"
         ))
-        .arg(&wav)
-        .spawn();
-    match child {
-        Ok(child) => Ok(Player { child, wav }),
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run pw-play: {e}"))?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("pw-play has no stdin".into());
+    };
+    // The tone (320 KB) is larger than a pipe buffer, so a thread feeds it while pw-play plays.
+    let writer = std::thread::Builder::new()
+        .name("dmn-probe-tone".into())
+        .spawn(move || {
+            let _ = stdin.write_all(&tone_f32le(TONE_SECS));
+        })
+        .map_err(|e| format!("cannot spawn the tone writer: {e}"));
+    match writer {
+        Ok(w) => Ok(Player {
+            child,
+            writer: Some(w),
+        }),
         Err(e) => {
-            let _ = std::fs::remove_file(&wav);
-            Err(format!("cannot run pw-play: {e}"))
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(e)
         }
     }
 }
@@ -226,8 +241,8 @@ fn capture_pw_record(target: &str, dur: Duration) -> Result<Tone, String> {
 const APP_FIX: &str = "per-app capture does not work on this PipeWire/WirePlumber; set \
     [audio].app_stream = \"\" to capture the whole sink monitor (docs/SPEC.md § Open questions \
     and risks) and report your `pipewire --version` / `wireplumber --version`";
-const MONITOR_FIX: &str = "check the default output device in your sound settings; \
-    `pw-record -P '{ stream.capture.sink = true }' /tmp/t.wav` should record what plays";
+const MONITOR_FIX: &str = "check the default output device in your sound settings, then \
+    run `dmn devices` while something plays";
 
 /// Run the probe. Plays about 3 s of a quiet tone through the default output.
 pub fn run() -> Vec<Check> {
@@ -409,14 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn tone_wav_has_a_valid_header_and_length() {
-        let b = tone_wav_bytes(0.5);
-        assert_eq!(&b[0..4], b"RIFF");
-        assert_eq!(&b[8..16], b"WAVEfmt ");
-        assert_eq!(&b[36..40], b"data");
-        let data_len = u32::from_le_bytes([b[40], b[41], b[42], b[43]]) as usize;
-        assert_eq!(data_len, 24_000 * 2);
-        assert_eq!(b.len(), 44 + data_len);
+    fn generated_tone_is_raw_f32le_that_the_detector_accepts() {
+        let b = tone_f32le(0.5);
+        assert_eq!(b.len(), 8_000 * 4, "0.5 s at 16 kHz mono f32");
+        let samples: Vec<f32> = b
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(samples.iter().all(|s| s.abs() <= 0.5));
+        let t = analyse(&samples);
+        assert!(t.detected(), "{t:?}");
+        assert!(
+            (t.dbfs() - (-9.0)).abs() < 1.0,
+            "-6 dBFS peak is -9 dBFS rms: {}",
+            t.dbfs()
+        );
     }
 
     /// Plays about 3 s of a quiet tone and captures it back. `just probe`.

@@ -1018,32 +1018,41 @@ mod tests {
         use std::process::{Child, Command as Proc};
         use std::time::Instant;
 
-        fn tone_wav(dir: &std::path::Path, secs: f32) -> std::path::PathBuf {
-            let path = dir.join("tone.wav");
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 48_000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            let mut w = hound::WavWriter::create(&path, spec).unwrap();
-            for i in 0..(48_000.0 * secs) as usize {
-                let v = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin();
-                w.write_sample((v * 0.5 * i16::MAX as f32) as i16).unwrap();
-            }
-            w.finalize().unwrap();
-            path
-        }
-
-        fn play(wav: &std::path::Path, app: &str) -> Child {
-            Proc::new("pw-play")
+        /// Play `secs` of a 440 Hz tone as `app`. The tone is generated in memory and piped to
+        /// pw-play as raw 16 kHz mono f32: no audio on disk, even in tests (CLAUDE.md).
+        fn play(secs: f32, app: &str) -> Child {
+            use std::io::Write as _;
+            let mut child = Proc::new("pw-play")
+                .args([
+                    "--raw",
+                    "--rate",
+                    "16000",
+                    "--channels",
+                    "1",
+                    "--format",
+                    "f32",
+                ])
                 .args(["--volume", "0.1", "-P"])
                 .arg(format!(
                     "{{ application.name = \"{app}\" media.name = \"dmn test tone\" }}"
                 ))
-                .arg(wav)
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
                 .spawn()
-                .expect("pw-play on PATH")
+                .expect("pw-play on PATH");
+            let mut stdin = child.stdin.take().unwrap();
+            let bytes: Vec<u8> = (0..(SAMPLE_RATE as f32 * secs) as usize)
+                .flat_map(|i| {
+                    let v =
+                        (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin();
+                    (0.5 * v).to_le_bytes()
+                })
+                .collect();
+            // Larger than a pipe buffer; pw-play reads it as it plays. EOF ends playback.
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&bytes);
+            });
+            child
         }
 
         /// Drain frames for `dur`, returning them concatenated.
@@ -1098,13 +1107,11 @@ mod tests {
         #[test]
         #[ignore]
         fn live_app_stream_capture_receives_the_tone() {
-            let dir = tempfile::tempdir().unwrap();
-            let wav = tone_wav(dir.path(), 2.0);
             let app = format!("dmn-test-{}", std::process::id());
             let ctx = Arc::new(PipeWireContext::connect().expect("PipeWire running"));
             assert!(ctx.wait_for_sync(Duration::from_secs(2)).synced);
 
-            let mut player = play(&wav, &app);
+            let mut player = play(2.0, &app);
             let mut src = PipeWireSource::new(
                 Arc::clone(&ctx),
                 Source::Interviewer,
@@ -1139,8 +1146,6 @@ mod tests {
         #[test]
         #[ignore]
         fn live_app_stream_disconnects_and_reattaches_when_the_app_restarts() {
-            let dir = tempfile::tempdir().unwrap();
-            let wav = tone_wav(dir.path(), 1.0);
             let app = format!("dmn-reattach-{}", std::process::id());
             let ctx = Arc::new(PipeWireContext::connect().expect("PipeWire running"));
             assert!(ctx.wait_for_sync(Duration::from_secs(2)).synced);
@@ -1169,7 +1174,7 @@ mod tests {
             });
 
             // First run of the "app".
-            let mut first = play(&wav, &app);
+            let mut first = play(1.0, &app);
             wait_for("first stream", Duration::from_secs(2), || {
                 status.state() == CaptureState::Streaming
             });
@@ -1192,7 +1197,7 @@ mod tests {
             assert_eq!(mic_status.state(), CaptureState::Streaming);
 
             // The app comes back as a new node with the same application.name.
-            let mut second = play(&wav, &app);
+            let mut second = play(1.0, &app);
             wait_for("reattach", Duration::from_secs(2), || {
                 status.state() == CaptureState::Streaming
             });
