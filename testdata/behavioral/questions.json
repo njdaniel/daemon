@@ -1,0 +1,74 @@
+[
+  {
+    "t": 21.113,
+    "end": 25.235,
+    "text": "Tell me about a time you disagreed with a technical decision and how you handled it.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 82.902,
+    "end": 85.839,
+    "text": "What would you have done if he'd said no after seeing the spike?",
+    "kind": "clarification"
+  },
+  {
+    "t": 106.625,
+    "end": 112.041,
+    "text": "Let's talk about failure. Describe a project that didn't go well, and what you took from it.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 170.985,
+    "end": 173.527,
+    "text": "How did you handle it with finance while it was going wrong?",
+    "kind": "clarification"
+  },
+  {
+    "t": 199.387,
+    "end": 204.211,
+    "text": "Give me an example of a time you had to cut scope to ship something. How did you decide what to cut?",
+    "kind": "behavioral"
+  },
+  {
+    "t": 259.933,
+    "end": 261.442,
+    "text": "Was there pushback on that?",
+    "kind": "clarification"
+  },
+  {
+    "t": 276.003,
+    "end": 279.52,
+    "text": "Tell me about a time you mentored someone, and what changed for them.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 330.6,
+    "end": 337.804,
+    "text": "I want to dig into ownership. Describe a situation where something was broken that wasn't your responsibility, and what you did.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 396.342,
+    "end": 399.372,
+    "text": "And how did the original team react to you taking it over?",
+    "kind": "clarification"
+  },
+  {
+    "t": 413.754,
+    "end": 417.678,
+    "text": "Walk me through a time you had to deliver bad news to a stakeholder.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 466.598,
+    "end": 473.071,
+    "text": "Let's do one more. Tell me about a time you had to get something done with a team that didn't report to you, where you had no authority.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 519.07,
+    "end": 522.745,
+    "text": "That's a good place to end. Do you have anything you'd like to ask me?",
+    "kind": "knowledge"
+  }
+]

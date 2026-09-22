@@ -1,0 +1,62 @@
+[
+  {
+    "t": 33.44,
+    "end": 47.281,
+    "text": "Great. So this is a general engineering screen. I'll mix in some technical questions and some questions about your background, and we'll see where it goes. Let's start easy. Tell me about the system you've worked on that you're proudest of.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 94.696,
+    "end": 101.447,
+    "text": "Exactly-once is a phrase that means a lot of different things. What did it actually mean in your pipeline, and how did you achieve it?",
+    "kind": "knowledge"
+  },
+  {
+    "t": 148.201,
+    "end": 163.023,
+    "text": "Sorry about that. Where were we. Right, the pipeline. Let's switch gears to something more hands-on. Suppose you have a service whose p ninety-nine latency doubled overnight and nothing was deployed. How do you go about finding the cause?",
+    "kind": "knowledge"
+  },
+  {
+    "t": 210.46,
+    "end": 213.258,
+    "text": "And if it turns out to be the cache hit rate, what then?",
+    "kind": "clarification"
+  },
+  {
+    "t": 238.751,
+    "end": 252.621,
+    "text": "You know, we had exactly that last month. Turned out to be a bot scraping us with a random query parameter. Anyway. Next question. I'd like to hear about a time you had a conflict with a coworker. How did it get resolved?",
+    "kind": "behavioral"
+  },
+  {
+    "t": 306.598,
+    "end": 316.966,
+    "text": "That's a mature way to put it. Okay, a coding one. Given a stream of integers, describe how you'd find the median at any point, and what the time complexity is per element.",
+    "kind": "coding"
+  },
+  {
+    "t": 348.364,
+    "end": 350.21,
+    "text": "What if the stream is too big for memory?",
+    "kind": "clarification"
+  },
+  {
+    "t": 389.457,
+    "end": 397.573,
+    "text": "Alright. Let me ask about databases. Explain the difference between optimistic and pessimistic locking, and when you'd pick each.",
+    "kind": "knowledge"
+  },
+  {
+    "t": 441.076,
+    "end": 450.586,
+    "text": "Imagine you join us and in your first month you discover that our main database has no backups being tested. Nobody has restored one in two years. What do you do?",
+    "kind": "behavioral"
+  },
+  {
+    "t": 496.011,
+    "end": 502.763,
+    "text": "Good. We're almost at time. Last one. Why are you looking to leave your current role?",
+    "kind": "behavioral"
+  }
+]

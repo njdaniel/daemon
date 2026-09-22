@@ -1,0 +1,86 @@
+[
+  {
+    "t": 19.935,
+    "end": 29.845,
+    "text": "Let's start with something concrete. How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",
+    "kind": "system_design"
+  },
+  {
+    "t": 94.629,
+    "end": 100.545,
+    "text": "Good. And what if Redis goes down for a whole region, not just one node?",
+    "kind": "clarification"
+  },
+  {
+    "t": 136.424,
+    "end": 144.325,
+    "text": "That's a reasonable tradeoff. Where would you put the limiter in the request path, and does that change if the API is behind a CDN?",
+    "kind": "system_design"
+  },
+  {
+    "t": 173.058,
+    "end": 184.25,
+    "text": "Okay, let's switch gears. Design a URL shortener, something like bit dot ly. Walk me through the data model, the write path, and how you'd generate the short keys.",
+    "kind": "system_design"
+  },
+  {
+    "t": 248.46,
+    "end": 250.201,
+    "text": "How many characters do you need?",
+    "kind": "clarification"
+  },
+  {
+    "t": 267.595,
+    "end": 274.649,
+    "text": "Suppose one link goes viral and gets a hundred thousand redirects a second. What breaks first, and what would you do about it?",
+    "kind": "system_design"
+  },
+  {
+    "t": 312.263,
+    "end": 328.582,
+    "text": "Great. I'd like to hear how you think about fan-out. Imagine a notification system where a user with ten million followers posts something, and every follower should get a notification. How would you design the fan-out, and what are the tradeoffs between doing it on write versus on read?",
+    "kind": "system_design"
+  },
+  {
+    "t": 388.113,
+    "end": 392.658,
+    "text": "You said idempotent. How exactly do you make a notification write idempotent?",
+    "kind": "clarification"
+  },
+  {
+    "t": 412.53,
+    "end": 425.824,
+    "text": "Right, that's the standard answer, and it works, so let's keep moving. Next question. How would you design the storage for a chat application that needs to keep message history forever, and support search across a user's history?",
+    "kind": "system_design"
+  },
+  {
+    "t": 481.812,
+    "end": 486.335,
+    "text": "Forever is a long time. How do you keep the search index from growing without bound?",
+    "kind": "clarification"
+  },
+  {
+    "t": 514.713,
+    "end": 523.822,
+    "text": "Let me ask a different kind of question. Talk me through how you would roll out a change to a critical service safely, where the change alters the data format on disk.",
+    "kind": "system_design"
+  },
+  {
+    "t": 576.278,
+    "end": 579.344,
+    "text": "What metric would tell you the backfill is safe to run faster?",
+    "kind": "clarification"
+  },
+  {
+    "t": 600.226,
+    "end": 615.964,
+    "text": "Last design question, and this one's more open-ended. If you were building a real-time collaborative document editor, like Google Docs, how would you keep everyone's view consistent, and how would you handle a user who goes offline for an hour and then reconnects?",
+    "kind": "system_design"
+  },
+  {
+    "t": 678.773,
+    "end": 685.566,
+    "text": "Okay. That's all I had on design. What questions do you have for me about the team or the role?",
+    "kind": "knowledge"
+  }
+]

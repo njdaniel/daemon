@@ -1,0 +1,13 @@
+[project]
+name = "dmn-tools"
+version = "0.1.0"
+description = "Offline developer tools for Daemon: TTS fixture generator (never on the audio path)"
+requires-python = ">=3.10"
+dependencies = [
+    "piper-tts>=1.8,<2",   # TTS for the mock-interview fixtures
+    "onnxruntime>=1.17",   # imported directly to seed Piper's in-graph noise
+    "numpy>=1.26",         # resampling, levels, WAV assembly
+]
+
+[tool.uv]
+package = false
