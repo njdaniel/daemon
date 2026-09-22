@@ -1,12 +1,12 @@
 //! `dmn doctor`: one line per check, a fix for every failure, exit 1 if a required check fails.
 //!
 //! Every check is a pure function over injected inputs ([`Runner`] for commands and PATH,
-//! [`Http`] for the Ollama endpoint) so the unit tests run without PipeWire or Ollama, which
-//! CI does not have. `--probe` (play a tone and capture it back, issue #5) lives in `probe.rs`.
+//! [`Http`] for the Ollama endpoint, [`Resolver`] for the privacy line) so the unit tests run
+//! without PipeWire, Ollama or DNS, none of which CI has. `--probe` (play a tone and capture it back, issue #5) lives in `probe.rs`.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -64,6 +64,25 @@ pub trait Runner {
 /// Fetches a URL. The real one is a tiny HTTP/1.1 client; tests return canned bodies.
 pub trait Http {
     fn get(&self, url: &str) -> Result<String, String>;
+}
+
+/// Resolves a hostname to addresses. Injected so the privacy line is testable offline.
+pub trait Resolver {
+    /// Addresses for `host`, or `None` when it cannot be resolved.
+    fn resolve(&self, host: &str) -> Option<Vec<IpAddr>>;
+}
+
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn resolve(&self, host: &str) -> Option<Vec<IpAddr>> {
+        let addrs: Vec<IpAddr> = (host, 0u16)
+            .to_socket_addrs()
+            .ok()?
+            .map(|a| a.ip())
+            .collect();
+        (!addrs.is_empty()).then_some(addrs)
+    }
 }
 
 pub struct SystemRunner;
@@ -153,9 +172,12 @@ fn parse_http_response(raw: &[u8]) -> Result<String, String> {
     if !(200..300).contains(&code) {
         return Err(format!("HTTP {code}"));
     }
-    let chunked = head
-        .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.contains("chunked"));
+    // Header names and transfer-coding values are both case-insensitive: "Transfer-Encoding:
+    // Chunked" is as valid as the lowercase spelling (Copilot on PR #18).
+    let chunked = head.lines().any(|l| {
+        let l = l.to_ascii_lowercase();
+        l.starts_with("transfer-encoding:") && l.contains("chunked")
+    });
     let body = if chunked {
         decode_chunked(body)
     } else {
@@ -281,7 +303,15 @@ pub fn ollama(h: &dyn Http, base_url: &str, model: &str) -> Vec<Check> {
             )];
         }
     };
-    let names = ollama_model_names(&body);
+    // A 2xx body we cannot parse is not an empty model list: it is a proxy, a captive portal or
+    // the wrong endpoint, and `ollama pull` would not fix it (Copilot on PR #18).
+    let Some(names) = ollama_model_names(&body) else {
+        return vec![Check::fail(
+            "ollama",
+            format!("unexpected response from {url}: not the JSON /api/tags returns"),
+            format!("check that {base_url} is an Ollama server (curl {url}) and not a proxy"),
+        )];
+    };
     let mut out = vec![Check::pass(
         "ollama",
         format!("{base_url} reachable, {} model(s)", names.len()),
@@ -301,19 +331,17 @@ pub fn ollama(h: &dyn Http, base_url: &str, model: &str) -> Vec<Check> {
     out
 }
 
-fn ollama_model_names(body: &str) -> Vec<String> {
-    let v: serde_json::Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    v["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["name"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default()
+/// Model names from an `/api/tags` body, or `None` when the body is not that shape at all
+/// (unparsable JSON, or no `models` array). An Ollama with nothing pulled answers
+/// `{"models":[]}`, which is `Some(vec![])` and a different situation.
+fn ollama_model_names(body: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let arr = v.get("models")?.as_array()?;
+    // Every entry must carry a string name. Dropping nameless entries would turn a malformed
+    // body into "no models pulled" and an `ollama pull` fix again (Copilot on PR #32).
+    arr.iter()
+        .map(|m| m.get("name")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// For remote providers the key must be present in the named env var.
@@ -364,6 +392,73 @@ pub fn gpu_backend(r: &dyn Runner) -> Check {
     .optional()
 }
 
+// ---- privacy --------------------------------------------------------------------------------
+
+/// Where the configured LLM endpoint actually is. `provider = "ollama"` says nothing about
+/// this: `base_url` can point at another host, and then transcript text leaves the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Locality {
+    /// Every resolved address is a loopback address.
+    Local,
+    /// At least one resolved address is not loopback, or the provider is a remote API.
+    Remote,
+    /// The host could not be resolved, so locality cannot be proven; treated as remote.
+    Unresolved,
+}
+
+/// The host part of `http://host:port/path`, without brackets for IPv6 literals.
+fn host_of(url: &str) -> &str {
+    let rest = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    match rest.strip_prefix('[') {
+        // [::1]:11434
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => rest.split(':').next().unwrap_or(rest),
+    }
+}
+
+/// Decide from the resolved host, not from the provider enum (review finding on PR #18).
+pub fn endpoint_locality(cfg: &Config, r: &dyn Resolver) -> Locality {
+    if cfg.llm.provider.is_remote() {
+        return Locality::Remote;
+    }
+    let host = host_of(&cfg.llm.base_url);
+    if host.is_empty() {
+        return Locality::Unresolved;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if ip.is_loopback() {
+            Locality::Local
+        } else {
+            Locality::Remote
+        };
+    }
+    match r.resolve(host) {
+        Some(addrs) if addrs.iter().all(IpAddr::is_loopback) => Locality::Local,
+        Some(_) => Locality::Remote,
+        None => Locality::Unresolved,
+    }
+}
+
+/// The one-sentence privacy statement in the report header (SPEC § Privacy rules).
+fn privacy_line(cfg: &Config, locality: &Locality) -> String {
+    let host = host_of(&cfg.llm.base_url);
+    match locality {
+        Locality::Local => "nothing leaves this machine".to_owned(),
+        Locality::Remote => format!(
+            "transcript text, retrieved chunks and the session summary LEAVE this machine ({host} is not this machine)"
+        ),
+        Locality::Unresolved => format!(
+            "cannot resolve {host}: assume transcript text, retrieved chunks and the session summary LEAVE this machine"
+        ),
+    }
+}
+
 // ---- report ----------------------------------------------------------------------------------
 
 pub struct Report {
@@ -401,16 +496,18 @@ impl Report {
     }
 }
 
-pub fn run_all(cfg: &Config, paths: &Paths, r: &dyn Runner, h: &dyn Http) -> Report {
+pub fn run_all(
+    cfg: &Config,
+    paths: &Paths,
+    r: &dyn Runner,
+    h: &dyn Http,
+    res: &dyn Resolver,
+) -> Report {
     let mut header = String::new();
     let _ = writeln!(header, "config:   {}", paths.config_file.display());
     let _ = writeln!(header, "log:      {}", paths.log_file.display());
     let provider = format!("{:?}", cfg.llm.provider).to_lowercase();
-    let privacy = if cfg.llm.provider.is_remote() {
-        "transcript text, retrieved chunks and the session summary LEAVE this machine"
-    } else {
-        "nothing leaves this machine"
-    };
+    let privacy = privacy_line(cfg, &endpoint_locality(cfg, res));
     let _ = writeln!(
         header,
         "provider: {provider}, model {} at {} — {privacy}",
@@ -469,6 +566,28 @@ mod tests {
     impl Http for FakeHttp {
         fn get(&self, _url: &str) -> Result<String, String> {
             self.0.clone()
+        }
+    }
+
+    /// Resolves the hosts it was given and nothing else.
+    struct FakeResolver(HashMap<&'static str, Vec<IpAddr>>);
+    impl FakeResolver {
+        fn local() -> Self {
+            Self(HashMap::new()).with("localhost", &["127.0.0.1", "::1"])
+        }
+        fn with(mut self, host: &'static str, ips: &[&str]) -> Self {
+            self.0.insert(
+                host,
+                ips.iter()
+                    .filter_map(|i| i.parse().ok())
+                    .collect::<Vec<_>>(),
+            );
+            self
+        }
+    }
+    impl Resolver for FakeResolver {
+        fn resolve(&self, host: &str) -> Option<Vec<IpAddr>> {
+            self.0.get(host).cloned()
         }
     }
 
@@ -619,6 +738,78 @@ mod tests {
     }
 
     #[test]
+    fn host_is_parsed_from_every_url_shape() {
+        assert_eq!(host_of("http://localhost:11434"), "localhost");
+        assert_eq!(host_of("http://127.0.0.1:11434/api/tags"), "127.0.0.1");
+        assert_eq!(host_of("http://[::1]:11434"), "::1");
+        assert_eq!(host_of("https://api.openai.com"), "api.openai.com");
+        assert_eq!(host_of("10.0.0.5:11434"), "10.0.0.5");
+        assert_eq!(host_of(""), "");
+    }
+
+    #[test]
+    fn locality_follows_the_resolved_host_not_the_provider() {
+        let res = FakeResolver::local().with("ollama.lan", &["10.0.0.5"]);
+        let local = |url: &str| {
+            let mut cfg = Config::default();
+            cfg.llm.base_url = url.into();
+            endpoint_locality(&cfg, &res)
+        };
+        // provider = ollama, but the endpoint is somewhere else: text leaves the machine.
+        assert_eq!(local("http://localhost:11434"), Locality::Local);
+        assert_eq!(local("http://127.0.0.1:11434"), Locality::Local);
+        assert_eq!(local("http://[::1]:11434"), Locality::Local);
+        assert_eq!(local("http://10.0.0.5:11434"), Locality::Remote);
+        assert_eq!(local("http://ollama.lan:11434"), Locality::Remote);
+        assert_eq!(local("http://nowhere.invalid:11434"), Locality::Unresolved);
+
+        // A remote provider is remote whatever the URL says.
+        let mut remote = Config::default();
+        remote.llm.provider = Provider::Anthropic;
+        remote.llm.base_url = "http://localhost:11434".into();
+        assert_eq!(endpoint_locality(&remote, &res), Locality::Remote);
+    }
+
+    #[test]
+    fn privacy_line_names_the_host_when_text_leaves() {
+        let mut cfg = Config::default();
+        cfg.llm.base_url = "http://10.0.0.5:11434".into();
+        let line = privacy_line(&cfg, &Locality::Remote);
+        assert!(line.contains("LEAVE this machine"), "{line}");
+        assert!(line.contains("10.0.0.5"), "{line}");
+        assert_eq!(
+            privacy_line(&cfg, &Locality::Local),
+            "nothing leaves this machine"
+        );
+        let unknown = privacy_line(&cfg, &Locality::Unresolved);
+        assert!(unknown.contains("cannot resolve 10.0.0.5"), "{unknown}");
+        assert!(unknown.contains("LEAVE this machine"), "{unknown}");
+    }
+
+    #[test]
+    fn ollama_on_another_host_says_text_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.base_url = "http://10.0.0.5:11434".into();
+        let report = run_all(
+            &cfg,
+            &Paths::under(dir.path()),
+            &FakeRunner::default(),
+            &FakeHttp(Ok(TAGS.into())),
+            &FakeResolver::local(),
+        );
+        // Printed with --nocapture; this is the line a user sees for a remote Ollama.
+        println!("{}", report.header.trim_end());
+        assert!(
+            report.header.contains("LEAVE this machine"),
+            "{}",
+            report.header
+        );
+        // Still an ollama provider, so the ollama checks still run.
+        assert!(report.checks.iter().any(|c| c.name == "ollama"));
+    }
+
+    #[test]
     fn report_exit_status_counts_only_required_failures() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
@@ -627,7 +818,13 @@ mod tests {
             .with("pkg-config", &["--modversion", "libpipewire-0.3"], "1.6.8")
             .with("pw-cli", &["info", "0"], "version: \"1.5.85\"")
             .on_path(&["pw-record", "pw-play"]);
-        let report = run_all(&cfg, &paths, &runner, &FakeHttp(Ok(TAGS.into())));
+        let report = run_all(
+            &cfg,
+            &paths,
+            &runner,
+            &FakeHttp(Ok(TAGS.into())),
+            &FakeResolver::local(),
+        );
         // whisper model is the only required failure; tools are a warning; gpu is info.
         assert_eq!(report.failed_required(), 1);
         let text = report.render();
@@ -653,6 +850,7 @@ mod tests {
             &Paths::under(dir.path()),
             &FakeRunner::default(),
             &FakeHttp(Err("unused".into())),
+            &FakeResolver::local(),
         );
         assert!(report.header.contains("LEAVE this machine"));
         assert!(report.checks.iter().any(|c| c.name == "api key"));
@@ -670,6 +868,67 @@ mod tests {
             "HTTP 404"
         );
         assert!(parse_http_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn transfer_encoding_value_is_case_insensitive() {
+        // Copilot on PR #18: only the header name was lowercased, so "Chunked" was not decoded
+        // and the raw chunk framing reached the JSON parser.
+        for header in [
+            "Transfer-Encoding: Chunked",
+            "transfer-encoding: chunked",
+            "Transfer-Encoding: CHUNKED",
+        ] {
+            let raw = format!("HTTP/1.1 200 OK\r\n{header}\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n");
+            assert_eq!(
+                parse_http_response(raw.as_bytes()).unwrap(),
+                "{}",
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_2xx_that_is_not_api_tags_is_not_a_missing_model() {
+        // Copilot on PR #18: unparsable JSON became an empty model list, so a proxy or the
+        // wrong port was misdiagnosed as "model not pulled" with an `ollama pull` fix.
+        assert_eq!(ollama_model_names(r#"{"models":[]}"#), Some(vec![]));
+        assert_eq!(ollama_model_names("<html>hello</html>"), None);
+        assert_eq!(ollama_model_names(r#"{"error":"nope"}"#), None);
+        // A models array whose entries have no string name is malformed, not empty.
+        assert_eq!(ollama_model_names(r#"{"models":[{}]}"#), None);
+        assert_eq!(ollama_model_names(r#"{"models":[{"name":7}]}"#), None);
+
+        let checks = ollama(
+            &FakeHttp(Ok("<html>proxy</html>".into())),
+            "http://localhost:11434",
+            "qwen3.6:35b-a3b",
+        );
+        assert_eq!(checks.len(), 1, "no model check on an unusable response");
+        assert!(!checks[0].ok);
+        assert!(
+            checks[0].detail.contains("unexpected response"),
+            "{}",
+            checks[0].detail
+        );
+        let fix = checks[0].fix.as_deref().unwrap_or_default();
+        assert!(!fix.contains("ollama pull"), "{fix}");
+
+        // An Ollama with nothing pulled is still an Ollama: that one does say `ollama pull`.
+        let empty = ollama(
+            &FakeHttp(Ok(r#"{"models":[]}"#.into())),
+            "http://localhost:11434",
+            "qwen3.6:35b-a3b",
+        );
+        assert_eq!(empty.len(), 2);
+        assert!(empty[0].ok, "reachable");
+        assert!(
+            empty[1]
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ollama pull")
+        );
     }
 
     #[test]
@@ -701,6 +960,10 @@ mod tests {
     #[ignore]
     fn live_ollama_tags() {
         let body = StdHttp.get("http://localhost:11434/api/tags").unwrap();
-        assert!(!ollama_model_names(&body).is_empty());
+        assert!(
+            !ollama_model_names(&body)
+                .expect("an /api/tags body")
+                .is_empty()
+        );
     }
 }

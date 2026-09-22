@@ -2,7 +2,10 @@
 name = "dmn-tools"
 version = "0.1.0"
 description = "Offline developer tools for Daemon: TTS fixture generator (never on the audio path)"
-requires-python = ">=3.10"
+# The locked onnxruntime ships cp311..cp314 wheels and no sdist, so this environment installs on
+# exactly those interpreters: below 3.11 and from 3.15 up there is nothing to install
+# (Copilot on PR #24 and PR #32). Widen this when a newer onnxruntime lock covers more.
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "piper-tts>=1.8,<2",   # TTS for the mock-interview fixtures
     "onnxruntime>=1.17",   # imported directly to seed Piper's in-graph noise

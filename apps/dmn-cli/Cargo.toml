@@ -24,6 +24,7 @@ dmn-stt = { path = "../../crates/dmn-stt" }
 dmn-transcript = { path = "../../crates/dmn-transcript" }
 dmn-vad = { path = "../../crates/dmn-vad" }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

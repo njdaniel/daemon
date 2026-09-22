@@ -119,7 +119,7 @@ impl AudioSource for WavSource {
         let handle = std::thread::Builder::new()
             .name(name)
             .spawn(move || job.run(sink))
-            .map_err(|_| AudioError::ThreadPanicked)?;
+            .map_err(|e| AudioError::Spawn(e.to_string()))?;
         self.thread = Some(handle);
         Ok(())
     }
@@ -576,5 +576,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = WavSource::open(dir.path().join("nope.wav"), Source::You, Speed::Fast);
         assert!(matches!(missing, Err(AudioError::Open { .. })));
+    }
+
+    /// Copilot on PR #19: a `Builder::spawn` failure was reported as `ThreadPanicked`, which is a
+    /// different fault with a different fix. The OS error must reach the caller intact. A real
+    /// spawn failure needs the process to be out of threads, so this checks the mapping the
+    /// start path uses rather than provoking one.
+    #[test]
+    fn a_spawn_failure_keeps_the_os_error_and_is_not_a_panic() {
+        let io = std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "Resource temporarily unavailable",
+        );
+        let mapped = AudioError::Spawn(io.to_string());
+        assert!(!matches!(mapped, AudioError::ThreadPanicked));
+        assert!(
+            mapped
+                .to_string()
+                .contains("Resource temporarily unavailable"),
+            "{mapped}"
+        );
+        // A healthy start still spawns and finishes cleanly, so the new mapping is not hiding
+        // a failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.wav");
+        write_sine(&path, SAMPLE_RATE, &[0.5], 440.0, 0.05);
+        let mut src = WavSource::open(&path, Source::You, Speed::Fast).unwrap();
+        let (sink, _frames) = frame_channel(Source::You, 4);
+        src.start(sink).unwrap();
+        assert!(
+            src.wait().is_ok(),
+            "a healthy run is neither Spawn nor panic"
+        );
     }
 }

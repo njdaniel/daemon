@@ -294,20 +294,42 @@ impl Config {
     }
 
     /// Write the commented template. Refuses to overwrite unless `force`.
+    ///
+    /// Without `force` the file is created with `create_new`, so the check and the write are one
+    /// atomic step: a config that appears in between is not clobbered, and a symlink pointing
+    /// somewhere else is not followed (Copilot on PR #17).
     pub fn write_template(path: &Path, force: bool) -> Result<(), ConfigError> {
         let shown = path.display().to_string();
-        if path.exists() && !force {
-            return Err(ConfigError::Exists(shown));
-        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|source| ConfigError::Write {
                 path: shown.clone(),
                 source,
             })?;
         }
-        std::fs::write(path, TEMPLATE).map_err(|source| ConfigError::Write {
-            path: shown,
-            source,
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        if force {
+            opts.create(true).truncate(true);
+        } else {
+            opts.create_new(true);
+        }
+        let mut file = match opts.open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ConfigError::Exists(shown));
+            }
+            Err(source) => {
+                return Err(ConfigError::Write {
+                    path: shown,
+                    source,
+                });
+            }
+        };
+        std::io::Write::write_all(&mut file, TEMPLATE.as_bytes()).map_err(|source| {
+            ConfigError::Write {
+                path: shown,
+                source,
+            }
         })
     }
 
@@ -443,6 +465,35 @@ keep_transcripts = true
         let err = Config::write_template(&path, false).unwrap_err();
         assert!(matches!(err, ConfigError::Exists(_)), "{err}");
         Config::write_template(&path, true).unwrap();
+    }
+
+    /// Copilot on PR #17: `exists()` then `write` is two steps. A file that appears in between
+    /// was overwritten, and a dangling symlink reported "missing" and was then followed.
+    #[test]
+    fn init_never_follows_a_symlink_or_clobbers_a_file_that_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("precious.toml");
+        std::fs::write(&victim, "keep me").unwrap();
+
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let err = Config::write_template(&link, false).unwrap_err();
+        assert!(matches!(err, ConfigError::Exists(_)), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+
+        // A dangling symlink is still a name that exists: creating through it is refused.
+        let dangling = dir.path().join("dangling.toml");
+        std::os::unix::fs::symlink(dir.path().join("nowhere.toml"), &dangling).unwrap();
+        let err = Config::write_template(&dangling, false).unwrap_err();
+        assert!(matches!(err, ConfigError::Exists(_)), "{err}");
+        assert!(
+            !dir.path().join("nowhere.toml").exists(),
+            "nothing written through the link"
+        );
+
+        // With --force the user has asked for it, and the template lands.
+        Config::write_template(&link, true).unwrap();
+        assert_eq!(Config::load(&link).unwrap(), Config::default());
     }
 
     #[test]

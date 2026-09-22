@@ -116,6 +116,17 @@ impl CaptureState {
             _ => CaptureState::Idle,
         }
     }
+
+    /// Short name for error messages and status lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureState::Idle => "idle",
+            CaptureState::Connecting => "connecting",
+            CaptureState::Streaming => "streaming",
+            CaptureState::Disconnected => "disconnected",
+            CaptureState::Error => "in error",
+        }
+    }
 }
 
 impl CaptureMode {
@@ -147,6 +158,12 @@ pub struct CaptureStatus {
     frames: AtomicU64,
     rate: AtomicU32,
     channels: AtomicU32,
+    /// Set by `param_changed` once PipeWire has settled on 16 kHz mono F32; the real-time
+    /// callback reads it and drops buffers while it is false, so a format we did not ask for
+    /// never reaches the ring as if it were 16 kHz mono.
+    format_ok: AtomicBool,
+    /// Buffers the callback dropped because the negotiated format was wrong.
+    bad_format_buffers: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -180,6 +197,21 @@ impl CaptureStatus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// True once PipeWire has negotiated the format we asked for. The callback pushes nothing
+    /// until then.
+    pub fn format_ok(&self) -> bool {
+        self.format_ok.load(Ordering::Acquire)
+    }
+
+    /// Buffers dropped because the negotiated format was not 16 kHz mono F32.
+    pub fn bad_format_buffers(&self) -> u64 {
+        self.bad_format_buffers.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_format_ok(&self, ok: bool) {
+        self.format_ok.store(ok, Ordering::Release);
     }
 
     pub(crate) fn set_state(&self, s: CaptureState) {
@@ -352,6 +384,21 @@ impl Accum {
         }
     }
 
+    /// Whether the negotiated format is the one we asked for. One relaxed atomic load; safe in
+    /// the real-time callback.
+    #[inline]
+    pub(crate) fn format_ok(&self) -> bool {
+        self.status.format_ok.load(Ordering::Acquire)
+    }
+
+    /// Count a buffer dropped for a wrong format. One relaxed atomic add, no allocation.
+    #[inline]
+    pub(crate) fn count_bad_format(&self) {
+        self.status
+            .bad_format_buffers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Append little-endian f32 samples. A trailing partial sample (never produced by F32LE
     /// buffers) is ignored.
     pub(crate) fn push_le_bytes(&mut self, bytes: &[u8]) {
@@ -392,6 +439,12 @@ fn process(stream: &pw::stream::Stream, acc: &mut Accum) {
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
+    // Dropping the buffer here requeues it; we just do not copy its samples. Until the format
+    // is settled at 16 kHz mono F32, its bytes are not what the ring expects.
+    if !acc.format_ok() {
+        acc.count_bad_format();
+        return;
+    }
     let Some(data) = buffer.datas_mut().first_mut() else {
         return;
     };
@@ -401,6 +454,26 @@ fn process(stream: &pw::stream::Stream, acc: &mut Accum) {
         let end = offset.saturating_add(size).min(bytes.len());
         let start = offset.min(end);
         acc.push_le_bytes(&bytes[start..end]);
+    }
+}
+
+/// What `PipeWireSource::stop` returns: a panicked supervisor first, then a stream that never
+/// reached `Idle` inside the timeout (its real-time callback may still be running).
+/// `final_state` is `None` when no Close was sent, i.e. there was nothing to wait for.
+fn stop_result(
+    panicked: bool,
+    final_state: Option<CaptureState>,
+    timeout: Duration,
+) -> Result<(), AudioError> {
+    if panicked {
+        return Err(AudioError::ThreadPanicked);
+    }
+    match final_state {
+        Some(state) if state != CaptureState::Idle => Err(AudioError::StopTimeout {
+            state: state.label(),
+            ms: timeout.as_millis() as u64,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -460,23 +533,38 @@ impl LoopCapture {
                 pw::stream::StreamState::Unconnected => {}
             })
             .param_changed(move |_, _, id, param| {
-                let Some(param) = param else { return };
                 if id != spa::param::ParamType::Format.as_raw() {
                     return;
                 }
+                let Some(param) = param else {
+                    // The format was cleared: stop the callback until a new one is negotiated.
+                    format_status.set_format_ok(false);
+                    return;
+                };
                 let mut info = spa::param::audio::AudioInfoRaw::new();
                 if info.parse(param).is_ok() {
                     format_status
                         .channels
                         .store(info.channels(), Ordering::Release);
                     format_status.rate.store(info.rate(), Ordering::Release);
-                    if info.rate() != SAMPLE_RATE || info.channels() != 1 {
+                    // The sample format matters as much as the rate: S16LE at 16 kHz mono
+                    // would open the gate and be read as f32 (Copilot on PR #32).
+                    let ok = info.rate() == SAMPLE_RATE
+                        && info.channels() == 1
+                        && info.format() == spa::param::audio::AudioFormat::F32LE;
+                    // Gate the real-time callback before reporting, so no buffer of the wrong
+                    // shape is ever copied into the 16 kHz mono ring.
+                    format_status.set_format_ok(ok);
+                    if !ok {
                         format_status.set_error(format!(
-                            "negotiated {} Hz × {} ch, need {SAMPLE_RATE} Hz mono",
+                            "negotiated {:?} {} Hz × {} ch, need F32LE {SAMPLE_RATE} Hz mono (dropping buffers)",
+                            info.format(),
                             info.rate(),
                             info.channels()
                         ));
                     }
+                } else {
+                    format_status.set_format_ok(false);
                 }
             })
             .register()
@@ -533,6 +621,9 @@ impl LoopCapture {
     }
 
     pub(crate) fn disconnect(&mut self) {
+        // A reconnect renegotiates the format, so the old verdict must not carry over into the
+        // new stream's first buffers.
+        self.status.set_format_ok(false);
         if self.connected {
             // After this returns the data thread no longer calls `process`.
             let _ = self.stream.disconnect();
@@ -739,6 +830,7 @@ impl AudioSource for PipeWireSource {
             .take()
             .map(|h| h.join().is_err())
             .unwrap_or(false);
+        let mut timed_out = None;
         if let Some(key) = self.key.take()
             && self.ctx.send(Command::Close { key }).is_ok()
         {
@@ -749,12 +841,11 @@ impl AudioSource for PipeWireSource {
             while self.status.state() != CaptureState::Idle && t.elapsed() < STOP_TIMEOUT {
                 std::thread::sleep(Duration::from_millis(2));
             }
+            // Never claim a clean stop we did not get: the caller may be about to drop the
+            // ring the callback writes into.
+            timed_out = Some(self.status.state());
         }
-        if panicked {
-            Err(AudioError::ThreadPanicked)
-        } else {
-            Ok(())
-        }
+        stop_result(panicked, timed_out, STOP_TIMEOUT)
     }
 
     fn is_finished(&self) -> bool {
@@ -989,6 +1080,76 @@ mod tests {
         acc.push_samples(&vec![0.0; FRAME_LEN / 2]);
         assert!(frames.pop_frame(&mut out));
         assert_eq!(out[0], (3 * FRAME_LEN) as f32);
+    }
+
+    #[test]
+    fn stop_reports_a_stream_that_never_went_idle() {
+        // Copilot on PR #25: stop() returned Ok(()) after the timeout, so a caller could drop
+        // the ring while the real-time callback was still writing into it.
+        let t = Duration::from_millis(1000);
+        assert!(stop_result(false, Some(CaptureState::Idle), t).is_ok());
+        assert!(stop_result(false, None, t).is_ok(), "nothing to wait for");
+
+        for state in [
+            CaptureState::Streaming,
+            CaptureState::Connecting,
+            CaptureState::Error,
+            CaptureState::Disconnected,
+        ] {
+            let err = stop_result(false, Some(state), t).unwrap_err();
+            assert!(
+                matches!(err, AudioError::StopTimeout { ms: 1000, .. }),
+                "{state:?} -> {err}"
+            );
+            assert!(err.to_string().contains(state.label()), "{err}");
+        }
+        // A panicked supervisor still wins: it is the more serious failure.
+        assert!(matches!(
+            stop_result(true, Some(CaptureState::Streaming), t).unwrap_err(),
+            AudioError::ThreadPanicked
+        ));
+    }
+
+    #[test]
+    fn the_callback_pushes_nothing_until_the_format_is_the_one_we_asked_for() {
+        // Copilot on PR #25: a mismatch only set the status to Error while `process` kept
+        // copying those buffers into the 16 kHz mono ring.
+        let status = Arc::new(CaptureStatus::default());
+        let (sink, mut frames) = frame_channel(Source::Interviewer, 10);
+        let mut acc = Accum::new(sink, Arc::clone(&status));
+        let samples = vec![0.5f32; FRAME_LEN * 2];
+
+        // Fresh status: nothing negotiated yet, so the callback must drop.
+        assert!(!status.format_ok(), "starts closed");
+        for _ in 0..2 {
+            if acc.format_ok() {
+                acc.push_samples(&samples);
+            } else {
+                acc.count_bad_format();
+            }
+        }
+        let mut out = [0.0; FRAME_LEN];
+        assert!(
+            !frames.pop_frame(&mut out),
+            "no frames while the gate is shut"
+        );
+        assert_eq!(status.frames(), 0);
+        assert_eq!(status.bad_format_buffers(), 2);
+
+        // 16 kHz mono negotiated: the gate opens.
+        status.set_format_ok(true);
+        assert!(acc.format_ok());
+        acc.push_samples(&samples);
+        assert_eq!(status.frames(), 2);
+        assert!(frames.pop_frame(&mut out));
+        assert_eq!(out[0], 0.5);
+
+        // A renegotiation to something else shuts it again.
+        status.set_format_ok(false);
+        assert!(!acc.format_ok());
+        acc.count_bad_format();
+        assert_eq!(status.bad_format_buffers(), 3);
+        assert_eq!(status.frames(), 2, "no further frames were pushed");
     }
 
     #[test]

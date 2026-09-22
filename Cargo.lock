@@ -432,6 +432,7 @@ dependencies = [
  "dmn-vad",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 
