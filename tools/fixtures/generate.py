@@ -7,7 +7,12 @@ writes, under testdata/<name>/:
                                    speaker's audio; everywhere else is a -60 dBFS noise floor so a
                                    VAD sees realistic (not digital) silence.
   questions.json                   every turn marked is_question, with start/end from the audio
-  turns.json                       every turn with its timing, for the eval harness (#10)
+  turns.json                       every turn with its timing, for the eval harness (#10). Besides
+                                   the clip window `t`/`end`, each turn carries `voiced_t` and
+                                   `voiced_end`: where sound actually starts and stops inside that
+                                   window. A Piper clip holds 20-60 ms of silence before the first
+                                   word and, for the Norman voice, 150-250 ms after the last one,
+                                   so `t`/`end` are not speech boundaries; see issue #27.
   script.md                        readable transcript with timestamps
 
 Reproducibility: Piper's VITS models sample noise inside the ONNX graph, so plain synthesis differs
@@ -24,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 import wave
 import zlib
@@ -48,6 +54,7 @@ LEAD_IN_S = 1.0
 TAIL_S = 1.5
 DEFAULT_PAUSE_S = 0.8
 FRAME = 320  # 20 ms at 16 kHz, same frame the VAD uses
+VOICED_DBFS = -40.0  # sound vs the -60 dBFS floor, for turns.json's voiced_t / voiced_end
 
 
 @dataclass
@@ -59,6 +66,8 @@ class Placed:
     text: str
     is_question: bool
     kind: str | None
+    voiced_start: float = 0.0
+    voiced_end: float = 0.0
 
 
 def dbfs(x: np.ndarray) -> float:
@@ -136,8 +145,44 @@ def synth_turn(voice: PiperVoice, text: str) -> np.ndarray:
     return x.astype(np.float32)
 
 
+def quantise(x: np.ndarray) -> np.ndarray:
+    """The int16 samples that go into the WAV, so callers can measure exactly what consumers read."""
+    return np.clip(np.round(x * 32767.0), -32768, 32767).astype("<i2")
+
+
+def voiced_bounds(track: np.ndarray, start: float, end: float) -> tuple[float, float, bool]:
+    """Where sound starts and stops inside the clip window [start, end) of one track.
+
+    Returns `(voiced_t, voiced_end, found)`. `track` holds the samples as written, in [-1, 1);
+    verify.py re-measures a WAV the same way.
+
+    The definition issue #27 accepted for VAD accuracy, applied to every sample in the window: the
+    first and last sample whose magnitude reaches VOICED_DBFS. The tracks' -60 dBFS Gaussian floor
+    would need a 10-sigma excursion to reach -40 dBFS, so on these fixtures a crossing is always
+    speech and no frame gate is needed.
+
+    The bounds are widened to the enclosing millisecond, never narrowed, so the recorded pair always
+    contains every sample that crossed the threshold and a one-sample turn still gets a real span
+    rather than collapsing. `found` is False only when nothing in the window crosses at all; the
+    window itself is then returned and verify.py warns, so a silent clip is noticed instead of
+    being absorbed into a full-width "voiced" span.
+    """
+    lo, hi = int(round(start * RATE)), min(int(round(end * RATE)), len(track))
+    win = np.abs(track[lo:hi].astype(np.float64))
+    loud = np.flatnonzero(win >= 10.0 ** (VOICED_DBFS / 20.0))
+    if not loud.size:
+        return round(start, 3), round(end, 3), False
+    first, last = (lo + int(loud[0])) / RATE, (lo + int(loud[-1]) + 1) / RATE
+    t0 = max(start, math.floor(first * 1000.0) / 1000.0)
+    t1 = min(end, math.ceil(last * 1000.0) / 1000.0)
+    if t1 <= t0:  # a span shorter than the rounding grid: give it one VAD frame inside the clip
+        t1 = min(end, round(t0 + FRAME / RATE, 3))
+        t0 = max(start, round(t1 - FRAME / RATE, 3))
+    return round(t0, 3), round(t1, 3), True
+
+
 def write_wav(path: Path, x: np.ndarray) -> None:
-    pcm = np.clip(np.round(x * 32767.0), -32768, 32767).astype("<i2")
+    pcm = quantise(x)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -197,6 +242,14 @@ def generate(script_path: Path, out_root: Path) -> dict:
     write_wav(out / "interviewer.wav", tracks["interviewer"])
     write_wav(out / "candidate.wav", tracks["candidate"])
 
+    # Measured on the int16 samples that were just written, not the float mix, so turns.json
+    # describes exactly what a consumer of the WAV sees.
+    quantised = {role: quantise(x).astype(np.float64) / 32768.0 for role, x in tracks.items()}
+    for p in placed:
+        p.voiced_start, p.voiced_end, found = voiced_bounds(quantised[p.speaker], p.start, p.end)
+        if not found:
+            print(f"  warning: turn {p.index} ({p.speaker}) has no sample over {VOICED_DBFS} dBFS")
+
     questions = [
         {"t": p.start, "end": p.end, "text": p.text, "kind": p.kind}
         for p in placed
@@ -208,6 +261,8 @@ def generate(script_path: Path, out_root: Path) -> dict:
             "speaker": p.speaker,
             "t": p.start,
             "end": p.end,
+            "voiced_t": p.voiced_start,
+            "voiced_end": p.voiced_end,
             "is_question": p.is_question,
             "kind": p.kind,
             "text": p.text,
