@@ -19,14 +19,17 @@ use dmn_vad::{VadConfig, VadWorker, WorkerStats, event_channel};
 /// about a live call falling behind, not about replay losing half the interview).
 const EVENT_CAPACITY: usize = 512;
 
-/// Ring frames per lane when replaying unpaced. A live capture keeps 2 s and drops what it
-/// cannot drain in time, which is right for a call and wrong here: an unpaced `WavSource`
-/// delivers a 12 minute file in about a second, so a 2 s ring would drop almost all of it (the
-/// first run of this command lost 32 000 frames). Sizing the ring to the file instead makes the
-/// producer wait-free and lossless, at 64 KB per second of audio: 12 minutes costs ~46 MB.
+/// Ring frames per lane. A paced lane (`RealTime` or `Factor`) delivers frames on a wall-clock
+/// schedule like a live call, so the live 2 s ring is enough and the VAD drains it under the
+/// same real-time pressure a call would apply. Only a genuinely unpaced `WavSource` — `dmn
+/// replay`'s `--speed` no longer produces one, but the type still allows it — needs a ring sized
+/// to the file: it delivers a 12 minute file in about a second, so a 2 s ring would drop almost
+/// all of it (the first run of this command lost 32 000 frames). Sizing that case's ring to the
+/// file instead makes the producer wait-free and lossless, at 64 KB per second of audio: 12
+/// minutes costs ~46 MB.
 fn ring_frames(audio: Duration, speed: Speed) -> usize {
     match speed {
-        Speed::RealTime => DEFAULT_CAPACITY_FRAMES,
+        Speed::RealTime | Speed::Factor(_) => DEFAULT_CAPACITY_FRAMES,
         Speed::Fast => {
             let frames = audio.as_millis() / u128::from(FRAME_MS);
             (frames as usize).saturating_add(DEFAULT_CAPACITY_FRAMES)
@@ -40,7 +43,7 @@ const DEFAULT_CAPACITY_FRAMES: usize = dmn_audio::DEFAULT_CAPACITY_FRAMES;
 pub struct Args {
     pub interviewer: PathBuf,
     pub candidate: PathBuf,
-    /// 1.0 plays at wall-clock speed like a live call; anything else runs unpaced.
+    /// Paces `WavSource` delivery at this many multiples of wall-clock time; 1.0 is a live call.
     pub speed: f32,
     pub model: Option<String>,
     pub threads: Option<usize>,
@@ -52,19 +55,23 @@ pub struct Args {
 /// Whether to transcribe the 1 s partials of an open utterance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Partials {
-    /// On at 1×, off when unpaced.
+    /// On for any paced speed (`RealTime` or `Factor`, which is every `--speed` this command
+    /// accepts); off only for an unpaced source, which `--speed` itself never produces.
     Auto,
     On,
     Off,
 }
 
 impl Partials {
-    /// Partials exist to keep a live view moving while someone is still speaking. Unpaced, the
-    /// audio arrives far faster than whisper runs, so every partial is stale before it is
-    /// transcribed and only crowds out the utterances that matter.
+    /// Partials exist to keep a live view moving while someone is still speaking. Whether
+    /// whisper can transcribe one before it is superseded is a question of whisper's real-time
+    /// factor at the model and thread count in use, not of the replay speed itself — a paced
+    /// lane at any factor gives the pipeline the same real-time pressure a live call would.
+    /// Only a genuinely unpaced run, where the whole file lands in a fraction of a second,
+    /// makes every partial stale before it starts.
     fn enabled(self, speed: Speed) -> bool {
         match self {
-            Partials::Auto => speed == Speed::RealTime,
+            Partials::Auto => !matches!(speed, Speed::Fast),
             Partials::On => true,
             Partials::Off => false,
         }
@@ -95,12 +102,12 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         threads: args.threads.unwrap_or(usize::from(cfg.stt.threads)),
         ..SttConfig::default()
     };
-    // SPEC § Milestones: replay runs at 1× or faster. A true N× pacing needs a Speed::Factor in
-    // dmn-audio, which #30 is editing; until then anything but 1.0 runs unpaced.
+    // #34: `--speed N` paces delivery at N× wall-clock (SPEC § Milestones only requires 1× or
+    // faster, but the flag's own name promises real pacing at any N).
     let speed = if (args.speed - 1.0).abs() < f32::EPSILON {
         Speed::RealTime
     } else {
-        Speed::Fast
+        Speed::Factor(args.speed)
     };
 
     let partials = args.partials.enabled(speed);
@@ -123,10 +130,10 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         pretty(audio),
         name,
         stt_cfg.threads,
-        if speed == Speed::RealTime {
-            "1× (wall clock)"
-        } else {
-            "unpaced"
+        match speed {
+            Speed::RealTime => "1× (wall clock)".to_string(),
+            Speed::Factor(f) => format!("{f}× (wall clock)"),
+            Speed::Fast => "unpaced".to_string(),
         },
         if partials { "on" } else { "off" },
     );
@@ -323,6 +330,7 @@ mod tests {
     #[test]
     fn partials_follow_the_pacing_unless_forced() {
         assert!(Partials::Auto.enabled(Speed::RealTime));
+        assert!(Partials::Auto.enabled(Speed::Factor(4.0)), "still paced");
         assert!(
             !Partials::Auto.enabled(Speed::Fast),
             "stale before they are run"
@@ -335,9 +343,13 @@ mod tests {
     fn an_unpaced_lane_gets_a_ring_that_holds_the_whole_file() {
         // 12 minutes at 20 ms per frame, plus the live margin.
         assert_eq!(ring_frames(Duration::from_secs(725), Speed::Fast), 36_350);
-        // Paced replay behaves like a live call: 2 s, and the VAD keeps up.
+        // Paced replay behaves like a live call: 2 s, and the VAD keeps up, at any factor.
         assert_eq!(
             ring_frames(Duration::from_secs(725), Speed::RealTime),
+            DEFAULT_CAPACITY_FRAMES
+        );
+        assert_eq!(
+            ring_frames(Duration::from_secs(725), Speed::Factor(4.0)),
             DEFAULT_CAPACITY_FRAMES
         );
     }

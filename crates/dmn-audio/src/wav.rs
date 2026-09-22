@@ -1,6 +1,6 @@
 //! `WavSource`: a file standing in for a capture stream. Any rate and channel count in; 16 kHz
-//! mono frames out, paced at 1× wall-clock for demos and live-like tests, or as fast as the
-//! disk allows for the eval harness.
+//! mono frames out, paced at an arbitrary multiple of wall-clock for demos and live-like tests,
+//! or as fast as the disk allows for the eval harness.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,12 +18,16 @@ use crate::source::{AudioError, AudioSource, Source};
 use crate::{FRAME_LEN, FRAME_MS, SAMPLE_RATE};
 
 /// How fast a `WavSource` plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Speed {
-    /// One second of audio per second of wall-clock, like a live call.
+    /// One second of audio per second of wall-clock, like a live call. Equivalent to
+    /// `Factor(1.0)`, kept as its own variant since it is the common case.
     RealTime,
     /// No pacing: frames are pushed as soon as they are decoded.
     Fast,
+    /// `factor`× wall-clock; the caller (`dmn replay`) validates that it is positive and
+    /// finite before constructing this.
+    Factor(f32),
 }
 
 /// Input frames handed to the resampler per call. Large enough to amortise the FFT, small
@@ -183,8 +187,9 @@ impl Job {
         self.emit_full_frames(&mut pending, &mut pacer, &mut sink);
         if !pending.is_empty() && !self.stop.load(Ordering::Acquire) {
             pending.resize(FRAME_LEN, 0.0);
-            pacer.wait_for_next();
-            sink.push_frame(&pending);
+            if !pacer.wait_for_next(&self.stop) {
+                sink.push_frame(&pending);
+            }
         }
         self.finished.store(true, Ordering::Release);
         Ok(())
@@ -193,10 +198,9 @@ impl Job {
     fn emit_full_frames(&self, pending: &mut Vec<f32>, pacer: &mut Pacer, sink: &mut FrameSink) {
         let mut offset = 0;
         while pending.len() - offset >= FRAME_LEN {
-            if self.stop.load(Ordering::Acquire) {
+            if self.stop.load(Ordering::Acquire) || pacer.wait_for_next(&self.stop) {
                 break;
             }
-            pacer.wait_for_next();
             sink.push_frame(&pending[offset..offset + FRAME_LEN]);
             offset += FRAME_LEN;
         }
@@ -360,31 +364,73 @@ impl RateConverter {
     }
 }
 
-/// Holds each frame until its wall-clock slot in `RealTime` mode; a no-op in `Fast` mode.
+/// Holds each frame until its wall-clock slot for `RealTime` and `Factor`; a no-op in `Fast`
+/// mode. The deadline for frame `n` is always `start + n * frame_interval`, computed fresh from
+/// the fixed start instant rather than accumulated from previous sleeps, so pacing cannot drift
+/// over a long file.
 struct Pacer {
     speed: Speed,
+    /// Wall-clock seconds per 20 ms frame at this speed; unused when `speed` is `Fast`.
+    frame_secs: f64,
     start: Instant,
     emitted: u64,
 }
 
+/// How often a long wait wakes up to recheck `stop`, so a tiny `--speed` factor (a multi-second
+/// sleep per frame) still lets `WavSource::stop` return promptly instead of blocking until the
+/// next deadline.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 impl Pacer {
     fn new(speed: Speed) -> Self {
+        let factor = match speed {
+            Speed::Factor(f) => f64::from(f),
+            Speed::RealTime | Speed::Fast => 1.0,
+        };
+        let frame_secs = f64::from(FRAME_MS) / 1000.0 / factor;
         Self {
             speed,
+            frame_secs,
             start: Instant::now(),
             emitted: 0,
         }
     }
 
-    fn wait_for_next(&mut self) {
-        if self.speed == Speed::RealTime {
-            let due = self.start + Duration::from_millis(self.emitted * u64::from(FRAME_MS));
-            let now = Instant::now();
-            if due > now {
-                std::thread::sleep(due - now);
+    /// Sleep until frame `self.emitted`'s deadline, waking every `STOP_POLL_INTERVAL` to check
+    /// `stop`. Returns `true` if `stop` was seen, in which case the caller must not emit the
+    /// frame. A deadline too far in the future to represent as an `Instant` (an absurdly small
+    /// `Factor`, not reachable through `dmn replay`'s own validation but possible through the
+    /// library API) is treated as already due rather than panicking: the source runs unpaced
+    /// from that point instead of crashing.
+    fn wait_for_next(&mut self, stop: &AtomicBool) -> bool {
+        if !matches!(self.speed, Speed::Fast) {
+            let due_secs = self.emitted as f64 * self.frame_secs;
+            if let Some(due) = Self::deadline(self.start, due_secs) {
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return true;
+                    }
+                    let now = Instant::now();
+                    if due <= now {
+                        break;
+                    }
+                    std::thread::sleep((due - now).min(STOP_POLL_INTERVAL));
+                }
             }
         }
         self.emitted += 1;
+        false
+    }
+
+    /// `None` when `due_secs` cannot be turned into an `Instant` (not finite, or beyond what
+    /// `Duration`/`Instant` can represent).
+    fn deadline(start: Instant, due_secs: f64) -> Option<Instant> {
+        if !due_secs.is_finite() {
+            return None;
+        }
+        Duration::try_from_secs_f64(due_secs)
+            .ok()
+            .and_then(|d| start.checked_add(d))
     }
 }
 
@@ -534,6 +580,50 @@ mod tests {
     }
 
     #[test]
+    fn factor_paces_at_n_times_real_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 1.0);
+
+        // 4× a 1 s file should land near 250 ms, not the ~1 s of RealTime or the near-0 of Fast.
+        let t = Instant::now();
+        let mut src = WavSource::open(&path, Source::You, Speed::Factor(4.0)).unwrap();
+        let (sink, mut frames) = frame_channel(Source::You, 100);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(drain(&mut frames).len(), SAMPLE_RATE as usize);
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(400),
+            "4× took {elapsed:?} for 1 s of audio"
+        );
+    }
+
+    #[test]
+    fn factor_stays_drift_free_over_many_frames() {
+        // A deadline computed as `start + n * interval` for every frame, rather than
+        // accumulated from each sleep, so a long file does not creep behind schedule.
+        // 8× on a 4 s file is 500 ms of wall clock over 200 frames: a naive per-sleep
+        // accumulation (each sleep rounded up by the OS scheduler) would drift well past the
+        // tolerance below by the last frame.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 4.0);
+
+        let t = Instant::now();
+        let mut src = WavSource::open(&path, Source::You, Speed::Factor(8.0)).unwrap();
+        let (sink, frames) = frame_channel(Source::You, 300);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(frames.overruns(), 0);
+        assert!(
+            elapsed >= Duration::from_millis(450) && elapsed < Duration::from_millis(650),
+            "8× took {elapsed:?} for 4 s of audio, expected about 500 ms"
+        );
+    }
+
+    #[test]
     fn stop_ends_a_realtime_source_early() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("long.wav");
@@ -554,6 +644,48 @@ mod tests {
         );
         assert!(!src.is_finished());
         assert!(frames.queued_frames() >= 3 && frames.queued_frames() < 20);
+    }
+
+    /// Review of PR #35: an extreme `Factor` (not reachable through `dmn replay`'s own
+    /// validation, but constructible through the library API) turned the per-frame deadline into
+    /// a `Duration` too large to represent, which panicked in `Duration::from_secs_f64`. The
+    /// source must degrade to running unpaced instead of crashing the thread.
+    #[test]
+    fn an_absurdly_small_factor_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 0.1);
+
+        let mut src = WavSource::open(&path, Source::You, Speed::Factor(1e-30)).unwrap();
+        let (sink, mut frames) = frame_channel(Source::You, 100);
+        src.start(sink).unwrap();
+        src.wait().unwrap();
+        assert!(src.is_finished());
+        assert!(!drain(&mut frames).is_empty());
+    }
+
+    /// Review of PR #35: pacing slept for the whole frame interval in one uninterruptible call,
+    /// so a small `Factor` (a multi-second sleep per 20 ms frame) made `stop` block until the
+    /// next deadline instead of returning promptly.
+    #[test]
+    fn stop_is_prompt_even_at_a_slow_factor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slow.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 5.0);
+
+        // 0.001× makes each 20 ms frame a 20 s sleep; stop must not wait anywhere near that.
+        let mut src = WavSource::open(&path, Source::You, Speed::Factor(0.001)).unwrap();
+        let (sink, _frames) = frame_channel(Source::You, 100);
+        src.start(sink).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        src.stop().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "stop joined promptly, took {:?}",
+            t.elapsed()
+        );
+        assert!(!src.is_finished());
     }
 
     #[test]
