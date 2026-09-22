@@ -6,7 +6,8 @@ For each fixture directory with a turns.json:
   * turns are in time order, never overlap, and stay inside the audio
   * each turn's active-speech RMS on its own track is between -25 and -15 dBFS
   * the other track stays at the noise floor under every turn (speaker separation holds)
-  * every turn carries voiced bounds with t <= voiced_t < voiced_end <= end
+  * every turn carries voiced bounds with t <= voiced_t < voiced_end <= end, and they still match
+    what the audio says, so JSON left stale against regenerated WAVs is caught
   * questions.json is exactly the is_question turns of turns.json
 
 Exit status 0 when every check passes, 1 otherwise.
@@ -24,11 +25,20 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from generate import FRAME, RATE, ROOT, active_rms_dbfs, dbfs, write_wav  # noqa: E402
+from generate import (  # noqa: E402
+    FRAME,
+    RATE,
+    ROOT,
+    active_rms_dbfs,
+    dbfs,
+    voiced_bounds,
+    write_wav,
+)
 
 MIN_S, MAX_S = 7 * 60, 14 * 60
 RMS_LO, RMS_HI = -25.0, -15.0
 CROSSTALK_MAX_DBFS = -50.0
+VOICED_TOL_S = 0.002  # the recorded bounds are rounded to 3 decimals
 
 
 def read_wav(path: Path) -> tuple[np.ndarray, dict]:
@@ -75,6 +85,16 @@ def check(fixture: Path, quiet: bool = False) -> list[str]:
                 f"turn {t['i']} voiced bounds {t['voiced_t']}..{t['voiced_end']} "
                 f"outside the clip {t['t']}..{t['end']}"
             )
+        else:
+            want_t, want_end = voiced_bounds(tracks[t["speaker"]], t["t"], t["end"])
+            if (
+                abs(want_t - t["voiced_t"]) > VOICED_TOL_S
+                or abs(want_end - t["voiced_end"]) > VOICED_TOL_S
+            ):
+                errors.append(
+                    f"turn {t['i']} voiced bounds {t['voiced_t']}..{t['voiced_end']} do not match "
+                    f"the audio ({want_t}..{want_end}); regenerate with `just fixtures`"
+                )
         a, b = int(t["t"] * RATE), int(t["end"] * RATE)
         if b > len(tracks[t["speaker"]]):
             errors.append(
@@ -163,6 +183,7 @@ def self_test() -> int:
         ("turn past the end of the WAV", [turn(t=5.0, end=9.0, voiced_t=5.0, voiced_end=9.0)], "past the"),
         ("voiced end outside the clip", [turn(voiced_end=3.5)], "outside the clip"),
         ("voiced start before the clip", [turn(voiced_t=0.5)], "outside the clip"),
+        ("voiced bounds stale against the audio", [turn(voiced_t=1.5)], "do not match the audio"),
         ("voiced bounds missing", [missing], "no voiced_t"),
     ]
 

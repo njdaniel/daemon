@@ -15,8 +15,8 @@
     "speaker": "candidate",
     "t": 18.592,
     "end": 20.113,
-    "voiced_t": 18.612,
-    "voiced_end": 20.011,
+    "voiced_t": 18.598,
+    "voiced_end": 20.034,
     "is_question": false,
     "kind": null,
     "text": "Okay, that works for me."
@@ -27,7 +27,7 @@
     "t": 21.113,
     "end": 25.235,
     "voiced_t": 21.135,
-    "voiced_end": 25.024,
+    "voiced_end": 25.124,
     "is_question": true,
     "kind": "behavioral",
     "text": "Tell me about a time you disagreed with a technical decision and how you handled it."
@@ -38,7 +38,7 @@
     "t": 26.435,
     "end": 82.102,
     "voiced_t": 26.435,
-    "voiced_end": 81.975,
+    "voiced_end": 82.029,
     "is_question": false,
     "kind": null,
     "text": "Sure. At my last company we were choosing a message broker for a new event pipeline, and the tech lead wanted to go with a managed queue service because the team already knew it. I thought it was the wrong fit, because we needed replay and multiple consumers reading the same stream, which that service handled awkwardly. Rather than arguing in the meeting, I asked for two days and built a small spike with both options against our real event shapes. I wrote up the results: the queue service needed a fan-out layer we'd have to maintain, while a log-based broker gave us replay for free. I brought that to the lead one-on-one first, so it didn't feel like a public challenge. He pushed back on operational cost, which was a fair point, so we agreed to use the managed version of the log-based broker. It shipped on time, and a year later replay saved us during an incident where a downstream consumer had a bug for six hours."
@@ -49,7 +49,7 @@
     "t": 82.902,
     "end": 85.839,
     "voiced_t": 82.97,
-    "voiced_end": 85.601,
+    "voiced_end": 85.688,
     "is_question": true,
     "kind": "clarification",
     "text": "What would you have done if he'd said no after seeing the spike?"
@@ -59,8 +59,8 @@
     "speaker": "candidate",
     "t": 86.839,
     "end": 105.225,
-    "voiced_t": 86.86,
-    "voiced_end": 105.119,
+    "voiced_t": 86.845,
+    "voiced_end": 105.133,
     "is_question": false,
     "kind": null,
     "text": "I'd have committed to his choice. I'd already made my case with data, and at that point continuing to push costs the team more than it gains. I would have asked that we write down the replay limitation as a known risk so it wasn't a surprise later. Disagree and commit, but leave a paper trail."
@@ -71,7 +71,7 @@
     "t": 106.625,
     "end": 112.041,
     "voiced_t": 106.678,
-    "voiced_end": 111.757,
+    "voiced_end": 111.878,
     "is_question": true,
     "kind": "behavioral",
     "text": "Let's talk about failure. Describe a project that didn't go well, and what you took from it."
@@ -81,8 +81,8 @@
     "speaker": "candidate",
     "t": 113.241,
     "end": 170.185,
-    "voiced_t": 113.261,
-    "voiced_end": 170.057,
+    "voiced_t": 113.241,
+    "voiced_end": 170.1,
     "is_question": false,
     "kind": null,
     "text": "The one I think about most is a billing migration I led two years ago. We were moving invoicing off a legacy system, and I planned it as a big cutover on one weekend. I underestimated how many edge cases the old system had accumulated over eight years, things like manually adjusted invoices and customers on grandfathered plans. The cutover ran, but about two percent of invoices came out wrong, and we spent three weeks cleaning it up while finance manually verified numbers. What I took from it was mostly about approach. I should have run the two systems in parallel for a billing cycle, comparing outputs, before switching anything. Since then, every migration I've led has had a shadow phase where the new system computes results that nobody acts on, and we diff them against the old system until the diff is empty. It's slower on the calendar but it has caught real bugs every single time."
@@ -92,8 +92,8 @@
     "speaker": "interviewer",
     "t": 170.985,
     "end": 173.527,
-    "voiced_t": 171.086,
-    "voiced_end": 173.365,
+    "voiced_t": 171.04,
+    "voiced_end": 173.4,
     "is_question": true,
     "kind": "clarification",
     "text": "How did you handle it with finance while it was going wrong?"
@@ -104,7 +104,7 @@
     "t": 174.527,
     "end": 197.987,
     "voiced_t": 174.527,
-    "voiced_end": 197.886,
+    "voiced_end": 197.901,
     "is_question": false,
     "kind": null,
     "text": "I went to them the first morning with what we knew, before they found it themselves. I gave them a daily written update with the count of affected invoices, what was fixed, and what wasn't yet. They were frustrated, understandably, but they said afterwards that the daily notes were the reason they trusted the numbers again. I learned that in a mess, cadence and honesty matter more than having the fix."
@@ -114,8 +114,8 @@
     "speaker": "interviewer",
     "t": 199.387,
     "end": 204.211,
-    "voiced_t": 199.467,
-    "voiced_end": 203.947,
+    "voiced_t": 199.438,
+    "voiced_end": 204.043,
     "is_question": true,
     "kind": "behavioral",
     "text": "Give me an example of a time you had to cut scope to ship something. How did you decide what to cut?"
@@ -125,8 +125,8 @@
     "speaker": "candidate",
     "t": 205.411,
     "end": 259.132,
-    "voiced_t": 205.431,
-    "voiced_end": 259.01,
+    "voiced_t": 205.428,
+    "voiced_end": 259.048,
     "is_question": false,
     "kind": null,
     "text": "We had a customer-facing audit log feature promised for a conference date, and three weeks out it was clear we couldn't ship the full design, which included filtering, export, and retention policies. I sat down with the product manager and we listed every capability against two questions: what did the customers who asked for this actually need on day one, and what could be added later without a migration. Filtering and export could be added later cleanly. Retention could not, because if we launched without a retention policy we'd be storing data we'd later have to delete, which is a legal problem. So we shipped a plain, unfiltered log with retention built in and nothing else. It looked modest on stage, but the two enterprise customers who'd asked for it were satisfied, because what they needed was the record, not the search. Filtering came out six weeks later."
@@ -136,8 +136,8 @@
     "speaker": "interviewer",
     "t": 259.933,
     "end": 261.442,
-    "voiced_t": 259.993,
-    "voiced_end": 261.213,
+    "voiced_t": 259.989,
+    "voiced_end": 261.223,
     "is_question": true,
     "kind": "clarification",
     "text": "Was there pushback on that?"
@@ -147,8 +147,8 @@
     "speaker": "candidate",
     "t": 262.342,
     "end": 274.603,
-    "voiced_t": 262.362,
-    "voiced_end": 274.462,
+    "voiced_t": 262.344,
+    "voiced_end": 274.492,
     "is_question": false,
     "kind": null,
     "text": "From sales, yes. They'd been demoing the mock-ups with filtering. I offered to join the customer calls and explain the timeline myself, which I did for two of them, and that took most of the heat off the sales team."
@@ -159,7 +159,7 @@
     "t": 276.003,
     "end": 279.52,
     "voiced_t": 276.025,
-    "voiced_end": 279.319,
+    "voiced_end": 279.352,
     "is_question": true,
     "kind": "behavioral",
     "text": "Tell me about a time you mentored someone, and what changed for them."
@@ -169,8 +169,8 @@
     "speaker": "candidate",
     "t": 280.72,
     "end": 329.2,
-    "voiced_t": 280.74,
-    "voiced_end": 329.08,
+    "voiced_t": 280.726,
+    "voiced_end": 329.093,
     "is_question": false,
     "kind": null,
     "text": "A junior engineer joined my team about eighteen months ago, straight out of school, and she was technically strong but very quiet in design discussions and wouldn't open pull requests until they were perfect, which meant they were enormous. I did two things. First, we agreed she'd open a draft pull request within a day of starting any task, even if it was only a skeleton, so that feedback came early and small. Second, before each design review I'd ask her to write down one question or concern about the proposal ahead of time, so she had something prepared to say. Within a few months her pull requests were small and frequent, and by the end of the year she was leading the design of a service on her own. She told me recently that the draft PR habit is the thing she now tells new hires."
@@ -181,7 +181,7 @@
     "t": 330.6,
     "end": 337.804,
     "voiced_t": 330.655,
-    "voiced_end": 337.52,
+    "voiced_end": 337.547,
     "is_question": true,
     "kind": "behavioral",
     "text": "I want to dig into ownership. Describe a situation where something was broken that wasn't your responsibility, and what you did."
@@ -203,7 +203,7 @@
     "t": 396.342,
     "end": 399.372,
     "voiced_t": 396.391,
-    "voiced_end": 399.162,
+    "voiced_end": 399.163,
     "is_question": true,
     "kind": "clarification",
     "text": "And how did the original team react to you taking it over?"
@@ -214,7 +214,7 @@
     "t": 400.372,
     "end": 412.354,
     "voiced_t": 400.392,
-    "voiced_end": 412.211,
+    "voiced_end": 412.258,
     "is_question": false,
     "kind": null,
     "text": "Relieved, honestly. It was a burden they'd stopped having time for. I made a point of asking them to review the first few changes so it felt like a handoff rather than a takeover."
@@ -225,7 +225,7 @@
     "t": 413.754,
     "end": 417.678,
     "voiced_t": 413.808,
-    "voiced_end": 417.551,
+    "voiced_end": 417.575,
     "is_question": true,
     "kind": "behavioral",
     "text": "Walk me through a time you had to deliver bad news to a stakeholder."
@@ -235,8 +235,8 @@
     "speaker": "candidate",
     "t": 418.878,
     "end": 465.198,
-    "voiced_t": 418.898,
-    "voiced_end": 465.058,
+    "voiced_t": 418.879,
+    "voiced_end": 465.1,
     "is_question": false,
     "kind": null,
     "text": "A few months into a partner integration, I found out that the partner's API rate limits meant the feature we'd promised couldn't sync in real time for our largest customers; the numbers just didn't work. The product director had already announced real-time sync to those customers. I asked for fifteen minutes with her the same day. I opened with the conclusion, real-time isn't possible for accounts above a certain size, then showed the math, and then gave her two options I'd already thought through: near-real-time with a five minute delay for large accounts, or real-time for a subset of data. She chose the five minute delay. It wasn't a comfortable conversation, but because I brought options and not just a problem, it was a short one, and she told the customers herself with a clear story."
@@ -257,8 +257,8 @@
     "speaker": "candidate",
     "t": 474.271,
     "end": 518.27,
-    "voiced_t": 474.291,
-    "voiced_end": 518.171,
+    "voiced_t": 474.29,
+    "voiced_end": 518.186,
     "is_question": false,
     "kind": null,
     "text": "We needed the security team to review a new authentication flow before launch, and they had a six week backlog while we had a two week deadline. I couldn't jump the queue by asking. So I did the work that made their job small. I wrote the threat model myself in their template, listed the specific decisions I wanted them to validate, and pre-answered the questions from their standard checklist. Then I asked for a thirty minute session instead of a full review. Because the preparation was done, they agreed, and the session found one real issue, a token lifetime we'd set too long, which we fixed the same day. We launched on time. The general pattern I use is to make the other team's yes as cheap as possible."
@@ -268,8 +268,8 @@
     "speaker": "interviewer",
     "t": 519.07,
     "end": 522.745,
-    "voiced_t": 519.13,
-    "voiced_end": 522.57,
+    "voiced_t": 519.127,
+    "voiced_end": 522.574,
     "is_question": true,
     "kind": "knowledge",
     "text": "That's a good place to end. Do you have anything you'd like to ask me?"
@@ -301,8 +301,8 @@
     "speaker": "candidate",
     "t": 548.297,
     "end": 550.614,
-    "voiced_t": 548.337,
-    "voiced_end": 550.517,
+    "voiced_t": 548.323,
+    "voiced_end": 550.543,
     "is_question": false,
     "kind": null,
     "text": "Thank you. I enjoyed this."

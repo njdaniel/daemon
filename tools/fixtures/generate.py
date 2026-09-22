@@ -150,30 +150,24 @@ def quantise(x: np.ndarray) -> np.ndarray:
 
 
 def voiced_bounds(track: np.ndarray, start: float, end: float) -> tuple[float, float]:
-    """Where sound starts and stops inside the clip window [start, end) of one quantised track.
+    """Where sound starts and stops inside the clip window [start, end) of one track.
 
-    A 20 ms frame counts as sound when its RMS reaches VOICED_DBFS, which the -60 dBFS floor never
-    does; inside the first and last such frame the bound is refined to the sample. Since a frame's
-    peak is at least its RMS, a voiced frame always holds a sample over the threshold. Falls back to
-    the clip window when a turn holds no sound at all, which verify.py then reports.
+    `track` holds the samples as written, in [-1, 1); verify.py re-measures a WAV the same way.
+
+    The definition issue #27 accepted for VAD accuracy, applied to every sample in the window: the
+    first and last sample whose magnitude reaches VOICED_DBFS. The tracks' -60 dBFS Gaussian floor
+    would need a 10-sigma excursion to reach -40 dBFS, so on these fixtures a crossing is always
+    speech and no frame gate is needed. Falls back to the clip window when a turn holds no sound at
+    all, which verify.py then reports.
     """
     lo, hi = int(round(start * RATE)), min(int(round(end * RATE)), len(track))
-    win = track[lo:hi].astype(np.float64) / 32768.0
-    n = len(win) // FRAME
-    thresh = 10.0 ** (VOICED_DBFS / 20.0)
-    if n:
-        frames = win[: n * FRAME].reshape(n, FRAME)
-        rms = np.sqrt(np.mean(np.square(frames), axis=1))
-        loud = np.flatnonzero(rms >= thresh)
-        if loud.size:
-            head = win[loud[0] * FRAME : (loud[0] + 1) * FRAME]
-            tail = win[loud[-1] * FRAME : (loud[-1] + 1) * FRAME]
-            first = loud[0] * FRAME + int(np.argmax(np.abs(head) >= thresh))
-            last = loud[-1] * FRAME + int(len(tail) - 1 - np.argmax(np.abs(tail)[::-1] >= thresh))
-            t0 = max(start, round((lo + first) / RATE, 3))
-            t1 = min(end, round((lo + last + 1) / RATE, 3))
-            if t1 > t0:
-                return t0, t1
+    win = np.abs(track[lo:hi].astype(np.float64))
+    loud = np.flatnonzero(win >= 10.0 ** (VOICED_DBFS / 20.0))
+    if loud.size:
+        t0 = max(start, round((lo + int(loud[0])) / RATE, 3))
+        t1 = min(end, round((lo + int(loud[-1]) + 1) / RATE, 3))
+        if t1 > t0:
+            return t0, t1
     return round(start, 3), round(end, 3)
 
 
@@ -240,7 +234,7 @@ def generate(script_path: Path, out_root: Path) -> dict:
 
     # Measured on the int16 samples that were just written, not the float mix, so turns.json
     # describes exactly what a consumer of the WAV sees.
-    quantised = {role: quantise(x) for role, x in tracks.items()}
+    quantised = {role: quantise(x).astype(np.float64) / 32768.0 for role, x in tracks.items()}
     for p in placed:
         p.voiced_start, p.voiced_end = voiced_bounds(quantised[p.speaker], p.start, p.end)
 
