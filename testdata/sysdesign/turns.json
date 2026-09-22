@@ -1,0 +1,290 @@
+[
+  {
+    "i": 0,
+    "speaker": "interviewer",
+    "t": 1.0,
+    "end": 15.601,
+    "is_question": false,
+    "kind": "small_talk",
+    "text": "Hi, thanks for making the time today. I'm on the platform team here, and this session is going to be about an hour of system design. We'll do a couple of problems, I'll push on the details, and there's time at the end for your questions. Sound good?"
+  },
+  {
+    "i": 1,
+    "speaker": "candidate",
+    "t": 16.201,
+    "end": 18.935,
+    "is_question": false,
+    "kind": null,
+    "text": "Sounds great. Thanks for having me."
+  },
+  {
+    "i": 2,
+    "speaker": "interviewer",
+    "t": 19.935,
+    "end": 29.845,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Let's start with something concrete. How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?"
+  },
+  {
+    "i": 3,
+    "speaker": "candidate",
+    "t": 31.045,
+    "end": 93.829,
+    "is_question": false,
+    "kind": null,
+    "text": "Okay. First I'd clarify the scope. Are we limiting per API key, per user, or per IP, and is the limit something like one thousand requests per minute with some burst allowance? I'll assume per API key with a burst. For the algorithm I'd lean towards a token bucket, because it gives a clean burst semantic and it's cheap to evaluate. The hard part is distribution. If clients can hit any region, a purely local counter lets a client get N times the limit by spraying regions. So I'd keep the hot path local, with a per-region bucket in memory on the edge nodes, and then reconcile asynchronously through a shared store like Redis, so the global view converges within a second or two. For the failure case, the limiter should fail open for most endpoints, because blocking all traffic is worse than briefly over-admitting, but fail closed for a small set of expensive or abusable endpoints. I'd also have the edge fall back to its local bucket if Redis is unreachable, and alert on that state."
+  },
+  {
+    "i": 4,
+    "speaker": "interviewer",
+    "t": 94.629,
+    "end": 100.545,
+    "is_question": true,
+    "kind": "clarification",
+    "text": "Good. And what if Redis goes down for a whole region, not just one node?"
+  },
+  {
+    "i": 5,
+    "speaker": "candidate",
+    "t": 101.545,
+    "end": 135.424,
+    "is_question": false,
+    "kind": null,
+    "text": "Then every edge node in that region is on its local bucket. Each node still enforces the limit per key, it just can't see the other nodes. The worst case is that a client gets roughly node count times the limit within that region until Redis recovers. To bound that, I'd scale each local bucket down when the node knows it's disconnected, say divide the limit by the expected number of nodes in the region, which under-admits a little but keeps the global ceiling roughly intact. And I'd make sure the reconnection re-syncs the counters rather than starting from zero."
+  },
+  {
+    "i": 6,
+    "speaker": "interviewer",
+    "t": 136.424,
+    "end": 144.325,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "That's a reasonable tradeoff. Where would you put the limiter in the request path, and does that change if the API is behind a CDN?"
+  },
+  {
+    "i": 7,
+    "speaker": "candidate",
+    "t": 145.325,
+    "end": 171.657,
+    "is_question": false,
+    "kind": null,
+    "text": "As early as possible, ideally in the API gateway or the ingress layer, before any authentication that hits a database. If there's a CDN in front, I'd still keep the authoritative limiter at the origin gateway, because the CDN usually can't see the API key semantics, but I'd add a coarse per-IP limit at the CDN as a first line of defense against floods. The two layers protect different things."
+  },
+  {
+    "i": 8,
+    "speaker": "interviewer",
+    "t": 173.058,
+    "end": 184.25,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Okay, let's switch gears. Design a URL shortener, something like bit dot ly. Walk me through the data model, the write path, and how you'd generate the short keys."
+  },
+  {
+    "i": 9,
+    "speaker": "candidate",
+    "t": 185.45,
+    "end": 247.66,
+    "is_question": false,
+    "kind": null,
+    "text": "Sure. The data model is small. A table keyed by the short code, holding the long URL, the owner, a creation time, an optional expiry, and maybe a click counter. The write path is: validate the URL, generate a code, insert with a uniqueness constraint, and return it. For key generation I'd avoid hashing the long URL directly, because two users shortening the same URL should get different codes and analytics. I'd use a counter-based approach: a distributed ID generator, something Snowflake-like, and base sixty-two encode the ID. That gives short, unique, non-guessable-enough codes without a coordination step on every write. If we need unpredictability for security, I'd add a random salt component or use a keyed permutation on the ID. Reads massively outnumber writes, so the read path is a cache in front of the store, with the redirect served from the cache in the common case."
+  },
+  {
+    "i": 10,
+    "speaker": "interviewer",
+    "t": 248.46,
+    "end": 250.201,
+    "is_question": true,
+    "kind": "clarification",
+    "text": "How many characters do you need?"
+  },
+  {
+    "i": 11,
+    "speaker": "candidate",
+    "t": 251.101,
+    "end": 266.595,
+    "is_question": false,
+    "kind": null,
+    "text": "Base sixty-two with seven characters is about three and a half trillion combinations. Even at a billion new links a year that lasts thousands of years, so seven is comfortable and six is probably fine for a long time."
+  },
+  {
+    "i": 12,
+    "speaker": "interviewer",
+    "t": 267.595,
+    "end": 274.649,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Suppose one link goes viral and gets a hundred thousand redirects a second. What breaks first, and what would you do about it?"
+  },
+  {
+    "i": 13,
+    "speaker": "candidate",
+    "t": 275.649,
+    "end": 310.863,
+    "is_question": false,
+    "kind": null,
+    "text": "The cache handles the redirect itself fine, that's a single hot key, and a CDN can absorb that if the redirect is cacheable. What breaks first is the click counter, because a hundred thousand increments a second on one row is a write hot spot. I'd stop doing synchronous increments. Instead the edge nodes count locally and flush aggregated counts every second or so, or I'd push click events onto a stream and aggregate them downstream. That makes analytics slightly delayed, which is fine, and it takes the database out of the redirect path completely."
+  },
+  {
+    "i": 14,
+    "speaker": "interviewer",
+    "t": 312.263,
+    "end": 328.582,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Great. I'd like to hear how you think about fan-out. Imagine a notification system where a user with ten million followers posts something, and every follower should get a notification. How would you design the fan-out, and what are the tradeoffs between doing it on write versus on read?"
+  },
+  {
+    "i": 15,
+    "speaker": "candidate",
+    "t": 329.782,
+    "end": 387.313,
+    "is_question": false,
+    "kind": null,
+    "text": "This is the classic push versus pull tradeoff. Fan-out on write means when the post happens, we write a notification record into every follower's inbox. That makes reads trivial, each user just reads their own inbox, but a ten million follower post becomes ten million writes, which is slow and expensive, and most of those users may never look. Fan-out on read means we store the post once and each follower's client queries the people they follow when they open the app. Reads get more expensive, but writes are cheap. In practice I'd do a hybrid. For normal users, fan out on write, it's cheap and gives instant delivery. For accounts above some follower threshold, mark them as hot, don't fan out, and have the read path merge the hot accounts' recent posts in at query time. The fan-out itself runs through a queue with workers, batched, and it's idempotent so a retry doesn't double-notify."
+  },
+  {
+    "i": 16,
+    "speaker": "interviewer",
+    "t": 388.113,
+    "end": 392.658,
+    "is_question": true,
+    "kind": "clarification",
+    "text": "You said idempotent. How exactly do you make a notification write idempotent?"
+  },
+  {
+    "i": 17,
+    "speaker": "candidate",
+    "t": 393.658,
+    "end": 411.33,
+    "is_question": false,
+    "kind": null,
+    "text": "Give every notification a deterministic ID derived from the post ID and the recipient ID, and make the inbox write an upsert on that ID. Then a retried job writes the same row again instead of a duplicate. The queue can be at-least-once and the storage absorbs the duplicates."
+  },
+  {
+    "i": 18,
+    "speaker": "interviewer",
+    "t": 412.53,
+    "end": 425.824,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Right, that's the standard answer, and it works, so let's keep moving. Next question. How would you design the storage for a chat application that needs to keep message history forever, and support search across a user's history?"
+  },
+  {
+    "i": 19,
+    "speaker": "candidate",
+    "t": 427.024,
+    "end": 481.012,
+    "is_question": false,
+    "kind": null,
+    "text": "Messages are append-only and time-ordered per conversation, so the primary store wants to be partitioned by conversation and sorted by time. A wide-column store like Cassandra or a partitioned Postgres fits well: partition key conversation ID, clustering key message time or a time-based ID. Recent messages are read constantly, old ones rarely, so I'd tier: hot storage for the last few months, and cold, cheaper object storage for older segments, with the application transparently reading across both. Search is a separate concern. I wouldn't search the primary store. I'd index messages into a search engine like Elasticsearch, partitioned per user or per workspace so that a search only touches that user's shard. Indexing is asynchronous off the write path, and the index can be rebuilt from the primary store if it's lost, so it's not the source of truth."
+  },
+  {
+    "i": 20,
+    "speaker": "interviewer",
+    "t": 481.812,
+    "end": 486.335,
+    "is_question": true,
+    "kind": "clarification",
+    "text": "Forever is a long time. How do you keep the search index from growing without bound?"
+  },
+  {
+    "i": 21,
+    "speaker": "candidate",
+    "t": 487.335,
+    "end": 513.313,
+    "is_question": false,
+    "kind": null,
+    "text": "Time-based indices. Roll a new index every month or quarter per shard, and let old indices move to slower, cheaper nodes or get frozen. A search across all time fans out across indices, which is slower, but the common case, search recent messages, only hits the newest ones. And if the product allows it, offer search over the last two years by default with an explicit option to go further."
+  },
+  {
+    "i": 22,
+    "speaker": "interviewer",
+    "t": 514.713,
+    "end": 523.822,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Let me ask a different kind of question. Talk me through how you would roll out a change to a critical service safely, where the change alters the data format on disk."
+  },
+  {
+    "i": 23,
+    "speaker": "candidate",
+    "t": 525.022,
+    "end": 575.278,
+    "is_question": false,
+    "kind": null,
+    "text": "The key rule is that at every step, both the old and the new version of the software must be able to run against the data. So I'd do it in phases. Phase one, deploy code that can read both formats but still writes the old one. Phase two, flip a flag so new writes use the new format, still reading both. Phase three, run a backfill that rewrites old records into the new format, throttled and resumable. Phase four, once everything is migrated and has been stable for a while, remove the old read path. Each phase is a separate deploy behind a flag, so rollback at any point is just flipping the flag or redeploying the previous version, never a data rollback. I'd also canary each phase on a small slice of traffic and watch error rates and latency before going wide."
+  },
+  {
+    "i": 24,
+    "speaker": "interviewer",
+    "t": 576.278,
+    "end": 579.344,
+    "is_question": true,
+    "kind": "clarification",
+    "text": "What metric would tell you the backfill is safe to run faster?"
+  },
+  {
+    "i": 25,
+    "speaker": "candidate",
+    "t": 580.244,
+    "end": 598.826,
+    "is_question": false,
+    "kind": null,
+    "text": "The p ninety-nine latency of the foreground traffic on the same database, and replication lag if there are replicas. If those stay flat as I raise the backfill rate, I keep raising it. The moment they move, I back off. The backfill should be adaptive on those signals rather than a fixed rate."
+  },
+  {
+    "i": 26,
+    "speaker": "interviewer",
+    "t": 600.226,
+    "end": 615.964,
+    "is_question": true,
+    "kind": "system_design",
+    "text": "Last design question, and this one's more open-ended. If you were building a real-time collaborative document editor, like Google Docs, how would you keep everyone's view consistent, and how would you handle a user who goes offline for an hour and then reconnects?"
+  },
+  {
+    "i": 27,
+    "speaker": "candidate",
+    "t": 617.164,
+    "end": 677.973,
+    "is_question": false,
+    "kind": null,
+    "text": "For consistency the two families are operational transformation and CRDTs. I'd go with a CRDT for text, because it lets clients apply edits locally with no coordination and guarantees convergence when operations are exchanged in any order, which is exactly the offline case. Each client keeps a replica, applies its own edits immediately, and sends operations to a server that relays them to the other clients and persists them as an operation log. For the user who's offline for an hour, their client keeps accumulating local operations. When they reconnect, they send their operations and receive everything they missed, and because it's a CRDT, both sides merge deterministically. The cost is that CRDT metadata grows, so the server periodically compacts the log into a snapshot, and a reconnecting client that's very far behind just fetches the snapshot plus the tail rather than replaying an hour of operations."
+  },
+  {
+    "i": 28,
+    "speaker": "interviewer",
+    "t": 678.773,
+    "end": 685.566,
+    "is_question": true,
+    "kind": "knowledge",
+    "text": "Okay. That's all I had on design. What questions do you have for me about the team or the role?"
+  },
+  {
+    "i": 29,
+    "speaker": "candidate",
+    "t": 686.566,
+    "end": 696.121,
+    "is_question": false,
+    "kind": null,
+    "text": "I'd love to hear what the platform team's biggest source of toil is right now, and how much of the roadmap is paying that down versus new capabilities."
+  },
+  {
+    "i": 30,
+    "speaker": "interviewer",
+    "t": 696.921,
+    "end": 719.447,
+    "is_question": false,
+    "kind": "small_talk",
+    "text": "That's a fair question. Honestly, our biggest toil is the deploy pipeline. It works, but it's slow and every team has their own fork of it. About a third of this year is consolidating that. The rest is the new multi-region work, which is where the rate limiter question came from, so you can guess it's a real problem for us. Thanks again for your time today. The recruiter will follow up within a couple of days."
+  },
+  {
+    "i": 31,
+    "speaker": "candidate",
+    "t": 720.047,
+    "end": 723.466,
+    "is_question": false,
+    "kind": null,
+    "text": "Thanks, this was a lot of fun. Talk soon."
+  }
+]

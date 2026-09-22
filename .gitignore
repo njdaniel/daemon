@@ -4,6 +4,8 @@
 /testdata/**/*.wav
 !/testdata/README.md
 /eval/.venv
+/tools/.venv
+/fixtures-v*.tar.gz
 __pycache__/
 /frontend/node_modules
 /frontend/dist
