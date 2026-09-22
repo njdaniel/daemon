@@ -763,6 +763,8 @@ mod tests {
             &FakeHttp(Ok(TAGS.into())),
             &FakeResolver::local(),
         );
+        // Printed with --nocapture; this is the line a user sees for a remote Ollama.
+        println!("{}", report.header.trim_end());
         assert!(
             report.header.contains("LEAVE this machine"),
             "{}",
