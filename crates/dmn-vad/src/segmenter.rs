@@ -21,6 +21,13 @@ pub struct SegmenterConfig {
     pub tail: Duration,
     /// Utterances with less speech than this are dropped as clicks or coughs.
     pub min_speech: Duration,
+    /// How often to emit a [`VadEvent::Partial`] while an utterance is open, so the transcript
+    /// keeps moving during a long question (SPEC § Transcription: partials every 1 s). `None`
+    /// turns partials off, which is what a consumer that only wants closed utterances should do:
+    /// each partial clones up to `partial_window` of audio.
+    pub partial_every: Option<Duration>,
+    /// How much of the open utterance a partial carries: whisper re-runs this sliding window.
+    pub partial_window: Duration,
 }
 
 impl Default for SegmenterConfig {
@@ -32,6 +39,8 @@ impl Default for SegmenterConfig {
             pre_roll: Duration::from_millis(200),
             tail: Duration::from_millis(100),
             min_speech: Duration::from_millis(100),
+            partial_every: Some(Duration::from_secs(1)),
+            partial_window: Duration::from_secs(8),
         }
     }
 }
@@ -73,6 +82,17 @@ pub enum VadEvent {
         source: Source,
         at: Duration,
     },
+    /// A slice of an utterance that is still open, for the STT worker's 1 s partials. `start` is
+    /// the onset of that utterance, so a partial and the [`Utterance`] that eventually closes it
+    /// share it: that is the key a consumer uses to replace partial text with the final text.
+    Partial {
+        source: Source,
+        start: Duration,
+        /// End of the audio in `samples`.
+        at: Duration,
+        /// The last `partial_window` of the open utterance (less, early on).
+        samples: Vec<f32>,
+    },
     Utterance(Utterance),
 }
 
@@ -85,6 +105,8 @@ struct Open {
     pause_sent: bool,
     pre_roll_frames: usize,
     samples: Vec<f32>,
+    /// Frame at which the last [`VadEvent::Partial`] was emitted.
+    last_partial: u64,
 }
 
 #[derive(Debug)]
@@ -96,6 +118,10 @@ pub struct Segmenter {
     pre_roll: usize,
     tail: usize,
     min_speech: u64,
+    /// Frames between partials; 0 when partials are off.
+    partial_every: u64,
+    /// Frames of audio a partial carries.
+    partial_window: usize,
     /// Frames seen so far; frame `n` covers `[n·20 ms, (n+1)·20 ms)`.
     n: u64,
     recent: VecDeque<[f32; FRAME_LEN]>,
@@ -120,6 +146,8 @@ impl Segmenter {
             pre_roll: frames(cfg.pre_roll) as usize,
             tail: frames(cfg.tail) as usize,
             min_speech: frames(cfg.min_speech),
+            partial_every: cfg.partial_every.map_or(0, |d| frames(d).max(1)),
+            partial_window: frames(cfg.partial_window).max(1) as usize,
             n: 0,
             recent: VecDeque::new(),
             open: None,
@@ -154,6 +182,7 @@ impl Segmenter {
                     pause_sent: false,
                     pre_roll_frames: self.recent.len(),
                     samples,
+                    last_partial: n,
                 });
                 out.push(VadEvent::SpeechStart {
                     source: self.source,
@@ -188,6 +217,8 @@ impl Segmenter {
         };
         if let Some(reason) = close {
             self.emit(reason, out);
+        } else {
+            self.emit_partial(out);
         }
 
         self.recent.push_back(*frame);
@@ -202,6 +233,35 @@ impl Segmenter {
         if self.open.is_some() {
             self.emit(CloseReason::EndOfStream, out);
         }
+    }
+
+    /// Emit a [`VadEvent::Partial`] if one is due for the open utterance. Called with `self.n`
+    /// still pointing at the frame just pushed, so the partial covers `[start, n+1)`.
+    fn emit_partial(&mut self, out: &mut Vec<VadEvent>) {
+        if self.partial_every == 0 {
+            return;
+        }
+        let window = self.partial_window * FRAME_LEN;
+        let (source, n) = (self.source, self.n);
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if n + 1 - open.last_partial < self.partial_every {
+            return;
+        }
+        if open.silence >= self.pause {
+            // The speaker has already paused: the text cannot have changed since the last
+            // partial, and the close is usually imminent. Don't spend an inference on it.
+            return;
+        }
+        open.last_partial = n + 1;
+        let from = open.samples.len().saturating_sub(window);
+        out.push(VadEvent::Partial {
+            source,
+            start: at(open.start),
+            at: at(n + 1),
+            samples: open.samples[from..].to_vec(),
+        });
     }
 
     fn emit(&mut self, reason: CloseReason, out: &mut Vec<VadEvent>) {
@@ -333,6 +393,65 @@ mod tests {
     fn a_click_shorter_than_min_speech_is_dropped() {
         let ev = run(&[(10, false), (3, true), (50, false)]);
         assert!(utterances(&ev).is_empty());
+    }
+
+    fn partials(ev: &[VadEvent]) -> Vec<(Duration, Duration, usize)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                VadEvent::Partial {
+                    start, at, samples, ..
+                } => Some((*start, *at, samples.len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partials_arrive_every_second_and_slide_over_the_last_eight() {
+        // 12 s of speech, then silence: 11 partials (1 s .. 11 s), then the close at 12 s.
+        let ev = run(&[(600, true), (40, false)]);
+        let p = partials(&ev);
+        assert_eq!(p.len(), 11, "one per second while open: {p:?}");
+        assert_eq!(p[0].0, ms(0), "every partial keys on the utterance onset");
+        assert_eq!((p[0].1, p[1].1), (ms(1000), ms(2000)));
+        // Early partials carry everything so far (this stream opens in speech, so no pre-roll),
+        // later ones only the last 8 s.
+        assert_eq!(p[0].2, 16 * 1000);
+        assert_eq!(p[6].2, 16 * 7000, "7 s is still under the window");
+        assert_eq!(p[7].2, 16 * 8000, "capped at the 8 s window");
+        assert_eq!(p[10].2, 16 * 8000);
+        // The final utterance shares the partials' start, so a consumer can replace their text.
+        let u = utterances(&ev);
+        assert_eq!(u[0].start, p[0].0);
+    }
+
+    #[test]
+    fn no_partials_once_the_speaker_has_paused() {
+        // 2 s of speech, then 2 s of silence: partials at 1 s and 2 s, then nothing, because
+        // re-running whisper over trailing silence cannot change the text.
+        let ev = run(&[(100, true), (100, false)]);
+        let p = partials(&ev);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert_eq!((p[0].1, p[1].1), (ms(1000), ms(2000)));
+        // And the utterance still closes 700 ms into that silence.
+        let u = utterances(&ev);
+        assert_eq!((u[0].start, u[0].end), (ms(0), ms(2000)));
+    }
+
+    #[test]
+    fn partials_can_be_turned_off() {
+        let cfg = SegmenterConfig {
+            partial_every: None,
+            ..SegmenterConfig::default()
+        };
+        let mut seg = Segmenter::new(Source::You, &cfg);
+        let mut out = Vec::new();
+        for _ in 0..300 {
+            seg.push(&LOUD, true, &mut out);
+        }
+        seg.flush(&mut out);
+        assert!(partials(&out).is_empty());
+        assert_eq!(utterances(&out).len(), 1);
     }
 
     #[test]

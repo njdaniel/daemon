@@ -4,8 +4,9 @@
 //! [`VadWorker`] thread per source.
 //! Output: [`VadEvent`]s on a bounded `crossbeam-channel`: [`VadEvent::Utterance`] (closed after
 //! 700 ms of trailing silence, force-split at 12 s, or flushed at end of stream),
-//! [`VadEvent::Pause`] after 300 ms of silence inside an open utterance, and
-//! [`VadEvent::SpeechStart`] at onset.
+//! [`VadEvent::Pause`] after 300 ms of silence inside an open utterance,
+//! [`VadEvent::SpeechStart`] at onset, and [`VadEvent::Partial`] every second while an utterance
+//! is open (the last 8 s of it), which is what `dmn-stt` re-runs to keep the transcript moving.
 //! Owns: the per-source VAD thread, the [`Frames`](dmn_audio::Frames) consumer it drains, and the
 //! dropped-event counter the status bar reads alongside the ring's overrun counter.
 //!
