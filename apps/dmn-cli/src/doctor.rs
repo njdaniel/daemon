@@ -235,15 +235,36 @@ pub fn pipewire_tools(r: &dyn Runner) -> Check {
 }
 
 pub fn whisper_model(models_dir: &Path, model: &str) -> Check {
-    let file = models_dir.join(format!("ggml-{model}.bin"));
-    if file.is_file() {
-        Check::pass("whisper model", file.display().to_string())
-    } else {
-        Check::fail(
+    let m = match dmn_stt::Model::from_name(model) {
+        Ok(m) => m,
+        Err(e) => {
+            return Check::fail(
+                "whisper model",
+                e.to_string(),
+                "set [stt].model in ~/.config/dmn/config.toml to one of the known names",
+            );
+        }
+    };
+    let file = dmn_stt::model_path(models_dir, m);
+    match std::fs::metadata(&file) {
+        Ok(meta) if meta.len() == m.size_bytes() => {
+            Check::pass("whisper model", file.display().to_string())
+        }
+        Ok(meta) => Check::fail(
+            "whisper model",
+            format!(
+                "{} is {} bytes, expected {} (partial download?)",
+                file.display(),
+                meta.len(),
+                m.size_bytes()
+            ),
+            format!("rm {} && dmn doctor --fetch {model}", file.display()),
+        ),
+        Err(_) => Check::fail(
             "whisper model",
             format!("{} missing", file.display()),
-            format!("dmn doctor --fetch {model}   (arrives with issue #8)"),
-        )
+            format!("dmn doctor --fetch {model}"),
+        ),
     }
 }
 
@@ -505,8 +526,22 @@ mod tests {
                 .unwrap()
                 .starts_with("dmn doctor --fetch small.en")
         );
-        std::fs::write(dir.path().join("ggml-small.en.bin"), b"x").unwrap();
+        let file = dir.path().join("ggml-small.en.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let partial = whisper_model(dir.path(), "small.en");
+        assert!(
+            !partial.ok && partial.detail.contains("partial download"),
+            "{}",
+            partial.detail
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(dmn_stt::Model::SmallEn.size_bytes())
+            .unwrap();
         assert!(whisper_model(dir.path(), "small.en").ok);
+        assert!(!whisper_model(dir.path(), "small").ok, "unknown names fail");
     }
 
     #[test]

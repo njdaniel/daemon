@@ -21,5 +21,7 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `tokio-util` | `dmn-llm` | `CancellationToken`: a newer unpinned question cancels the in-flight LLM request |
 | `reqwest` (json, stream; rustls by default) | `dmn-llm` | HTTP client for Ollama, OpenAI-compatible and Anthropic endpoints; streaming bodies |
 | `futures-util` | `dmn-llm` | `BoxStream` / `BoxFuture` so `Provider` is object-safe without a macro crate |
+| `whisper-rs` (=0.16.0, `tracing_backend`; bundles whisper.cpp 1.8.3 via `whisper-rs-sys` 0.15.0) | `dmn-stt` | In-process whisper.cpp inference; pinned exactly because the build compiles C++ from source (SPEC § risks). Features `cuda` / `vulkan` / `openblas` forwarded from `dmn-stt`; CPU by default |
+| `reqwest` feature `blocking` | `dmn-stt` | One-shot model download for `dmn doctor --fetch` without an async runtime; same client crate as `dmn-llm` |
 
-Planned by the spec (add the line when the issue lands): `crossbeam-channel`, `whisper-rs` (#8); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+Planned by the spec (add the line when the issue lands): `crossbeam-channel` (#7 / #9); `rusqlite` (#13); `ratatui`, `crossterm` (#14).

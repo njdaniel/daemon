@@ -6,8 +6,22 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# GPU / BLAS backends for whisper.cpp. CPU is the default and what CI builds.
+cuda = ["whisper-rs/cuda"]
+vulkan = ["whisper-rs/vulkan"]
+openblas = ["whisper-rs/openblas"]
+
 [dependencies]
 thiserror = { workspace = true }
+tracing = { workspace = true }
+whisper-rs = { version = "=0.16.0", features = ["tracing_backend"] }
+# Blocking client for model downloads: `dmn doctor --fetch` is a one-shot CLI step with no
+# async runtime around it; same crate as dmn-llm, one more feature.
+reqwest = { workspace = true, features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
