@@ -88,8 +88,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("wrote {}", paths.config_file.display());
             } else {
                 let cfg = Config::load(&paths.config_file)?;
-                let mut report =
-                    doctor::run_all(&cfg, &paths, &doctor::SystemRunner, &doctor::StdHttp);
+                let mut report = doctor::run_all(
+                    &cfg,
+                    &paths,
+                    &doctor::SystemRunner,
+                    &doctor::StdHttp,
+                    &doctor::SystemResolver,
+                );
                 if probe {
                     report.checks.extend(probe::run());
                 }
