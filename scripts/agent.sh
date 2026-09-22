@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# just agent <n|next> [--budget USD] [--dry-run]
+# just agent <n|next> [--dry-run]
 # Runs one issue headlessly per docs/PROCESS.md § 4: branch issue/<n>-<slug>, claude -p, PR. Never merges.
 source "$(dirname "$0")/lib.sh"
 
-n=""; budget=""; dry=0
+n=""; dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --budget) budget="$2"; shift 2 ;;
     --dry-run) dry=1; shift ;;
     -*) die "unknown flag $1" ;;
     *) n="$1"; shift ;;
   esac
 done
-[ -n "$n" ] || die "usage: agent.sh <issue-number|next> [--budget USD] [--dry-run]"
+[ -n "$n" ] || die "usage: agent.sh <issue-number|next> [--dry-run]"
 
 deps_merged() { # <issue json> -> 0 if every "## Depends on" issue is closed
   local body deps d st
@@ -45,12 +44,8 @@ mlabel=$(label "$issue" "model:"); [ -n "$mlabel" ] || die "issue #$n has no mod
 lane=$(label "$issue" "lane:");   [ -n "$lane" ] || die "issue #$n has no lane:* label"
 [ "$size" != "XL" ] || die "XL is not allowed; split the issue (PROCESS.md § 1)"
 
-read -r tmodel turns cap reviewer <<<"$(size_row "$size")"
+read -r tmodel turns reviewer <<<"$(size_row "$size")"
 [ "$(tr '[:upper:]' '[:lower:]' <<<"$tmodel")" = "$mlabel" ] || die "label model:$mlabel disagrees with PROCESS.md size $size ($tmodel); fix the label"
-if [ -z "$budget" ]; then
-  [[ "$cap" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "no budget cap recorded for size $size in PROCESS.md; pass --budget USD"
-  budget="$cap"
-fi
 deps_merged "$issue" || die "issue #$n has unmerged dependencies"
 lane_free "$lane" || die "lane $lane has a PR in flight"
 
@@ -75,7 +70,7 @@ prompt="$(kickoff "$n" "$labels" "$turns")
 $(jq -r .body <<<"$issue")"
 
 echo "issue:   #$n $title"
-echo "size:    $size  model: $model  turns: $turns  budget: \$$budget  reviewer: $reviewer"
+echo "size:    $size  model: $model  turns: $turns  reviewer: $reviewer"
 echo "branch:  $branch"
 if [ "$dry" = 1 ]; then echo "(dry run; not starting)"; exit 0; fi
 
@@ -86,7 +81,7 @@ git switch -c "$branch"
 log="$RUNS/$n-$(date +%Y%m%d-%H%M%S).log"
 echo "log:     $log"
 set +e
-claude -p "$prompt" --model "$model" --max-budget-usd "$budget" "${turns_flag[@]}" \
+claude -p "$prompt" --model "$model" "${turns_flag[@]}" \
   --permission-mode dontAsk --allowedTools "$base" --disallowedTools "$disallowed" \
   --output-format text 2>&1 | tee "$log"
 rc=${PIPESTATUS[0]}

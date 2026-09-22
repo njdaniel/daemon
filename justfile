@@ -61,7 +61,7 @@ eval:
 
 # --- Development process (docs/PROCESS.md) ---
 
-# Run one issue headlessly: just agent 2, or `just agent next`; add --budget USD until caps are recorded
+# Run one issue headlessly: just agent 2, or `just agent next`
 agent +args:
     scripts/agent.sh {{args}}
 

@@ -1,5 +1,5 @@
 # Daemon (`dmn`)
-Rust Linux interview copilot. M1–M2 is a ratatui TUI; M3 adds a Tauri 2 window. Spec: docs/SPEC.md. Process: docs/PROCESS.md (sizes, budgets, kickoff prompt, review, merge rules). Design: docs/design/. Issues: GitHub, mirrored in docs/issues/.
+Rust Linux interview copilot. M1–M2 is a ratatui TUI; M3 adds a Tauri 2 window. Spec: docs/SPEC.md. Process: docs/PROCESS.md (sizes, turn caps, kickoff prompt, review, merge rules). Design: docs/design/. Issues: GitHub, mirrored in docs/issues/.
 
 ## Commands (use `just`; every recipe is also runnable by hand)
 - Check fast: `just check` (`cargo check --workspace --all-targets`) — run this after every edit

@@ -29,7 +29,7 @@ n=$(jq -r .body <<<"$prj" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-
 [ -n "$n" ] || die "cannot find the issue number in the PR body (Closes #n) or branch name"
 [ -n "$size" ] || size=$(gh issue view "$n" --json labels | jq -r '.labels[].name | select(startswith("size:")) | sub("size:";"")')
 [ -n "$size" ] || die "no size label on PR #$pr or issue #$n"
-read -r _ _ _ reviewer <<<"$(size_row "$size")"
+read -r _ _ reviewer <<<"$(size_row "$size")"
 case "$via" in
   claude) model=$(model_id "$(tr '[:upper:]' '[:lower:]' <<<"$reviewer" | grep -oE 'sonnet|opus|fable' | head -1)") ;;
   agy)    need agy; model="gemini-3.1-pro-high" ;;

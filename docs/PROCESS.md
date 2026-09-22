@@ -1,21 +1,21 @@
 # Daemon — Development Process
 
-Every change enters the repo as a sized issue, is implemented by one agent run under a turn and dollar budget matched to its size, is reviewed by a different model, and merges only when CI and the reviewer agree. This file is the contract every issue, run and PR follows. `just agent <n>` and `just review <pr>` read it through the issue labels; if this file and a label disagree, fix the label.
+Every change enters the repo as a sized issue, is implemented by one agent run under a turn budget matched to its size, is reviewed by a different model, and merges only when CI and the reviewer agree. This file is the contract every issue, run and PR follows. `just agent <n>` and `just review <pr>` read it through the issue labels; if this file and a label disagree, fix the label.
 
 Spec: `docs/SPEC.md`. Design: `docs/design/`. Build rules: `CLAUDE.md`.
 
 ## 1. Sizes
 
-An issue gets exactly one size. The size sets the model, the budget and the reviewer.
+An issue gets exactly one size. The size sets the model, the turn cap and the reviewer.
 
-| Size | Fits when | Model | Max turns | Budget (USD) | Reviewed by |
-| --- | --- | --- | --- | --- | --- |
-| S | One file or module, known crates, no threads, no FFI, tests trivial or already present | Sonnet | 30 | 5 | Opus |
-| M | One crate of pure Rust with new tests on fixtures, or one async client | Opus | 45 | 15 | Opus, fresh session |
-| L | FFI, `unsafe`, real-time or threading constraints, or one unfamiliar C-backed API | Fable | 60, two runs planned | 40 | Fable |
-| XL | Anything larger | not allowed — split it | — | — | — |
+| Size | Fits when | Model | Max turns | Reviewed by |
+| --- | --- | --- | --- | --- |
+| S | One file or module, known crates, no threads, no FFI, tests trivial or already present | Sonnet | 30 | Opus |
+| M | One crate of pure Rust with new tests on fixtures, or one async client | Opus | 45 | Opus, fresh session |
+| L | FFI, `unsafe`, real-time or threading constraints, or one unfamiliar C-backed API | Fable | 60, two runs planned | Fable |
+| XL | Anything larger | not allowed — split it | — | — |
 
-The caps above are provisional (set 2026-09-21 before any run); replace each with measured cost × 1.5 after the first run of that size lands. Until a cap is recorded, `just agent` refuses to start a run of that size without an explicit `--budget`.
+Runs are capped by turns, not dollars: agent usage comes from subscriptions, so there is no per-run API budget to enforce.
 
 ## 2. Breaking work down
 
@@ -25,7 +25,7 @@ Rules for whoever writes issues, human or agent:
 - Every issue is verifiable by a command in its Verify section without a live call: fixtures in `testdata/`, `dmn replay`, `MockProvider`, snapshot tests.
 - Every issue leaves `main` green and shippable. No half-wired feature flags, no "finished in the next issue".
 - `Depends on` lists merged prerequisites only; nothing references a later issue.
-- If the estimate exceeds the L budget, split along the issue's own bullet list before opening it.
+- If the estimate exceeds an L (two runs), split along the issue's own bullet list before opening it.
 - Title: `<crate or area>: <outcome>`.
 - Labels, all required: `size:S|M|L`, `model:sonnet|opus|fable`, `m0|m1|m2|m3|m4`, `lane:audio|stt|llm|ui|infra`.
 
@@ -50,12 +50,12 @@ Exact command(s) and expected output, runnable without a live call.
 ## 4. Running an issue — `just agent <n>`
 
 1. The dispatcher (cron or by hand) picks the lowest-numbered open issue whose `Depends on` are all merged and whose lane has no run in flight.
-2. It calls `claude -p` with the kickoff prompt plus the issue body, `--allowedTools` from the size, and `--max-turns` / `--max-budget-usd` from the labels.
+2. It calls `claude -p` with the kickoff prompt plus the issue body, `--allowedTools` from the size, and `--max-turns` from the labels.
    - S and M: file edits, `just check`, `just test`, `just lint`.
    - L: the above plus `cargo run -p dmn-cli -- replay …` and `just probe`.
    - Never: network beyond crates.io, `git push --force`, anything under `~/.config/dmn/`.
 3. Commit-only contract: the run works on branch `issue/<n>-<slug>`, commits, and opens a PR whose body is the issue's acceptance checklist with the command used to verify each line. It never merges.
-4. CI runs `just check`, `just test`, `just lint`; a red CI is the run's own problem to fix within its budget.
+4. CI runs `just check`, `just test`, `just lint`; a red CI is the run's own problem to fix within its turn cap.
 
 **Kickoff prompt** (prepended to every issue body; the number changes):
 
@@ -94,8 +94,8 @@ A PR merges when all of these hold:
 
 ## 7. When a run fails
 
-- Budget exhausted, tests green, acceptance unmet: split the remainder into a new issue, close the original with a pointer, merge nothing.
-- Budget exhausted, tests red: discard the branch; re-run once with the failure log appended to the prompt.
+- Turn cap reached, tests green, acceptance unmet: split the remainder into a new issue, close the original with a pointer, merge nothing.
+- Turn cap reached, tests red: discard the branch; re-run once with the failure log appended to the prompt.
 - An L issue that fails twice becomes an interactive session; notes from that session update `docs/SPEC.md` before any further headless run touches that crate.
 - A review that flags a spec problem rather than a code problem: open a spec issue (`lane:infra`, `size:S`), fix the spec, then re-run.
 
