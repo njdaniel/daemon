@@ -547,13 +547,18 @@ impl LoopCapture {
                         .channels
                         .store(info.channels(), Ordering::Release);
                     format_status.rate.store(info.rate(), Ordering::Release);
-                    let ok = info.rate() == SAMPLE_RATE && info.channels() == 1;
+                    // The sample format matters as much as the rate: S16LE at 16 kHz mono
+                    // would open the gate and be read as f32 (Copilot on PR #32).
+                    let ok = info.rate() == SAMPLE_RATE
+                        && info.channels() == 1
+                        && info.format() == spa::param::audio::AudioFormat::F32LE;
                     // Gate the real-time callback before reporting, so no buffer of the wrong
                     // shape is ever copied into the 16 kHz mono ring.
                     format_status.set_format_ok(ok);
                     if !ok {
                         format_status.set_error(format!(
-                            "negotiated {} Hz × {} ch, need {SAMPLE_RATE} Hz mono (dropping buffers)",
+                            "negotiated {:?} {} Hz × {} ch, need F32LE {SAMPLE_RATE} Hz mono (dropping buffers)",
+                            info.format(),
                             info.rate(),
                             info.channels()
                         ));

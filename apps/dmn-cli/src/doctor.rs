@@ -316,11 +316,11 @@ pub fn ollama(h: &dyn Http, base_url: &str, model: &str) -> Vec<Check> {
 fn ollama_model_names(body: &str) -> Option<Vec<String>> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let arr = v.get("models")?.as_array()?;
-    Some(
-        arr.iter()
-            .filter_map(|m| m["name"].as_str().map(str::to_owned))
-            .collect(),
-    )
+    // Every entry must carry a string name. Dropping nameless entries would turn a malformed
+    // body into "no models pulled" and an `ollama pull` fix again (Copilot on PR #32).
+    arr.iter()
+        .map(|m| m.get("name")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// For remote providers the key must be present in the named env var.
@@ -860,6 +860,9 @@ mod tests {
         assert_eq!(ollama_model_names(r#"{"models":[]}"#), Some(vec![]));
         assert_eq!(ollama_model_names("<html>hello</html>"), None);
         assert_eq!(ollama_model_names(r#"{"error":"nope"}"#), None);
+        // A models array whose entries have no string name is malformed, not empty.
+        assert_eq!(ollama_model_names(r#"{"models":[{}]}"#), None);
+        assert_eq!(ollama_model_names(r#"{"models":[{"name":7}]}"#), None);
 
         let checks = ollama(
             &FakeHttp(Ok("<html>proxy</html>".into())),

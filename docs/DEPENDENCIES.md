@@ -35,4 +35,4 @@ Offline only: these run when a human regenerates the fixtures. Nothing here is o
 | `onnxruntime` | `tools/fixtures/generate.py` | Imported directly to seed Piper's in-graph noise, so two runs produce byte-identical WAVs |
 | `numpy` | `tools/fixtures/{generate,verify}.py` | Resampling, level measurement and WAV assembly on the shared timeline |
 
-Python floor is 3.11: the locked `onnxruntime` publishes cp311–cp314 wheels and no source distribution.
+Python range is `>=3.11,<3.15`: the locked `onnxruntime` publishes cp311–cp314 wheels and no source distribution, so nothing installs outside it.
