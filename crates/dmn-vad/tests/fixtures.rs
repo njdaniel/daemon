@@ -1,13 +1,13 @@
 //! Issue #7 acceptance on the TTS fixtures (`just fixtures-fetch`): utterance boundaries within
 //! 200 ms of the reference for at least 90 % of turns, and a 1× drain with no overruns.
 //!
-//! Two references are scored and both are printed:
-//! - **scripted**: a turn's `t` / `end` in `turns.json`, which are the edges of the synthesised
-//!   clip. Piper voices put 20–60 ms of silence before the first word and, for the Norman voice
-//!   (interviewer), 150–250 ms after the last one, so a scripted `end` is not where speech ends.
-//! - **voiced**: the first and last sample inside the turn's clip window whose magnitude reaches
-//!   -40 dBFS, 20 dB above the tracks' -60 dBFS noise floor. On these clean synthetic tracks that
-//!   is exactly where sound is, independent of the frame-RMS VAD under test.
+//! Two references are scored and both are printed, both read from `turns.json` (issue #28):
+//! - **scripted**: a turn's `t` / `end`, which are the edges of the synthesised clip. Piper voices
+//!   put 20–60 ms of silence before the first word and, for the Norman voice (interviewer),
+//!   150–250 ms after the last one, so a scripted `end` is not where speech ends.
+//! - **voiced**: `voiced_t` / `voiced_end`, where sound actually starts and stops inside that clip
+//!   window. `tools/fixtures/generate.py` measures them on the written int16 samples at -40 dBFS,
+//!   20 dB above the tracks' -60 dBFS noise floor, independent of the frame-RMS VAD under test.
 //!
 //! The assertion uses the voiced reference; see the PR for why.
 //!
@@ -24,8 +24,6 @@ use dmn_vad::{CloseReason, Utterance, VadConfig, VadEvent, VadWorker, event_chan
 
 const TOLERANCE_S: f64 = 0.200;
 const REQUIRED: f64 = 0.90;
-/// Sample magnitude that counts as sound for the voiced reference: -40 dBFS.
-const VOICED_PEAK: f64 = 0.01;
 
 fn testdata() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -50,59 +48,45 @@ struct Bounds {
     end: f64,
 }
 
-fn turns(fixture: &str, speaker: &str) -> Vec<Bounds> {
-    let text = std::fs::read_to_string(testdata().join(fixture).join("turns.json")).unwrap();
+/// One turn's two references, both recorded by `tools/fixtures/generate.py`.
+struct TurnRefs {
+    scripted: Vec<Bounds>,
+    voiced: Vec<Bounds>,
+}
+
+fn turns(fixture: &str, speaker: &str) -> TurnRefs {
+    let path = testdata().join(fixture).join("turns.json");
+    let text = std::fs::read_to_string(&path).unwrap();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-    v.as_array()
+    let mut refs = TurnRefs {
+        scripted: Vec::new(),
+        voiced: Vec::new(),
+    };
+    for x in v
+        .as_array()
         .unwrap()
         .iter()
         .filter(|x| x["speaker"] == speaker)
-        .map(|x| Bounds {
-            t: x["t"].as_f64().unwrap(),
-            end: x["end"].as_f64().unwrap(),
-        })
-        .collect()
-}
-
-/// 16 kHz mono 16-bit PCM samples of a fixture WAV, as f64 in [-1, 1).
-fn pcm16(path: &Path) -> Vec<f64> {
-    let bytes = std::fs::read(path).unwrap();
-    assert_eq!(&bytes[0..4], b"RIFF");
-    let mut i = 12;
-    while i + 8 <= bytes.len() {
-        let id = &bytes[i..i + 4];
-        let len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
-        if id == b"data" {
-            return bytes[i + 8..(i + 8 + len).min(bytes.len())]
-                .chunks_exact(2)
-                .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
-                .collect();
-        }
-        i += 8 + len + (len & 1);
+    {
+        let f = |key: &str| {
+            x[key].as_f64().unwrap_or_else(|| {
+                panic!(
+                    "{}: turn {} has no {key}; regenerate with `just fixtures` (issue #28)",
+                    path.display(),
+                    x["i"]
+                )
+            })
+        };
+        refs.scripted.push(Bounds {
+            t: f("t"),
+            end: f("end"),
+        });
+        refs.voiced.push(Bounds {
+            t: f("voiced_t"),
+            end: f("voiced_end"),
+        });
     }
-    panic!("{}: no data chunk", path.display());
-}
-
-/// Where sound actually is inside each turn's clip window.
-fn voiced(turns: &[Bounds], samples: &[f64]) -> Vec<Bounds> {
-    let rate = 16_000.0;
-    turns
-        .iter()
-        .map(|b| {
-            let lo = ((b.t * rate) as usize).min(samples.len());
-            let hi = ((b.end * rate) as usize).min(samples.len());
-            let win = &samples[lo..hi];
-            let first = win.iter().position(|x| x.abs() >= VOICED_PEAK).unwrap_or(0);
-            let last = win
-                .iter()
-                .rposition(|x| x.abs() >= VOICED_PEAK)
-                .unwrap_or(win.len().saturating_sub(1));
-            Bounds {
-                t: (lo + first) as f64 / rate,
-                end: (lo + last + 1) as f64 / rate,
-            }
-        })
-        .collect()
+    refs
 }
 
 /// Run one speaker WAV through WavSource (fast) → VadWorker and return its utterances.
@@ -245,10 +229,9 @@ fn check_fixture(fixture: &str) {
             return;
         };
         let utts = segment(&path, source);
-        let scripted_refs = turns(fixture, speaker);
-        let voiced_refs = voiced(&scripted_refs, &pcm16(&path));
-        let scripted = score(&scripted_refs, &utts);
-        let voiced = score(&voiced_refs, &utts);
+        let refs = turns(fixture, speaker);
+        let scripted = score(&refs.scripted, &utts);
+        let voiced = score(&refs.voiced, &utts);
         line(fixture, speaker, "scripted", &scripted);
         line(fixture, speaker, "voiced", &voiced);
         add(&mut scripted_total, scripted);

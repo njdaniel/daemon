@@ -7,7 +7,12 @@ writes, under testdata/<name>/:
                                    speaker's audio; everywhere else is a -60 dBFS noise floor so a
                                    VAD sees realistic (not digital) silence.
   questions.json                   every turn marked is_question, with start/end from the audio
-  turns.json                       every turn with its timing, for the eval harness (#10)
+  turns.json                       every turn with its timing, for the eval harness (#10). Besides
+                                   the clip window `t`/`end`, each turn carries `voiced_t` and
+                                   `voiced_end`: where sound actually starts and stops inside that
+                                   window. A Piper clip holds 20-60 ms of silence before the first
+                                   word and, for the Norman voice, 150-250 ms after the last one,
+                                   so `t`/`end` are not speech boundaries; see issue #27.
   script.md                        readable transcript with timestamps
 
 Reproducibility: Piper's VITS models sample noise inside the ONNX graph, so plain synthesis differs
@@ -48,6 +53,7 @@ LEAD_IN_S = 1.0
 TAIL_S = 1.5
 DEFAULT_PAUSE_S = 0.8
 FRAME = 320  # 20 ms at 16 kHz, same frame the VAD uses
+VOICED_DBFS = -40.0  # sound vs the -60 dBFS floor, for turns.json's voiced_t / voiced_end
 
 
 @dataclass
@@ -59,6 +65,8 @@ class Placed:
     text: str
     is_question: bool
     kind: str | None
+    voiced_start: float = 0.0
+    voiced_end: float = 0.0
 
 
 def dbfs(x: np.ndarray) -> float:
@@ -136,8 +144,41 @@ def synth_turn(voice: PiperVoice, text: str) -> np.ndarray:
     return x.astype(np.float32)
 
 
+def quantise(x: np.ndarray) -> np.ndarray:
+    """The int16 samples that go into the WAV, so callers can measure exactly what consumers read."""
+    return np.clip(np.round(x * 32767.0), -32768, 32767).astype("<i2")
+
+
+def voiced_bounds(track: np.ndarray, start: float, end: float) -> tuple[float, float]:
+    """Where sound starts and stops inside the clip window [start, end) of one quantised track.
+
+    A 20 ms frame counts as sound when its RMS reaches VOICED_DBFS, which the -60 dBFS floor never
+    does; inside the first and last such frame the bound is refined to the sample. Since a frame's
+    peak is at least its RMS, a voiced frame always holds a sample over the threshold. Falls back to
+    the clip window when a turn holds no sound at all, which verify.py then reports.
+    """
+    lo, hi = int(round(start * RATE)), min(int(round(end * RATE)), len(track))
+    win = track[lo:hi].astype(np.float64) / 32768.0
+    n = len(win) // FRAME
+    thresh = 10.0 ** (VOICED_DBFS / 20.0)
+    if n:
+        frames = win[: n * FRAME].reshape(n, FRAME)
+        rms = np.sqrt(np.mean(np.square(frames), axis=1))
+        loud = np.flatnonzero(rms >= thresh)
+        if loud.size:
+            head = win[loud[0] * FRAME : (loud[0] + 1) * FRAME]
+            tail = win[loud[-1] * FRAME : (loud[-1] + 1) * FRAME]
+            first = loud[0] * FRAME + int(np.argmax(np.abs(head) >= thresh))
+            last = loud[-1] * FRAME + int(len(tail) - 1 - np.argmax(np.abs(tail)[::-1] >= thresh))
+            t0 = max(start, round((lo + first) / RATE, 3))
+            t1 = min(end, round((lo + last + 1) / RATE, 3))
+            if t1 > t0:
+                return t0, t1
+    return round(start, 3), round(end, 3)
+
+
 def write_wav(path: Path, x: np.ndarray) -> None:
-    pcm = np.clip(np.round(x * 32767.0), -32768, 32767).astype("<i2")
+    pcm = quantise(x)
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -197,6 +238,12 @@ def generate(script_path: Path, out_root: Path) -> dict:
     write_wav(out / "interviewer.wav", tracks["interviewer"])
     write_wav(out / "candidate.wav", tracks["candidate"])
 
+    # Measured on the int16 samples that were just written, not the float mix, so turns.json
+    # describes exactly what a consumer of the WAV sees.
+    quantised = {role: quantise(x) for role, x in tracks.items()}
+    for p in placed:
+        p.voiced_start, p.voiced_end = voiced_bounds(quantised[p.speaker], p.start, p.end)
+
     questions = [
         {"t": p.start, "end": p.end, "text": p.text, "kind": p.kind}
         for p in placed
@@ -208,6 +255,8 @@ def generate(script_path: Path, out_root: Path) -> dict:
             "speaker": p.speaker,
             "t": p.start,
             "end": p.end,
+            "voiced_t": p.voiced_start,
+            "voiced_end": p.voiced_end,
             "is_question": p.is_question,
             "kind": p.kind,
             "text": p.text,

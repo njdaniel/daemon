@@ -4,6 +4,8 @@
     "speaker": "interviewer",
     "t": 1.0,
     "end": 3.154,
+    "voiced_t": 1.054,
+    "voiced_end": 2.999,
     "is_question": false,
     "kind": "small_talk",
     "text": "Hello? Can you hear me okay?"
@@ -13,6 +15,8 @@
     "speaker": "candidate",
     "t": 3.954,
     "end": 7.153,
+    "voiced_t": 4.014,
+    "voiced_end": 7.053,
     "is_question": false,
     "kind": null,
     "text": "Yes, I can hear you fine. Can you hear me?"
@@ -22,6 +26,8 @@
     "speaker": "interviewer",
     "t": 7.753,
     "end": 16.781,
+    "voiced_t": 7.813,
+    "voiced_end": 16.542,
     "is_question": false,
     "kind": "small_talk",
     "text": "Loud and clear. Sorry, my calendar double-booked me and the other call ran over. How's the weather where you are? It's been pouring here all week."
@@ -31,6 +37,8 @@
     "speaker": "candidate",
     "t": 17.581,
     "end": 22.916,
+    "voiced_t": 17.581,
+    "voiced_end": 22.821,
     "is_question": false,
     "kind": null,
     "text": "No problem at all. It's actually sunny here for once, which is rare in September."
@@ -40,6 +48,8 @@
     "speaker": "interviewer",
     "t": 23.716,
     "end": 28.738,
+    "voiced_t": 23.772,
+    "voiced_end": 28.472,
     "is_question": false,
     "kind": "small_talk",
     "text": "Lucky you. Did you find the calendar invite okay, the link changed at the last minute?"
@@ -49,6 +59,8 @@
     "speaker": "candidate",
     "t": 29.538,
     "end": 32.44,
+    "voiced_t": 29.558,
+    "voiced_end": 32.351,
     "is_question": false,
     "kind": null,
     "text": "I did, the recruiter sent the update this morning."
@@ -58,6 +70,8 @@
     "speaker": "interviewer",
     "t": 33.44,
     "end": 47.281,
+    "voiced_t": 33.49,
+    "voiced_end": 47.0,
     "is_question": true,
     "kind": "behavioral",
     "text": "Great. So this is a general engineering screen. I'll mix in some technical questions and some questions about your background, and we'll see where it goes. Let's start easy. Tell me about the system you've worked on that you're proudest of."
@@ -67,6 +81,8 @@
     "speaker": "candidate",
     "t": 48.481,
     "end": 84.415,
+    "voiced_t": 48.502,
+    "voiced_end": 84.301,
     "is_question": false,
     "kind": null,
     "text": "I'd say the ingestion pipeline at my current company. When I joined it was a nightly batch job that took six hours and failed about once a week. Over about a year I rebuilt it as a streaming pipeline with exactly-once semantics into the warehouse. The part I'm proudest of isn't the technology, it's that I did it incrementally, one source at a time, with the old and new paths running side by side, so there was never a big risky cutover. It now processes about two billion events a day and the on-call load for it is close to zero."
@@ -76,6 +92,8 @@
     "speaker": "interviewer",
     "t": 85.215,
     "end": 90.307,
+    "voiced_t": 85.256,
+    "voiced_end": 90.094,
     "is_question": false,
     "kind": "small_talk",
     "text": "Two billion a day, that's a decent scale, right? Most people don't get to touch that."
@@ -85,6 +103,8 @@
     "speaker": "candidate",
     "t": 91.107,
     "end": 93.696,
+    "voiced_t": 91.11,
+    "voiced_end": 93.586,
     "is_question": false,
     "kind": null,
     "text": "It was a good learning experience, for sure."
@@ -94,6 +114,8 @@
     "speaker": "interviewer",
     "t": 94.696,
     "end": 101.447,
+    "voiced_t": 94.752,
+    "voiced_end": 101.196,
     "is_question": true,
     "kind": "knowledge",
     "text": "Exactly-once is a phrase that means a lot of different things. What did it actually mean in your pipeline, and how did you achieve it?"
@@ -103,6 +125,8 @@
     "speaker": "candidate",
     "t": 102.647,
     "end": 136.701,
+    "voiced_t": 102.667,
+    "voiced_end": 136.584,
     "is_question": false,
     "kind": null,
     "text": "In our case it meant that every source event lands in the warehouse exactly one time, even across retries and restarts. We didn't get that from the transport; the stream was at-least-once. We got it at the sink. Every event carried a deterministic ID, the source ID plus its offset, and the warehouse loader wrote through a staging table with a merge on that ID, so a replayed batch updated existing rows instead of duplicating them. Combined with committing the consumer offset only after the merge succeeded, that gives effectively-once end to end."
@@ -112,6 +136,8 @@
     "speaker": "interviewer",
     "t": 138.101,
     "end": 141.201,
+    "voiced_t": 138.155,
+    "voiced_end": 141.061,
     "is_question": false,
     "kind": "small_talk",
     "text": "Okay, hold on one second, someone's at my door."
@@ -121,6 +147,8 @@
     "speaker": "interviewer",
     "t": 148.201,
     "end": 163.023,
+    "voiced_t": 148.261,
+    "voiced_end": 162.821,
     "is_question": true,
     "kind": "knowledge",
     "text": "Sorry about that. Where were we. Right, the pipeline. Let's switch gears to something more hands-on. Suppose you have a service whose p ninety-nine latency doubled overnight and nothing was deployed. How do you go about finding the cause?"
@@ -130,6 +158,8 @@
     "speaker": "candidate",
     "t": 164.223,
     "end": 209.66,
+    "voiced_t": 164.225,
+    "voiced_end": 209.522,
     "is_question": false,
     "kind": null,
     "text": "Nothing was deployed to the service, but something changed somewhere, so I'd widen the search. First I'd check whether the latency increase is uniform or concentrated: one endpoint, one customer, one region, one host. That usually cuts the space in half immediately. Then I'd look at the dependencies: database latency, cache hit rate, downstream service latency, and I'd check whether traffic shape changed, like a new client sending bigger requests. Common overnight causes are a data-dependent thing, a table crossing a size where an index stops fitting in memory, a certificate rotation, a noisy neighbor on shared infrastructure, or a scheduled job. I'd look at the metrics for those before touching anything."
@@ -139,6 +169,8 @@
     "speaker": "interviewer",
     "t": 210.46,
     "end": 213.258,
+    "voiced_t": 210.513,
+    "voiced_end": 213.099,
     "is_question": true,
     "kind": "clarification",
     "text": "And if it turns out to be the cache hit rate, what then?"
@@ -148,6 +180,8 @@
     "speaker": "candidate",
     "t": 214.258,
     "end": 237.351,
+    "voiced_t": 214.258,
+    "voiced_end": 237.238,
     "is_question": false,
     "kind": null,
     "text": "Then I'd ask why it dropped. Either the cache got smaller, someone changed its size or it restarted and is cold, or the key space got bigger, like a new client that generates unique keys per request and pollutes it. The fix depends on which, but the immediate mitigation is usually to warm it or to shield the database with a request coalescer while we figure it out."
@@ -157,6 +191,8 @@
     "speaker": "interviewer",
     "t": 238.751,
     "end": 252.621,
+    "voiced_t": 238.816,
+    "voiced_end": 252.37,
     "is_question": true,
     "kind": "behavioral",
     "text": "You know, we had exactly that last month. Turned out to be a bot scraping us with a random query parameter. Anyway. Next question. I'd like to hear about a time you had a conflict with a coworker. How did it get resolved?"
@@ -166,6 +202,8 @@
     "speaker": "candidate",
     "t": 253.821,
     "end": 305.198,
+    "voiced_t": 253.827,
+    "voiced_end": 305.06,
     "is_question": false,
     "kind": null,
     "text": "I had a long-running disagreement with another senior engineer about code review standards. He wanted every pull request to have a hundred percent test coverage of changed lines, and I thought that was slowing us down and producing tests that didn't test much. We went back and forth in review comments for a few weeks, which wasn't healthy. Eventually I asked him to lunch and we talked about what each of us was actually worried about. He'd been burned by an untested change that took down production; I'd seen teams grind to a halt on coverage rules. Once that was on the table we agreed on a middle ground: coverage on business logic and anything on a critical path, judgment elsewhere, and we wrote that down for the team. The relationship got noticeably better after that, because we'd both been arguing with a caricature of the other person."
@@ -175,6 +213,8 @@
     "speaker": "interviewer",
     "t": 306.598,
     "end": 316.966,
+    "voiced_t": 306.7,
+    "voiced_end": 316.718,
     "is_question": true,
     "kind": "coding",
     "text": "That's a mature way to put it. Okay, a coding one. Given a stream of integers, describe how you'd find the median at any point, and what the time complexity is per element."
@@ -184,6 +224,8 @@
     "speaker": "candidate",
     "t": 318.166,
     "end": 347.564,
+    "voiced_t": 318.166,
+    "voiced_end": 347.426,
     "is_question": false,
     "kind": null,
     "text": "Two heaps. A max-heap holding the smaller half and a min-heap holding the larger half, kept balanced so their sizes differ by at most one. For each new number, push it onto one heap, then rebalance by moving the top of one heap to the other if the sizes are off. The median is then the top of the larger heap, or the average of the two tops if they're equal in size. Each insert is log n for the heap operations, and reading the median is constant time."
@@ -193,6 +235,8 @@
     "speaker": "interviewer",
     "t": 348.364,
     "end": 350.21,
+    "voiced_t": 348.42,
+    "voiced_end": 349.975,
     "is_question": true,
     "kind": "clarification",
     "text": "What if the stream is too big for memory?"
@@ -202,6 +246,8 @@
     "speaker": "candidate",
     "t": 351.21,
     "end": 369.253,
+    "voiced_t": 351.23,
+    "voiced_end": 369.11,
     "is_question": false,
     "kind": null,
     "text": "Then exact median isn't feasible in one pass, so I'd use an approximate structure. A t-digest or a histogram with fixed buckets gives a median within a small error in constant memory. If the values have a bounded integer range, a counting array is exact and tiny."
@@ -211,6 +257,8 @@
     "speaker": "interviewer",
     "t": 370.853,
     "end": 383.457,
+    "voiced_t": 370.973,
+    "voiced_end": 383.273,
     "is_question": false,
     "kind": "small_talk",
     "text": "Nice. We have a lot of integer streams, so you'd fit right in, right? Okay. Give me a second, I'm just writing a note."
@@ -220,6 +268,8 @@
     "speaker": "interviewer",
     "t": 389.457,
     "end": 397.573,
+    "voiced_t": 389.512,
+    "voiced_end": 397.316,
     "is_question": true,
     "kind": "knowledge",
     "text": "Alright. Let me ask about databases. Explain the difference between optimistic and pessimistic locking, and when you'd pick each."
@@ -229,6 +279,8 @@
     "speaker": "candidate",
     "t": 398.773,
     "end": 439.676,
+    "voiced_t": 398.774,
+    "voiced_end": 439.552,
     "is_question": false,
     "kind": null,
     "text": "Pessimistic locking takes a lock before reading or writing, so other transactions wait. Optimistic locking doesn't lock; it reads a version number, does its work, and on write checks the version hasn't changed, retrying if it has. Pessimistic is right when conflicts are frequent or a retry is expensive, like a long-running edit on a hot row. Optimistic is right when conflicts are rare, which is most web traffic, because it avoids holding locks across user think time and it scales better. Most of what I've built used optimistic locking with a version column, and pessimistic only in a few inventory-style cases where two people really do fight over the same row."
@@ -238,6 +290,8 @@
     "speaker": "interviewer",
     "t": 441.076,
     "end": 450.586,
+    "voiced_t": 441.13,
+    "voiced_end": 450.414,
     "is_question": true,
     "kind": "behavioral",
     "text": "Imagine you join us and in your first month you discover that our main database has no backups being tested. Nobody has restored one in two years. What do you do?"
@@ -247,6 +301,8 @@
     "speaker": "candidate",
     "t": 451.786,
     "end": 494.611,
+    "voiced_t": 451.806,
+    "voiced_end": 494.506,
     "is_question": false,
     "kind": null,
     "text": "First I'd verify it's actually true, quietly, because that's an alarming claim to raise if it's wrong. If it is true, I'd raise it with my manager the same day, framed as a risk with a proposal, not as a complaint about whoever owns it. The proposal would be simple: do a restore into an isolated environment this week, time it, and document the steps. That first restore tells you whether the backups even work, which is the real question. Then I'd propose making it a scheduled, automated check with an alert if it fails. It's the kind of thing where the first restore takes a day and finds three problems, and after that it's a boring monthly job, which is exactly what you want."
@@ -256,6 +312,8 @@
     "speaker": "interviewer",
     "t": 496.011,
     "end": 502.763,
+    "voiced_t": 496.155,
+    "voiced_end": 502.628,
     "is_question": true,
     "kind": "behavioral",
     "text": "Good. We're almost at time. Last one. Why are you looking to leave your current role?"
@@ -265,6 +323,8 @@
     "speaker": "candidate",
     "t": 503.963,
     "end": 526.952,
+    "voiced_t": 503.983,
+    "voiced_end": 526.858,
     "is_question": false,
     "kind": null,
     "text": "The honest answer is that the pipeline work I described is done, and the company is in a phase where the next few years are maintenance and incremental features. I'm at my best when there's a hard system to build, and the multi-region work I read about in your job description is exactly that kind of problem. I'm not running from anything; I'm looking for the next difficult thing."
@@ -274,6 +334,8 @@
     "speaker": "interviewer",
     "t": 527.952,
     "end": 538.141,
+    "voiced_t": 528.012,
+    "voiced_end": 537.931,
     "is_question": false,
     "kind": "small_talk",
     "text": "That makes sense. Well, I think that's everything from my side. You'll hear from the recruiter in a few days. Have a good rest of your afternoon, and enjoy the sun."
@@ -283,6 +345,8 @@
     "speaker": "candidate",
     "t": 538.741,
     "end": 541.15,
+    "voiced_t": 538.781,
+    "voiced_end": 541.061,
     "is_question": false,
     "kind": null,
     "text": "Thanks, you too. Stay dry."
