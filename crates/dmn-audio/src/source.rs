@@ -57,6 +57,10 @@ pub enum AudioError {
     Subprocess(String),
     #[error("cannot spawn a thread: {0}")]
     Spawn(String),
+    /// `stop` gave up waiting for the PipeWire loop to destroy the stream, so the real-time
+    /// callback may still be running and writing into the ring.
+    #[error("the capture stream was still {state} after {ms} ms; its callback may still run")]
+    StopTimeout { state: &'static str, ms: u64 },
 }
 
 /// A labelled producer of 16 kHz mono frames. `start` hands the source its ring producer and

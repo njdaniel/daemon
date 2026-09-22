@@ -5,8 +5,8 @@
 
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::frames::FrameSink;
@@ -20,6 +20,11 @@ pub struct PwRecordSource {
     child: Option<Child>,
     reader: Option<JoinHandle<()>>,
     finished: Arc<AtomicBool>,
+    /// Set by `stop` before it kills the child, so the read error that the kill causes is not
+    /// reported as a capture failure.
+    stopping: Arc<AtomicBool>,
+    /// The read error that ended the stream, if it ended badly.
+    read_error: Arc<Mutex<Option<String>>>,
 }
 
 impl PwRecordSource {
@@ -40,6 +45,16 @@ impl PwRecordSource {
         Self::from_command(source, cmd)
     }
 
+    /// The read error that ended the stream, if it ended badly rather than at EOF. Set only
+    /// for failures outside a `stop`, so the status dot can tell a dead fallback from a
+    /// finished one.
+    pub fn read_error(&self) -> Option<String> {
+        self.read_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
     /// Any command that writes raw little-endian f32 samples to stdout. Tests use this.
     pub fn from_command(source: Source, command: Command) -> Self {
         Self {
@@ -48,8 +63,56 @@ impl PwRecordSource {
             child: None,
             reader: None,
             finished: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            read_error: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// Read raw f32 samples until EOF or a read error, cutting them into 20 ms frames.
+///
+/// EOF is a clean finish. A read error is recorded unless `stopping` is set, which means we
+/// killed the child ourselves and the broken pipe is expected (Copilot on PR #25: both used to
+/// look like a clean finish, so a dead fallback was silent).
+fn read_loop(
+    src: &mut dyn Read,
+    sink: &mut FrameSink,
+    finished: &AtomicBool,
+    stopping: &AtomicBool,
+    read_error: &Mutex<Option<String>>,
+) {
+    let mut bytes = [0u8; 4096];
+    let mut carry = [0u8; 4];
+    let mut carried = 0usize;
+    let mut frame = [0.0f32; FRAME_LEN];
+    let mut fill = 0usize;
+    loop {
+        let n = match src.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                if !stopping.load(Ordering::Acquire) {
+                    *read_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
+                }
+                break;
+            }
+        };
+        for &b in &bytes[..n] {
+            carry[carried] = b;
+            carried += 1;
+            if carried == 4 {
+                frame[fill] = f32::from_le_bytes(carry);
+                carried = 0;
+                fill += 1;
+                if fill == FRAME_LEN {
+                    sink.push_frame(&frame);
+                    fill = 0;
+                }
+            }
+        }
+    }
+    finished.store(true, Ordering::Release);
 }
 
 impl AudioSource for PwRecordSource {
@@ -70,35 +133,11 @@ impl AudioSource for PwRecordSource {
             .take()
             .ok_or_else(|| AudioError::Subprocess("no stdout".into()))?;
         let finished = Arc::clone(&self.finished);
+        let stopping = Arc::clone(&self.stopping);
+        let read_error = Arc::clone(&self.read_error);
         let reader = std::thread::Builder::new()
             .name("dmn-pw-record".into())
-            .spawn(move || {
-                let mut bytes = [0u8; 4096];
-                let mut carry = [0u8; 4];
-                let mut carried = 0usize;
-                let mut frame = [0.0f32; FRAME_LEN];
-                let mut fill = 0usize;
-                loop {
-                    let n = match stdout.read(&mut bytes) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    for &b in &bytes[..n] {
-                        carry[carried] = b;
-                        carried += 1;
-                        if carried == 4 {
-                            frame[fill] = f32::from_le_bytes(carry);
-                            carried = 0;
-                            fill += 1;
-                            if fill == FRAME_LEN {
-                                sink.push_frame(&frame);
-                                fill = 0;
-                            }
-                        }
-                    }
-                }
-                finished.store(true, Ordering::Release);
-            })
+            .spawn(move || read_loop(&mut stdout, &mut sink, &finished, &stopping, &read_error))
             .map_err(|e| AudioError::Spawn(e.to_string()))?;
         self.child = Some(child);
         self.reader = Some(reader);
@@ -106,13 +145,17 @@ impl AudioSource for PwRecordSource {
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
+        self.stopping.store(true, Ordering::Release);
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        match self.reader.take().map(JoinHandle::join) {
-            Some(Err(_)) => Err(AudioError::ThreadPanicked),
-            _ => Ok(()),
+        if let Some(Err(_)) = self.reader.take().map(JoinHandle::join) {
+            return Err(AudioError::ThreadPanicked);
+        }
+        match self.read_error() {
+            Some(e) => Err(AudioError::Subprocess(format!("stdout: {e}"))),
+            None => Ok(()),
         }
     }
 
@@ -132,6 +175,71 @@ mod tests {
     use super::*;
     use crate::frames::frame_channel;
     use std::time::{Duration, Instant};
+
+    /// Yields `bytes` once, then fails the way a broken pipe does.
+    struct FailAfter {
+        bytes: Vec<u8>,
+        done: bool,
+    }
+    impl Read for FailAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.done {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "pw-record went away",
+                ));
+            }
+            self.done = true;
+            let n = self.bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_read_error_is_recorded_and_not_mistaken_for_eof() {
+        // Copilot on PR #25: `Ok(0) | Err(_) => break` made a broken pipe look like a clean
+        // finish, so the emergency fallback died silently.
+        let (mut sink, frames) = frame_channel(Source::Interviewer, 4);
+        let finished = AtomicBool::new(false);
+        let stopping = AtomicBool::new(false);
+        let err = Mutex::new(None);
+        let mut src = FailAfter {
+            bytes: vec![0u8; FRAME_LEN * 4],
+            done: false,
+        };
+        read_loop(&mut src, &mut sink, &finished, &stopping, &err);
+        assert!(finished.load(Ordering::Acquire), "the thread still ends");
+        assert_eq!(
+            frames.queued_frames(),
+            1,
+            "the bytes before the error arrive"
+        );
+        let recorded = err.lock().unwrap().clone().expect("error recorded");
+        assert!(recorded.contains("pw-record went away"), "{recorded}");
+
+        // The same failure during stop() is our own kill: not reported.
+        let (mut sink, _frames) = frame_channel(Source::Interviewer, 4);
+        let stopping = AtomicBool::new(true);
+        let err = Mutex::new(None);
+        let mut src = FailAfter {
+            bytes: Vec::new(),
+            done: false,
+        };
+        read_loop(&mut src, &mut sink, &finished, &stopping, &err);
+        assert_eq!(*err.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn stop_surfaces_a_read_error_as_a_subprocess_error() {
+        let mut src = PwRecordSource::from_command(Source::You, Command::new("true"));
+        *src.read_error.lock().unwrap() = Some("pw-record went away".into());
+        let e = src.stop().unwrap_err();
+        assert!(
+            matches!(&e, AudioError::Subprocess(m) if m.contains("pw-record went away")),
+            "{e}"
+        );
+    }
 
     #[test]
     fn raw_f32_stdout_becomes_frames_and_eof_finishes() {

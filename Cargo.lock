@@ -430,6 +430,7 @@ dependencies = [
  "dmn-stt",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 
