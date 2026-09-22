@@ -9,21 +9,30 @@
 //! ([`FRAME_LEN`] samples at [`SAMPLE_RATE`]) into an SPSC ring; the consumer drains them through
 //! [`Frames`] on its own thread. [`WavSource`] is the file-backed implementation every later
 //! stage is tested against. [`PipeWireContext`] (issue #4) runs the PipeWire loop thread and
-//! keeps the live [`NodeTable`] of mics and app streams; `PipeWireSource` arrives with #5.
+//! keeps the live [`NodeTable`] of mics and app streams. [`PipeWireSource`] (issue #5) captures a
+//! mic, one app's output stream (by `target.object`) or the default sink monitor on that loop
+//! thread, and re-attaches when the app restarts; [`PwRecordSource`] is the `pw-record`
+//! emergency fallback behind the same trait.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod capture;
 mod frames;
 mod pipewire;
+mod pwrecord;
 mod source;
 mod wav;
 
+pub use capture::{
+    Action, CaptureMode, CaptureState, CaptureStatus, CaptureTarget, PipeWireSource, Reattach,
+};
 pub use frames::{FrameSink, Frames, frame_channel};
 pub use pipewire::{
     AppStream, CaptureNode, NodeTable, PipeWireContext, PipeWireError, RegistryEvent,
     parse_default_name,
 };
+pub use pwrecord::PwRecordSource;
 pub use source::{AudioError, AudioSource, Source};
 pub use wav::{Speed, WavSource};
 

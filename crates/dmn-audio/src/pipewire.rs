@@ -1,6 +1,8 @@
 //! PipeWire discovery: one OS thread runs the PipeWire main loop; a registry listener keeps a
 //! live [`NodeTable`] of capture sources and app output streams (docs/SPEC.md § Audio capture on
-//! PipeWire, Discovery). Capture streams arrive with issue #5.
+//! PipeWire, Discovery). The same loop thread owns the capture streams of
+//! [`crate::PipeWireSource`] (issue #5), which it creates, retargets and closes on
+//! [`Command`]s.
 //!
 //! Threading: everything PipeWire-owned (`MainLoopRc`, `CoreRc`, `RegistryRc`, proxies,
 //! listeners) lives on the loop thread and is `!Send`; the table is shared through an
@@ -9,11 +11,13 @@
 //! on tokio. Shutdown sends [`Command::Quit`] over a [`pipewire::channel`], the loop thread
 //! quits its own `MainLoop`, and `Drop` joins it.
 //!
-//! No `unsafe` here: the `pipewire` crate's `Rc` API covers everything discovery needs.
+//! No `unsafe` here: the `pipewire` crate's `Rc` API covers everything discovery needs. The one
+//! `unsafe` call capture needs lives in `capture.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -25,6 +29,9 @@ use pw::node::Node;
 use pw::proxy::Listener;
 use pw::types::ObjectType;
 
+use crate::capture::{LoopCapture, OpenSpec};
+use crate::frames::FrameSink;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PipeWireError {
     /// libpipewire refused to start a loop or context (library missing at runtime, etc.).
@@ -35,6 +42,9 @@ pub enum PipeWireError {
     Connect(String),
     #[error("PipeWire loop thread ended before reporting its state")]
     ThreadGone,
+    /// The loop thread no longer accepts commands (it quit or the server went away).
+    #[error("PipeWire loop thread is not accepting commands")]
+    LoopGone,
 }
 
 /// A microphone or other capture node (`media.class = Audio/Source`).
@@ -56,8 +66,10 @@ pub struct AppStream {
     pub application: String,
     /// `media.name`, e.g. "Google Meet" or "Playback".
     pub media_name: String,
-    /// `node.name`, usable as `target.object` (issue #5).
+    /// `node.name`. Not unique across apps with several streams, so capture prefers `serial`.
     pub node_name: String,
+    /// `object.serial`, the preferred `target.object` value (unique for the node's lifetime).
+    pub serial: Option<String>,
 }
 
 /// One registry event, decoupled from libpipewire so the table logic is testable without a
@@ -155,6 +167,7 @@ impl NodeTable {
                             .to_owned();
                         let media_name = get("media.name").unwrap_or_default().to_owned();
                         let node_name = get("node.name").unwrap_or_default().to_owned();
+                        let serial = get("object.serial").map(str::to_owned);
                         self.streams.insert(
                             id,
                             AppStream {
@@ -162,6 +175,7 @@ impl NodeTable {
                                 application,
                                 media_name,
                                 node_name,
+                                serial,
                             },
                         );
                         true
@@ -257,8 +271,29 @@ impl Shared {
     }
 }
 
-enum Command {
+/// Work for the loop thread. Everything PipeWire-owned is created and touched there.
+pub(crate) enum Command {
     Quit,
+    /// Create a capture stream (not connected yet) under `key`.
+    Open {
+        key: u64,
+        spec: OpenSpec,
+        sink: FrameSink,
+    },
+    /// Retarget and (re)connect the stream under `key`.
+    Connect {
+        key: u64,
+        target_object: Option<String>,
+        capture_sink: bool,
+    },
+    /// Disconnect the stream under `key`; it can be connected again.
+    Disconnect {
+        key: u64,
+    },
+    /// Disconnect and destroy the stream under `key`.
+    Close {
+        key: u64,
+    },
 }
 
 /// A bound `default` metadata proxy and its listener, kept alive for the loop's lifetime.
@@ -277,6 +312,7 @@ pub struct PipeWireContext {
     shared: Arc<Shared>,
     quit: pw::channel::Sender<Command>,
     thread: Option<JoinHandle<()>>,
+    next_key: AtomicU64,
 }
 
 impl PipeWireContext {
@@ -298,6 +334,7 @@ impl PipeWireContext {
             shared,
             quit: quit_tx,
             thread: Some(thread),
+            next_key: AtomicU64::new(1),
         };
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(ctx),
@@ -344,6 +381,16 @@ impl PipeWireContext {
         guard.clone()
     }
 
+    /// Hand work to the loop thread.
+    pub(crate) fn send(&self, cmd: Command) -> Result<(), PipeWireError> {
+        self.quit.send(cmd).map_err(|_| PipeWireError::LoopGone)
+    }
+
+    /// A fresh key for a capture stream.
+    pub(crate) fn next_key(&self) -> u64 {
+        self.next_key.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn join(&mut self) {
         let _ = self.quit.send(Command::Quit);
         if let Some(t) = self.thread.take() {
@@ -386,11 +433,44 @@ fn loop_thread(
         }
     };
 
-    // Quit from another thread: Drop sends Command::Quit, this callback runs on the loop.
+    // Commands from other threads run here, on the loop. Drop sends Command::Quit; capture
+    // sources open, retarget and close their streams through the rest.
+    let captures: Rc<RefCell<HashMap<u64, LoopCapture>>> = Rc::new(RefCell::new(HashMap::new()));
+    let cmd_captures = Rc::clone(&captures);
+    let cmd_core = core.clone();
     let loop_weak = main_loop.downgrade();
-    let _quit_source = quit_rx.attach(main_loop.loop_(), move |Command::Quit| {
-        if let Some(l) = loop_weak.upgrade() {
-            l.quit();
+    let _commands = quit_rx.attach(main_loop.loop_(), move |cmd| match cmd {
+        Command::Quit => {
+            if let Some(l) = loop_weak.upgrade() {
+                l.quit();
+            }
+        }
+        Command::Open { key, spec, sink } => {
+            let status = Arc::clone(&spec.status);
+            match LoopCapture::open(&cmd_core, spec, sink) {
+                Ok(c) => {
+                    cmd_captures.borrow_mut().insert(key, c);
+                }
+                Err(e) => status.set_error(e),
+            }
+        }
+        Command::Connect {
+            key,
+            target_object,
+            capture_sink,
+        } => {
+            if let Some(c) = cmd_captures.borrow_mut().get_mut(&key) {
+                c.connect(target_object.as_deref(), capture_sink);
+            }
+        }
+        Command::Disconnect { key } => {
+            if let Some(c) = cmd_captures.borrow_mut().get_mut(&key) {
+                c.disconnect();
+            }
+        }
+        Command::Close { key } => {
+            let closed = cmd_captures.borrow_mut().remove(&key);
+            drop(closed);
         }
     });
 
@@ -522,7 +602,10 @@ fn loop_thread(
 
     main_loop.run();
 
-    // Listeners before proxies before the core: drop in reverse creation order.
+    // Capture streams first (they hang off the core), then listeners before proxies before the
+    // core: drop in reverse creation order.
+    captures.borrow_mut().clear();
+    drop(_commands);
     drop(_registry_listener);
     drop(nodes);
     drop(holders);

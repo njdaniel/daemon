@@ -1,14 +1,15 @@
 //! `dmn`: the Daemon command-line entry point.
 //!
-//! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `config show` (#2),
-//! `devices` (#4). Later: `run`, `sources`, `replay`, `bench`, `doctor --probe` (#5),
-//! `--fetch` (#8).
+//! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
+//! `config show` (#2), `devices` (#4). Later: `run`, `sources`, `replay`, `bench`,
+//! `doctor --fetch` (#8).
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod devices;
 mod doctor;
+mod probe;
 
 use std::process::ExitCode;
 
@@ -33,6 +34,10 @@ enum Command {
         /// Overwrite an existing config file (only with --init)
         #[arg(long, requires = "init")]
         force: bool,
+        /// Also play a quiet 440 Hz tone and capture it back through the app stream, the sink
+        /// monitor and pw-record (about 3 s of sound through the default output)
+        #[arg(long, conflicts_with = "init")]
+        probe: bool,
     },
     /// Inspect configuration
     Config {
@@ -76,14 +81,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         }
-        Some(Command::Doctor { init, force }) => {
+        Some(Command::Doctor { init, force, probe }) => {
             if init {
                 Config::write_template(&paths.config_file, force)?;
                 tracing::info!(path = %paths.config_file.display(), "wrote config template");
                 println!("wrote {}", paths.config_file.display());
             } else {
                 let cfg = Config::load(&paths.config_file)?;
-                let report = doctor::run_all(&cfg, &paths, &doctor::SystemRunner, &doctor::StdHttp);
+                let mut report =
+                    doctor::run_all(&cfg, &paths, &doctor::SystemRunner, &doctor::StdHttp);
+                if probe {
+                    report.checks.extend(probe::run());
+                }
                 print!("{}", report.render());
                 let failed = report.failed_required();
                 tracing::info!(failed, "doctor");
