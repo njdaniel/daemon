@@ -38,6 +38,9 @@ enum CliError {
     /// `dmn bench` could not read a fixture or its turns.
     #[error("bench: {0}")]
     Bench(String),
+    /// `dmn replay` could not run the pipeline over the given files.
+    #[error("{0}")]
+    Replay(String),
     #[error("{failed} required check(s) failed")]
     ChecksFailed { failed: usize },
 }
@@ -198,6 +201,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             transcript,
         }) => {
             let cfg = Config::load(&paths.config_file)?;
+            // As with bench above, the module keeps its boxed error and it is mapped here.
             replay::run(
                 &cfg,
                 &paths,
@@ -211,6 +215,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     transcript,
                 },
             )
+            .map_err(|e| CliError::Replay(e.to_string()))
         }
         Some(Command::Config {
             action: ConfigAction::Show,
