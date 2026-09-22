@@ -1,8 +1,8 @@
 //! `dmn`: the Daemon command-line entry point.
 //!
 //! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
-//! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4). Later: `run`,
-//! `sources`, `replay`.
+//! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4), `replay` (#9).
+//! Later: `run`, `sources`.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -11,6 +11,7 @@ mod bench;
 mod devices;
 mod doctor;
 mod probe;
+mod replay;
 
 use std::process::ExitCode;
 
@@ -37,6 +38,9 @@ enum CliError {
     /// `dmn bench` could not read a fixture or its turns.
     #[error("bench: {0}")]
     Bench(String),
+    /// `dmn replay` could not run the pipeline over the given files.
+    #[error("{0}")]
+    Replay(String),
     #[error("{failed} required check(s) failed")]
     ChecksFailed { failed: usize },
 }
@@ -96,6 +100,28 @@ enum Command {
     },
     /// List PipeWire capture sources and application output streams
     Devices,
+    /// Run two fixture WAVs through the real pipeline and print labelled transcript segments
+    Replay {
+        /// The interviewer's audio
+        interviewer: std::path::PathBuf,
+        /// Your audio
+        candidate: std::path::PathBuf,
+        /// 1 plays at wall-clock speed like a live call; any other value runs unpaced
+        #[arg(long, default_value_t = 1.0)]
+        speed: f32,
+        /// Model name; default is [stt].model from the config
+        #[arg(long)]
+        model: Option<String>,
+        /// Decoder threads; default is [stt].threads from the config
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Transcribe the 1 s partials of an open utterance: on at 1×, off when unpaced
+        #[arg(long, value_enum, default_value_t = replay::Partials::Auto)]
+        partials: replay::Partials,
+        /// Print the merged transcript and the last 60 s window at the end
+        #[arg(long)]
+        transcript: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -164,6 +190,32 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 }
             }
             Ok(())
+        }
+        Some(Command::Replay {
+            interviewer,
+            candidate,
+            speed,
+            model,
+            threads,
+            partials,
+            transcript,
+        }) => {
+            let cfg = Config::load(&paths.config_file)?;
+            // As with bench above, the module keeps its boxed error and it is mapped here.
+            replay::run(
+                &cfg,
+                &paths,
+                &replay::Args {
+                    interviewer,
+                    candidate,
+                    speed,
+                    model,
+                    threads,
+                    partials,
+                    transcript,
+                },
+            )
+            .map_err(|e| CliError::Replay(e.to_string()))
         }
         Some(Command::Config {
             action: ConfigAction::Show,

@@ -1,25 +1,31 @@
 //! Speech to text via whisper.cpp (`whisper-rs`).
 //!
-//! Input: 16 kHz mono f32 samples of one closed utterance, plus the previous utterance's text as a
-//! prompt for continuity. (From #9 these arrive as `Utterance`s over a bounded channel.)
-//! Output: a [`Transcript`] per utterance: text, mean token log-probability and a low-confidence
-//! flag (`avg_logprob < -1.0`, SPEC § STT worker).
-//! Owns: one `WhisperState` per [`Transcriber`] (one per source, inference serialised per state)
+//! Input: [`VadEvent`](dmn_vad::VadEvent)s from one source's bounded channel: closed
+//! `Utterance`s and, every second, `Partial`s of the utterance still open.
+//! Output: [`Segment`](dmn_transcript::Segment)s published through the callback the caller hands
+//! [`SttWorker::spawn`] (in the pipeline, `dmn-transcript`'s bus): one partial per second while
+//! an utterance is open, then the final that replaces them. Hallucinations and low-confidence
+//! text are dropped and counted ([`filter`]).
+//! Owns: one worker thread and one `WhisperState` per source (inference serialised per state),
 //! and the ggml model files under the models directory the caller passes in (`dmn` passes
-//! `~/.cache/dmn/models/`). The per-source worker thread and its channel arrive with issue #9.
+//! `~/.cache/dmn/models/`).
 //!
 //! No dependency on `dmn-core`: the wiring crate converts `[stt]` config into [`SttConfig`].
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod filter;
 pub mod model;
 pub mod transcriber;
 pub mod wer;
+pub mod worker;
 
+pub use filter::{Dropped, FilterConfig, should_drop};
 pub use model::{Model, download_model, model_path};
 pub use transcriber::{Backend, SttConfig, Transcriber, Transcript};
 pub use wer::word_error_rate;
+pub use worker::{Speech, SttStats, SttWorker, SttWorkerConfig};
 
 /// Sample rate whisper expects; `dmn-audio` delivers exactly this.
 pub const SAMPLE_RATE: usize = 16_000;
