@@ -244,9 +244,31 @@ impl Job {
         }
     }
 
+    /// Close an utterance that produced no usable text, so its partials cannot sit on screen for
+    /// ever: only a final with the same `start` clears them. Both no-text paths — a filtered
+    /// final and a failed inference — go through here so they cannot drift apart.
+    fn close_without_text(&mut self, u: &Utterance, avg_logprob: f32) {
+        (self.publish)(Segment {
+            source: u.source,
+            start: u.start,
+            end: u.end,
+            text: String::new(),
+            is_final: true,
+            avg_logprob,
+        });
+    }
+
     fn handle_final(&mut self, u: Utterance) {
         let prompt = (!self.last_final.is_empty()).then(|| self.last_final.clone());
         let Some(t) = self.run_inference(&u.samples, prompt.as_deref()) else {
+            // `run_inference` counted the error and logged the cause. The utterance still has to
+            // close, and nothing about it was heard, so it carries the lowest possible score: no
+            // consumer can mistake it for a confident empty result.
+            tracing::warn!(
+                source = %u.source, start = ?u.start, end = ?u.end,
+                "inference failed; closing the utterance with no text"
+            );
+            self.close_without_text(&u, f32::MIN);
             return;
         };
         let text = normalise(&t.text);
@@ -256,16 +278,7 @@ impl Job {
                 source = %u.source, start = ?u.start, reason = why.label(), text = %text,
                 "dropped segment"
             );
-            // Say the utterance closed anyway, with no text: otherwise its partials would sit
-            // on screen for ever, since only a final clears them.
-            (self.publish)(Segment {
-                source: u.source,
-                start: u.start,
-                end: u.end,
-                text: String::new(),
-                is_final: true,
-                avg_logprob: t.avg_logprob,
-            });
+            self.close_without_text(&u, t.avg_logprob);
             return;
         }
         self.counters.finals.fetch_add(1, Ordering::Relaxed);
@@ -689,6 +702,67 @@ mod tests {
         h.worker.finish();
         let calls = h.calls.lock().unwrap();
         assert_eq!(calls[1].1, None, "a dropped hallucination is not context");
+    }
+
+    #[test]
+    fn a_failed_inference_still_closes_the_utterance() {
+        /// whisper can fail mid-session (a bad state, an OOM); the utterance must still close.
+        struct Failing;
+        impl Speech for Failing {
+            fn transcribe(&mut self, _: &[f32], _: Option<&str>) -> Result<Transcript, SttError> {
+                Err(SttError::Io {
+                    path: "whisper".to_owned(),
+                    source: std::io::Error::other("inference exploded"),
+                })
+            }
+        }
+
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&out);
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let worker = SttWorker::spawn(
+            Box::new(Failing),
+            rx,
+            Box::new(move |s| sink.lock().unwrap().push(s)),
+            SttWorkerConfig::default(),
+            "failing",
+        )
+        .unwrap();
+        tx.send(utterance(1_000, 4_000)).unwrap();
+        drop(tx);
+        let stats = worker.finish();
+
+        let published = out.lock().unwrap().clone();
+        assert_eq!(published.len(), 1, "the utterance closed: {published:?}");
+        let closing = &published[0];
+        assert!(closing.is_final && closing.text.is_empty());
+        assert_eq!(closing.start, Duration::from_millis(1_000));
+        assert_eq!(closing.end, Duration::from_millis(4_000));
+        assert_eq!(
+            closing.avg_logprob,
+            f32::MIN,
+            "a failure cannot look like a confident empty result"
+        );
+        assert_eq!(stats.errors, 1, "counted as an inference failure");
+        assert_eq!((stats.finals, stats.dropped()), (0, 0), "not a filter drop");
+
+        // And that closing segment clears the partial the utterance had already shown.
+        let mut log = dmn_transcript::TranscriptLog::new();
+        log.apply(Segment {
+            source: Source::Interviewer,
+            start: Duration::from_millis(1_000),
+            end: Duration::from_millis(2_000),
+            text: "how would you".to_owned(),
+            is_final: false,
+            avg_logprob: -0.2,
+        });
+        assert_eq!(log.open_partials().len(), 1);
+        log.apply(closing.clone());
+        assert!(log.open_partials().is_empty(), "no stale partial is left");
+        assert!(
+            log.finals().is_empty(),
+            "and no empty line in the transcript"
+        );
     }
 
     #[test]
