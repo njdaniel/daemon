@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 import wave
 import zlib
@@ -149,26 +150,35 @@ def quantise(x: np.ndarray) -> np.ndarray:
     return np.clip(np.round(x * 32767.0), -32768, 32767).astype("<i2")
 
 
-def voiced_bounds(track: np.ndarray, start: float, end: float) -> tuple[float, float]:
+def voiced_bounds(track: np.ndarray, start: float, end: float) -> tuple[float, float, bool]:
     """Where sound starts and stops inside the clip window [start, end) of one track.
 
-    `track` holds the samples as written, in [-1, 1); verify.py re-measures a WAV the same way.
+    Returns `(voiced_t, voiced_end, found)`. `track` holds the samples as written, in [-1, 1);
+    verify.py re-measures a WAV the same way.
 
     The definition issue #27 accepted for VAD accuracy, applied to every sample in the window: the
     first and last sample whose magnitude reaches VOICED_DBFS. The tracks' -60 dBFS Gaussian floor
     would need a 10-sigma excursion to reach -40 dBFS, so on these fixtures a crossing is always
-    speech and no frame gate is needed. Falls back to the clip window when a turn holds no sound at
-    all, which verify.py then reports.
+    speech and no frame gate is needed.
+
+    The bounds are widened to the enclosing millisecond, never narrowed, so the recorded pair always
+    contains every sample that crossed the threshold and a one-sample turn still gets a real span
+    rather than collapsing. `found` is False only when nothing in the window crosses at all; the
+    window itself is then returned and verify.py warns, so a silent clip is noticed instead of
+    being absorbed into a full-width "voiced" span.
     """
     lo, hi = int(round(start * RATE)), min(int(round(end * RATE)), len(track))
     win = np.abs(track[lo:hi].astype(np.float64))
     loud = np.flatnonzero(win >= 10.0 ** (VOICED_DBFS / 20.0))
-    if loud.size:
-        t0 = max(start, round((lo + int(loud[0])) / RATE, 3))
-        t1 = min(end, round((lo + int(loud[-1]) + 1) / RATE, 3))
-        if t1 > t0:
-            return t0, t1
-    return round(start, 3), round(end, 3)
+    if not loud.size:
+        return round(start, 3), round(end, 3), False
+    first, last = (lo + int(loud[0])) / RATE, (lo + int(loud[-1]) + 1) / RATE
+    t0 = max(start, math.floor(first * 1000.0) / 1000.0)
+    t1 = min(end, math.ceil(last * 1000.0) / 1000.0)
+    if t1 <= t0:  # a span shorter than the rounding grid: give it one VAD frame inside the clip
+        t1 = min(end, round(t0 + FRAME / RATE, 3))
+        t0 = max(start, round(t1 - FRAME / RATE, 3))
+    return round(t0, 3), round(t1, 3), True
 
 
 def write_wav(path: Path, x: np.ndarray) -> None:
@@ -236,7 +246,9 @@ def generate(script_path: Path, out_root: Path) -> dict:
     # describes exactly what a consumer of the WAV sees.
     quantised = {role: quantise(x).astype(np.float64) / 32768.0 for role, x in tracks.items()}
     for p in placed:
-        p.voiced_start, p.voiced_end = voiced_bounds(quantised[p.speaker], p.start, p.end)
+        p.voiced_start, p.voiced_end, found = voiced_bounds(quantised[p.speaker], p.start, p.end)
+        if not found:
+            print(f"  warning: turn {p.index} ({p.speaker}) has no sample over {VOICED_DBFS} dBFS")
 
     questions = [
         {"t": p.start, "end": p.end, "text": p.text, "kind": p.kind}

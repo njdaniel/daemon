@@ -31,6 +31,7 @@ from generate import (  # noqa: E402
     ROOT,
     active_rms_dbfs,
     dbfs,
+    VOICED_DBFS,
     voiced_bounds,
     write_wav,
 )
@@ -48,13 +49,18 @@ def read_wav(path: Path) -> tuple[np.ndarray, dict]:
     return pcm.astype(np.float32) / 32768.0, meta
 
 
-def check(fixture: Path, quiet: bool = False) -> list[str]:
+def check(fixture: Path, quiet: bool = False) -> tuple[list[str], list[str]]:
+    """Return (errors, warnings). Warnings never fail the run; a silent turn is one."""
     errors: list[str] = []
+    warnings: list[str] = []
     tracks: dict[str, np.ndarray] = {}
     for role in ("interviewer", "candidate"):
         path = fixture / f"{role}.wav"
         if not path.exists():
-            return [f"missing {path.relative_to(ROOT)} (run `just fixtures` or `just fixtures-fetch`)"]
+            return (
+                [f"missing {path.relative_to(ROOT)} (run `just fixtures` or `just fixtures-fetch`)"],
+                warnings,
+            )
         x, meta = read_wav(path)
         if meta != {"rate": RATE, "channels": 1, "width": 2}:
             errors.append(f"{role}.wav is {meta}, want 16 kHz mono 16-bit")
@@ -86,8 +92,13 @@ def check(fixture: Path, quiet: bool = False) -> list[str]:
                 f"outside the clip {t['t']}..{t['end']}"
             )
         else:
-            want_t, want_end = voiced_bounds(tracks[t["speaker"]], t["t"], t["end"])
-            if (
+            want_t, want_end, found = voiced_bounds(tracks[t["speaker"]], t["t"], t["end"])
+            if not found:
+                warnings.append(
+                    f"turn {t['i']} ({t['speaker']}) has no sound over {VOICED_DBFS} dBFS; "
+                    f"voiced bounds fall back to the whole clip {t['t']}..{t['end']}"
+                )
+            elif (
                 abs(want_t - t["voiced_t"]) > VOICED_TOL_S
                 or abs(want_end - t["voiced_end"]) > VOICED_TOL_S
             ):
@@ -121,13 +132,14 @@ def check(fixture: Path, quiet: bool = False) -> list[str]:
 
     n_frames = len(tracks["interviewer"]) // FRAME
     if quiet:
-        return errors
+        return errors, warnings
     print(
         f"{fixture.name:<11} {duration / 60:5.2f} min  {len(turns):2d} turns  {len(questions):2d} questions  "
         f"speech RMS {worst_lo:.1f}..{worst_hi:.1f} dBFS  worst crosstalk {worst_x:.1f} dBFS  "
         f"{n_frames} frames  {'OK' if not errors else 'FAIL'}"
+        f"{f'  ({len(warnings)} warning(s))' if warnings else ''}"
     )
-    return errors
+    return errors, warnings
 
 
 def self_test() -> int:
@@ -139,7 +151,9 @@ def self_test() -> int:
     """
     import tempfile
 
-    def build(root: Path, turns: list[dict], seconds: float = 6.0) -> Path:
+    def build(root: Path, turns: list[dict], seconds: float = 6.0, sound: str = "tone") -> Path:
+        """A tiny fixture. `sound` shapes the interviewer's turn: a 2 s tone, a single loud sample
+        (the degenerate case for voiced bounds), or nothing but the noise floor."""
         fixture = root / "selftest"
         fixture.mkdir(parents=True, exist_ok=True)
         n = int(seconds * RATE)
@@ -149,7 +163,10 @@ def self_test() -> int:
         for role in ("interviewer", "candidate"):
             track = (rng.standard_normal(n) * floor).astype(np.float32)
             if role == "interviewer":
-                track[RATE : 3 * RATE] += tone[RATE : 3 * RATE]
+                if sound == "tone":
+                    track[RATE : 3 * RATE] += tone[RATE : 3 * RATE]
+                elif sound == "blip":
+                    track[2 * RATE] = 0.2  # one sample over -40 dBFS, nothing else
             write_wav(fixture / f"{role}.wav", track)
         (fixture / "turns.json").write_text(json.dumps(turns, indent=2) + "\n")
         (fixture / "questions.json").write_text(
@@ -190,7 +207,7 @@ def self_test() -> int:
     failures = 0
     with tempfile.TemporaryDirectory() as tmp:
         for name, turns, expect in cases:
-            errors = check(build(Path(tmp), turns), quiet=True)
+            errors, _ = check(build(Path(tmp), turns), quiet=True)
             hit = [e for e in errors if expect and expect in e]
             if expect is None:
                 bad = [e for e in errors if "past the" in e or "voiced" in e]
@@ -200,7 +217,39 @@ def self_test() -> int:
                 ok = bool(hit)
                 detail = hit[0] if hit else f"NOT REPORTED; got {errors}"
             failures += 0 if ok else 1
-            print(f"  self-test {name:<32} {'OK  ' if ok else 'FAIL'} {detail}")
+            print(f"  self-test {name:<40} {'OK  ' if ok else 'FAIL'} {detail}")
+
+        # A turn whose only sound is one sample: the bounds must still be that sample's
+        # millisecond, never a silent fallback to the whole 1..3 s clip (issue #28 review).
+        fixture = build(Path(tmp), [turn()], sound="blip")
+        track, _ = read_wav(fixture / "interviewer.wav")
+        t0, t1, found = voiced_bounds(track, 1.0, 3.0)
+        ok = found and 1.9 < t0 < 2.01 and t0 < t1 <= t0 + 0.021
+        failures += 0 if ok else 1
+        print(
+            f"  self-test {'single-sample turn keeps a real span':<40} "
+            f"{'OK  ' if ok else 'FAIL'} bounds {t0}..{t1} (found={found}), clip 1.0..3.0"
+        )
+        errors, _ = check(
+            build(Path(tmp), [turn(voiced_t=t0, voiced_end=t1)], sound="blip"), quiet=True
+        )
+        ok = not [e for e in errors if "voiced" in e]
+        failures += 0 if ok else 1
+        print(
+            f"  self-test {'single-sample bounds verify clean':<40} "
+            f"{'OK  ' if ok else 'FAIL'} {[e for e in errors if 'voiced' in e] or 'no voiced errors'}"
+        )
+
+        # A genuinely silent turn: warned about by name, not failed, and not silently recorded
+        # as if the whole clip were voiced.
+        errors, warns = check(build(Path(tmp), [turn()], sound="silent"), quiet=True)
+        hit = [w for w in warns if "no sound over" in w]
+        ok = bool(hit) and not [e for e in errors if "voiced" in e]
+        failures += 0 if ok else 1
+        print(
+            f"  self-test {'silent turn warns instead of failing':<40} "
+            f"{'OK  ' if ok else 'FAIL'} {hit[0] if hit else f'NOT WARNED; got {warns} {errors}'}"
+        )
     print(f"self-test: {'all checks catch their fault' if not failures else f'{failures} broken check(s)'}")
     return 1 if failures else 0
 
@@ -217,7 +266,10 @@ def main() -> int:
         return 1
     failed = False
     for f in fixtures:
-        for e in check(f):
+        errors, warns = check(f)
+        for w in warns:
+            print(f"  {f.name}: warning: {w}")
+        for e in errors:
             failed = True
             print(f"  {f.name}: {e}")
     return 1 if failed else 0
