@@ -11,7 +11,7 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `directories` | `dmn-core` | XDG config / data / cache / state paths without hand-rolled env logic |
 | `tracing` | all crates | Structured events; the only logging API in the workspace |
 | `tracing-subscriber` (json, env-filter) | `dmn-core` | JSON lines to the log file; `DMN_LOG` filter |
-| `serde_json` | `dmn-core` (dev), `dmn-cli`, later `dmn-llm` | Assert log lines are JSON; parse Ollama `/api/tags` in `dmn doctor`; LLM request/response bodies |
+| `serde_json` | `dmn-core` (dev), `dmn-cli`, `dmn-llm`, `dmn-vad` (dev) | Assert log lines are JSON; parse Ollama `/api/tags` in `dmn doctor`; LLM request/response bodies; read fixture `turns.json` in VAD accuracy tests |
 | `tempfile` (dev) | `dmn-core`, `dmn-cli`, `dmn-audio` tests | Isolated config / log / WAV directories so tests never touch `~` |
 | `hound` | `dmn-audio` | Read fixture / replay WAVs of any rate, channel count and sample format |
 | `rubato` | `dmn-audio` | FFT resampler from the file's rate to 16 kHz; PipeWire resamples live audio itself |
@@ -21,7 +21,8 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `tokio-util` | `dmn-llm` | `CancellationToken`: a newer unpinned question cancels the in-flight LLM request |
 | `reqwest` (json, stream; rustls by default) | `dmn-llm` | HTTP client for Ollama, OpenAI-compatible and Anthropic endpoints; streaming bodies |
 | `futures-util` | `dmn-llm` | `BoxStream` / `BoxFuture` so `Provider` is object-safe without a macro crate |
+| `crossbeam-channel` | `dmn-vad`, later `dmn-stt` | Bounded channel from each VAD thread to the STT worker; `try_send` lets the drain count and drop instead of blocking when the consumer stalls |
 | `whisper-rs` (=0.16.0, `tracing_backend`; bundles whisper.cpp 1.8.3 via `whisper-rs-sys` 0.15.0) | `dmn-stt` | In-process whisper.cpp inference; pinned exactly because the build compiles C++ from source (SPEC § risks). Features `cuda` / `vulkan` / `openblas` forwarded from `dmn-stt`; CPU by default |
 | `reqwest` feature `blocking` | `dmn-stt` | One-shot model download for `dmn doctor --fetch` without an async runtime; same client crate as `dmn-llm` |
 
-Planned by the spec (add the line when the issue lands): `crossbeam-channel` (#7 / #9); `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+Planned by the spec (add the line when the issue lands): `rusqlite` (#13); `ratatui`, `crossterm` (#14).
