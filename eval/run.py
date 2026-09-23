@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import subprocess
@@ -42,6 +43,8 @@ MATCH_SLACK_S = 2.0
 # Below this word-level similarity the texts are different questions that happen to sit close in
 # time, so the pairing is rejected.
 MIN_SIMILARITY = 0.35
+# docs/SPEC.md: final segment to candidate.
+LATENCY_BUDGET_MS = 100
 
 
 @dataclass
@@ -107,9 +110,23 @@ def overlaps(q: Question, c: Candidate) -> bool:
     return False
 
 
+def fingerprint(args) -> str:
+    """What replay's output depends on: the flags passed to it, the source tree (HEAD plus any
+    uncommitted diff) and the user's config file. A cached run is reused only when all match."""
+    h = hashlib.sha256()
+    h.update(repr((args.speed, args.model, args.threads, args.spec_literal)).encode())
+    for cmd in (["git", "rev-parse", "HEAD"], ["git", "diff", "HEAD"]):
+        out = subprocess.run(cmd, cwd=REPO, capture_output=True, check=False)
+        h.update(out.stdout)
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "dmn" / "config.toml"
+    if config.is_file():
+        h.update(config.read_bytes())
+    return h.hexdigest()[:12]
+
+
 def replay(fixture: str, cache: Path, args) -> list[dict]:
     """Run `dmn replay --json` (or reuse its cached output) and return the parsed events."""
-    cached = cache / f"{fixture}{'-literal' if args.spec_literal else ''}.ndjson"
+    cached = cache / f"{fixture}{'-literal' if args.spec_literal else ''}-{fingerprint(args)}.ndjson"
     if args.reuse and cached.is_file():
         return [json.loads(line) for line in cached.read_text().splitlines() if line.strip()]
 
@@ -223,7 +240,7 @@ def detail(results: list[Result]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--fixture", action="append", choices=FIXTURES, help="default: all three")
-    p.add_argument("--speed", default=8, type=float, help="replay pacing; anything but 1 is unpaced")
+    p.add_argument("--speed", default=8, type=float, help="replay pacing factor: N plays the audio at N x real time (default 8)")
     p.add_argument("--model", help="whisper model; default is [stt].model")
     p.add_argument("--threads", type=int, help="decoder threads")
     p.add_argument("--reuse", action="store_true", help="reuse cached replay output when present")
@@ -254,18 +271,26 @@ def main() -> int:
         report(run_all(True), "SPEC cue table as written")
 
     pipeline = [r.summary for r in results if r.summary]
+    # Final-to-candidate time for candidates emitted on arrival. A line that only clears the bar
+    # once the next final shows it was followed (>= 1.5 s of silence or the candidate answering)
+    # cannot meet a 100 ms budget by definition, so those are counted, not timed.
+    slowest = max((s.get("detect_slowest_us", 0) for s in pipeline), default=0) / 1000.0
+    late = sum(s.get("candidates_late", 0) for s in pipeline)
     if pipeline:
         lines = sum(s.get("lines", 0) for s in pipeline)
-        slowest = max((s.get("detect_slowest_us", 0) for s in pipeline), default=0) / 1000.0
         print(
-            f"\npipeline: {lines} transcript lines, slowest single scoring {slowest:.2f} ms "
-            f"(budget 100 ms)"
+            f"\npipeline: {lines} transcript lines, slowest final-to-candidate {slowest:.2f} ms "
+            f"(budget {LATENCY_BUDGET_MS} ms), {late} candidate(s) emitted once followed"
         )
+    else:
+        print("\npipeline: no replay summary, so latency is unmeasured")
 
-    ok = recall >= 0.85 and precision >= 0.8
+    fast = bool(pipeline) and slowest <= LATENCY_BUDGET_MS
+    ok = recall >= 0.85 and precision >= 0.8 and fast
     print(
-        f"\nM1 targets (recall >= 0.85, precision >= 0.8): "
-        f"{'met' if ok else 'NOT met'} — recall {recall:.2f}, precision {precision:.2f}"
+        f"\nM1 targets (recall >= 0.85, precision >= 0.8, detection <= {LATENCY_BUDGET_MS} ms): "
+        f"{'met' if ok else 'NOT met'} — recall {recall:.2f}, precision {precision:.2f}, "
+        f"slowest {slowest:.2f} ms"
     )
     return 0 if ok or wanted_literal else 1
 

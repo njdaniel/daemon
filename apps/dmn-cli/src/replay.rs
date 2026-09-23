@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use dmn_audio::{AudioSource, FRAME_MS, Source, Speed, WavSource, frame_channel};
 use dmn_core::{Config, Paths};
-use dmn_detect::{Candidate, DetectConfig, Detector, Following, candidate_channel};
+use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog, timestamp};
 use dmn_vad::{VadConfig, VadWorker, WorkerStats, event_channel};
@@ -93,78 +93,109 @@ struct Lane {
 
 /// Runs the detector over the finals as they arrive.
 ///
-/// One final is held back: the SPEC's "followed by >= 1.5 s of silence or a You segment" cue can
-/// only be judged once something follows, and replay is offline, so it waits for the next final
-/// rather than guessing. A live session scores at once with [`Following::UNKNOWN`] and loses that
-/// one point; nothing here changes the detector, only what it is told.
+/// Each interviewer final is scored the moment it arrives with [`Following::UNKNOWN`], exactly as
+/// a live session would, and a line that clears the bar is emitted then; that is the latency the
+/// SPEC's 100 ms budget is about. A line that falls short is held until the next final: the
+/// "followed by >= 1.5 s of silence or a You segment" cue can only be judged once something
+/// follows, and if that point lifts it over the bar it is emitted late. Such a candidate cannot
+/// arrive within 100 ms of its final by definition, so it is counted apart.
 struct Detecting {
     detector: Detector,
-    pending: Option<Segment>,
-    /// Candidates with the time the scorer itself took, for the latency line in the summary.
-    found: Vec<(Candidate, Duration)>,
+    /// An interviewer final that did not clear the bar on its own, with when it arrived.
+    pending: Option<(Segment, Instant)>,
+    found: Vec<Found>,
+}
+
+/// One emitted candidate and how long after its final it came out.
+struct Found {
+    candidate: Candidate,
+    latency: Duration,
+    /// Emitted only once the next final showed the line was followed.
+    late: bool,
 }
 
 impl Detecting {
-    fn new(spec_literal: bool) -> Self {
+    fn new(spec_literal: bool, sensitivity: Sensitivity) -> Self {
         let cfg = if spec_literal {
             DetectConfig::spec_literal()
         } else {
             DetectConfig::default()
         };
         Self {
-            detector: Detector::new(cfg),
+            detector: Detector::new(cfg.with_sensitivity(sensitivity)),
             pending: None,
             found: Vec::new(),
         }
     }
 
     /// Feed one segment; returns the candidates that became decidable because of it.
-    fn feed(&mut self, seg: &Segment) -> Vec<(Candidate, Duration)> {
+    fn feed(&mut self, seg: &Segment) -> Vec<&Found> {
         if !seg.is_final {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        if let Some(prev) = self.pending.take() {
+        let before = self.found.len();
+        if let Some((prev, arrived)) = self.pending.take() {
             let following = Following {
                 silence: Some(seg.start.saturating_sub(prev.end)),
                 next_speaker: Some(seg.source),
             };
-            out.extend(self.score(&prev, following));
+            self.score(&prev, following, arrived, true);
         }
-        if seg.source == Source::Interviewer {
-            self.pending = Some(seg.clone());
+        if seg.source == Source::Interviewer
+            && !self.score(seg, Following::UNKNOWN, Instant::now(), false)
+        {
+            self.pending = Some((seg.clone(), Instant::now()));
         }
-        out
+        self.found[before..].iter().collect()
     }
 
     /// Score whatever is still held after the audio ends.
-    fn flush(&mut self) -> Vec<(Candidate, Duration)> {
-        match self.pending.take() {
-            Some(prev) => self.score(&prev, Following::UNKNOWN),
-            None => Vec::new(),
+    fn flush(&mut self) -> Vec<&Found> {
+        let before = self.found.len();
+        if let Some((prev, arrived)) = self.pending.take() {
+            self.score(&prev, Following::UNKNOWN, arrived, true);
         }
+        self.found[before..].iter().collect()
     }
 
-    fn score(&mut self, seg: &Segment, following: Following) -> Vec<(Candidate, Duration)> {
-        let started = Instant::now();
-        let candidate = self.detector.observe(seg, following);
-        let took = started.elapsed();
-        match candidate {
-            Some(c) => {
-                self.found.push((c.clone(), took));
-                vec![(c, took)]
+    /// Score one line; true when it became a candidate.
+    fn score(&mut self, seg: &Segment, following: Following, arrived: Instant, late: bool) -> bool {
+        match self.detector.observe(seg, following) {
+            Some(candidate) => {
+                self.found.push(Found {
+                    candidate,
+                    latency: arrived.elapsed(),
+                    late,
+                });
+                true
             }
-            None => Vec::new(),
+            None => false,
         }
     }
 
-    /// Slowest single scoring call, for the summary's check against the 100 ms budget.
+    /// Slowest final-to-candidate time among candidates emitted on arrival, for the check
+    /// against the 100 ms budget.
     fn slowest(&self) -> Duration {
         self.found
             .iter()
-            .map(|(_, d)| *d)
+            .filter(|f| !f.late)
+            .map(|f| f.latency)
             .max()
             .unwrap_or(Duration::ZERO)
+    }
+
+    fn late(&self) -> usize {
+        self.found.iter().filter(|f| f.late).count()
+    }
+}
+
+/// `[detect].sensitivity` from the config file, in the detector's own type (dmn-detect does not
+/// depend on dmn-core).
+fn sensitivity(s: dmn_core::config::Sensitivity) -> Sensitivity {
+    match s {
+        dmn_core::config::Sensitivity::Eager => Sensitivity::Eager,
+        dmn_core::config::Sensitivity::Balanced => Sensitivity::Balanced,
+        dmn_core::config::Sensitivity::Strict => Sensitivity::Strict,
     }
 }
 
@@ -263,7 +294,10 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     };
 
     let mut log = TranscriptLog::new();
-    let mut detecting = Detecting::new(args.spec_literal_detector);
+    let mut detecting = Detecting::new(
+        args.spec_literal_detector,
+        sensitivity(cfg.detect.sensitivity),
+    );
     // The detector publishes on its own bounded channel, the one `dmn-session` will subscribe to
     // in #13; here the same loop drains it to print.
     let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
@@ -280,13 +314,13 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
                         println!("{}", seg.render());
                     }
                 }
-                for (candidate, took) in detecting.feed(&seg) {
-                    if candidates_tx.try_send(candidate).is_err() {
+                for found in detecting.feed(&seg) {
+                    // The channel the fast phase will read from (#12); replay drains it at once.
+                    if candidates_tx.try_send(found.candidate.clone()).is_err() {
                         dropped_candidates += 1;
                     }
-                    for c in candidates_rx.try_iter() {
-                        print_candidate(&c, took, args.json);
-                    }
+                    candidates_rx.try_iter().for_each(drop);
+                    print_candidate(found, args.json);
                 }
                 log.apply(seg);
             }
@@ -294,8 +328,8 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             Err(_) => {}
         }
     }
-    for (candidate, took) in detecting.flush() {
-        print_candidate(&candidate, took, args.json);
+    for found in detecting.flush() {
+        print_candidate(found, args.json);
     }
     let (stats, failures) = finisher.join().map_err(|_| "replay thread panicked")?;
     let wall = started.elapsed();
@@ -325,9 +359,11 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     }
     print_summary(&stats, &log, audio, wall, bus.dropped());
     println!(
-        "detector     {} candidate(s), slowest scoring {:?} (budget 100 ms){}",
+        "detector     {} candidate(s), {} on arrival (slowest {:?}, budget 100 ms), {} once followed{}",
         detecting.found.len(),
+        detecting.found.len() - detecting.late(),
         detecting.slowest(),
+        detecting.late(),
         if dropped_candidates > 0 {
             format!(", {dropped_candidates} dropped by a full channel")
         } else {
@@ -356,7 +392,8 @@ fn print_segment_json(seg: &Segment) {
     );
 }
 
-fn print_candidate(c: &Candidate, took: Duration, json: bool) {
+fn print_candidate(found: &Found, json: bool) {
+    let c = &found.candidate;
     if json {
         println!(
             "{}",
@@ -369,11 +406,17 @@ fn print_candidate(c: &Candidate, took: Duration, json: bool) {
                 "line": c.line,
                 "score": c.score,
                 "cues": c.cues.iter().map(|q| q.label()).collect::<Vec<_>>(),
-                "detect_us": took.as_micros() as u64,
+                "detect_us": found.latency.as_micros() as u64,
+                "late": found.late,
             })
         );
     } else {
-        println!("  -> candidate {}", c.render());
+        let when = if found.late {
+            " (after the next final)"
+        } else {
+            ""
+        };
+        println!("  -> candidate {}{when}", c.render());
     }
 }
 
@@ -410,6 +453,7 @@ fn print_summary_json(
             "lines": log.finals().len(),
             "candidates": detecting.found.len(),
             "detect_slowest_us": detecting.slowest().as_micros() as u64,
+            "candidates_late": detecting.late(),
             "audio_s": audio.as_secs_f64(),
             "wall_s": wall.as_secs_f64(),
             "bus_dropped": bus_dropped,
@@ -525,6 +569,19 @@ fn pretty(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_uses_the_configured_sensitivity() {
+        let threshold = |s| {
+            Detecting::new(false, sensitivity(s))
+                .detector
+                .config()
+                .effective_threshold()
+        };
+        assert_eq!(threshold(dmn_core::config::Sensitivity::Eager), 1);
+        assert_eq!(threshold(dmn_core::config::Sensitivity::Balanced), 2);
+        assert_eq!(threshold(dmn_core::config::Sensitivity::Strict), 3);
+    }
 
     #[test]
     fn partials_follow_the_pacing_unless_forced() {

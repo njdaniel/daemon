@@ -46,7 +46,7 @@ impl Cue {
     /// being the interviewer, or speaking for more than six words, says nothing about whether a
     /// question was asked.
     pub fn is_question_form(self) -> bool {
-        matches!(self, Cue::QuestionMark | Cue::QuestionOpener | Cue::HandOff)
+        matches!(self, Cue::QuestionMark | Cue::QuestionOpener)
     }
 }
 
@@ -56,20 +56,24 @@ impl Cue {
 /// Kept to the SPEC's class: wh-words and auxiliaries. Openers like "give me" or "have a" are
 /// deliberately absent — they open requests and pleasantries ("give me a second", "have a good
 /// afternoon"), not interview questions.
-const OPENERS: [&str; 27] = [
+const OPENERS: [&str; 28] = [
     // wh-words
     "how", "what", "why", "when", "which", "who", "whom", "whose", "where",
     // auxiliaries
     "can", "could", "would", "will", "should", "do", "does", "did", "is", "are", "was", "were",
     // imperative openers from the SPEC's list
     "describe", "explain", "imagine", "suppose", "tell", "walk",
+    // "Design a URL shortener": the standard system-design prompt is an imperative
+    "design",
 ];
 
 /// Multi-word openers checked before the single-word list, so "tell me about a time" matches as an
 /// opener but "tell" alone in "I will tell you why" does not open the sentence.
-const OPENER_PHRASES: [&str; 6] = [
+const OPENER_PHRASES: [&str; 7] = [
     "tell me",
     "walk me through",
+    // whisper's usual mishearing of the line above; rare in ordinary speech
+    "work me through",
     "talk me through",
     "let's say",
     "let us say",
@@ -260,7 +264,16 @@ mod tests {
             starts_with_opener("So how would you shard it?"),
             "one marker is skipped"
         );
+        assert!(starts_with_opener(
+            "Design a URL shortener, something like bit.ly."
+        ));
+        assert!(
+            starts_with_opener("Work me through the data model."),
+            "whisper's mishearing of walk me through"
+        );
         assert!(!starts_with_opener("I shipped it on Friday"));
+        assert!(!starts_with_opener("The design review is on Friday."));
+        assert!(!starts_with_opener("I work with the data team."));
         assert!(!starts_with_opener("Give me a second, I'm writing a note."));
         assert!(!starts_with_opener("Have a good rest of your afternoon."));
         assert!(!starts_with_opener(""));
@@ -344,7 +357,10 @@ mod tests {
     fn form_cues_are_the_ones_that_read_as_a_question() {
         assert!(Cue::QuestionMark.is_question_form());
         assert!(Cue::QuestionOpener.is_question_form());
-        assert!(Cue::HandOff.is_question_form());
+        assert!(
+            !Cue::HandOff.is_question_form(),
+            "\"let's switch gears\" introduces a question but is not one"
+        );
         assert!(!Cue::Interviewer.is_question_form());
         assert!(!Cue::Long.is_question_form());
         assert!(!Cue::Followed.is_question_form());

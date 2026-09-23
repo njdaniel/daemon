@@ -19,8 +19,8 @@ pub struct Sentence<'a> {
 /// Abbreviations that end in a period without ending a sentence. Whisper writes few of these, so
 /// the list is short on purpose: a missed split costs a slightly long candidate, a wrong split
 /// costs a truncated question.
-const ABBREVIATIONS: [&str; 10] = [
-    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc", "e.g",
+const ABBREVIATIONS: [&str; 11] = [
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "vs", "etc", "e.g", "i.e",
 ];
 
 /// Split a line into sentences at `.`, `?`, `!` and `…`, keeping the terminator with its sentence.
@@ -30,19 +30,18 @@ const ABBREVIATIONS: [&str; 10] = [
 pub fn split(line: &str) -> Vec<Sentence<'_>> {
     let mut out = Vec::new();
     let mut start = 0;
-    let bytes = line.as_bytes();
     for (i, ch) in line.char_indices() {
         if !matches!(ch, '.' | '?' | '!' | '…') {
             continue;
         }
-        // "3.5" and "p99." style decimals: a period between digits is not a sentence end.
+        // A period with a letter or digit straight after it is inside a token, not at the end of
+        // a sentence: "3.5", "bit.ly", and the first dot of "e.g." (whose second dot the
+        // abbreviation check below then sees as "e.g").
         if ch == '.'
-            && i > 0
-            && bytes[i - 1].is_ascii_digit()
             && line[i + ch.len_utf8()..]
                 .chars()
                 .next()
-                .is_some_and(|c| c.is_ascii_digit())
+                .is_some_and(char::is_alphanumeric)
         {
             continue;
         }
@@ -103,6 +102,21 @@ pub fn words(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dotted_abbreviations_and_domains_do_not_end_a_sentence() {
+        let got: Vec<&str> = split("Use e.g. a queue, i.e. Kafka, like bit.ly does? Next one.")
+            .iter()
+            .map(|s| s.text)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "Use e.g. a queue, i.e. Kafka, like bit.ly does?",
+                "Next one."
+            ]
+        );
+    }
+
     use super::*;
 
     fn texts(line: &str) -> Vec<&str> {

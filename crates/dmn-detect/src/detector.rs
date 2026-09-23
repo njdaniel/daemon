@@ -285,6 +285,16 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_off_alone_is_not_a_question() {
+        let d = Detector::default();
+        let s = seg("Okay, let's switch gears.");
+        assert!(
+            d.observe(&s, Following::speaker(Source::You)).is_none(),
+            "hand-off + interviewer + followed with nothing asked"
+        );
+    }
+
+    #[test]
     fn small_talk_questions_stay_below_the_bar() {
         assert!(detect("Hello? Can you hear me okay?").is_none());
         assert!(detect("How's the weather where you are?").is_none());
