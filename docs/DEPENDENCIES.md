@@ -6,18 +6,18 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | --- | --- | --- |
 | `clap` (derive) | `dmn` | CLI parsing for `run`, `doctor`, `devices`, `sources`, `replay`, `bench` |
 | `thiserror` | all pipeline crates | Error enums per crate; no `unwrap` in pipeline code |
-| `serde` (derive) | `dmn-core`, later every crate with a data type | Config structs, session JSON, LLM schema |
+| `serde` (derive) | `dmn-core`, `dmn-session`, `dmn-store`, `dmn-llm`, later every crate with a data type | Config structs, session JSON, LLM schema |
 | `toml` | `dmn-core` | Parse and write `~/.config/dmn/config.toml` |
 | `directories` | `dmn-core` | XDG config / data / cache / state paths without hand-rolled env logic |
 | `tracing` | all crates | Structured events; the only logging API in the workspace |
 | `tracing-subscriber` (json, env-filter) | `dmn-core`, `dmn-llm` (dev) | JSON lines to the log file; `DMN_LOG` filter. `dmn-llm` tests capture the log to check an ignored candidate is logged with its score |
-| `serde_json` | `dmn-core` (dev), `dmn-cli`, `dmn-llm`, `dmn-vad` (dev), `dmn-stt` (dev) | Assert log lines are JSON; parse Ollama `/api/tags` in `dmn doctor`; LLM request/response bodies; read fixture `turns.json` / `questions.json` in the VAD and pipeline tests |
-| `tempfile` (dev) | `dmn-core`, `dmn-cli`, `dmn-audio` tests | Isolated config / log / WAV directories so tests never touch `~` |
+| `serde_json` | `dmn-core`, `dmn-session` (dev), `dmn-cli`, `dmn-llm`, `dmn-store`, `dmn-vad` (dev), `dmn-stt` (dev) | Assert log lines are JSON; parse Ollama `/api/tags` in `dmn doctor`; LLM request/response bodies; JSONL session export; the fast-phase payload the session writer stores; action-log round trips in the session tests; read fixture `turns.json` / `questions.json` in the VAD and pipeline tests |
+| `tempfile` (dev) | `dmn-core`, `dmn-cli`, `dmn-audio`, `dmn-store` tests | Isolated config / log / WAV / database directories so tests never touch `~` |
 | `hound` | `dmn-audio` | Read fixture / replay WAVs of any rate, channel count and sample format |
 | `rubato` | `dmn-audio` | FFT resampler from the file's rate to 16 kHz; PipeWire resamples live audio itself |
 | `ringbuf` | `dmn-audio` | Lock-free SPSC ring from the capture thread to the VAD thread; the RT callback only pushes |
 | `pipewire` (0.10, official pipewire-rs) | `dmn-audio` | Main loop, registry discovery and, from #5, capture streams with `target.object`; the `Rc` API needs no `unsafe` for discovery |
-| `tokio` (rt-multi-thread, macros, time, sync) | `dmn-llm`, `dmn-cli`, later `dmn-core` | Async runtime for HTTP, SQLite access and UI events; never on the audio path. `dmn replay` runs the fast phase on its own thread with a current-thread runtime |
+| `tokio` (rt-multi-thread, macros, time, sync) | `dmn-llm`, `dmn-cli`, `dmn-core`, `dmn-session` | Async runtime for HTTP, SQLite access and UI events; never on the audio path. `dmn replay` runs the fast phase on its own thread with a current-thread runtime. `dmn-session` uses only `sync` (`watch` for the state, `broadcast` for the action log); `dmn-core`'s store writer drains that broadcast on a plain thread with `blocking_recv` |
 | `tokio-util` | `dmn-llm` | `CancellationToken`: a newer unpinned question cancels the in-flight LLM request |
 | `reqwest` (json, stream; rustls by default) | `dmn-llm` | HTTP client for Ollama, OpenAI-compatible and Anthropic endpoints; streaming bodies |
 | `futures-util` | `dmn-llm` | `BoxStream` / `BoxFuture` so `Provider` is object-safe without a macro crate |
@@ -25,8 +25,9 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `whisper-rs` (=0.16.0, `tracing_backend`; bundles whisper.cpp 1.8.3 via `whisper-rs-sys` 0.15.0) | `dmn-stt` | In-process whisper.cpp inference; pinned exactly because the build compiles C++ from source (SPEC § risks). Features `cuda` / `vulkan` / `openblas` forwarded from `dmn-stt`; CPU by default |
 | `reqwest` feature `blocking` | `dmn-stt` | One-shot model download for `dmn doctor --fetch` without an async runtime; same client crate as `dmn-llm` |
 | `serde_json` feature `preserve_order` (uses `indexmap`, already in the tree via `reqwest`) | `dmn-llm` | Keeps the fast-phase schema's property order. Ollama builds its grammar in that order, so `question` streams before `approach`; with the default sorted map `approach` would come first |
+| `rusqlite` (bundled) | `dmn-store` | SQLite schema + migration runner for sessions, segments, questions, suggestions; bundled SQLite avoids distro version drift (SPEC § Decisions) |
 
-Planned by the spec (add the line when the issue lands): `rusqlite` (#13); `ratatui`, `crossterm` (#14).
+Planned by the spec (add the line when the issue lands): `ratatui`, `crossterm` (#14).
 
 ## Developer tooling (`tools/`, Python)
 

@@ -1,8 +1,8 @@
 //! `dmn`: the Daemon command-line entry point.
 //!
 //! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
-//! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4), `replay` (#9).
-//! Later: `run`, `sources`.
+//! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4), `replay` (#9),
+//! `sessions list|export|purge` (#13). Later: `run`, `sources`.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -42,6 +42,11 @@ enum CliError {
     /// `dmn replay` could not run the pipeline over the given files.
     #[error("{0}")]
     Replay(String),
+    #[error(transparent)]
+    Sessions(#[from] dmn_core::recorder::RecorderError),
+    /// A command-line value clap could not check on its own.
+    #[error("{0}")]
+    Usage(String),
     #[error("{failed} required check(s) failed")]
     ChecksFailed { failed: usize },
 }
@@ -101,6 +106,11 @@ enum Command {
     },
     /// List PipeWire capture sources and application output streams
     Devices,
+    /// List, export or purge stored sessions
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
     /// Run two fixture WAVs through the real pipeline and print labelled transcript segments
     Replay {
         /// The interviewer's audio
@@ -133,6 +143,27 @@ enum Command {
         /// question + approach JSON is printed
         #[arg(long)]
         no_llm: bool,
+        /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite. By
+        /// default a replay writes the same session log a live call would
+        #[arg(long)]
+        no_store: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionsAction {
+    /// List stored sessions: id, start time, label, row counts
+    List,
+    /// Write one session as JSON Lines to ~/.local/share/dmn/sessions/<id>.jsonl
+    Export {
+        /// Session id (from `dmn sessions list`)
+        id: i64,
+    },
+    /// Delete sessions: their rows, their files under sessions/, and the free pages that held
+    /// them
+    Purge {
+        /// A session id, or `all`
+        target: String,
     },
 }
 
@@ -214,6 +245,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             json,
             spec_literal_detector,
             no_llm,
+            no_store,
         }) => {
             let cfg = Config::load(&paths.config_file)?;
             // As with bench above, the module keeps its boxed error and it is mapped here.
@@ -231,10 +263,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     json,
                     spec_literal_detector,
                     no_llm,
+                    no_store,
                 },
             )
             .map_err(|e| CliError::Replay(e.to_string()))
         }
+        Some(Command::Sessions { action }) => sessions(&paths, action),
         Some(Command::Config {
             action: ConfigAction::Show,
         }) => {
@@ -303,4 +337,74 @@ fn fetch_model(paths: &Paths, name: &str) -> Result<(), CliError> {
     tracing::info!(path = %path.display(), bytes = len, "whisper model ready");
     println!("model:    {} ({len} bytes)", path.display());
     Ok(())
+}
+
+/// `dmn sessions ...` (#13).
+fn sessions(paths: &Paths, action: SessionsAction) -> Result<(), CliError> {
+    use dmn_core::recorder::{self, PurgeTarget};
+    match action {
+        SessionsAction::List => {
+            if !paths.db_file.is_file() {
+                println!(
+                    "no sessions yet ({} does not exist)",
+                    paths.db_file.display()
+                );
+                return Ok(());
+            }
+            let store = recorder::open_store(paths)?;
+            let err = |source| recorder::RecorderError::Store {
+                path: paths.db_file.clone(),
+                source,
+            };
+            let ids = store.session_ids().map_err(err)?;
+            if ids.is_empty() {
+                println!("no sessions");
+            }
+            for id in ids {
+                let Some(s) = store.session(id).map_err(err)? else {
+                    continue;
+                };
+                let segments = store.segments(id).map_err(err)?.len();
+                let questions = store.questions(id).map_err(err)?;
+                let answered = questions.iter().filter(|q| q.text.is_some()).count();
+                println!(
+                    "#{id:<4} started {} ({} s){}  {segments} segments, {} questions ({answered} answered)  {}",
+                    s.started_at,
+                    s.ended_at.map_or(0, |e| e - s.started_at),
+                    if s.ended_at.is_none() { " open" } else { "" },
+                    questions.len(),
+                    s.label
+                );
+            }
+            Ok(())
+        }
+        SessionsAction::Export { id } => {
+            let (path, lines) = recorder::export(paths, id)?;
+            println!("wrote {lines} line(s) to {}", path.display());
+            Ok(())
+        }
+        SessionsAction::Purge { target } => {
+            let target = if target == "all" {
+                PurgeTarget::All
+            } else {
+                PurgeTarget::One(target.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "sessions purge: expected a session id or `all`, not {target:?}"
+                    ))
+                })?)
+            };
+            let report = recorder::purge(paths, target)?;
+            tracing::info!(
+                sessions = report.sessions.len(),
+                files = report.files.len(),
+                "sessions purge"
+            );
+            println!(
+                "purged {} session(s) and {} file(s)",
+                report.sessions.len(),
+                report.files.len()
+            );
+            Ok(())
+        }
+    }
 }

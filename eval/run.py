@@ -142,8 +142,10 @@ def replay(fixture: str, cache: Path, args) -> list[dict]:
         str(REPO / "testdata" / fixture / "interviewer.wav"),
         str(REPO / "testdata" / fixture / "candidate.wav"),
         "--json",
-        # The eval scores the detector; the LLM fast phase would only add wall time.
+        # The eval scores the detector; the LLM fast phase would only add wall time, and the
+        # session log would add three sessions to the user's history on every run.
         "--no-llm",
+        "--no-store",
         "--speed",
         str(args.speed),
     ]

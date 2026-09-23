@@ -8,8 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dmn_audio::{AudioSource, FRAME_MS, Source, Speed, WavSource, frame_channel};
-use dmn_core::{Config, Paths};
+use dmn_core::recorder::{Recorder, WriterReport, open_store};
+use dmn_core::{Config, Paths, wire};
 use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
+use dmn_session::Action;
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog, timestamp};
 use dmn_vad::{VadConfig, VadWorker, WorkerStats, event_channel};
@@ -60,6 +62,9 @@ pub struct Args {
     pub spec_literal_detector: bool,
     /// Skip the LLM fast phase (#12): transcribe and detect only.
     pub no_llm: bool,
+    /// Keep the session in memory only: write nothing to `dmn.sqlite` (#13). The eval harness
+    /// uses it so measuring the detector does not add sessions to the user's history.
+    pub no_store: bool,
 }
 
 /// Whether to transcribe the 1 s partials of an open utterance.
@@ -216,6 +221,12 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     if !args.speed.is_finite() || args.speed <= 0.0 {
         return Err(format!("--speed must be a positive number, not {}", args.speed).into());
     }
+    // #13: the session log. Opened before any audio moves so a bad database fails at once.
+    let store = if args.no_store {
+        None
+    } else {
+        Some(open_store(paths)?)
+    };
     let stt_cfg = SttConfig {
         threads: args.threads.unwrap_or(usize::from(cfg.stt.threads)),
         ..SttConfig::default()
@@ -297,6 +308,22 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         })
     };
 
+    // The same session hub + store writer a live call starts (dmn-core's `Recorder`), fed the
+    // same actions: every segment from the bus, every candidate, every fast-phase field.
+    let recorder = Recorder::start(store, (!args.no_store).then_some(paths.db_file.as_path()));
+    let hub = recorder.hub();
+    // Session time runs at the replay speed, so every stored time lines up with the audio the
+    // way it would on the call itself.
+    let clock = wire::SessionClock::start(f64::from(args.speed));
+    hub.dispatch(Action::Started {
+        label: format!(
+            "replay {} + {}",
+            args.interviewer.display(),
+            args.candidate.display()
+        ),
+        at: clock.started_at(),
+    });
+    let mut next_candidate = 0u64;
     let mut log = TranscriptLog::new();
     let mut detecting = Detecting::new(
         args.spec_literal_detector,
@@ -307,11 +334,13 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
     // #12: each candidate goes through the LLM fast phase on its own thread, which prints the
     // question + approach JSON when it is ready.
-    let suggester = (!args.no_llm).then(|| Suggester::start(&cfg.llm, args.json));
+    let suggester = (!args.no_llm)
+        .then(|| Suggester::start(&cfg.llm, args.json, std::sync::Arc::clone(&hub), clock));
     let mut dropped_candidates = 0u64;
     loop {
         match segments.recv_timeout(Duration::from_millis(50)) {
             Ok(seg) => {
+                hub.dispatch(wire::segment(&seg));
                 // An empty final is dmn-stt saying "this utterance was dropped"; it closes the
                 // partial in the log and has nothing to print.
                 if !seg.text.is_empty() {
@@ -329,8 +358,14 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
                 }
                 // The detector's channel feeds the fast phase, with the last 60 s of transcript.
                 for candidate in candidates_rx.try_iter() {
+                    next_candidate += 1;
+                    hub.dispatch(wire::candidate(next_candidate, &candidate));
                     if let Some(s) = &suggester {
-                        s.submit(&candidate, log.render_window(DEFAULT_WINDOW));
+                        s.submit(
+                            next_candidate,
+                            &candidate,
+                            log.render_window(DEFAULT_WINDOW),
+                        );
                     }
                 }
                 log.apply(seg);
@@ -341,17 +376,34 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     }
     for found in detecting.flush() {
         print_candidate(found, args.json);
+        next_candidate += 1;
+        hub.dispatch(wire::candidate(next_candidate, &found.candidate));
         if let Some(s) = &suggester {
-            s.submit(&found.candidate, log.render_window(DEFAULT_WINDOW));
+            s.submit(
+                next_candidate,
+                &found.candidate,
+                log.render_window(DEFAULT_WINDOW),
+            );
         }
     }
     let (stats, failures) = finisher.join().map_err(|_| "replay thread panicked")?;
     let wall = started.elapsed();
     // Answer whatever is still queued; the transcript is complete by now.
     let tally = suggester.map(Suggester::finish);
+    // Every other holder of the hub is gone now; ending the session lets the writer finish.
+    drop(hub);
+    let session = recorder.finish(clock.now())?;
 
     if args.json {
-        print_summary_json(&stats, &log, &detecting, audio, wall, bus.dropped(), tally);
+        print_summary_json(
+            &stats,
+            &log,
+            &detecting,
+            audio,
+            wall,
+            bus.dropped(),
+            Downstream { tally, session },
+        );
         if !failures.is_empty() {
             return Err(failures.join("; ").into());
         }
@@ -392,6 +444,23 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             t.shown, t.clarifications, t.ignored, t.failed, t.skipped
         ),
         None => println!("fast phase   off (--no-llm)"),
+    }
+    match session {
+        Some(r) => println!(
+            "session log  #{} in {}: {} segment(s), {} question(s), {} suggestion(s){}",
+            r.session_id
+                .map_or_else(|| "?".to_string(), |id| id.to_string()),
+            paths.db_file.display(),
+            r.segments,
+            r.questions,
+            r.suggestions,
+            if r.errors + r.lagged > 0 {
+                format!(", {} not stored, {} lost", r.errors, r.lagged)
+            } else {
+                String::new()
+            }
+        ),
+        None => println!("session log  off (--no-store)"),
     }
     if !failures.is_empty() {
         return Err(failures.join("; ").into());
@@ -443,6 +512,12 @@ fn print_candidate(found: &Found, json: bool) {
     }
 }
 
+/// What the stages after the detector did: the fast phase and the session writer.
+struct Downstream {
+    tally: Option<Tally>,
+    session: Option<WriterReport>,
+}
+
 fn print_summary_json(
     stats: &[(Source, WorkerStats, SttStats)],
     log: &TranscriptLog,
@@ -450,8 +525,9 @@ fn print_summary_json(
     audio: Duration,
     wall: Duration,
     bus_dropped: u64,
-    tally: Option<Tally>,
+    downstream: Downstream,
 ) {
+    let Downstream { tally, session } = downstream;
     let lanes: Vec<serde_json::Value> = stats
         .iter()
         .map(|(source, vad, stt)| {
@@ -487,6 +563,14 @@ fn print_summary_json(
                 "ignored": t.ignored,
                 "failed": t.failed,
                 "skipped": t.skipped,
+            })),
+            "session": session.map(|r| serde_json::json!({
+                "id": r.session_id,
+                "segments": r.segments,
+                "questions": r.questions,
+                "suggestions": r.suggestions,
+                "errors": r.errors,
+                "lagged": r.lagged,
             })),
         })
     );
