@@ -5,7 +5,7 @@ Rust Linux interview copilot. M1–M2 is a ratatui TUI; M3 adds a Tauri 2 window
 - Check fast: `just check` (`cargo check --workspace --all-targets`) — run this after every edit
 - Test: `just test` (`cargo test --workspace`)
 - Lint: `just lint` (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`)
-- Build: `just build` (`cargo build --release -p dmn`; M3 adds `cargo tauri build`)
+- Build: `just build` (`cargo build --release -p dmn-cli`, binary `dmn`; M3 adds `cargo tauri build`)
 - Replay a fixture: `cargo run -p dmn-cli -- replay testdata/sysdesign/interviewer.wav testdata/sysdesign/candidate.wav`
 - Eval: `just eval` (python3 eval/run.py; prints recall/precision/latency)
 - Process: `just agent <n|next>` runs an issue headlessly on branch `issue/<n>-<slug>` and opens a PR; `just review <pr>` reviews it; `just issues-push` mirrors docs/issues/ to GitHub

@@ -76,10 +76,10 @@ These are enforced rules from `CLAUDE.md` / `docs/PROCESS.md`, not preferences:
 
 ## Testing instructions
 
-- Tests use the `testdata/` fixture WAVs and `MockProvider`, **never a microphone or live network**. CI has no PipeWire server, no Ollama, and no whisper models.
-- Anything needing a live PipeWire server goes behind `#[ignore]` and runs via `just probe` on a dev machine.
+- The default suite (`just test`, CI) uses the `testdata/` fixture WAVs and `MockProvider`, **never a microphone or live network**. CI has no PipeWire server, no Ollama, and no whisper models.
+- Anything needing a live service (PipeWire, or Ollama at `localhost:11434`) or a downloaded whisper model goes behind `#[ignore]` and runs via `just probe` on a dev machine, so `just probe` needs those running.
 - Fixture WAVs (~20 MB each) are not in git. Get them with `just fixtures-fetch` (release download, sha256-checked; CI caches this) or regenerate with `just fixtures`. `questions.json` / `turns.json` in each fixture directory are the eval ground truth and are checked in.
-- Whisper-dependent tests use the tiny/base models where needed; nothing downloads at test time in CI.
+- The whisper pipeline tests (`crates/dmn-stt/tests/pipeline.rs`, ignored) need `small.en` (`dmn doctor --fetch small.en`); nothing downloads at test time in CI.
 - Concurrency/pipeline tests drive stages from WAVs via `WavSource` at controlled speeds (`dmn replay --speed N` paces delivery).
 - CI (`.github/workflows/ci.yml`, ubuntu-24.04): fmt check → check → clippy `-D warnings` → test → `dmn --version`; `dmn doctor` runs informational-only. The whisper.cpp C++ build and fixtures are cached.
 
@@ -104,5 +104,5 @@ These are enforced rules from `CLAUDE.md` / `docs/PROCESS.md`, not preferences:
 
 - Local-first by design: audio buffers stay in memory; with `provider = "ollama"` (the default) nothing leaves the machine. Remote providers are opt-in via `[llm].provider`, and only the transcript window, retrieved chunks and summary are sent.
 - API keys are read from the environment variable named in `api_key_env` at start; the key itself is never written to config, logs or the database.
-- No accounts, telemetry, or update checks. `dmn sessions purge <id|all>` deletes local data.
+- No accounts, telemetry, or update checks. `dmn sessions purge <id|all>` (planned, arrives with #13) will delete local data.
 - Do not touch anything under `~/.config/dmn/` during agent runs.
