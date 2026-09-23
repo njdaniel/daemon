@@ -429,6 +429,7 @@ dependencies = [
  "dmn-core",
  "dmn-detect",
  "dmn-llm",
+ "dmn-session",
  "dmn-stt",
  "dmn-transcript",
  "dmn-vad",
