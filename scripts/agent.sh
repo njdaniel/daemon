@@ -59,8 +59,10 @@ base="Read,Glob,Grep,Edit,Write,Bash(just check),Bash(just test),Bash(just lint)
 [ "$size" = "L" ] && base="$base,Bash(cargo run -p dmn-cli -- replay*),Bash(cargo run -p dmn-cli -- doctor*),Bash(cargo run -p dmn-cli -- devices*),Bash(just probe),Bash(just replay*)"
 disallowed="Bash(git push --force*),Bash(git push -f*),Bash(gh pr merge*),Bash(rm -rf*),WebFetch,WebSearch"
 
-turns_flag=()
-if claude --help 2>/dev/null | grep -q -- "--max-turns" && [[ "$turns" =~ ^[0-9]+ ]]; then turns_flag=(--max-turns "${turns%% *}"); fi
+# The turn cap is the only run limit. `claude --help` does not list --max-turns, but -p accepts it
+# (checked on 2.1.280, which rejects unknown flags), so pass it unconditionally.
+[[ "$turns" =~ ^[0-9]+$ ]] || die "turn cap '$turns' for size $size is not a number"
+turns_flag=(--max-turns "$turns")
 
 prompt="$(kickoff "$n" "$labels" "$turns")
 

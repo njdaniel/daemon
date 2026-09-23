@@ -24,7 +24,11 @@ size_row() {
   row=$(grep -E "^\| $1 \|" "$PROCESS" | head -1) || true
   [ -n "$row" ] || die "size $1 not in $PROCESS"
   # columns: | Size | Fits when | Model | Max turns | Reviewed by |
-  echo "$row" | awk -F'|' '{gsub(/^ +| +$/,"",$4); gsub(/^ +| +$/,"",$5); gsub(/^ +| +$/,"",$6); print $4, $5, $6}'
+  local out
+  out=$(echo "$row" | awk -F'|' '{gsub(/^ +| +$/,"",$4); gsub(/^ +| +$/,"",$5); gsub(/^ +| +$/,"",$6); print $4, $5, $6}')
+  # agent.sh passes the turns field to --max-turns, so it must be a bare number
+  [[ "$(awk '{print $2}' <<<"$out")" =~ ^[0-9]+$ ]] || die "size $1: Max turns in $PROCESS is not a number: $out"
+  echo "$out"
 }
 
 # label <json> <prefix> -> value after prefix, or empty

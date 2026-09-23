@@ -12,10 +12,10 @@ An issue gets exactly one size. The size sets the model, the turn cap and the re
 | --- | --- | --- | --- | --- |
 | S | One file or module, known crates, no threads, no FFI, tests trivial or already present | Sonnet | 30 | Opus |
 | M | One crate of pure Rust with new tests on fixtures, or one async client | Opus | 45 | Opus, fresh session |
-| L | FFI, `unsafe`, real-time or threading constraints, or one unfamiliar C-backed API | Fable | 60, two runs planned | Fable |
+| L | FFI, `unsafe`, real-time or threading constraints, or one unfamiliar C-backed API | Fable | 60 | Fable |
 | XL | Anything larger | not allowed — split it | — | — |
 
-Runs are capped by turns, not dollars: agent usage comes from subscriptions, so there is no per-run API budget to enforce.
+Runs are capped by turns, not dollars: agent usage comes from subscriptions, so there is no per-run API budget to enforce. The Max turns cell must stay a bare number because `agent.sh` passes it to `--max-turns`; an L issue plans for two runs of 60 turns each.
 
 ## 2. Breaking work down
 
