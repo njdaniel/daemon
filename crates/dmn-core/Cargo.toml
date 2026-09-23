@@ -13,10 +13,17 @@ toml = { workspace = true }
 directories = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+dmn-audio = { path = "../dmn-audio" }
+dmn-detect = { path = "../dmn-detect" }
+dmn-llm = { path = "../dmn-llm" }
+dmn-session = { path = "../dmn-session" }
+dmn-store = { path = "../dmn-store" }
+dmn-transcript = { path = "../dmn-transcript" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

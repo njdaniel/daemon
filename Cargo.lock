@@ -451,10 +451,17 @@ name = "dmn-core"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "dmn-audio",
+ "dmn-detect",
+ "dmn-llm",
+ "dmn-session",
+ "dmn-store",
+ "dmn-transcript",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
