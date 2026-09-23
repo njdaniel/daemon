@@ -132,7 +132,7 @@ STT runs per utterance, not per fixed chunk: the VAD closes an utterance after 7
 
 **STT worker**
 
-- Input: 16 kHz mono f32; `whisper-rs` `FullParams` with `SamplingStrategy::Greedy`, `language=Some("en")`, `no_context=false`, `single_segment=true`, `temperature=0`, `suppress_blank=true`, `n_threads` from config.
+- Input: 16 kHz mono f32; `whisper-rs` `FullParams` with `SamplingStrategy::Greedy`, `language=Some("en")`, `no_context=true`, `single_segment=true`, `temperature=0`, `suppress_blank=true`, `n_threads` from config. The previous final goes in explicitly as prompt tokens; `no_context=true` stops whisper.cpp also prepending its own last decode, which is usually a partial of the same utterance and made the final drop the words that partial covered (#39).
 - Sliding window for partials: the last 8 s of the open utterance, re-run every 1 s; the final pass replaces all partials for that utterance.
 - Output: `Segment { source, start, end, text, is_final, avg_logprob }`. Segments with `avg_logprob < -1.0`, or fewer than 3 words that match whisper's known hallucination phrases ("Thank you.", "Thanks for watching."), are dropped.
 - Model files live in `~/.cache/dmn/models/`; `dmn doctor --fetch small.en` downloads. Default `small.en`; `dmn bench` measures real-time factor on the target machine at M0 and records it in `doctor` output. GPU: build with `--features vulkan` (or `cuda`) and the same code path applies.

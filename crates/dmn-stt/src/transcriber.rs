@@ -1,4 +1,5 @@
-//! One whisper model + one inference state. SPEC § STT worker fixes the decode parameters.
+//! One whisper model + one inference state. SPEC § STT worker fixes the decode parameters,
+//! including `no_context=true` (#39): see the comment at `set_no_context`.
 
 use std::ffi::c_int;
 use std::path::Path;
