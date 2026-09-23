@@ -1,7 +1,7 @@
 //! Pipeline values → session [`Action`]s. The only place that knows both sides: `dmn-session`
 //! depends on no pipeline crate, and no pipeline crate depends on `dmn-session`.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dmn_detect::Candidate;
 use dmn_llm::{FastEvent, FastOutcome, LlmError};
@@ -15,6 +15,44 @@ pub fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Session time in unix epoch seconds, advancing at the pace the audio is delivered.
+///
+/// A live call runs at 1×, so this is the wall clock. `dmn replay --speed N` delivers N seconds
+/// of audio per second, so its clock runs N× from the session start: a suggestion stamped by it
+/// lands just after its question (whose `created_at` is the session start plus the question's
+/// offset into the audio), and the session ends at start + audio length, as the call did.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionClock {
+    started_at: i64,
+    started: Instant,
+    speed: f64,
+}
+
+impl SessionClock {
+    /// Start now, at `speed` × wall clock (1.0 for a live call).
+    pub fn start(speed: f64) -> Self {
+        Self {
+            started_at: unix_now(),
+            started: Instant::now(),
+            speed: if speed.is_finite() && speed > 0.0 {
+                speed
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// The session start, for [`Action::Started`].
+    pub fn started_at(&self) -> i64 {
+        self.started_at
+    }
+
+    /// Session time now.
+    pub fn now(&self) -> i64 {
+        self.started_at + (self.started.elapsed().as_secs_f64() * self.speed).floor() as i64
+    }
 }
 
 pub fn speaker(source: dmn_audio::Source) -> Speaker {
@@ -112,5 +150,23 @@ pub fn outcome(id: u64, result: &Result<FastOutcome, LlmError>, at: i64) -> Acti
             candidate: id,
             error: e.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_session_clock_runs_at_the_replay_speed() {
+        let clock = SessionClock::start(3600.0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let ahead = clock.now() - clock.started_at();
+        // 20 ms at 3600× is 72 s of session time; allow for a slow scheduler.
+        assert!((72..=3600).contains(&ahead), "{ahead}");
+
+        let live = SessionClock::start(1.0);
+        assert!((live.now() - unix_now()).abs() <= 1, "1× is the wall clock");
+        assert_eq!(SessionClock::start(f64::NAN).speed, 1.0);
     }
 }

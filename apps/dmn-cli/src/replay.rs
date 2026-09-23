@@ -312,13 +312,16 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     // same actions: every segment from the bus, every candidate, every fast-phase field.
     let recorder = Recorder::start(store, (!args.no_store).then_some(paths.db_file.as_path()));
     let hub = recorder.hub();
+    // Session time runs at the replay speed, so every stored time lines up with the audio the
+    // way it would on the call itself.
+    let clock = wire::SessionClock::start(f64::from(args.speed));
     hub.dispatch(Action::Started {
         label: format!(
             "replay {} + {}",
             args.interviewer.display(),
             args.candidate.display()
         ),
-        at: wire::unix_now(),
+        at: clock.started_at(),
     });
     let mut next_candidate = 0u64;
     let mut log = TranscriptLog::new();
@@ -331,8 +334,8 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
     // #12: each candidate goes through the LLM fast phase on its own thread, which prints the
     // question + approach JSON when it is ready.
-    let suggester =
-        (!args.no_llm).then(|| Suggester::start(&cfg.llm, args.json, std::sync::Arc::clone(&hub)));
+    let suggester = (!args.no_llm)
+        .then(|| Suggester::start(&cfg.llm, args.json, std::sync::Arc::clone(&hub), clock));
     let mut dropped_candidates = 0u64;
     loop {
         match segments.recv_timeout(Duration::from_millis(50)) {
@@ -389,7 +392,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     let tally = suggester.map(Suggester::finish);
     // Every other holder of the hub is gone now; ending the session lets the writer finish.
     drop(hub);
-    let session = recorder.finish(wire::unix_now())?;
+    let session = recorder.finish(clock.now())?;
 
     if args.json {
         print_summary_json(

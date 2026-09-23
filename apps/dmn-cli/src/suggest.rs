@@ -52,10 +52,16 @@ pub struct Suggester {
 }
 
 impl Suggester {
-    pub fn start(llm: &config::Llm, json: bool, hub: Arc<SessionHub>) -> Self {
+    /// `clock` stamps each outcome in session time (`--speed` × wall clock).
+    pub fn start(
+        llm: &config::Llm,
+        json: bool,
+        hub: Arc<SessionHub>,
+        clock: wire::SessionClock,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let llm = llm.clone();
-        let handle = std::thread::spawn(move || worker(&llm, json, &rx, &hub));
+        let handle = std::thread::spawn(move || worker(&llm, json, &rx, &hub, clock));
         Self { tx, handle }
     }
 
@@ -81,7 +87,13 @@ fn warn(msg: &str) {
     eprintln!("replay: {msg}");
 }
 
-fn worker(llm: &config::Llm, json: bool, rx: &mpsc::Receiver<Job>, hub: &SessionHub) -> Tally {
+fn worker(
+    llm: &config::Llm,
+    json: bool,
+    rx: &mpsc::Receiver<Job>,
+    hub: &SessionHub,
+    clock: wire::SessionClock,
+) -> Tally {
     let mut tally = Tally::default();
     let model_down = |why: String| {
         hub.dispatch(Action::Status {
@@ -170,7 +182,7 @@ fn worker(llm: &config::Llm, json: bool, rx: &mpsc::Receiver<Job>, hub: &Session
                 hub.dispatch(wire::fast_event(job.id, &e));
             },
         ));
-        hub.dispatch(wire::outcome(job.id, &result, wire::unix_now()));
+        hub.dispatch(wire::outcome(job.id, &result, clock.now()));
         let timing = Timing {
             question: question_at,
             first_line: first_line_at,
@@ -370,7 +382,7 @@ mod tests {
             ..config::Llm::default()
         };
         let hub = Arc::new(SessionHub::default());
-        let s = Suggester::start(&llm, true, Arc::clone(&hub));
+        let s = Suggester::start(&llm, true, Arc::clone(&hub), wire::SessionClock::start(1.0));
         s.submit(1, &candidate(), String::new());
         s.submit(2, &candidate(), String::new());
         let tally = s.finish();
@@ -388,7 +400,12 @@ mod tests {
             provider: config::Provider::Anthropic,
             ..config::Llm::default()
         };
-        let s = Suggester::start(&llm, false, Arc::new(SessionHub::default()));
+        let s = Suggester::start(
+            &llm,
+            false,
+            Arc::new(SessionHub::default()),
+            wire::SessionClock::start(1.0),
+        );
         s.submit(1, &candidate(), String::new());
         assert_eq!(
             s.finish(),
