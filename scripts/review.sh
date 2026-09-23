@@ -76,7 +76,7 @@ prompt="You are reviewing PR #$pr for issue #$n of the Daemon repo. $ro
 
 List every acceptance criterion from the issue and state whether the diff meets it, with evidence from the diff.
 List blocking findings: correctness, safety (unsafe, RT callback rules, audio on disk), spec violations.
-$( [ "$copilot" = 1 ] && printf '%s' "GitHub Copilot has reviewed this PR; its $copilot_n inline findings (C1..C$copilot_n) are at the end of this prompt. For EACH one, give a verdict with evidence from the diff: VALID (still present at the PR head), FIXED (the head no longer has it), or FALSE (Copilot is wrong; say why). A VALID finding about correctness, safety or a CLAUDE.md / SPEC rule is a blocking finding and must be counted below; a VALID low-impact nit may be listed as non-blocking with a reason. Then add one line: COPILOT: <valid> valid, <fixed> fixed, <false> false." )
+$( [ "$copilot" = 1 ] && printf '%s' "GitHub Copilot has reviewed this PR; its $copilot_n inline findings (C1..C$copilot_n) are at the end of this prompt. For EACH one, give a verdict with evidence from the diff: VALID (still present at the PR head), FIXED (the head no longer has it), or FALSE (Copilot is wrong; say why). A VALID finding about correctness, safety or a CLAUDE.md / SPEC rule is a blocking finding and must be counted below; a VALID low-impact nit may be listed as non-blocking with a reason. Then add one line: COPILOT: <valid> valid, <fixed> fixed, <false> false." || true )
 Do not restyle, do not suggest scope beyond the issue.
 End with exactly one line: BLOCKING: <n> findings.
 
@@ -95,7 +95,7 @@ $(cat "$ROOT/docs/SPEC.md")
 ---
 # Diff
 $diff
-$( [ "$copilot" = 1 ] && printf '\n---\n# GitHub Copilot review of this PR\n\n%s' "$copilot_md" )"
+$( [ "$copilot" = 1 ] && printf '\n---\n# GitHub Copilot review of this PR\n\n%s' "$copilot_md" || true )"
 
 if [ "$prompt_only" = 1 ]; then printf '%s\n' "$prompt"; exit 0; fi
 
