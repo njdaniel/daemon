@@ -21,11 +21,13 @@ clap = { workspace = true }
 dmn-audio = { path = "../../crates/dmn-audio" }
 dmn-core = { path = "../../crates/dmn-core" }
 dmn-detect = { path = "../../crates/dmn-detect" }
+dmn-llm = { path = "../../crates/dmn-llm" }
 dmn-stt = { path = "../../crates/dmn-stt" }
 dmn-transcript = { path = "../../crates/dmn-transcript" }
 dmn-vad = { path = "../../crates/dmn-vad" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
