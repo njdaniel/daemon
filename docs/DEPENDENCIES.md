@@ -21,7 +21,7 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `tokio-util` | `dmn-llm` | `CancellationToken`: a newer unpinned question cancels the in-flight LLM request |
 | `reqwest` (json, stream; rustls by default) | `dmn-llm` | HTTP client for Ollama, OpenAI-compatible and Anthropic endpoints; streaming bodies |
 | `futures-util` | `dmn-llm` | `BoxStream` / `BoxFuture` so `Provider` is object-safe without a macro crate |
-| `crossbeam-channel` | `dmn-vad`, `dmn-stt`, `dmn-transcript` | Bounded channel from each VAD thread to its STT worker, and the transcript bus's per-subscriber queue; `try_send` lets the sender count and drop instead of blocking when a consumer stalls |
+| `crossbeam-channel` | `dmn-vad`, `dmn-stt`, `dmn-transcript`, `dmn-detect` | Bounded channel from each VAD thread to its STT worker, the transcript bus's per-subscriber queue, and the detector's candidate channel to the fast phase; `try_send` lets the sender count and drop instead of blocking when a consumer stalls |
 | `whisper-rs` (=0.16.0, `tracing_backend`; bundles whisper.cpp 1.8.3 via `whisper-rs-sys` 0.15.0) | `dmn-stt` | In-process whisper.cpp inference; pinned exactly because the build compiles C++ from source (SPEC § risks). Features `cuda` / `vulkan` / `openblas` forwarded from `dmn-stt`; CPU by default |
 | `reqwest` feature `blocking` | `dmn-stt` | One-shot model download for `dmn doctor --fetch` without an async runtime; same client crate as `dmn-llm` |
 

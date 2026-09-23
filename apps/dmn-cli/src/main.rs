@@ -121,6 +121,13 @@ enum Command {
         /// Print the merged transcript and the last 60 s window at the end
         #[arg(long)]
         transcript: bool,
+        /// Print one JSON object per line (segments, candidates, summary) for eval/run.py
+        #[arg(long, conflicts_with = "transcript")]
+        json: bool,
+        /// Score questions with the SPEC's cue table exactly as written: no question-form gate
+        /// and no vetoes on rhetorical tags or small talk
+        #[arg(long)]
+        spec_literal_detector: bool,
     },
 }
 
@@ -199,6 +206,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             threads,
             partials,
             transcript,
+            json,
+            spec_literal_detector,
         }) => {
             let cfg = Config::load(&paths.config_file)?;
             // As with bench above, the module keeps its boxed error and it is mapped here.
@@ -213,6 +222,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     threads,
                     partials,
                     transcript,
+                    json,
+                    spec_literal_detector,
                 },
             )
             .map_err(|e| CliError::Replay(e.to_string()))
