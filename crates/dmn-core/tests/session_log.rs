@@ -330,3 +330,68 @@ async fn purge_removes_rows_and_files() {
         "purged text is gone from the file, free pages included"
     );
 }
+
+#[test]
+fn purge_all_leaves_files_that_are_not_a_sessions_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    std::fs::create_dir_all(&paths.sessions_dir).unwrap();
+    for name in [
+        "7.jsonl",
+        "7-you.wav",
+        "notes.txt",
+        "70s-playlist.m3u",
+        "README",
+    ] {
+        std::fs::write(paths.sessions_dir.join(name), b"x").unwrap();
+    }
+    // No database at all: the rows are long gone, the files are not.
+    let one = recorder::purge(&paths, PurgeTarget::One(7)).unwrap();
+    assert_eq!(one.files.len(), 2);
+    assert!(one.sessions.is_empty());
+    std::fs::write(paths.sessions_dir.join("8.jsonl"), b"x").unwrap();
+    let all = recorder::purge(&paths, PurgeTarget::All).unwrap();
+    assert_eq!(all.files, [paths.sessions_dir.join("8.jsonl")]);
+    let mut left: Vec<String> = std::fs::read_dir(&paths.sessions_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["70s-playlist.m3u", "README", "notes.txt"]);
+}
+
+#[tokio::test]
+async fn a_failed_file_delete_leaves_the_rows_so_a_retry_finishes_the_purge() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    drive(&rec, &Config::default()).await;
+    let id = rec
+        .finish(1_700_000_600)
+        .unwrap()
+        .unwrap()
+        .session_id
+        .unwrap();
+    let (export, _) = recorder::export(&paths, id).unwrap();
+
+    // A read-only directory makes deleting the export fail.
+    let mode = |m| std::fs::Permissions::from_mode(m);
+    std::fs::set_permissions(&paths.sessions_dir, mode(0o555)).unwrap();
+    let first = recorder::purge(&paths, PurgeTarget::One(id));
+    std::fs::set_permissions(&paths.sessions_dir, mode(0o755)).unwrap();
+    if first.is_ok() {
+        // Running as root: permissions do not stop the delete, so there is nothing to retry.
+        return;
+    }
+    assert!(export.is_file(), "the file is still there");
+    assert_eq!(
+        open_store(&paths).unwrap().session_ids().unwrap(),
+        [id],
+        "and so are the rows"
+    );
+    let retry = recorder::purge(&paths, PurgeTarget::One(id)).unwrap();
+    assert_eq!(retry.sessions, [id]);
+    assert_eq!(retry.files, [export]);
+}

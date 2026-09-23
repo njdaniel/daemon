@@ -101,7 +101,17 @@ fn worker(
             health: Health::Error(why),
         });
     };
-    let skip_all = |tally: &mut Tally| tally.skipped += rx.iter().count();
+    // Every candidate still queued (and every later one) is closed with a Failed action, so
+    // the session does not sit on "loading" for a request that will never be made.
+    let skip_all = |tally: &mut Tally| {
+        for job in rx.iter() {
+            hub.dispatch(Action::Failed {
+                candidate: job.id,
+                error: "LLM unavailable".into(),
+            });
+            tally.skipped += 1;
+        }
+    };
 
     if llm.provider != config::Provider::Ollama {
         warn(&format!(
@@ -383,15 +393,20 @@ mod tests {
         };
         let hub = Arc::new(SessionHub::default());
         let s = Suggester::start(&llm, true, Arc::clone(&hub), wire::SessionClock::start(1.0));
-        s.submit(1, &candidate(), String::new());
-        s.submit(2, &candidate(), String::new());
+        for id in [1, 2] {
+            hub.dispatch(wire::candidate(id, &candidate()));
+            s.submit(id, &candidate(), String::new());
+        }
         let tally = s.finish();
         assert_eq!(tally.shown + tally.ignored + tally.clarifications, 0);
         assert_eq!(tally.skipped + tally.failed, 2, "{tally:?}");
+        let session = hub.snapshot();
         assert!(
-            matches!(hub.snapshot().status.model, Health::Error(_)),
+            matches!(session.status.model, Health::Error(_)),
             "the model dot goes red"
         );
+        assert_eq!(session.pending, None, "no candidate is left loading");
+        assert_eq!(session.counts.failed, 2);
     }
 
     #[test]

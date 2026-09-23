@@ -351,65 +351,98 @@ pub struct PurgeReport {
     pub files: Vec<PathBuf>,
 }
 
-/// Is `name` a file that belongs to session `id` (`<id>.jsonl`, `<id>-you.wav`, ...)?
-fn belongs_to(name: &str, id: i64) -> bool {
-    let id = id.to_string();
-    name.strip_prefix(&id)
-        .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('-'))
+/// The session a file under `sessions/` belongs to, from its name: `<id>.jsonl`, `<id>-you.wav`
+/// and so on. `None` for anything else, which purge never touches.
+fn session_of(name: &str) -> Option<i64> {
+    let digits = name.len() - name.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = &name[digits..];
+    if digits == 0 || !(rest.starts_with('.') || rest.starts_with('-')) {
+        return None;
+    }
+    name[..digits].parse().ok()
 }
 
-/// `dmn sessions purge <id|all>` (SPEC § Privacy rules): delete the rows, the session's files
-/// under `sessions/`, and the free pages that still held the deleted text.
+/// Files under `sessions/` that belong to one of `ids` (every session's, for `None`).
+fn session_files(paths: &Paths, ids: Option<&[i64]>) -> Result<Vec<PathBuf>, RecorderError> {
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| RecorderError::Io { path, source }
+    };
+    let entries = match std::fs::read_dir(&paths.sessions_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io(&paths.sessions_dir)(e)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io(&paths.sessions_dir))?;
+        let path = entry.path();
+        let Some(id) = session_of(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        let wanted = ids.is_none_or(|ids| ids.contains(&id));
+        if wanted && entry.file_type().map_err(io(&path))?.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// `dmn sessions purge <id|all>` (SPEC § Privacy rules): delete the session's files under
+/// `sessions/`, then its rows, then the free pages that still held the deleted text.
+///
+/// Files go first so a failure part-way leaves the rows in place and a retry finds the session
+/// again; a session whose rows are already gone but whose files are not is still purged. Only
+/// files named for a session (`<id>.…`, `<id>-…`) are touched, never anything else a user keeps
+/// in that directory.
 pub fn purge(paths: &Paths, target: PurgeTarget) -> Result<PurgeReport, RecorderError> {
+    let store = if paths.db_file.is_file() {
+        Some(open_store(paths)?)
+    } else {
+        None
+    };
+    let err = |source| RecorderError::Store {
+        path: paths.db_file.clone(),
+        source,
+    };
+    let (ids, files) = match target {
+        PurgeTarget::All => {
+            let ids = match &store {
+                Some(store) => store.session_ids().map_err(err)?,
+                None => Vec::new(),
+            };
+            (ids, session_files(paths, None)?)
+        }
+        PurgeTarget::One(id) => {
+            let files = session_files(paths, Some(&[id]))?;
+            let in_db = match &store {
+                Some(store) => store.session(id).map_err(err)?.is_some(),
+                None => false,
+            };
+            if !in_db && files.is_empty() {
+                return Err(RecorderError::NoSuchSession(id));
+            }
+            (if in_db { vec![id] } else { Vec::new() }, files)
+        }
+    };
+
     let mut report = PurgeReport::default();
-    if paths.db_file.is_file() {
-        let store = open_store(paths)?;
-        let err = |source| RecorderError::Store {
-            path: paths.db_file.clone(),
+    for path in files {
+        std::fs::remove_file(&path).map_err(|source| RecorderError::Io {
+            path: path.clone(),
             source,
-        };
-        let ids = match target {
-            PurgeTarget::All => store.session_ids().map_err(err)?,
-            PurgeTarget::One(id) => vec![id],
-        };
+        })?;
+        report.files.push(path);
+    }
+    if let Some(store) = &store {
         for id in ids {
             if store.delete_session(id).map_err(err)? {
                 report.sessions.push(id);
-            } else if target == PurgeTarget::One(id) {
-                return Err(RecorderError::NoSuchSession(id));
             }
         }
         store.compact().map_err(err)?;
-    } else if let PurgeTarget::One(id) = target {
-        return Err(RecorderError::NoSuchSession(id));
     }
-
-    let entries = match std::fs::read_dir(&paths.sessions_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
-        Err(source) => {
-            return Err(RecorderError::Io {
-                path: paths.sessions_dir.clone(),
-                source,
-            });
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let doomed = match target {
-            PurgeTarget::All => path.is_file(),
-            PurgeTarget::One(id) => path.is_file() && belongs_to(&name, id),
-        };
-        if doomed {
-            std::fs::remove_file(&path).map_err(|source| RecorderError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            report.files.push(path);
-        }
-    }
-    report.files.sort();
     Ok(report)
 }
 
@@ -431,12 +464,16 @@ pub fn export(paths: &Paths, id: i64) -> Result<(PathBuf, usize), RecorderError>
         source,
     })?;
     let path = paths.sessions_dir.join(format!("{id}.jsonl"));
-    let file = std::fs::File::create(&path).map_err(|source| RecorderError::Io {
+    let io = |source| RecorderError::Io {
         path: path.clone(),
         source,
-    })?;
-    let lines = store
-        .export_session_jsonl(id, std::io::BufWriter::new(file))
-        .map_err(err)?;
+    };
+    let file = std::fs::File::create(&path).map_err(io)?;
+    let mut out = std::io::BufWriter::new(file);
+    let lines = store.export_session_jsonl(id, &mut out).map_err(err)?;
+    // Flush and sync here: dropping a BufWriter swallows the error of its last write, which
+    // would turn a full disk into a truncated export reported as a success.
+    std::io::Write::flush(&mut out).map_err(io)?;
+    out.get_ref().sync_all().map_err(io)?;
     Ok((path, lines))
 }
