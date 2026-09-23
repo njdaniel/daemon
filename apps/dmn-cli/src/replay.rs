@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use dmn_audio::{AudioSource, FRAME_MS, Source, Speed, WavSource, frame_channel};
 use dmn_core::{Config, Paths};
+use dmn_detect::{Candidate, DetectConfig, Detector, Following, candidate_channel};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog, timestamp};
 use dmn_vad::{VadConfig, VadWorker, WorkerStats, event_channel};
@@ -50,6 +51,11 @@ pub struct Args {
     pub partials: Partials,
     /// Print the merged transcript at the end.
     pub transcript: bool,
+    /// Print one JSON object per line (segments, candidates, summary) instead of the readable
+    /// transcript, for `eval/run.py`.
+    pub json: bool,
+    /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
+    pub spec_literal_detector: bool,
 }
 
 /// Whether to transcribe the 1 s partials of an open utterance.
@@ -83,6 +89,83 @@ struct Lane {
     wav: WavSource,
     vad: VadWorker,
     stt: SttWorker,
+}
+
+/// Runs the detector over the finals as they arrive.
+///
+/// One final is held back: the SPEC's "followed by >= 1.5 s of silence or a You segment" cue can
+/// only be judged once something follows, and replay is offline, so it waits for the next final
+/// rather than guessing. A live session scores at once with [`Following::UNKNOWN`] and loses that
+/// one point; nothing here changes the detector, only what it is told.
+struct Detecting {
+    detector: Detector,
+    pending: Option<Segment>,
+    /// Candidates with the time the scorer itself took, for the latency line in the summary.
+    found: Vec<(Candidate, Duration)>,
+}
+
+impl Detecting {
+    fn new(spec_literal: bool) -> Self {
+        let cfg = if spec_literal {
+            DetectConfig::spec_literal()
+        } else {
+            DetectConfig::default()
+        };
+        Self {
+            detector: Detector::new(cfg),
+            pending: None,
+            found: Vec::new(),
+        }
+    }
+
+    /// Feed one segment; returns the candidates that became decidable because of it.
+    fn feed(&mut self, seg: &Segment) -> Vec<(Candidate, Duration)> {
+        if !seg.is_final {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Some(prev) = self.pending.take() {
+            let following = Following {
+                silence: Some(seg.start.saturating_sub(prev.end)),
+                next_speaker: Some(seg.source),
+            };
+            out.extend(self.score(&prev, following));
+        }
+        if seg.source == Source::Interviewer {
+            self.pending = Some(seg.clone());
+        }
+        out
+    }
+
+    /// Score whatever is still held after the audio ends.
+    fn flush(&mut self) -> Vec<(Candidate, Duration)> {
+        match self.pending.take() {
+            Some(prev) => self.score(&prev, Following::UNKNOWN),
+            None => Vec::new(),
+        }
+    }
+
+    fn score(&mut self, seg: &Segment, following: Following) -> Vec<(Candidate, Duration)> {
+        let started = Instant::now();
+        let candidate = self.detector.observe(seg, following);
+        let took = started.elapsed();
+        match candidate {
+            Some(c) => {
+                self.found.push((c.clone(), took));
+                vec![(c, took)]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Slowest single scoring call, for the summary's check against the 100 ms budget.
+    fn slowest(&self) -> Duration {
+        self.found
+            .iter()
+            .map(|(_, d)| *d)
+            .max()
+            .unwrap_or(Duration::ZERO)
+    }
 }
 
 pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error>> {
@@ -123,20 +206,22 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         audio = audio.max(lane.wav.duration());
         lanes.push(lane);
     }
-    println!(
-        "replay: {} + {} ({} of audio) through {} on {} threads, {}, partials {}\n",
-        args.interviewer.display(),
-        args.candidate.display(),
-        pretty(audio),
-        name,
-        stt_cfg.threads,
-        match speed {
-            Speed::RealTime => "1× (wall clock)".to_string(),
-            Speed::Factor(f) => format!("{f}× (wall clock)"),
-            Speed::Fast => "unpaced".to_string(),
-        },
-        if partials { "on" } else { "off" },
-    );
+    if !args.json {
+        println!(
+            "replay: {} + {} ({} of audio) through {} on {} threads, {}, partials {}\n",
+            args.interviewer.display(),
+            args.candidate.display(),
+            pretty(audio),
+            name,
+            stt_cfg.threads,
+            match speed {
+                Speed::RealTime => "1× (wall clock)".to_string(),
+                Speed::Factor(f) => format!("{f}× (wall clock)"),
+                Speed::Fast => "unpaced".to_string(),
+            },
+            if partials { "on" } else { "off" },
+        );
+    }
 
     let started = Instant::now();
     let done = Arc::new(AtomicBool::new(false));
@@ -178,13 +263,30 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     };
 
     let mut log = TranscriptLog::new();
+    let mut detecting = Detecting::new(args.spec_literal_detector);
+    // The detector publishes on its own bounded channel, the one `dmn-session` will subscribe to
+    // in #13; here the same loop drains it to print.
+    let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
+    let mut dropped_candidates = 0u64;
     loop {
         match segments.recv_timeout(Duration::from_millis(50)) {
             Ok(seg) => {
                 // An empty final is dmn-stt saying "this utterance was dropped"; it closes the
                 // partial in the log and has nothing to print.
                 if !seg.text.is_empty() {
-                    println!("{}", seg.render());
+                    if args.json {
+                        print_segment_json(&seg);
+                    } else {
+                        println!("{}", seg.render());
+                    }
+                }
+                for (candidate, took) in detecting.feed(&seg) {
+                    if candidates_tx.try_send(candidate).is_err() {
+                        dropped_candidates += 1;
+                    }
+                    for c in candidates_rx.try_iter() {
+                        print_candidate(&c, took, args.json);
+                    }
                 }
                 log.apply(seg);
             }
@@ -192,9 +294,19 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             Err(_) => {}
         }
     }
+    for (candidate, took) in detecting.flush() {
+        print_candidate(&candidate, took, args.json);
+    }
     let (stats, failures) = finisher.join().map_err(|_| "replay thread panicked")?;
     let wall = started.elapsed();
 
+    if args.json {
+        print_summary_json(&stats, &log, &detecting, audio, wall, bus.dropped());
+        if !failures.is_empty() {
+            return Err(failures.join("; ").into());
+        }
+        return Ok(());
+    }
     if args.transcript {
         println!("\n--- transcript (finals, splits merged) ---");
         for seg in log.window(Duration::MAX) {
@@ -212,10 +324,97 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         );
     }
     print_summary(&stats, &log, audio, wall, bus.dropped());
+    println!(
+        "detector     {} candidate(s), slowest scoring {:?} (budget 100 ms){}",
+        detecting.found.len(),
+        detecting.slowest(),
+        if dropped_candidates > 0 {
+            format!(", {dropped_candidates} dropped by a full channel")
+        } else {
+            String::new()
+        }
+    );
     if !failures.is_empty() {
         return Err(failures.join("; ").into());
     }
     Ok(())
+}
+
+/// One NDJSON line per segment, for `eval/run.py`.
+fn print_segment_json(seg: &Segment) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "segment",
+            "source": seg.source.label(),
+            "start": seg.start.as_secs_f64(),
+            "end": seg.end.as_secs_f64(),
+            "text": seg.text,
+            "is_final": seg.is_final,
+            "avg_logprob": seg.avg_logprob,
+        })
+    );
+}
+
+fn print_candidate(c: &Candidate, took: Duration, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "candidate",
+                "source": c.source.label(),
+                "start": c.start.as_secs_f64(),
+                "end": c.end.as_secs_f64(),
+                "text": c.text,
+                "line": c.line,
+                "score": c.score,
+                "cues": c.cues.iter().map(|q| q.label()).collect::<Vec<_>>(),
+                "detect_us": took.as_micros() as u64,
+            })
+        );
+    } else {
+        println!("  -> candidate {}", c.render());
+    }
+}
+
+fn print_summary_json(
+    stats: &[(Source, WorkerStats, SttStats)],
+    log: &TranscriptLog,
+    detecting: &Detecting,
+    audio: Duration,
+    wall: Duration,
+    bus_dropped: u64,
+) {
+    let lanes: Vec<serde_json::Value> = stats
+        .iter()
+        .map(|(source, vad, stt)| {
+            serde_json::json!({
+                "source": source.label(),
+                "finals": stt.finals,
+                "partials": stt.partials,
+                "dropped": stt.dropped(),
+                "errors": stt.errors,
+                "utterances": vad.utterances,
+                "overruns": vad.overruns,
+                "dropped_events": vad.dropped_events,
+                "inference_ms": stt.inference_ms,
+                "slowest_ms": stt.slowest_ms,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "summary",
+            "lanes": lanes,
+            "lines": log.finals().len(),
+            "candidates": detecting.found.len(),
+            "detect_slowest_us": detecting.slowest().as_micros() as u64,
+            "audio_s": audio.as_secs_f64(),
+            "wall_s": wall.as_secs_f64(),
+            "bus_dropped": bus_dropped,
+        })
+    );
 }
 
 fn start_lane(

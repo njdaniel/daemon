@@ -20,6 +20,7 @@ vulkan = ["dmn-stt/vulkan"]
 clap = { workspace = true }
 dmn-audio = { path = "../../crates/dmn-audio" }
 dmn-core = { path = "../../crates/dmn-core" }
+dmn-detect = { path = "../../crates/dmn-detect" }
 dmn-stt = { path = "../../crates/dmn-stt" }
 dmn-transcript = { path = "../../crates/dmn-transcript" }
 dmn-vad = { path = "../../crates/dmn-vad" }

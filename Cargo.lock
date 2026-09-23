@@ -427,6 +427,7 @@ dependencies = [
  "clap",
  "dmn-audio",
  "dmn-core",
+ "dmn-detect",
  "dmn-stt",
  "dmn-transcript",
  "dmn-vad",
@@ -461,6 +462,10 @@ dependencies = [
 name = "dmn-detect"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
+ "dmn-audio",
+ "dmn-transcript",
+ "serde_json",
  "thiserror",
 ]
 

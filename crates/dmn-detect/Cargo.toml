@@ -8,6 +8,12 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+crossbeam-channel = { workspace = true }
+dmn-audio = { path = "../dmn-audio" }
+dmn-transcript = { path = "../dmn-transcript" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
