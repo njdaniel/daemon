@@ -14,6 +14,8 @@ use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcribe
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog, timestamp};
 use dmn_vad::{VadConfig, VadWorker, WorkerStats, event_channel};
 
+use crate::suggest::{Suggester, Tally};
+
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
 /// but an unpaced replay hands the VAD a whole interview in seconds, so this holds every
 /// utterance of a long fixture rather than dropping them (the SPEC's drop-don't-stall rule is
@@ -56,6 +58,8 @@ pub struct Args {
     pub json: bool,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
+    /// Skip the LLM fast phase (#12): transcribe and detect only.
+    pub no_llm: bool,
 }
 
 /// Whether to transcribe the 1 s partials of an open utterance.
@@ -301,6 +305,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     // The detector publishes on its own bounded channel, the one `dmn-session` will subscribe to
     // in #13; here the same loop drains it to print.
     let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
+    // #12: each candidate goes through the LLM fast phase on its own thread, which prints the
+    // question + approach JSON when it is ready.
+    let suggester = (!args.no_llm).then(|| Suggester::start(&cfg.llm, args.json));
     let mut dropped_candidates = 0u64;
     loop {
         match segments.recv_timeout(Duration::from_millis(50)) {
@@ -315,12 +322,16 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
                     }
                 }
                 for found in detecting.feed(&seg) {
-                    // The channel the fast phase will read from (#12); replay drains it at once.
                     if candidates_tx.try_send(found.candidate.clone()).is_err() {
                         dropped_candidates += 1;
                     }
-                    candidates_rx.try_iter().for_each(drop);
                     print_candidate(found, args.json);
+                }
+                // The detector's channel feeds the fast phase, with the last 60 s of transcript.
+                for candidate in candidates_rx.try_iter() {
+                    if let Some(s) = &suggester {
+                        s.submit(&candidate, log.render_window(DEFAULT_WINDOW));
+                    }
                 }
                 log.apply(seg);
             }
@@ -330,12 +341,17 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     }
     for found in detecting.flush() {
         print_candidate(found, args.json);
+        if let Some(s) = &suggester {
+            s.submit(&found.candidate, log.render_window(DEFAULT_WINDOW));
+        }
     }
     let (stats, failures) = finisher.join().map_err(|_| "replay thread panicked")?;
     let wall = started.elapsed();
+    // Answer whatever is still queued; the transcript is complete by now.
+    let tally = suggester.map(Suggester::finish);
 
     if args.json {
-        print_summary_json(&stats, &log, &detecting, audio, wall, bus.dropped());
+        print_summary_json(&stats, &log, &detecting, audio, wall, bus.dropped(), tally);
         if !failures.is_empty() {
             return Err(failures.join("; ").into());
         }
@@ -370,6 +386,13 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             String::new()
         }
     );
+    match tally {
+        Some(t) => println!(
+            "fast phase   {} shown, {} clarification(s), {} not shown, {} failed, {} skipped (LLM unavailable)",
+            t.shown, t.clarifications, t.ignored, t.failed, t.skipped
+        ),
+        None => println!("fast phase   off (--no-llm)"),
+    }
     if !failures.is_empty() {
         return Err(failures.join("; ").into());
     }
@@ -427,6 +450,7 @@ fn print_summary_json(
     audio: Duration,
     wall: Duration,
     bus_dropped: u64,
+    tally: Option<Tally>,
 ) {
     let lanes: Vec<serde_json::Value> = stats
         .iter()
@@ -457,6 +481,13 @@ fn print_summary_json(
             "audio_s": audio.as_secs_f64(),
             "wall_s": wall.as_secs_f64(),
             "bus_dropped": bus_dropped,
+            "suggestions": tally.map(|t| serde_json::json!({
+                "shown": t.shown,
+                "clarifications": t.clarifications,
+                "ignored": t.ignored,
+                "failed": t.failed,
+                "skipped": t.skipped,
+            })),
         })
     );
 }

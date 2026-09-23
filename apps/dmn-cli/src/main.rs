@@ -12,6 +12,7 @@ mod devices;
 mod doctor;
 mod probe;
 mod replay;
+mod suggest;
 
 use std::process::ExitCode;
 
@@ -128,6 +129,10 @@ enum Command {
         /// and no vetoes on rhetorical tags or small talk
         #[arg(long)]
         spec_literal_detector: bool,
+        /// Skip the LLM fast phase; by default each candidate goes to [llm] (Ollama) and the
+        /// question + approach JSON is printed
+        #[arg(long)]
+        no_llm: bool,
     },
 }
 
@@ -208,6 +213,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             transcript,
             json,
             spec_literal_detector,
+            no_llm,
         }) => {
             let cfg = Config::load(&paths.config_file)?;
             // As with bench above, the module keeps its boxed error and it is mapped here.
@@ -224,6 +230,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     transcript,
                     json,
                     spec_literal_detector,
+                    no_llm,
                 },
             )
             .map_err(|e| CliError::Replay(e.to_string()))

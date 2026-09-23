@@ -5,8 +5,12 @@
 //! length-limited in `limits.rs` after parsing. Providers: Ollama (default), OpenAI-compatible, Anthropic.
 //! Owns: the in-flight request `CancellationToken`; a newer unpinned question cancels the current request.
 //!
-//! Issue #11 ships the [`Provider`] trait, the [`ollama`] client and [`MockProvider`]. Prompts,
-//! schema and `limits.rs` arrive with #12; the OpenAI-compatible and Anthropic providers with M2.
+//! Issue #11 ships the [`Provider`] trait, the [`ollama`] client and [`MockProvider`]. #12 adds the
+//! fast phase: per-kind prompts ([`prompt`]), the [`schema`], [`limits`], and [`run_fast_phase`],
+//! which parses the streamed reply incrementally ([`stream_json`]) and hands each [`FastEvent`]
+//! (question first, then approach lines one by one) to a caller-supplied callback; the session
+//! crate owns what happens to them. The slow phase and the OpenAI-compatible and Anthropic
+//! providers arrive with M2.
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:
@@ -19,16 +23,24 @@
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod fast;
+pub mod limits;
 pub mod mock;
 pub mod ndjson;
 pub mod ollama;
+pub mod prompt;
 mod provider;
+pub mod schema;
+pub mod stream_json;
 
+pub use fast::{FastEvent, FastOutcome, IgnoreReason, run_fast_phase};
 pub use futures_util::future::BoxFuture;
 pub use futures_util::stream::BoxStream;
 pub use mock::MockProvider;
 pub use ollama::{OllamaProvider, OllamaSettings};
+pub use prompt::{CurrentQuestion, FastRequest};
 pub use provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard, guard_until,
 };
+pub use schema::{Kind, Suggestion};
 pub use tokio_util::sync::CancellationToken;
