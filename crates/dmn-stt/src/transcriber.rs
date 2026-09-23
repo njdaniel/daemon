@@ -164,7 +164,11 @@ impl Transcriber {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(c_int::try_from(self.cfg.threads.max(1)).unwrap_or(4));
         params.set_language(Some("en"));
-        params.set_no_context(false);
+        // The previous utterance's text goes in explicitly as `tokens` above. With no_context
+        // false whisper.cpp would also prepend its own last decode, which here is usually a
+        // partial of this same utterance, and the final would then resume after it and drop
+        // everything the partial had already covered.
+        params.set_no_context(true);
         params.set_single_segment(true);
         params.set_temperature(0.0);
         // No temperature fallback: a retry at a higher temperature can double the latency of a
