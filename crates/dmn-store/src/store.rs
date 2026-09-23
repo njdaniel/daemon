@@ -342,6 +342,42 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Ids of every session, oldest first.
+    pub fn session_ids(&self) -> Result<Vec<i64>, StoreError> {
+        let mut stmt = self.conn.prepare("SELECT id FROM sessions ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Delete one session and, by cascade, its segments, questions and suggestions. Returns
+    /// whether the session existed. Call [`Store::compact`] afterwards so the deleted text does
+    /// not linger in the file's free pages.
+    pub fn delete_session(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    /// Rewrite the database file (`VACUUM`), dropping free pages that still hold deleted rows.
+    pub fn compact(&self) -> Result<(), StoreError> {
+        self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    /// Number of rows in each table, for reports and tests: (sessions, segments, questions,
+    /// suggestions).
+    pub fn counts(&self) -> Result<(i64, i64, i64, i64), StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT count(*) FROM sessions), (SELECT count(*) FROM segments),
+                    (SELECT count(*) FROM questions), (SELECT count(*) FROM suggestions)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?)
+    }
+
     /// All suggestions for one question, oldest first.
     pub fn suggestions_for_question(
         &self,

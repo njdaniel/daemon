@@ -310,3 +310,40 @@ fn check_constraints_reject_bad_enum_text() {
     );
     assert!(matches!(bad, Err(StoreError::Sqlite(_))));
 }
+
+#[test]
+fn delete_session_removes_its_rows_and_compact_drops_the_text_from_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    let store = Store::open(&path).unwrap();
+    let (keep, keep_segment) = session_with_segment(&store);
+    let (gone, gone_segment) = session_with_segment(&store);
+    question_with_suggestion(&store, keep, keep_segment);
+    question_with_suggestion(&store, gone, gone_segment);
+    store
+        .insert_segment(&NewSegment {
+            session_id: gone,
+            source: Source::You,
+            start_time: 20.0,
+            end_time: 22.0,
+            text: "purge-me-marker-7f3a".to_string(),
+            is_final: true,
+            avg_logprob: -0.1,
+        })
+        .unwrap();
+    assert_eq!(store.session_ids().unwrap(), [keep, gone]);
+
+    assert!(store.delete_session(gone).unwrap());
+    assert!(!store.delete_session(gone).unwrap(), "already gone");
+    store.compact().unwrap();
+
+    assert_eq!(store.session_ids().unwrap(), [keep]);
+    assert_eq!(store.counts().unwrap(), (1, 1, 1, 1));
+    drop(store);
+    let bytes = std::fs::read(&path).unwrap();
+    let marker = b"purge-me-marker-7f3a";
+    assert!(
+        !bytes.windows(marker.len()).any(|w| w == marker),
+        "deleted text is not left in free pages"
+    );
+}
