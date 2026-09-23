@@ -9,12 +9,17 @@ rust-version.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# preserve_order: the fast-phase schema must reach Ollama with `question` before `approach`,
+# because the grammar follows property order and that order is what lets the question stream first.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

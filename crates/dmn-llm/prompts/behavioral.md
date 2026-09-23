@@ -1,0 +1,1 @@
+behavioral: approach is the STAR outline in four or five lines. Also fill star with one sentence each for situation, task, action, result, drawn from the candidate's stories or resume when given; the action is the longest and most specific.
