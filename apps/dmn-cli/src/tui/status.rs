@@ -65,7 +65,7 @@ fn transcript_line(l: &TranscriptLine, partial: bool, cells: usize) -> Line<'sta
 }
 
 pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
-    let keys = shortcuts(view.mode, view.loading);
+    let keys = shortcuts(view);
     let keys_cells = u16::try_from(width(&keys)).unwrap_or(u16::MAX);
     let [left, right] =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(keys_cells)]).areas(area);
@@ -122,12 +122,21 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
 }
 
 /// The two most useful keys for the state on screen (SPEC § Transcript & status: "Footer shows
-/// the two most useful shortcuts for the current state").
-fn shortcuts(mode: Mode, loading: bool) -> String {
-    let pair = match (mode, loading) {
-        (Mode::Pinned, _) => "p unpin · r redo",
-        (Mode::Live, false) => "p pin · r redo",
-        (Mode::Live, true) | (Mode::Listening, _) => "m mute · q quit",
+/// the two most useful shortcuts for the current state"). While a coding question is on screen
+/// the second one is `s` with the coding-solutions mode it would switch from (#50), so which
+/// mode Deeper Answer follows is always visible.
+fn shortcuts(view: &View<'_>) -> String {
+    let coding = view.live().is_some_and(|q| q.kind == CODING);
+    let solutions = view.session.coding_solutions.label();
+    let pair = match (view.mode, view.loading, coding) {
+        (Mode::Pinned, _, true) => format!("p unpin · s: {solutions}"),
+        (Mode::Live, _, true) => format!("p pin · s: {solutions}"),
+        (Mode::Pinned, _, false) => "p unpin · r redo".to_owned(),
+        (Mode::Live, false, false) => "p pin · r redo".to_owned(),
+        (Mode::Live, true, false) | (Mode::Listening, _, _) => "m mute · q quit".to_owned(),
     };
     format!("{pair} ")
 }
+
+/// The fast phase's `kind` for a coding question (SPEC § Transcription and question detection).
+const CODING: &str = "coding";

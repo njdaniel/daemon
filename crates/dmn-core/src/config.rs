@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub use dmn_session::CodingSolutions;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]
@@ -185,6 +187,10 @@ pub struct Ui {
     pub force_x11: bool,
     pub opacity: f32,
     pub never_auto_expand: bool,
+    /// What Deeper Answer may hold for a coding question (#50): `hints` (insight, data
+    /// structure, edge cases, complexity, no complete code) or `full` (a worked solution too).
+    /// `dmn run --solutions` overrides it for one run and `s` toggles it during a call.
+    pub coding_solutions: CodingSolutions,
 }
 
 impl Default for Ui {
@@ -194,6 +200,7 @@ impl Default for Ui {
             force_x11: false,
             opacity: 1.0,
             never_auto_expand: true,
+            coding_solutions: CodingSolutions::Hints,
         }
     }
 }
@@ -276,6 +283,7 @@ always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above on GNOME Wayland
 opacity = 1.0                        # 0.7 – 1.0
 never_auto_expand = true
+coding_solutions = "hints"           # hints | full: worked solutions in Deeper Answer (s toggles)
 
 [privacy]
 record_audio = false                 # write WAVs of the session (shows a red REC dot)
@@ -400,6 +408,7 @@ always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above
 opacity = 1.0
 never_auto_expand = true
+coding_solutions = "hints"           # hints | full (worked solutions in Deeper Answer)
 
 [privacy]
 record_audio = false                 # write WAVs of the session
@@ -434,7 +443,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 23, "spec example has 23 keys: {keys:?}");
+        assert_eq!(keys.len(), 24, "spec example has 24 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -453,6 +462,19 @@ keep_transcripts = true
         assert_eq!(c.llm.provider, Provider::Anthropic);
         assert!(c.llm.provider.is_remote());
         assert_eq!(c.llm.model, Config::default().llm.model);
+    }
+
+    #[test]
+    fn coding_solutions_default_to_hints_and_parse_full() {
+        assert_eq!(
+            Config::default().ui.coding_solutions,
+            CodingSolutions::Hints
+        );
+        let c = Config::from_toml("[ui]\ncoding_solutions = \"full\"\n", "full").unwrap();
+        assert_eq!(c.ui.coding_solutions, CodingSolutions::Full);
+        assert!(c.to_toml().unwrap().contains("coding_solutions = \"full\""));
+        let err = Config::from_toml("[ui]\ncoding_solutions = \"all\"\n", "bad").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
     }
 
     #[test]

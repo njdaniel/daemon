@@ -84,6 +84,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             no_store: args.no_store,
             output: Output::Print { json: args.json },
             policy: Policy::AnswerAll,
+            coding_solutions: None,
         },
     )?;
     if !args.json {

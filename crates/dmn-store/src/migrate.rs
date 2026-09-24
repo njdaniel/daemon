@@ -21,7 +21,7 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 struct Migration {
     version: i64,
@@ -36,6 +36,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: V2,
+    },
+    Migration {
+        version: 3,
+        sql: V3,
     },
 ];
 
@@ -115,6 +119,14 @@ CREATE TABLE cpu_samples (
     whisper     REAL NOT NULL
 );
 CREATE INDEX idx_cpu_samples_session ON cpu_samples(session_id);
+";
+
+/// v3 (#50): `questions.coding_solutions`, the coding-solutions mode (`hints` or `full`) in
+/// effect when the question was detected, so a later review shows which mode a session ran in
+/// even after `s` switched it mid-call. Nullable: rows from older builds read back as unknown.
+const V3: &str = "
+ALTER TABLE questions ADD COLUMN coding_solutions TEXT
+    CHECK (coding_solutions IS NULL OR coding_solutions IN ('hints', 'full'));
 ";
 
 /// Apply every migration newer than the database's `user_version`, each in a transaction.

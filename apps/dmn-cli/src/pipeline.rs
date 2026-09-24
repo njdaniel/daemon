@@ -38,7 +38,7 @@ use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
 use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
 use dmn_llm::{CurrentQuestion, Kind};
-use dmn_session::{Action, Dot, Health, SessionHub, Stage};
+use dmn_session::{Action, CodingSolutions, Dot, Health, SessionHub, Stage};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
 use dmn_vad::{EnergyVad, Vad, VadConfig, VadWorker, WorkerStats, event_channel};
@@ -170,6 +170,9 @@ pub struct Options {
     /// Whether a newer question cancels the older one's request (`dmn run`) or every candidate
     /// is answered (`dmn replay`).
     pub policy: Policy,
+    /// `dmn run --solutions`: the coding-solutions mode for this run, over
+    /// `[ui].coding_solutions` (#50).
+    pub coding_solutions: Option<CodingSolutions>,
 }
 
 /// Facts about the running pipeline, for a header line.
@@ -359,6 +362,13 @@ impl Controls {
             dot: Dot::Mic,
             health: if muted { Health::Muted } else { Health::Ok },
         });
+    }
+
+    /// `s`: switch coding solutions between hints and full (#50). One action per press, so the
+    /// session log replays to the same mode.
+    pub fn toggle_coding_solutions(&self) {
+        let mode = self.hub.snapshot().coding_solutions.toggled();
+        self.hub.dispatch(Action::CodingSolutions { mode });
     }
 
     #[cfg(test)]
@@ -616,6 +626,10 @@ impl Pipeline {
         hub.dispatch(Action::Started {
             label: opts.input.label(),
             at: clock.started_at(),
+        });
+        // In the log from the start, so every stored question records the mode it ran under.
+        hub.dispatch(Action::CodingSolutions {
+            mode: opts.coding_solutions.unwrap_or(cfg.ui.coding_solutions),
         });
         for lane in &lanes {
             // A file is fine once open; a live capture's dot follows its state (the monitor).
@@ -1342,6 +1356,7 @@ mod tests {
                 no_store: true,
                 output: Output::Quiet,
                 policy: Policy::Supersede,
+                coding_solutions: None,
             },
         )
         .err()

@@ -44,7 +44,8 @@
     },
     "model": {
       "state": "ok"
-    }
+    },
+    "overruns": 0
   },
   "counts": {
     "candidates": 0,
@@ -52,5 +53,6 @@
     "clarifications": 0,
     "ignored": 0,
     "failed": 0
-  }
+  },
+  "coding_solutions": "hints"
 }

@@ -137,6 +137,10 @@ pub struct QuestionRow {
     pub emitted_at: Option<f64>,
     pub question_at: Option<f64>,
     pub approach_at: Option<f64>,
+    /// The coding-solutions mode (`hints` / `full`) when it was detected (schema v3, #50);
+    /// `None` for rows from older builds.
+    #[serde(default)]
+    pub coding_solutions: Option<String>,
 }
 
 /// Which moment of a question's life [`Store::mark_question`] records.
@@ -422,6 +426,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// Record the coding-solutions mode (`hints` / `full`) in effect for a question (#50).
+    pub fn set_question_coding_solutions(&self, id: i64, mode: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE questions SET coding_solutions = ?2 WHERE id = ?1",
+            params![id, mode],
+        )?;
+        Ok(())
+    }
+
     pub fn set_question_pinned(&self, id: i64, pinned: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE questions SET pinned = ?2 WHERE id = ?1",
@@ -434,7 +447,7 @@ impl Store {
     pub fn questions(&self, session_id: i64) -> Result<Vec<QuestionRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, segment_id, score, text, kind, focus, pinned, created_at,
-                    emitted_at, question_at, approach_at
+                    emitted_at, question_at, approach_at, coding_solutions
              FROM questions WHERE session_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt
@@ -581,6 +594,7 @@ fn question_from_row(row: &Row<'_>) -> rusqlite::Result<QuestionRow> {
         emitted_at: row.get("emitted_at")?,
         question_at: row.get("question_at")?,
         approach_at: row.get("approach_at")?,
+        coding_solutions: row.get("coding_solutions")?,
     })
 }
 

@@ -508,3 +508,58 @@ fn a_status_saved_before_overruns_existed_still_loads() {
     let status: Status = serde_json::from_str(old).unwrap();
     assert_eq!(status.overruns, 0);
 }
+
+#[test]
+fn coding_solutions_default_to_hints_and_follow_each_action() {
+    let mut log = vec![Action::Started {
+        label: "coding".into(),
+        at: 1,
+    }];
+    assert_eq!(
+        Session::replay(&log).coding_solutions,
+        CodingSolutions::Hints
+    );
+
+    log.push(Action::CodingSolutions {
+        mode: CodingSolutions::Full,
+    });
+    assert_eq!(
+        Session::replay(&log).coding_solutions,
+        CodingSolutions::Full
+    );
+
+    // `s` toggles: each press is one action, so the log replays to the same mode.
+    let mode = Session::replay(&log).coding_solutions.toggled();
+    log.push(Action::CodingSolutions { mode });
+    let s = Session::replay(&log);
+    assert_eq!(s.coding_solutions, CodingSolutions::Hints);
+    assert_eq!(Session::replay(&log), s, "deterministic");
+
+    // Through JSON Lines like every other action.
+    let back: Vec<Action> = log
+        .iter()
+        .map(|a| serde_json::from_str(&serde_json::to_string(a).unwrap()).unwrap())
+        .collect();
+    assert_eq!(back, log);
+    assert_eq!(
+        serde_json::to_string(&log[1]).unwrap(),
+        r#"{"type":"coding_solutions","mode":"full"}"#
+    );
+}
+
+#[test]
+fn coding_solutions_labels_round_trip() {
+    for m in [CodingSolutions::Hints, CodingSolutions::Full] {
+        assert_eq!(CodingSolutions::from_label(m.label()), Some(m));
+        assert_eq!(m.toggled().toggled(), m);
+    }
+    assert_eq!(CodingSolutions::from_label("solutions"), None);
+}
+
+#[test]
+fn a_session_saved_before_coding_solutions_existed_still_loads() {
+    let mut v = serde_json::to_value(Session::default()).unwrap();
+    v.as_object_mut().unwrap().remove("coding_solutions");
+    let s: Session = serde_json::from_value(v).unwrap();
+    assert_eq!(s.coding_solutions, CodingSolutions::Hints);
+}

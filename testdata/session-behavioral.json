@@ -58,7 +58,8 @@
     "model": {
       "state": "error",
       "detail": "ollama unreachable"
-    }
+    },
+    "overruns": 0
   },
   "counts": {
     "candidates": 1,
@@ -66,5 +67,6 @@
     "clarifications": 0,
     "ignored": 0,
     "failed": 0
-  }
+  },
+  "coding_solutions": "hints"
 }

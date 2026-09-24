@@ -53,6 +53,45 @@ pub struct StarCards {
     pub story: Option<String>,
 }
 
+/// What Deeper Answer may hold for a coding question (#50, SPEC § AI Assistance): hints only
+/// (insight, data structure, edge cases, complexity) or a worked solution as well. Set from
+/// `[ui].coding_solutions` or `dmn run --solutions`, toggled with `s`; the M2 slow phase reads
+/// it. Nothing in M1 generates either, so today it shows only in the footer and the log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodingSolutions {
+    #[default]
+    Hints,
+    Full,
+}
+
+impl CodingSolutions {
+    /// The other mode: what `s` switches to.
+    pub fn toggled(self) -> Self {
+        match self {
+            CodingSolutions::Hints => CodingSolutions::Full,
+            CodingSolutions::Full => CodingSolutions::Hints,
+        }
+    }
+
+    /// The name used in the config, on the command line, in the footer and in the store.
+    pub fn label(self) -> &'static str {
+        match self {
+            CodingSolutions::Hints => "hints",
+            CodingSolutions::Full => "full",
+        }
+    }
+
+    /// Parse a [`label`](Self::label).
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "hints" => Some(CodingSolutions::Hints),
+            "full" => Some(CodingSolutions::Full),
+            _ => None,
+        }
+    }
+}
+
 /// Why the fast phase put nothing on screen for a candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -141,6 +180,9 @@ pub enum Action {
     Regenerate { candidate: u64 },
     /// `p`: pin the live question; new questions queue behind it.
     Pin,
+    /// The coding-solutions mode from now on: dispatched once after `Started` (from the config
+    /// or `--solutions`) and again on each `s`.
+    CodingSolutions { mode: CodingSolutions },
     /// Unpin: the newest queued question (if any) becomes live.
     Unpin,
     /// A status dot changed.

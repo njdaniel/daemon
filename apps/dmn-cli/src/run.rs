@@ -3,7 +3,8 @@
 //! The pipeline ([`crate::pipeline`], the same one `dmn replay` runs) works on its own thread
 //! and dispatches everything into the session; this thread redraws the TUI from the session's
 //! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
-//! `r` regenerate, `m` mute the mic, `q` (or Ctrl-C) quit. Nothing else writes to the terminal
+//! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), `q` (or Ctrl-C)
+//! quit. Nothing else writes to the terminal
 //! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
@@ -23,7 +24,7 @@ use std::time::Duration;
 use dmn_audio::CaptureTarget;
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths};
-use dmn_session::Session;
+use dmn_session::{CodingSolutions, Session};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::watch;
 
@@ -58,6 +59,8 @@ pub struct Args {
     pub headless: bool,
     /// Live: stop after this many seconds, as if `q` had been pressed.
     pub duration: Option<u64>,
+    /// `--solutions <hints|full>`: coding solutions for this run, over `[ui].coding_solutions`.
+    pub solutions: Option<CodingSolutions>,
 }
 
 /// A key the TUI acts on.
@@ -66,6 +69,8 @@ pub enum Key {
     Pin,
     Regenerate,
     Mute,
+    /// `s`: coding solutions hints ↔ full (#50).
+    Solutions,
     Quit,
 }
 
@@ -82,6 +87,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('p' | 'P') => Some(Key::Pin),
         KeyCode::Char('r' | 'R') => Some(Key::Regenerate),
         KeyCode::Char('m' | 'M') => Some(Key::Mute),
+        KeyCode::Char('s' | 'S') => Some(Key::Solutions),
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Key::Quit),
         _ => None,
     }
@@ -93,6 +99,7 @@ pub fn press(k: Key, controls: &Controls) -> bool {
         Key::Pin => controls.toggle_pin(),
         Key::Regenerate => controls.regenerate(),
         Key::Mute => controls.toggle_mute(),
+        Key::Solutions => controls.toggle_coding_solutions(),
         Key::Quit => {
             controls.quit();
             return true;
@@ -152,6 +159,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             output: Output::Quiet,
             // SPEC § Threading rules: a newer unpinned question cancels the one in flight.
             policy: Policy::Supersede,
+            coding_solutions: args.solutions,
         },
     )?;
     let audio = pipeline.info().audio;
@@ -402,6 +410,7 @@ mod tests {
         assert_eq!(key(press_key('p')), Some(Key::Pin));
         assert_eq!(key(press_key('r')), Some(Key::Regenerate));
         assert_eq!(key(press_key('m')), Some(Key::Mute));
+        assert_eq!(key(press_key('s')), Some(Key::Solutions));
         assert_eq!(key(press_key('q')), Some(Key::Quit));
         assert_eq!(
             key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -464,6 +473,27 @@ mod tests {
     }
 
     #[test]
+    fn s_toggles_coding_solutions_and_the_footer_follows_on_a_coding_question() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        hub.dispatch(Action::Question {
+            candidate: 1,
+            text: "Reverse a linked list in place.".into(),
+            kind: "coding".into(),
+        });
+        let status_line = |s: &str| s.lines().last().unwrap_or_default().to_owned();
+        assert_eq!(hub.snapshot().coding_solutions, CodingSolutions::Hints);
+        assert!(status_line(&screen(&hub.snapshot())).contains("s: hints"));
+
+        assert!(!press(key(press_key('s')).unwrap(), &controls));
+        assert_eq!(hub.snapshot().coding_solutions, CodingSolutions::Full);
+        assert!(status_line(&screen(&hub.snapshot())).contains("s: full"));
+
+        press(Key::Solutions, &controls);
+        assert_eq!(hub.snapshot().coding_solutions, CodingSolutions::Hints);
+    }
+
+    #[test]
     fn r_goes_to_the_pipeline_thread() {
         let (controls, commands) = Controls::for_test();
         assert!(!press(key(press_key('r')).unwrap(), &controls));
@@ -510,6 +540,7 @@ mod tests {
             no_store: true,
             headless: false,
             duration: None,
+            solutions: None,
         }
     }
 

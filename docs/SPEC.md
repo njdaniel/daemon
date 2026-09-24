@@ -214,7 +214,7 @@ Timeouts: fast phase 4 s, slow phase 20 s; on timeout the UI keeps the previous 
 
 The window is 440 px wide, 760 px tall by default, frameless with a 36 px custom title bar, always-on-top where the compositor allows, and it never grows on its own. The [canvas](https://claude.ai/artifact/Kya3g5rdSzQ7k9tGPqZV2B) is the visual source of truth; this section states the behavior.
 
-**Terminal MVP (M1–M2)** renders the same three areas in a ratatui TUI, sized for a 100 × 30 pane beside the call: question + focus in a top block (2–4 lines), the numbered Approach in the middle, the last two transcript lines and the mic / system / model status in a one-line footer. Keys: `p` pin, `r` regenerate, `1`–`6` toggle one section, `m` mute mic, `q` quit. The same density rules apply: no paragraph over 3 sentences, one section open at a time, nothing auto-expands. Everything below describes the M3 window.
+**Terminal MVP (M1–M2)** renders the same three areas in a ratatui TUI, sized for a 100 × 30 pane beside the call: question + focus in a top block (2–4 lines), the numbered Approach in the middle, the last two transcript lines and the mic / system / model status in a one-line footer. Keys: `p` pin, `r` regenerate, `1`–`6` toggle one section, `m` mute mic, `s` coding solutions hints ↔ full, `q` quit. The same density rules apply: no paragraph over 3 sentences, one section open at a time, nothing auto-expands. Everything below describes the M3 window.
 
 **Window**
 
@@ -237,7 +237,7 @@ The window is 440 px wide, 760 px tall by default, frameless with a 36 px custom
 - Approach: 3–5 numbered lines, each ≤ 90 characters, visible within 2.0 s of the question ending. While loading, the previous Approach dims to 50 % rather than clearing.
 - Six expandable rows in fixed order: Deeper Answer, Follow-up Questions, Tradeoffs, Example, Things I Should Mention, Resume Context. Shortcuts ⌥1–⌥6. Exactly one open at a time; opening another closes the first. Rows whose slow-phase content is not yet available show a subtle "…" hint; rows with no content for this question are hidden.
 - Behavioral questions replace the Approach block with the STAR block (S/T/A/R cards, Action card emphasised, matched story path in the header, Swap picks another story).
-- Coding questions show Approach + Example (language from the job description or config); no full solutions unless the user expands Deeper Answer.
+- Coding questions show Approach + Example (language from the job description or config). What Deeper Answer holds follows the coding-solutions mode (#50): **hints** (the default) gives the key insight, the data structure, edge cases and pitfalls, and time/space complexity, with no complete code; **full** adds a worked solution in the job's language, capped in `limits.rs` (≈ 40 lines). Either way it stays collapsed until opened. The mode comes from `[ui].coding_solutions`, `dmn run --solutions <hints|full>` overrides it for one run, and `s` toggles it during a call; the footer shows `s: hints` / `s: full` while a coding question is on screen, and each stored question records the mode it was detected under.
 - Redo regenerates with `temperature=0.7` and the note "user asked for a different angle".
 
 **3. Transcript & status**
@@ -312,6 +312,7 @@ always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above
 opacity = 1.0
 never_auto_expand = true
+coding_solutions = "hints"           # hints | full (worked solutions in Deeper Answer)
 
 [privacy]
 record_audio = false                 # write WAVs of the session
@@ -468,7 +469,7 @@ The two decisions most likely to change are the `pipewire` crate's low-level API
 - [ ] Target hardware for the latency numbers: which laptop, CPU-only or GPU (Vulkan/CUDA)? Sets the default model.
 - [x] Default local model: `qwen3.6:35b-a3b` (fast phase 0.95 s on the dev 4090; `llama3.1:8b` misclassified question kind; `qwen3.6:27b` took 3.0 s). Decided 2026-09-21.
 - [ ] Does the app need to work for in-person interviews (single mic, no system audio) in v1, which pulls diarization from M3 into M2?
-- [ ] Coding-interview mode: show worked solutions in Deeper Answer at all, or only hints and complexity notes?
+- [x] Coding-interview mode: show worked solutions in Deeper Answer at all, or only hints and complexity notes? Hints and complexity notes by default; worked solutions on request (`[ui].coding_solutions = "full"`, `dmn run --solutions full`, or `s`), still collapsed until opened. Decided 2026-09-24 (#50).
 - [ ] Session recording (WAVs) off by default is the current call; confirm.
 
 **Sources**: [`pipewire` crate documentation](https://pipewire.pages.freedesktop.org/pipewire-rs/pipewire/index.html) (main loop, context, registry pattern), [pipewire crate on docs.rs](https://docs.rs/crate/pipewire/latest). Tauri 2, `whisper-rs`, `ort` and `rusqlite` versions, PipeWire property names and whisper speed figures are from working knowledge and are pinned and verified by `dmn doctor` and `dmn bench` in M0.

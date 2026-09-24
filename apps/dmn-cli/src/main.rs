@@ -71,7 +71,7 @@ struct Cli {
 enum Command {
     /// Run the copilot in this terminal: live question, Approach, transcript and status.
     /// Captures the call live (your mic, the call app's output) until q.
-    /// Keys: p pin/unpin, r regenerate, m mute mic, q quit
+    /// Keys: p pin/unpin, r regenerate, m mute mic, s coding solutions hints/full, q quit
     Run {
         /// Feed the pipeline from two WAV files at 1× instead of live capture
         #[arg(long, num_args = 2, value_names = ["INTERVIEWER", "CANDIDATE"])]
@@ -104,6 +104,11 @@ enum Command {
         /// Live: stop after this many seconds, as if q had been pressed
         #[arg(long, value_name = "SECS", conflicts_with = "replay")]
         duration: Option<u64>,
+        /// Coding questions: "hints" (insight, edge cases, complexity; no complete code) or
+        /// "full" (a worked solution too) in Deeper Answer; overrides [ui].coding_solutions for
+        /// this run. `s` toggles it during the call
+        #[arg(long, value_name = "MODE", value_parser = ["hints", "full"])]
+        solutions: Option<String>,
     },
     /// Check the machine and, with --init, write a commented config file
     Doctor {
@@ -338,8 +343,13 @@ fn run(cli: Cli) -> Result<(), CliError> {
             no_store,
             headless,
             duration,
+            solutions,
         }) => {
             let cfg = Config::load(&paths.config_file)?;
+            // clap's value_parser has already limited it to the two labels.
+            let solutions = solutions
+                .as_deref()
+                .and_then(dmn_session::CodingSolutions::from_label);
             let replay = match replay.as_deref() {
                 None => None,
                 Some([interviewer, candidate]) => Some((interviewer.clone(), candidate.clone())),
@@ -362,6 +372,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     no_store,
                     headless,
                     duration,
+                    solutions,
                 },
             )
             .map_err(|e| CliError::Run(e.to_string()))
