@@ -2,8 +2,8 @@
 //!
 //! Input: a `&Session` (the value behind `dmn-session`'s `watch` channel).
 //! Output: cells in a ratatui [`Buffer`]; no terminal I/O happens here.
-//! Owns: no channel. #14 renders a saved session; #15 wires `dmn run` to redraw on every
-//! `watch` change and adds the keys.
+//! Owns: no channel. `dmn run` (`crate::run`) redraws it on every `watch` change and handles
+//! the keys; the snapshot tests render saved sessions.
 //!
 //! Layout, top to bottom (SPEC § UI, Terminal MVP), sized for a 100 × 30 pane beside the call
 //! and still readable at 80 × 24:
@@ -69,10 +69,12 @@ impl<'a> View<'a> {
         let live_candidate = session.live.as_ref().map(|q| q.candidate);
         // While pinned, a newer question queues instead of replacing this one, so the pinned
         // Approach is not "previous" and stays at full strength.
-        let loading = mode != Mode::Pinned
+        // `r` dims the Approach on screen the same way until the new reply starts.
+        let loading = (mode != Mode::Pinned
             && session
                 .pending
-                .is_some_and(|p| live_candidate.is_none_or(|c| c != p));
+                .is_some_and(|p| live_candidate.is_none_or(|c| c != p)))
+            || session.live.as_ref().is_some_and(|q| q.regenerating);
         let streaming = session.live.as_ref().is_some_and(|q| {
             q.progress == Progress::Streaming && session.pending == Some(q.candidate)
         });
@@ -89,7 +91,7 @@ impl<'a> View<'a> {
     }
 }
 
-/// Draw the whole UI into a frame (what `dmn run` calls on every change, from #15).
+/// Draw the whole UI into a frame (what `dmn run` calls on every change).
 pub fn draw(frame: &mut Frame, session: &Session) {
     let area = frame.area();
     render(session, area, frame.buffer_mut());

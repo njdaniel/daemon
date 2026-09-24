@@ -520,6 +520,7 @@ name = "dmn-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crossbeam-channel",
  "dmn-audio",
  "dmn-core",
  "dmn-detect",

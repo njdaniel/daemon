@@ -1,0 +1,427 @@
+//! `dmn run`: the copilot in a terminal beside the call (SPEC § UI, Terminal MVP).
+//!
+//! The pipeline ([`crate::pipeline`], the same one `dmn replay` runs) works on its own thread
+//! and dispatches everything into the session; this thread redraws the TUI from the session's
+//! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
+//! `r` regenerate, `m` mute the mic, `q` (or Ctrl-C) quit. Nothing else writes to the terminal
+//! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
+//! errors show only as the status dots. The terminal is restored on the way out, on an error,
+//! and (through ratatui's panic hook) on a panic.
+//!
+//! Only `--replay <interviewer.wav> <candidate.wav>` at 1× is wired in #15; live PipeWire
+//! capture is exercised with #16. `--headless` runs the same pipeline with no terminal and
+//! prints how long each scripted question took to reach the screen (#15's latency criterion).
+
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::path::PathBuf;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use dmn_core::{Config, Paths};
+use dmn_session::Session;
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use tokio::sync::watch;
+
+use crate::latency::{self, Screen, Seen};
+use crate::pipeline::{Controls, Found, Observer, Options, Partials, Pipeline, Quiet, Report};
+use crate::replay;
+use crate::suggest::Output;
+use crate::tui;
+
+/// SPEC § UI: the Approach is visible within 2.0 s of the question ending.
+pub const APPROACH_BUDGET_S: f64 = 2.0;
+
+/// How often the TUI looks for keys and session changes.
+const FRAME: Duration = Duration::from_millis(33);
+/// How often `--headless` samples the session: the resolution of the latency it reports.
+const SAMPLE: Duration = Duration::from_millis(10);
+
+pub struct Args {
+    /// `--replay <interviewer.wav> <candidate.wav>`.
+    pub replay: Option<(PathBuf, PathBuf)>,
+    pub model: Option<String>,
+    pub threads: Option<usize>,
+    pub no_store: bool,
+    pub headless: bool,
+}
+
+/// A key the TUI acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Pin,
+    Regenerate,
+    Mute,
+    Quit,
+}
+
+/// Map a terminal key event to a [`Key`]. Only presses count (terminals that report releases
+/// would otherwise act twice).
+pub fn key(ev: KeyEvent) -> Option<Key> {
+    if ev.kind != KeyEventKind::Press {
+        return None;
+    }
+    if ev.modifiers.contains(KeyModifiers::CONTROL) {
+        return (ev.code == KeyCode::Char('c')).then_some(Key::Quit);
+    }
+    match ev.code {
+        KeyCode::Char('p' | 'P') => Some(Key::Pin),
+        KeyCode::Char('r' | 'R') => Some(Key::Regenerate),
+        KeyCode::Char('m' | 'M') => Some(Key::Mute),
+        KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Key::Quit),
+        _ => None,
+    }
+}
+
+/// Act on one key. Returns `true` when the TUI should close.
+pub fn press(k: Key, controls: &Controls) -> bool {
+    match k {
+        Key::Pin => controls.toggle_pin(),
+        Key::Regenerate => controls.regenerate(),
+        Key::Mute => controls.toggle_mute(),
+        Key::Quit => {
+            controls.quit();
+            return true;
+        }
+    }
+    false
+}
+
+pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error>> {
+    let Some((interviewer, candidate)) = args.replay.clone() else {
+        return Err("live capture is not wired into `dmn run` yet (#16); \
+                    run a fixture with `dmn run --replay <interviewer.wav> <candidate.wav>`"
+            .into());
+    };
+    let questions = interviewer.parent().map(|d| d.join("questions.json"));
+    let pipeline = Pipeline::start(
+        cfg,
+        paths,
+        &Options {
+            interviewer,
+            candidate,
+            // #15: `--replay` runs at 1×, like the call it stands in for.
+            speed: 1.0,
+            model: args.model.clone(),
+            threads: args.threads,
+            partials: Partials::Auto,
+            spec_literal_detector: false,
+            no_llm: false,
+            no_store: args.no_store,
+            output: Output::Quiet,
+        },
+    )?;
+    let audio = pipeline.info().audio;
+    let report = if args.headless {
+        let (report, rows) = headless(pipeline, questions.as_deref())?;
+        replay::print_summary(&report, audio);
+        replay::print_downstream(&report, paths);
+        match rows {
+            Some(rows) => print!("\n{}", latency::render(&rows, APPROACH_BUDGET_S)),
+            None => {
+                println!("\nno questions.json next to the interviewer file: latency not measured")
+            }
+        }
+        report
+    } else {
+        let report = interactive(pipeline)?;
+        replay::print_summary(&report, audio);
+        replay::print_downstream(&report, paths);
+        if report.stopped {
+            println!("stopped      with q before the audio ended");
+        }
+        report
+    };
+    if !report.failures.is_empty() {
+        return Err(report.failures.join("; ").into());
+    }
+    Ok(())
+}
+
+type Worker<T> = JoinHandle<(Result<Report, String>, T)>;
+
+/// Run the pipeline on its own thread with `observer`; `keep_alive` keeps it serving keys after
+/// the audio ends, until quit.
+fn spawn<O: Observer + Send + 'static>(
+    mut pipeline: Pipeline,
+    mut observer: O,
+    keep_alive: bool,
+) -> Worker<O> {
+    std::thread::spawn(move || {
+        pipeline.run(&mut observer, keep_alive);
+        let report = pipeline.finish(&mut observer).map_err(|e| e.to_string());
+        (report, observer)
+    })
+}
+
+fn join<T>(worker: Worker<T>) -> Result<(Report, T), Box<dyn Error>> {
+    let (report, extra) = worker.join().map_err(|_| "pipeline thread panicked")?;
+    Ok((report?, extra))
+}
+
+/// Restores the terminal however the TUI loop ends.
+struct Restore;
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
+}
+
+fn interactive(pipeline: Pipeline) -> Result<Report, Box<dyn Error>> {
+    let controls = pipeline.controls();
+    let mut session = pipeline.hub().watch();
+    let worker = spawn(pipeline, Quiet, true);
+    let ui = (|| -> Result<(), Box<dyn Error>> {
+        let mut terminal = ratatui::try_init()?;
+        let _restore = Restore;
+        ui_loop(&mut terminal, &mut session, &controls)
+    })();
+    // However the UI ended, stop the pipeline so the session is closed and stored.
+    controls.quit();
+    let (report, Quiet) = join(worker)?;
+    ui?;
+    Ok(report)
+}
+
+fn ui_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    session: &mut watch::Receiver<Session>,
+    controls: &Controls,
+) -> Result<(), Box<dyn Error>> {
+    let mut dirty = true;
+    loop {
+        if dirty || session.has_changed().unwrap_or(false) {
+            // Clone out of the channel so the hub is never blocked behind a draw.
+            let s = session.borrow_and_update().clone();
+            terminal.draw(|f| tui::draw(f, &s))?;
+            dirty = false;
+        }
+        if !event::poll(FRAME)? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(ev) => {
+                if let Some(k) = key(ev) {
+                    if press(k, controls) {
+                        return Ok(());
+                    }
+                    dirty = true;
+                }
+            }
+            Event::Resize(..) => dirty = true,
+            _ => {}
+        }
+    }
+}
+
+/// Records, on the pipeline thread, when each candidate's final arrived and when it was emitted.
+struct Emitted {
+    zero: Instant,
+    seen: BTreeMap<u64, Seen>,
+}
+
+impl Observer for Emitted {
+    fn candidate(&mut self, id: u64, found: &Found) {
+        let now = self.zero.elapsed().as_secs_f64();
+        self.seen.insert(
+            id,
+            Seen {
+                start: found.candidate.start.as_secs_f64(),
+                end: found.candidate.end.as_secs_f64(),
+                final_at: now - found.latency.as_secs_f64(),
+                emitted_at: now,
+                ..Seen::default()
+            },
+        );
+    }
+}
+
+/// What `--headless` measured: one row per scripted question, when the fixture has a
+/// `questions.json`.
+type Timed = Option<Vec<latency::Row>>;
+
+/// The TUI's pipeline with no terminal: sample the session every 10 ms and time each scripted
+/// question from its end to the screen.
+fn headless(
+    pipeline: Pipeline,
+    questions: Option<&std::path::Path>,
+) -> Result<(Report, Timed), Box<dyn Error>> {
+    let zero = pipeline.audio_zero();
+    let mut session = pipeline.hub().watch();
+    let worker = spawn(
+        pipeline,
+        Emitted {
+            zero,
+            seen: BTreeMap::new(),
+        },
+        false,
+    );
+    let mut screen = Screen::default();
+    while !worker.is_finished() {
+        if session.has_changed().unwrap_or(false) {
+            let now = zero.elapsed().as_secs_f64();
+            screen.observe(&session.borrow_and_update(), now);
+        }
+        std::thread::sleep(SAMPLE);
+    }
+    let (report, mut emitted) = join(worker)?;
+    screen.apply(&mut emitted.seen);
+    let rows = match questions.filter(|p| p.is_file()) {
+        Some(path) => Some(latency::pair(&latency::load_scripted(path)?, &emitted.seen)),
+        None => None,
+    };
+    Ok((report, rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dmn_session::{Action, Health};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn press_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn screen(session: &Session) -> String {
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| tui::draw(f, session)).unwrap();
+        let buf = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn question(candidate: u64, text: &str) -> Vec<Action> {
+        vec![
+            Action::Question {
+                candidate,
+                text: text.into(),
+                kind: "system_design".into(),
+            },
+            Action::ApproachLine {
+                candidate,
+                index: 0,
+                text: format!("first step for {text}"),
+            },
+        ]
+    }
+
+    #[test]
+    fn keys_map_to_actions_and_only_presses_count() {
+        assert_eq!(key(press_key('p')), Some(Key::Pin));
+        assert_eq!(key(press_key('r')), Some(Key::Regenerate));
+        assert_eq!(key(press_key('m')), Some(Key::Mute));
+        assert_eq!(key(press_key('q')), Some(Key::Quit));
+        assert_eq!(
+            key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Key::Quit)
+        );
+        assert_eq!(
+            key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Key::Quit)
+        );
+        assert_eq!(key(press_key('x')), None);
+        let mut release = press_key('p');
+        release.kind = KeyEventKind::Release;
+        assert_eq!(key(release), None);
+    }
+
+    #[test]
+    fn pin_blocks_replacement_and_shows_the_new_badge_then_unpin_shows_the_newest() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        for a in question(1, "Design a rate limiter") {
+            hub.dispatch(a);
+        }
+        assert!(screen(&hub.snapshot()).contains("LIVE QUESTION"));
+
+        assert!(!press(key(press_key('p')).unwrap(), &controls));
+        for a in question(2, "Design a URL shortener") {
+            hub.dispatch(a);
+        }
+        let pinned = screen(&hub.snapshot());
+        assert!(pinned.contains("PINNED QUESTION"), "{pinned}");
+        assert!(pinned.contains("1 new"), "{pinned}");
+        assert!(
+            pinned.contains("Design a rate limiter"),
+            "not replaced:\n{pinned}"
+        );
+        assert!(!pinned.contains("URL shortener"), "{pinned}");
+
+        press(Key::Pin, &controls);
+        let unpinned = screen(&hub.snapshot());
+        assert!(unpinned.contains("LIVE QUESTION"), "{unpinned}");
+        assert!(unpinned.contains("Design a URL shortener"), "{unpinned}");
+        assert!(!unpinned.contains("1 new"), "{unpinned}");
+    }
+
+    #[test]
+    fn mute_shows_on_the_mic_dot_and_quit_closes() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        assert!(!press(key(press_key('m')).unwrap(), &controls));
+        assert_eq!(hub.snapshot().status.mic, Health::Muted);
+        assert!(screen(&hub.snapshot()).contains("mic muted"));
+        press(Key::Mute, &controls);
+        assert_eq!(hub.snapshot().status.mic, Health::Ok);
+
+        assert!(
+            press(key(press_key('q')).unwrap(), &controls),
+            "q closes the TUI"
+        );
+        assert!(controls.is_stopped());
+    }
+
+    #[test]
+    fn r_goes_to_the_pipeline_thread() {
+        let (controls, commands) = Controls::for_test();
+        assert!(!press(key(press_key('r')).unwrap(), &controls));
+        assert_eq!(
+            commands.try_recv(),
+            Ok(crate::pipeline::Command::Regenerate)
+        );
+    }
+
+    #[test]
+    fn errors_show_only_as_a_red_dot_with_its_reason() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        hub.dispatch(Action::Status {
+            dot: dmn_session::Dot::Model,
+            health: Health::Error("connection refused".into()),
+        });
+        let s = screen(&hub.snapshot());
+        let status_line = s.lines().last().unwrap_or_default();
+        assert!(status_line.contains("model: connection refused"), "{s}");
+        // Nowhere else on screen.
+        assert_eq!(s.matches("connection refused").count(), 1, "{s}");
+    }
+
+    #[test]
+    fn live_capture_is_a_clear_error_naming_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let err = run(
+            &Config::default(),
+            &paths,
+            &Args {
+                replay: None,
+                model: None,
+                threads: None,
+                no_store: true,
+                headless: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--replay"), "{err}");
+    }
+}
