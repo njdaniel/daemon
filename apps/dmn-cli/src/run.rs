@@ -125,7 +125,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         report
     } else {
         let report = interactive(pipeline)?;
-        replay::print_summary(&report, audio);
+        // At 1× the audio delivered is the wall time, up to the file's length: `q` can end the
+        // run early, and after the audio ends the TUI stays up until `q`.
+        replay::print_summary(&report, audio.min(report.wall));
         replay::print_downstream(&report, paths);
         if report.stopped {
             println!("stopped      with q before the audio ended");
