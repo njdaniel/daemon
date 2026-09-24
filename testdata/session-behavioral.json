@@ -1,0 +1,70 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    }
+  ],
+  "partials": [],
+  "last_interviewer": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "live": {
+    "candidate": 1,
+    "text": "Tell me about a time you disagreed with a teammate.",
+    "kind": "behavioral",
+    "focus": "",
+    "approach": [],
+    "star": {
+      "situation": "Payments team, 2024: a rushed schema migration before a launch.",
+      "task": "I owned the rollout plan and had to get sign-off from the lead.",
+      "action": "Wrote a one-page risk comparison and proposed a dual-write step.",
+      "result": "Shipped a week later with zero incidents; dual-write became standard.",
+      "story": "payments-migration"
+    },
+    "clarifications": [
+      {
+        "candidate": 2,
+        "text": "And how did the teammate take it afterwards?",
+        "approach": [],
+        "progress": {
+          "state": "streaming"
+        }
+      }
+    ],
+    "progress": {
+      "state": "done"
+    }
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "muted"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "error",
+      "detail": "ollama unreachable"
+    }
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 1,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  }
+}

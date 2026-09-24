@@ -1,0 +1,24 @@
+┌ LISTENING ───────────────────────────────────────────────────────────────────┐
+│ Great. Let me tell you a bit about the team before we start.                 │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────┐
+│ The Approach appears here when the interviewer asks a question.              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+Interviewer Great. Let me tell you a bit about the team before we start.
+Interviewer We run the platform▍
+ ● mic  ● system  ● model                                       m mute · q quit
