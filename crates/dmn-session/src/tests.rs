@@ -435,8 +435,29 @@ fn a_declined_or_failed_regenerate_leaves_the_question_as_it_was() {
         let live = s.live.as_ref().expect("live");
         assert!(!live.regenerating);
         assert_eq!(live.approach, ["a", "b"]);
+        assert_eq!(live.progress, Progress::Done, "the earlier answer stands");
         assert_eq!(s.pending, None);
     }
+}
+
+#[test]
+fn a_regenerate_that_fails_after_its_new_reply_started_is_marked_failed() {
+    let mut log = vec![candidate(1, 20.0, "q")];
+    log.extend(shown(1, "Q", &["a", "b"]));
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::Question {
+        candidate: 1,
+        text: "Q, again".into(),
+        kind: "system_design".into(),
+    });
+    log.push(Action::Failed {
+        candidate: 1,
+        error: "timeout".into(),
+    });
+    let s = Session::replay(&log);
+    let live = s.live.as_ref().expect("live");
+    assert_eq!(live.text, "Q, again", "what was shown stays");
+    assert_eq!(live.progress, Progress::Failed("timeout".into()));
 }
 
 #[test]

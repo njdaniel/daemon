@@ -464,6 +464,21 @@ impl<P: Provider> Answerer<'_, P> {
             return Ok(());
         }
         hub.dispatch(wire::outcome(job.id, &result, self.clock.now()));
+        // SPEC § Transcript & status: a failed request turns the model dot red with its reason
+        // (the dots are the only place errors show); the next good reply turns it green again.
+        let health = match &result {
+            Ok(_) => Some(Health::Ok),
+            Err(LlmError::Cancelled) if self.cancel.is_cancelled() => None,
+            Err(e) => Some(Health::Error(e.to_string())),
+        };
+        if let Some(health) = health
+            && hub.snapshot().status.model != health
+        {
+            hub.dispatch(Action::Status {
+                dot: Dot::Model,
+                health,
+            });
+        }
         let timing = Timing {
             question: question_at,
             first_line: first_line_at,
@@ -812,6 +827,26 @@ mod tests {
         assert_eq!(live.approach.len(), 2);
         assert!(!live.regenerating);
         assert_eq!(tally.regenerated, 1);
+    }
+
+    #[test]
+    fn a_failed_request_turns_the_model_dot_red_and_a_good_one_green_again() {
+        let hub = Arc::new(SessionHub::default());
+        let broken =
+            dmn_llm::MockProvider::new(vec![dmn_llm::mock::Step::Error("model crashed".into())]);
+        let s = Suggester::start_with(broken, Policy::AnswerAll, Arc::clone(&hub));
+        submit_with_candidate(&s, &hub, 1);
+        assert_eq!(s.finish().failed, 1);
+        let dot = hub.snapshot().status.model;
+        assert!(
+            matches!(&dot, Health::Error(why) if why.contains("model crashed")),
+            "{dot:?}"
+        );
+
+        let s = Suggester::start_with(slow_reply("Q"), Policy::AnswerAll, Arc::clone(&hub));
+        submit_with_candidate(&s, &hub, 2);
+        assert_eq!(s.finish().shown, 1);
+        assert_eq!(hub.snapshot().status.model, Health::Ok);
     }
 
     /// A reply that streams for about 2 s (50 ms per 7-character chunk).

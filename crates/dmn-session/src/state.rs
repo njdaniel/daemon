@@ -152,7 +152,13 @@ impl Session {
             self.pending = None;
         }
         if let Some(q) = self.question_mut(candidate) {
-            q.progress = progress.clone();
+            // Still `regenerating` means the new reply never started: the question on screen
+            // is the earlier, complete one, and a failed retry leaves it as it was.
+            q.progress = if q.regenerating {
+                Progress::Done
+            } else {
+                progress.clone()
+            };
             q.regenerating = false;
         } else if let Some(c) = self.clarification_mut(candidate) {
             c.progress = progress.clone();

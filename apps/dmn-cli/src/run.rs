@@ -269,6 +269,11 @@ fn headless(
         }
         std::thread::sleep(SAMPLE);
     }
+    // The worker can finish between a sample and the next `is_finished` check; take the last
+    // state so a reply that landed in that gap is not reported as missed (its time is then
+    // at most one sample late).
+    let now = zero.elapsed().as_secs_f64();
+    screen.observe(&session.borrow_and_update(), now);
     let (report, mut emitted) = join(worker)?;
     screen.apply(&mut emitted.seen);
     let rows = match questions.filter(|p| p.is_file()) {

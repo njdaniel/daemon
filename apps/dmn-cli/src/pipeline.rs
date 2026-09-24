@@ -286,9 +286,13 @@ impl Controls {
     }
 
     /// `m`: mute or unmute the mic. Muted, the mic lane's VAD hears only silence, so nothing
-    /// you say reaches whisper, the transcript or the model; the mic dot shows it.
+    /// you say reaches whisper, the transcript or the model; the mic dot shows it, unless the
+    /// dot is already red: a failed mic lane stays red, muted or not.
     pub fn toggle_mute(&self) {
         let muted = !self.mic_muted.fetch_xor(true, Ordering::AcqRel);
+        if matches!(self.hub.snapshot().status.mic, Health::Error(_)) {
+            return;
+        }
         self.hub.dispatch(Action::Status {
             dot: Dot::Mic,
             health: if muted { Health::Muted } else { Health::Ok },
@@ -897,6 +901,17 @@ mod tests {
         assert_eq!(hub.snapshot().status.mic, Health::Muted);
         controls.toggle_mute();
         assert_eq!(hub.snapshot().status.mic, Health::Ok);
+
+        // A failed mic lane stays red through mute and unmute.
+        let failed = Health::Error("You audio: truncated file".into());
+        hub.dispatch(Action::Status {
+            dot: Dot::Mic,
+            health: failed.clone(),
+        });
+        controls.toggle_mute();
+        controls.toggle_mute();
+        assert_eq!(hub.snapshot().status.mic, failed);
+        assert!(!controls.is_muted(), "the gate itself still toggles");
 
         controls.regenerate();
         assert_eq!(rx.try_recv(), Ok(Command::Regenerate));
