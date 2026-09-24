@@ -26,7 +26,7 @@ use tokio::sync::watch;
 use crate::latency::{self, Screen, Seen};
 use crate::pipeline::{Controls, Found, Observer, Options, Partials, Pipeline, Quiet, Report};
 use crate::replay;
-use crate::suggest::Output;
+use crate::suggest::{Output, Policy};
 use crate::tui;
 
 /// SPEC § UI: the Approach is visible within 2.0 s of the question ending.
@@ -109,6 +109,8 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             no_llm: false,
             no_store: args.no_store,
             output: Output::Quiet,
+            // SPEC § Threading rules: a newer unpinned question cancels the one in flight.
+            policy: Policy::Supersede,
         },
     )?;
     let audio = pipeline.info().audio;

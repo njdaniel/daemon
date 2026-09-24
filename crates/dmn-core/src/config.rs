@@ -80,7 +80,10 @@ impl Default for Stt {
         Self {
             engine: SttEngine::WhisperCpp,
             model: "small.en".into(),
-            threads: 4,
+            // Per lane. #15 measured `dmn run --replay` on the sysdesign fixture at 1×
+            // (Ryzen 7700X, small.en on CPU): question + Approach p50 2.29 s at 4 threads,
+            // 1.95 s at 8. The final whisper pass is the stage threads move.
+            threads: 8,
             vad: Vad::Energy,
         }
     }
@@ -246,7 +249,7 @@ echo_guard = true                    # drop mic text that duplicates the loopbac
 [stt]
 engine = "whisper.cpp"
 model = "small.en"                   # under ~/.cache/dmn/models/; `dmn doctor --fetch small.en`
-threads = 4
+threads = 8                          # whisper threads per lane; the final pass is most of the 2 s budget
 vad = "energy"                       # energy | silero (M2)
 
 [detect]
@@ -369,7 +372,7 @@ echo_guard = true
 [stt]
 engine = "whisper.cpp"
 model = "small.en"
-threads = 4
+threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "energy"                       # energy | silero (M2)
 
 [detect]

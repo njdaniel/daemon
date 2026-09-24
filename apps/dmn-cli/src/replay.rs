@@ -16,7 +16,7 @@ use dmn_transcript::{DEFAULT_WINDOW, Segment, timestamp};
 use dmn_vad::WorkerStats;
 
 use crate::pipeline::{Found, Observer, Options, Partials, Pipeline, Report};
-use crate::suggest::Output;
+use crate::suggest::{Output, Policy};
 
 pub struct Args {
     pub interviewer: PathBuf,
@@ -79,6 +79,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             no_llm: args.no_llm,
             no_store: args.no_store,
             output: Output::Print { json: args.json },
+            policy: Policy::AnswerAll,
         },
     )?;
     if !args.json {
@@ -152,8 +153,8 @@ pub fn print_downstream(report: &Report, paths: &Paths) {
     );
     match report.tally {
         Some(t) => println!(
-            "fast phase   {} shown ({} regenerated), {} clarification(s), {} not shown, {} failed, {} skipped",
-            t.shown, t.regenerated, t.clarifications, t.ignored, t.failed, t.skipped
+            "fast phase   {} shown ({} regenerated), {} clarification(s), {} not shown, {} failed, {} skipped, {} superseded",
+            t.shown, t.regenerated, t.clarifications, t.ignored, t.failed, t.skipped, t.superseded
         ),
         None => println!("fast phase   off (--no-llm)"),
     }

@@ -291,7 +291,7 @@ echo_guard = true
 [stt]
 engine = "whisper.cpp"
 model = "small.en"
-threads = 4
+threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "energy"                       # energy | silero (M2)
 
 [detect]

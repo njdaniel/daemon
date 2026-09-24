@@ -32,7 +32,7 @@ use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcribe
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
 use dmn_vad::{EnergyVad, Vad, VadConfig, VadWorker, WorkerStats, event_channel};
 
-use crate::suggest::{Output, Suggester, Tally};
+use crate::suggest::{Output, Policy, Suggester, Tally};
 
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
 /// but an unpaced replay hands the VAD a whole interview in seconds, so this holds every
@@ -107,6 +107,9 @@ pub struct Options {
     pub no_store: bool,
     /// Where the fast phase prints (`dmn replay`) or not (`dmn run`).
     pub output: Output,
+    /// Whether a newer question cancels the older one's request (`dmn run`) or every candidate
+    /// is answered (`dmn replay`).
+    pub policy: Policy,
 }
 
 /// Facts about the running pipeline, for a header line.
@@ -489,7 +492,7 @@ impl Pipeline {
         let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
         // #12: each candidate goes through the LLM fast phase on its own thread.
         let suggester = (!opts.no_llm)
-            .then(|| Suggester::start(&cfg.llm, opts.output, Arc::clone(&hub), clock));
+            .then(|| Suggester::start(&cfg.llm, opts.output, opts.policy, Arc::clone(&hub), clock));
         let (commands_tx, commands) = mpsc::channel();
         Ok(Self {
             info: Info {

@@ -4,10 +4,12 @@
 //! ([`Output::Quiet`]) and the session the TUI mirrors is the only output.
 //!
 //! The thread owns a current-thread tokio runtime, so the pipeline loop stays synchronous and the
-//! audio path never waits on HTTP. Candidates are handled in order, one request at a time. The
-//! live pipeline is meant to cancel an in-flight request when a newer unpinned question arrives;
-//! for now every candidate is answered in turn, so the output covers each one. [`Suggester::stop`]
-//! does cancel: `q` in `dmn run` drops the in-flight request and everything still queued.
+//! audio path never waits on HTTP. Candidates are handled in order, one request at a time.
+//! Under `dmn run` ([`Policy::Supersede`], SPEC § Threading rules) a newer unpinned question
+//! cancels the request in flight and any older one still queued is never sent; `dmn replay`
+//! ([`Policy::AnswerAll`]) answers every candidate so its output covers each one.
+//! [`Suggester::stop`] cancels everything: `q` in `dmn run` drops the in-flight request and
+//! whatever is still queued.
 //!
 //! `r` (regenerate) is a job like any other ([`Suggester::regenerate`]): the same candidate id,
 //! the question on screen as the current question, temperature 0.7 and the "different angle"
@@ -22,7 +24,8 @@
 //! Every published field and every outcome is also dispatched into the session (#13), so the
 //! session log gets the same actions a live call's fast phase would produce.
 
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -58,6 +61,9 @@ impl Output {
     }
 }
 
+/// The error a superseded candidate's `Failed` action carries.
+const SUPERSEDED: &str = "superseded by a newer question";
+
 /// One candidate and the last 60 s of transcript at the moment it was found.
 struct Job {
     /// The session's candidate id, which tags every action for this candidate.
@@ -79,12 +85,43 @@ pub struct Tally {
     pub skipped: usize,
     /// How many of the shown replies were regenerations.
     pub regenerated: usize,
+    /// Requests cancelled, or never sent, because a newer unpinned question arrived.
+    pub superseded: usize,
+}
+
+/// Whether a newer question replaces an older one's request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// SPEC § Threading rules, for `dmn run`: a newer unpinned question cancels the request in
+    /// flight, and a candidate still queued behind a newer one is never sent. While pinned,
+    /// new questions queue on screen, so every one is answered.
+    Supersede,
+    /// `dmn replay`: answer every candidate in order, so the output covers each one.
+    AnswerAll,
+}
+
+/// What a newer question needs to reach the request it replaces.
+#[derive(Default)]
+struct Latest {
+    /// The newest candidate submitted (regenerations are not new questions).
+    newest: AtomicU64,
+    /// The request in flight, if any.
+    inflight: Mutex<Option<CancellationToken>>,
+}
+
+impl Latest {
+    fn inflight(&self) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
+        self.inflight.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 pub struct Suggester {
     tx: mpsc::Sender<Job>,
     cancel: CancellationToken,
     handle: JoinHandle<Tally>,
+    hub: Arc<SessionHub>,
+    /// `Some` under [`Policy::Supersede`].
+    latest: Option<Arc<Latest>>,
 }
 
 impl Suggester {
@@ -92,19 +129,83 @@ impl Suggester {
     pub fn start(
         llm: &config::Llm,
         output: Output,
+        policy: Policy,
         hub: Arc<SessionHub>,
         clock: wire::SessionClock,
     ) -> Self {
-        let (tx, rx) = mpsc::channel();
         let llm = llm.clone();
-        let cancel = CancellationToken::new();
-        let token = cancel.clone();
-        let handle = std::thread::spawn(move || worker(&llm, output, &rx, &hub, clock, &token));
-        Self { tx, cancel, handle }
+        Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
+            worker(&llm, output, rx, hub, clock, cancel, latest)
+        })
     }
 
-    /// Queue candidate `id` for the fast phase. Never blocks the pipeline loop.
+    /// Serve jobs on `provider` directly, with no warm-up: the tests' way in.
+    #[cfg(test)]
+    fn start_with<P: Provider + Send + 'static>(
+        provider: P,
+        policy: Policy,
+        hub: Arc<SessionHub>,
+    ) -> Self {
+        Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let answerer = Answerer {
+                rt: &rt,
+                provider: &provider,
+                hub,
+                clock: wire::SessionClock::start(1.0),
+                output: Output::Quiet,
+                cancel,
+                latest,
+            };
+            let mut tally = Tally::default();
+            let mut current = None;
+            while let Ok(job) = rx.recv() {
+                let _ = answerer.answer(job, &mut current, &mut tally);
+            }
+            tally
+        })
+    }
+
+    fn spawn(
+        policy: Policy,
+        hub: Arc<SessionHub>,
+        serve: impl FnOnce(
+            &mpsc::Receiver<Job>,
+            &SessionHub,
+            Option<&Latest>,
+            &CancellationToken,
+        ) -> Tally
+        + Send
+        + 'static,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancellationToken::new();
+        let latest = (policy == Policy::Supersede).then(|| Arc::new(Latest::default()));
+        let (token, shared, worker_hub) = (cancel.clone(), latest.clone(), Arc::clone(&hub));
+        let handle = std::thread::spawn(move || serve(&rx, &worker_hub, shared.as_deref(), &token));
+        Self {
+            tx,
+            cancel,
+            handle,
+            hub,
+            latest,
+        }
+    }
+
+    /// Queue candidate `id` for the fast phase. Never blocks the pipeline loop. Under
+    /// [`Policy::Supersede`], unless the session is pinned, this cancels the request in flight.
     pub fn submit(&self, id: u64, candidate: &Candidate, transcript: String) {
+        if let Some(latest) = &self.latest {
+            latest.newest.fetch_max(id, Ordering::AcqRel);
+            if !self.hub.snapshot().pinned
+                && let Some(inflight) = latest.inflight().as_ref()
+            {
+                inflight.cancel();
+            }
+        }
         self.send(Job {
             id,
             candidate: candidate.clone(),
@@ -155,6 +256,7 @@ fn worker(
     hub: &SessionHub,
     clock: wire::SessionClock,
     cancel: &CancellationToken,
+    latest: Option<&Latest>,
 ) -> Tally {
     let mut tally = Tally::default();
     let model_down = |why: String| {
@@ -247,6 +349,7 @@ fn worker(
         clock,
         output,
         cancel,
+        latest,
     };
     let mut current: Option<CurrentQuestion> = None;
     while let Ok(job) = rx.recv() {
@@ -270,6 +373,8 @@ struct Answerer<'a, P: Provider> {
     clock: wire::SessionClock,
     output: Output,
     cancel: &'a CancellationToken,
+    /// `Some` under [`Policy::Supersede`].
+    latest: Option<&'a Latest>,
 }
 
 /// The request for `job`: a new candidate (answered with the question on screen as context, so
@@ -302,15 +407,36 @@ impl<P: Provider> Answerer<'_, P> {
             return Ok(());
         }
         let regenerating = job.regenerate.is_some();
+        // Publish this request's token before looking at `newest`: `submit` bumps `newest`
+        // before it looks at the token, so a newer question either sees this token and cancels
+        // it, or this check sees the newer question.
+        let token = self.cancel.child_token();
+        if let Some(latest) = self.latest {
+            *latest.inflight() = Some(token.clone());
+        }
+        // A question still queued behind a newer one is never sent, unless pinned (then both
+        // are on screen). A regeneration is the user asking about the question on screen, so
+        // it is always sent.
+        if let Some(latest) = self.latest
+            && !regenerating
+            && latest.newest.load(Ordering::Acquire) > job.id
+            && !hub.snapshot().pinned
+        {
+            *latest.inflight() = None;
+            hub.dispatch(Action::Failed {
+                candidate: job.id,
+                error: SUPERSEDED.into(),
+            });
+            tally.superseded += 1;
+            return Ok(());
+        }
         let req = request(&job, current.as_ref());
         let started = Instant::now();
         let mut question_at = None;
         let mut first_line_at = None;
-        let result = self.rt.block_on(run_fast_phase(
-            self.provider,
-            &req,
-            self.cancel.child_token(),
-            |e| {
+        let result = self
+            .rt
+            .block_on(run_fast_phase(self.provider, &req, token.clone(), |e| {
                 match e {
                     FastEvent::Question { .. } | FastEvent::Clarification { .. } => {
                         question_at.get_or_insert_with(|| started.elapsed());
@@ -321,8 +447,22 @@ impl<P: Provider> Answerer<'_, P> {
                     FastEvent::Focus { .. } | FastEvent::Star(_) => {}
                 }
                 hub.dispatch(wire::fast_event(job.id, &e));
-            },
-        ));
+            }));
+        if let Some(latest) = self.latest {
+            *latest.inflight() = None;
+        }
+        // Cancelled by a newer question, not by `q`: say so in the session and the tally.
+        let superseded = matches!(result, Err(LlmError::Cancelled))
+            && token.is_cancelled()
+            && !self.cancel.is_cancelled();
+        if superseded {
+            hub.dispatch(Action::Failed {
+                candidate: job.id,
+                error: SUPERSEDED.into(),
+            });
+            tally.superseded += 1;
+            return Ok(());
+        }
         hub.dispatch(wire::outcome(job.id, &result, self.clock.now()));
         let timing = Timing {
             question: question_at,
@@ -532,6 +672,7 @@ mod tests {
         let s = Suggester::start(
             &llm,
             Output::Print { json: true },
+            Policy::AnswerAll,
             Arc::clone(&hub),
             wire::SessionClock::start(1.0),
         );
@@ -560,6 +701,7 @@ mod tests {
         let s = Suggester::start(
             &llm,
             Output::Quiet,
+            Policy::AnswerAll,
             Arc::new(SessionHub::default()),
             wire::SessionClock::start(1.0),
         );
@@ -585,6 +727,7 @@ mod tests {
         let s = Suggester::start(
             &llm,
             Output::Quiet,
+            Policy::Supersede,
             Arc::clone(&hub),
             wire::SessionClock::start(1.0),
         );
@@ -621,6 +764,7 @@ mod tests {
             clock: wire::SessionClock::start(1.0),
             output: Output::Quiet,
             cancel: &cancel,
+            latest: None,
         };
         // Candidate 1 is on screen, answered once already.
         hub.dispatch(wire::candidate(1, &candidate()));
@@ -668,6 +812,78 @@ mod tests {
         assert_eq!(live.approach.len(), 2);
         assert!(!live.regenerating);
         assert_eq!(tally.regenerated, 1);
+    }
+
+    /// A reply that streams for about 2 s (50 ms per 7-character chunk).
+    fn slow_reply(question: &str) -> dmn_llm::MockProvider {
+        dmn_llm::MockProvider::json(&serde_json::json!({
+            "is_question": true,
+            "kind": "system_design",
+            "question": question,
+            "focus": "tradeoffs",
+            "approach": [
+                "Clarify the requirements and the scale first.",
+                "Pick the core data model and the write path.",
+                "Name the failure modes and how each degrades."
+            ]
+        }))
+        .with_delay(Duration::from_millis(50))
+    }
+
+    fn submit_with_candidate(s: &Suggester, hub: &SessionHub, id: u64) {
+        hub.dispatch(wire::candidate(id, &candidate()));
+        s.submit(id, &candidate(), String::new());
+    }
+
+    #[test]
+    fn a_newer_unpinned_question_cancels_the_one_in_flight_and_skips_the_queue() {
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with(slow_reply("Q"), Policy::Supersede, Arc::clone(&hub));
+        submit_with_candidate(&s, &hub, 1);
+        // Candidate 1 is streaming; 2 queues behind it, then 3 arrives.
+        std::thread::sleep(Duration::from_millis(300));
+        submit_with_candidate(&s, &hub, 2);
+        submit_with_candidate(&s, &hub, 3);
+        let tally = s.finish();
+        assert_eq!(
+            tally.superseded, 2,
+            "1 cancelled in flight, 2 never sent: {tally:?}"
+        );
+        assert_eq!(tally.shown, 1, "{tally:?}");
+        let session = hub.snapshot();
+        assert_eq!(session.live.map(|q| q.candidate), Some(3));
+        assert_eq!(session.pending, None, "nothing left loading");
+    }
+
+    #[test]
+    fn while_pinned_every_question_is_answered() {
+        let hub = Arc::new(SessionHub::default());
+        hub.dispatch(Action::Question {
+            candidate: 0,
+            text: "Pinned".into(),
+            kind: "system_design".into(),
+        });
+        hub.dispatch(Action::Pin);
+        let s = Suggester::start_with(slow_reply("Q"), Policy::Supersede, Arc::clone(&hub));
+        submit_with_candidate(&s, &hub, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        submit_with_candidate(&s, &hub, 2);
+        let tally = s.finish();
+        assert_eq!((tally.shown, tally.superseded), (2, 0), "{tally:?}");
+        let session = hub.snapshot();
+        assert_eq!(session.live.map(|q| q.candidate), Some(0), "still pinned");
+        assert_eq!(session.queued.len(), 2);
+    }
+
+    #[test]
+    fn replay_answers_every_candidate() {
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with(slow_reply("Q"), Policy::AnswerAll, Arc::clone(&hub));
+        submit_with_candidate(&s, &hub, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        submit_with_candidate(&s, &hub, 2);
+        let tally = s.finish();
+        assert_eq!((tally.shown, tally.superseded), (2, 0), "{tally:?}");
     }
 
     #[test]
