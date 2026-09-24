@@ -90,14 +90,16 @@ pub fn wrap(s: &str, max: usize, max_lines: usize) -> Vec<String> {
         if !cur.is_empty() {
             lines.push(std::mem::take(&mut cur));
         }
-        // A word wider than the line: break it across lines.
+        // A word wider than the line: break it across lines. Each piece takes at least one
+        // character, so a character wider than the whole line (a CJK glyph at width 1) still
+        // moves the loop forward instead of pushing empty pieces for ever.
         let mut rest = word;
-        while width(rest) > max {
+        while width(rest) > max && lines.len() < max_lines {
             let mut cut = 0;
             let mut used = 0;
             for (i, c) in rest.char_indices() {
                 let w = char_width(c);
-                if used + w > max {
+                if used + w > max && cut > 0 {
                     break;
                 }
                 used += w;
@@ -155,6 +157,15 @@ mod tests {
         assert_eq!(w.len(), 2);
         assert!(w[1].ends_with('…'), "{w:?}");
         assert!(w.iter().all(|l| width(l) <= 9), "{w:?}");
+    }
+
+    #[test]
+    fn wrap_terminates_when_one_character_is_wider_than_the_line() {
+        // A double-width glyph in a one-cell line: each piece takes one glyph and the lines run
+        // out, rather than looping on empty pieces.
+        let w = wrap("東京大阪", 1, 3);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w.iter().all(|l| !l.is_empty()), "{w:?}");
     }
 
     #[test]
