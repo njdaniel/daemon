@@ -369,7 +369,7 @@ impl Controls {
         self.stop.store(true, Ordering::Release);
     }
 
-    #[cfg(test)]
+    /// Quit was asked for (by `q`, or by `dmn run --duration`).
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
@@ -899,6 +899,8 @@ struct Monitor {
     overruns: u64,
     /// Interviewer frames consumed at the last anchor.
     anchored_frames: u64,
+    /// Whisper inference time so far, over both lanes, at the last tick.
+    whisper_ms: u64,
 }
 
 impl Monitor {
@@ -912,11 +914,13 @@ impl Monitor {
             last_cpu: None,
             overruns: 0,
             anchored_frames: 0,
+            whisper_ms: 0,
         }
     }
 
     fn tick(&mut self, lanes: &[Lane]) {
         let now = Instant::now();
+        self.whisper_ms = lanes.iter().map(|l| l.stt.stats().inference_ms).sum();
         let mut overruns = 0;
         let mut snapshot = None;
         for lane in lanes {
@@ -970,6 +974,7 @@ impl Monitor {
                 at: self.clock.at(now),
                 wall: now.duration_since(self.started).as_secs_f64(),
                 cpu: cpu - cpu0,
+                whisper: self.whisper_ms as f64 / 1000.0,
             });
         }
     }

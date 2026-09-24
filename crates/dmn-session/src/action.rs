@@ -152,9 +152,15 @@ pub enum Action {
         stage: Stage,
         at: f64,
     },
-    /// The process had used `cpu` seconds of CPU at audio time `at`, `wall` seconds after the
-    /// session started. For the session log and `dmn bench --live`; the screen does not change.
-    Cpu { at: f64, wall: f64, cpu: f64 },
+    /// The process had used `cpu` seconds of CPU, whisper `whisper` seconds of inference, at
+    /// audio time `at`, `wall` seconds after the session started. For the session log and
+    /// `dmn bench --live`; the screen does not change.
+    Cpu {
+        at: f64,
+        wall: f64,
+        cpu: f64,
+        whisper: f64,
+    },
     /// The session ends. `at` is unix epoch seconds.
     Ended { at: i64 },
 }

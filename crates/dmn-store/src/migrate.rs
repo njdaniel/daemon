@@ -95,8 +95,9 @@ CREATE INDEX idx_suggestions_question ON suggestions(question_id);
 ///   start (the clock segment times use) at which the detector emitted the candidate, the fast
 ///   phase produced its question (or clarification) line, and its first Approach line (or STAR
 ///   card). The first showing counts: a regenerate does not move them.
-/// - `cpu_samples`: the process's CPU seconds (`cpu`) at audio time `at` and wall seconds
-///   `wall` since the session started, sampled every few seconds.
+/// - `cpu_samples`: the process's CPU seconds (`cpu`) and whisper's inference seconds
+///   (`whisper`) at audio time `at` and wall seconds `wall` since the session started, sampled
+///   every few seconds. A window in which `whisper` did not move is one nobody was speaking in.
 /// - `sessions.overruns`: ring-buffer frames dropped over the session (SPEC § Threading rules).
 const V2: &str = "
 ALTER TABLE sessions ADD COLUMN overruns INTEGER NOT NULL DEFAULT 0;
@@ -110,7 +111,8 @@ CREATE TABLE cpu_samples (
     session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     at          REAL NOT NULL,
     wall        REAL NOT NULL,
-    cpu         REAL NOT NULL
+    cpu         REAL NOT NULL,
+    whisper     REAL NOT NULL
 );
 CREATE INDEX idx_cpu_samples_session ON cpu_samples(session_id);
 ";

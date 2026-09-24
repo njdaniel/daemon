@@ -22,6 +22,6 @@ mod tests;
 pub use error::StoreError;
 pub use migrate::SCHEMA_VERSION;
 pub use store::{
-    CpuSampleRow, Mark, NewQuestion, NewSegment, NewSession, NewSuggestion, Phase, QuestionRow,
-    SegmentRow, SessionRow, Source, Store, SuggestionRow,
+    CpuSampleRow, Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, NewSuggestion, Phase,
+    QuestionRow, SegmentRow, SessionRow, Source, Store, SuggestionRow,
 };

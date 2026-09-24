@@ -93,10 +93,14 @@ enum Command {
         /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
         #[arg(long)]
         no_store: bool,
-        /// No terminal UI: run the same pipeline and print how long each scripted question in
-        /// the fixture's questions.json took to reach the screen (p50 / p95)
-        #[arg(long, requires = "replay")]
+        /// No terminal UI. With --replay: print how long each scripted question in the
+        /// fixture's questions.json took to reach the screen (p50 / p95). Live: capture for
+        /// --duration seconds, then print the summary (`dmn bench --live` reads the rest)
+        #[arg(long)]
         headless: bool,
+        /// Live: stop after this many seconds, as if q had been pressed
+        #[arg(long, value_name = "SECS", conflicts_with = "replay")]
+        duration: Option<u64>,
     },
     /// Check the machine and, with --init, write a commented config file
     Doctor {
@@ -324,6 +328,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             threads,
             no_store,
             headless,
+            duration,
         }) => {
             let cfg = Config::load(&paths.config_file)?;
             let replay = match replay.as_deref() {
@@ -346,6 +351,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     threads,
                     no_store,
                     headless,
+                    duration,
                 },
             )
             .map_err(|e| CliError::Run(e.to_string()))

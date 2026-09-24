@@ -16,9 +16,10 @@
 //!
 //! CPU is the dmn process's user + system time between samples (Ollama runs in its own
 //! process and is not counted). "Idle listening" is every sample window in which nobody was
-//! speaking and no question was being answered: no final segment of either speaker overlapping
-//! it (extended by [`BUSY_AFTER_S`] for the final whisper pass) and no question between its
-//! emission and its first Approach line.
+//! speaking and no question was being answered: whisper ran no inference in it (it transcribes
+//! only while someone speaks, a partial every second and a final at the end), nor in the window
+//! after it, since an inference is counted when it finishes, up to a couple of seconds after it
+//! starts; and no question was between its emission and its first Approach line.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,9 +35,8 @@ use crate::run::APPROACH_BUDGET_S;
 pub const APPROACH_P95_BUDGET_S: f64 = 3.5;
 /// The #16 idle-listening CPU budget, in cores.
 pub const IDLE_CPU_BUDGET_CORES: f64 = 1.0;
-/// A speaker's segment keeps the CPU busy this long after it ends: the VAD's 700 ms close and
-/// the final whisper pass.
-pub const BUSY_AFTER_S: f64 = 3.0;
+/// Whisper inference below this, in a window, counts as none (the counter is in milliseconds).
+const NO_INFERENCE_S: f64 = 0.001;
 
 pub struct Args {
     /// Session id; the newest session when `None`.
@@ -156,24 +156,33 @@ pub fn cpu(s: &Stored) -> Cpu {
         (Some(a), Some(b)) if b.wall > a.wall => Some((b.cpu - a.cpu) / (b.wall - a.wall)),
         _ => None,
     };
-    let busy: Vec<(f64, f64)> = s
-        .segments
+    // A question is in flight from its emission to its first Approach line (or its question
+    // line, or a second after emission when it was never shown).
+    let answering: Vec<(f64, f64)> = s
+        .questions
         .iter()
-        .map(|g| (g.start_time, g.end_time + BUSY_AFTER_S))
-        .chain(s.questions.iter().filter_map(|q| {
+        .filter_map(|q| {
             let from = q.emitted_at?;
-            Some((from, q.approach_at.or(q.question_at).unwrap_or(from) + 1.0))
-        }))
-        .collect();
-    let idle = samples
-        .windows(2)
-        .filter(|w| w[1].wall > w[0].wall)
-        .filter(|w| {
-            !busy
-                .iter()
-                .any(|(from, to)| *from < w[1].at && *to > w[0].at)
+            Some((from, q.approach_at.or(q.question_at).unwrap_or(from + 1.0)))
         })
-        .map(|w| (w[1].cpu - w[0].cpu) / (w[1].wall - w[0].wall))
+        .collect();
+    let transcribed = |i: usize| {
+        samples
+            .get(i + 1)
+            .is_some_and(|b| b.whisper - samples[i].whisper >= NO_INFERENCE_S)
+    };
+    let idle = (0..samples.len().saturating_sub(1))
+        .filter(|&i| samples[i + 1].wall > samples[i].wall)
+        // This window and the next saw no inference: an inference is counted when it ends.
+        .filter(|&i| !transcribed(i) && !transcribed(i + 1))
+        .filter(|&i| {
+            let (from, to) = (samples[i].at, samples[i + 1].at);
+            !answering.iter().any(|(a, b)| *a < to && *b > from)
+        })
+        .map(|i| {
+            let (a, b) = (&samples[i], &samples[i + 1]);
+            (b.cpu - a.cpu) / (b.wall - a.wall)
+        })
         .collect();
     Cpu { overall, idle }
 }
@@ -186,7 +195,9 @@ fn cores(v: Option<f64>) -> String {
 pub fn report(s: &Stored, script: Option<&Path>) -> Result<String, String> {
     let mut out = format!("session {}: {}\n", s.id, s.label);
     let seen = seen(s);
-    if seen.is_empty() {
+    if s.questions.is_empty() {
+        out.push_str("no timed questions: the detector found no question in this session\n");
+    } else if seen.is_empty() {
         out.push_str(&format!(
             "no timed questions: {} question row(s), none with timing (sessions stored before \
              #16 have none)\n",
@@ -259,7 +270,7 @@ pub fn run(paths: &Paths, args: &Args) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dmn_store::{Mark, NewQuestion, NewSegment, NewSession, Source};
+    use dmn_store::{Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, Source};
 
     /// A stored session: two interviewer questions (one answered at 1.5 s, one at 2.5 s after
     /// its end), one candidate never shown, CPU sampled every 5 s over 60 s with the process
@@ -302,15 +313,23 @@ mod tests {
         ask(10.0, 14.0, "How would you shard it?", Some(1.5));
         ask(30.0, 33.0, "And if a region fails?", Some(2.5));
         ask(40.0, 41.0, "Right.", None);
-        // The windows starting at these times overlap a segment (plus BUSY_AFTER_S) or a
-        // question in flight; the process works hard in them and idles in the rest.
+        // Whisper finishes inferences in the windows starting at these times (the speech above),
+        // and the process works hard in them; it idles in the rest.
         let busy = [10, 15, 30, 35, 40];
-        let mut cpu = 0.0;
+        let (mut cpu, mut whisper) = (0.0, 0.0);
         for t in (0..=60).step_by(5) {
             store
-                .insert_cpu_sample(id, f64::from(t), f64::from(t), cpu)
+                .insert_cpu_sample(&NewCpuSample {
+                    session_id: id,
+                    at: f64::from(t),
+                    wall: f64::from(t),
+                    cpu,
+                    whisper,
+                })
                 .unwrap();
-            cpu += if busy.contains(&t) { 10.0 } else { 0.5 };
+            let speaking = busy.contains(&t);
+            cpu += if speaking { 10.0 } else { 0.5 };
+            whisper += if speaking { 1.0 } else { 0.0 };
         }
         store.set_session_overruns(id, 0).unwrap();
         id
@@ -330,9 +349,10 @@ mod tests {
         assert!(text.contains("overruns: 0"), "{text}");
 
         let c = cpu(&stored);
-        // 0–10, 20–30 and 45–60 are quiet: no segment within 3 s, no question in flight.
+        // Idle: 0–5, 20–25 and 45–60. 5–10 and 25–30 are quiet too, but an inference that
+        // started in them would only be counted in the next window, so they are not trusted.
         assert!(c.idle.iter().all(|&x| (x - 0.1).abs() < 1e-9), "{c:?}");
-        assert_eq!(c.idle.len(), 7, "{c:?}");
+        assert_eq!(c.idle.len(), 5, "{c:?}");
         assert!(c.overall.unwrap() > 0.1);
     }
 

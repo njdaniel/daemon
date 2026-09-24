@@ -55,6 +55,8 @@ pub struct Args {
     pub threads: Option<usize>,
     pub no_store: bool,
     pub headless: bool,
+    /// Live: stop after this many seconds, as if `q` had been pressed.
+    pub duration: Option<u64>,
 }
 
 /// A key the TUI acts on.
@@ -116,6 +118,9 @@ pub fn live_input(cfg: &Config, args: &Args) -> Result<Input, String> {
 }
 
 pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error>> {
+    if args.headless && args.replay.is_none() && args.duration.is_none() {
+        return Err("--headless needs --replay, or --duration for a live capture".into());
+    }
     let (input, questions) = match args.replay.clone() {
         Some((interviewer, candidate)) => {
             let questions = interviewer.parent().map(|d| d.join("questions.json"));
@@ -149,7 +154,23 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     )?;
     let audio = pipeline.info().audio;
     let live = pipeline.info().live;
-    let report = if args.headless {
+    if let Some(secs) = args.duration {
+        let controls = pipeline.controls();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            controls.quit();
+        });
+    }
+    let report = if live && args.headless {
+        // A live capture with no terminal, until --duration: the session log holds the timing.
+        let (report, Quiet) = join(spawn(pipeline, Quiet, false))?;
+        replay::print_summary(&report, report.wall);
+        replay::print_downstream(&report, paths);
+        if let Some(id) = report.session.and_then(|s| s.session_id) {
+            println!("latency      dmn bench --live --session {id}");
+        }
+        report
+    } else if args.headless {
         let (report, rows) = headless(pipeline, questions.as_deref())?;
         replay::print_summary(&report, audio);
         replay::print_downstream(&report, paths);
@@ -240,6 +261,10 @@ fn ui_loop(
 ) -> Result<(), Box<dyn Error>> {
     let mut dirty = true;
     loop {
+        // `--duration` (or anything else) stopped the run: close as `q` would.
+        if controls.is_stopped() {
+            return Ok(());
+        }
         if dirty || session.has_changed().unwrap_or(false) {
             // Clone out of the channel so the hub is never blocked behind a draw.
             let s = session.borrow_and_update().clone();
@@ -481,7 +506,24 @@ mod tests {
             threads: None,
             no_store: true,
             headless: false,
+            duration: None,
         }
+    }
+
+    #[test]
+    fn headless_without_a_replay_needs_a_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run(
+            &Config::default(),
+            &Paths::under(dir.path()),
+            &Args {
+                headless: true,
+                ..args(None, None)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--duration"), "{err}");
     }
 
     #[test]

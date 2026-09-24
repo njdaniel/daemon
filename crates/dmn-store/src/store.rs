@@ -160,8 +160,9 @@ impl Mark {
     }
 }
 
-/// A row of `cpu_samples` (schema v2): the process's CPU seconds `cpu` at audio time `at` and
-/// wall time `wall`, both seconds since the session started.
+/// A row of `cpu_samples` (schema v2): the process's CPU seconds `cpu` and whisper's cumulative
+/// inference seconds `whisper` at audio time `at` and wall time `wall`, both seconds since the
+/// session started.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CpuSampleRow {
     pub id: i64,
@@ -169,6 +170,17 @@ pub struct CpuSampleRow {
     pub at: f64,
     pub wall: f64,
     pub cpu: f64,
+    pub whisper: f64,
+}
+
+/// Insert form of [`CpuSampleRow`]; the id is assigned by SQLite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewCpuSample {
+    pub session_id: i64,
+    pub at: f64,
+    pub wall: f64,
+    pub cpu: f64,
+    pub whisper: f64,
 }
 
 /// A row of `suggestions`: the raw prompt-contract JSON for one phase of one question.
@@ -374,17 +386,17 @@ impl Store {
         Ok(())
     }
 
-    /// Record the process's CPU seconds `cpu` at audio time `at` and wall time `wall`.
-    pub fn insert_cpu_sample(
-        &self,
-        session_id: i64,
-        at: f64,
-        wall: f64,
-        cpu: f64,
-    ) -> Result<i64, StoreError> {
+    pub fn insert_cpu_sample(&self, sample: &NewCpuSample) -> Result<i64, StoreError> {
         self.conn.execute(
-            "INSERT INTO cpu_samples (session_id, at, wall, cpu) VALUES (?1, ?2, ?3, ?4)",
-            params![session_id, at, wall, cpu],
+            "INSERT INTO cpu_samples (session_id, at, wall, cpu, whisper)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sample.session_id,
+                sample.at,
+                sample.wall,
+                sample.cpu,
+                sample.whisper,
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -392,7 +404,7 @@ impl Store {
     /// A session's CPU samples in time order.
     pub fn cpu_samples(&self, session_id: i64) -> Result<Vec<CpuSampleRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, at, wall, cpu FROM cpu_samples
+            "SELECT id, session_id, at, wall, cpu, whisper FROM cpu_samples
              WHERE session_id = ?1 ORDER BY wall, id",
         )?;
         let rows = stmt
@@ -403,6 +415,7 @@ impl Store {
                     at: row.get("at")?,
                     wall: row.get("wall")?,
                     cpu: row.get("cpu")?,
+                    whisper: row.get("whisper")?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

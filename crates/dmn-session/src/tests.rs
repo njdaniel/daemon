@@ -483,6 +483,7 @@ fn measurements_change_nothing_on_screen_and_overruns_show_in_the_status() {
         at: 25.0,
         wall: 25.0,
         cpu: 3.1,
+        whisper: 1.2,
     });
     assert_eq!(Session::replay(&log), before, "timing and CPU are log-only");
 

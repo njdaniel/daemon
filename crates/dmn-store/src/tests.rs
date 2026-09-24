@@ -415,13 +415,23 @@ fn question_marks_keep_the_first_time_and_cpu_samples_round_trip() {
         (Some(18.05), Some(18.7), Some(19.1))
     );
 
-    store.insert_cpu_sample(session_id, 5.0, 5.0, 0.4).unwrap();
-    store
-        .insert_cpu_sample(session_id, 10.0, 10.0, 0.9)
-        .unwrap();
+    for (t, cpu, whisper) in [(5.0, 0.4, 0.0), (10.0, 0.9, 0.3)] {
+        store
+            .insert_cpu_sample(&NewCpuSample {
+                session_id,
+                at: t,
+                wall: t,
+                cpu,
+                whisper,
+            })
+            .unwrap();
+    }
     let cpu = store.cpu_samples(session_id).unwrap();
     assert_eq!(cpu.len(), 2);
-    assert_eq!((cpu[1].at, cpu[1].wall, cpu[1].cpu), (10.0, 10.0, 0.9));
+    assert_eq!(
+        (cpu[1].at, cpu[1].wall, cpu[1].cpu, cpu[1].whisper),
+        (10.0, 10.0, 0.9, 0.3)
+    );
 
     store.set_session_overruns(session_id, 3).unwrap();
     assert_eq!(store.session(session_id).unwrap().unwrap().overruns, 3);

@@ -282,7 +282,8 @@ pub fn print_summary(report: &Report, audio: Duration) {
     for (source, vad, stt) in stats {
         println!(
             "{:<12} {:>3} finals, {:>4} partials ({} stale skipped), {} dropped (empty {}, low confidence {}, phrase {}), \
-             whisper {} total / {} slowest, VAD {} utterances, {} overruns, {} events dropped",
+             whisper {} total / {} slowest, VAD {} frames, {} utterances, {} overruns, \
+             {} events dropped",
             source.label(),
             stt.finals,
             stt.partials,
@@ -293,6 +294,7 @@ pub fn print_summary(report: &Report, audio: Duration) {
             stt.dropped_phrase,
             pretty(Duration::from_millis(stt.inference_ms)),
             pretty(Duration::from_millis(stt.slowest_ms)),
+            vad.frames,
             vad.utterances,
             vad.overruns,
             vad.dropped_events,

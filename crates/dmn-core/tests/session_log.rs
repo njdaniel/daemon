@@ -472,6 +472,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
             at: 25.0,
             wall: 25.0,
             cpu: 4.5,
+            whisper: 1.5,
         },
         Action::Overruns { total: 2 },
     ] {
@@ -486,6 +487,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
         (row.emitted_at, row.question_at, row.approach_at),
         (Some(25.9), Some(26.5), Some(26.8))
     );
-    assert_eq!(store.cpu_samples(id).unwrap()[0].cpu, 4.5);
+    let sample = &store.cpu_samples(id).unwrap()[0];
+    assert_eq!((sample.cpu, sample.whisper), (4.5, 1.5));
     assert_eq!(store.session(id).unwrap().unwrap().overruns, 2);
 }
