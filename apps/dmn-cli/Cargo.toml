@@ -18,6 +18,7 @@ vulkan = ["dmn-stt/vulkan"]
 
 [dependencies]
 clap = { workspace = true }
+crossbeam-channel = { workspace = true }
 dmn-audio = { path = "../../crates/dmn-audio" }
 dmn-core = { path = "../../crates/dmn-core" }
 dmn-detect = { path = "../../crates/dmn-detect" }

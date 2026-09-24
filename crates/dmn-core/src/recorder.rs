@@ -270,6 +270,9 @@ impl StoreWriter {
             | Action::Star { .. }
             | Action::Ignored { .. }
             | Action::Failed { .. }
+            // A regenerate writes through the actions it causes: `Question` updates the same
+            // question row and `Answered` adds a second suggestion to it.
+            | Action::Regenerate { .. }
             | Action::Status { .. } => {}
         }
         Ok(())
@@ -295,6 +298,13 @@ impl Recorder {
                 let mut w = StoreWriter::new(store);
                 loop {
                     match rx.blocking_recv() {
+                        // `Ended` is the last action a session has, so the writer stops there
+                        // rather than waiting for every holder of the hub (the TUI's key
+                        // handler holds one) to drop it.
+                        Ok(action @ Action::Ended { .. }) => {
+                            w.apply(&action);
+                            break;
+                        }
                         Ok(action) => w.apply(&action),
                         Err(RecvError::Lagged(n)) => {
                             w.report.lagged += n;
@@ -322,8 +332,8 @@ impl Recorder {
         self.db_file.as_deref()
     }
 
-    /// Dispatch [`Action::Ended`], then wait for the writer to store everything. Every other
-    /// holder of the hub must have dropped it by now, or the writer never sees the channel close.
+    /// Dispatch [`Action::Ended`], then wait for the writer to store everything up to it. Other
+    /// holders of the hub may outlive this; anything they dispatch afterwards is not stored.
     pub fn finish(self, at: i64) -> Result<Option<WriterReport>, RecorderError> {
         self.hub.dispatch(Action::Ended { at });
         drop(self.hub);

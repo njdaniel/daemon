@@ -2,7 +2,7 @@
 //!
 //! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
 //! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4), `replay` (#9),
-//! `sessions list|export|purge` (#13). Later: `run`, `sources`.
+//! `sessions list|export|purge` (#13), `run --replay` (#15). Later: live `run`, `sources`.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -10,11 +10,12 @@
 mod bench;
 mod devices;
 mod doctor;
+mod latency;
+mod pipeline;
 mod probe;
 mod replay;
+mod run;
 mod suggest;
-// Rendered from a saved session and tested in #14; `dmn run` draws it live from #15.
-#[cfg_attr(not(test), allow(dead_code))]
 mod tui;
 
 use std::process::ExitCode;
@@ -45,6 +46,9 @@ enum CliError {
     /// `dmn replay` could not run the pipeline over the given files.
     #[error("{0}")]
     Replay(String),
+    /// `dmn run` could not start or ended with a pipeline failure.
+    #[error("{0}")]
+    Run(String),
     #[error(transparent)]
     Sessions(#[from] dmn_core::recorder::RecorderError),
     /// A command-line value clap could not check on its own.
@@ -64,6 +68,26 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run the copilot in this terminal: live question, Approach, transcript and status.
+    /// Keys: p pin/unpin, r regenerate, m mute mic, q quit
+    Run {
+        /// Feed the pipeline from two WAV files at 1× instead of live capture
+        #[arg(long, num_args = 2, value_names = ["INTERVIEWER", "CANDIDATE"])]
+        replay: Option<Vec<std::path::PathBuf>>,
+        /// Model name; default is [stt].model from the config
+        #[arg(long)]
+        model: Option<String>,
+        /// Decoder threads; default is [stt].threads from the config
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
+        #[arg(long)]
+        no_store: bool,
+        /// No terminal UI: run the same pipeline and print how long each scripted question in
+        /// the fixture's questions.json took to reach the screen (p50 / p95)
+        #[arg(long, requires = "replay")]
+        headless: bool,
+    },
     /// Check the machine and, with --init, write a commented config file
     Doctor {
         /// Write ~/.config/dmn/config.toml with comments and defaults
@@ -130,8 +154,8 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
         /// Transcribe the 1 s partials of an open utterance: on, since --speed always paces
-        #[arg(long, value_enum, default_value_t = replay::Partials::Auto)]
-        partials: replay::Partials,
+        #[arg(long, value_enum, default_value_t = pipeline::Partials::Auto)]
+        partials: pipeline::Partials,
         /// Print the merged transcript and the last 60 s window at the end
         #[arg(long)]
         transcript: bool,
@@ -270,6 +294,36 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 },
             )
             .map_err(|e| CliError::Replay(e.to_string()))
+        }
+        Some(Command::Run {
+            replay,
+            model,
+            threads,
+            no_store,
+            headless,
+        }) => {
+            let cfg = Config::load(&paths.config_file)?;
+            let replay = match replay.as_deref() {
+                None => None,
+                Some([interviewer, candidate]) => Some((interviewer.clone(), candidate.clone())),
+                Some(_) => {
+                    return Err(CliError::Usage(
+                        "run --replay takes two files: <interviewer.wav> <candidate.wav>".into(),
+                    ));
+                }
+            };
+            run::run(
+                &cfg,
+                &paths,
+                &run::Args {
+                    replay,
+                    model,
+                    threads,
+                    no_store,
+                    headless,
+                },
+            )
+            .map_err(|e| CliError::Run(e.to_string()))
         }
         Some(Command::Sessions { action }) => sessions(&paths, action),
         Some(Command::Config {

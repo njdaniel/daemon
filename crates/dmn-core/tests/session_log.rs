@@ -395,3 +395,31 @@ async fn a_failed_file_delete_leaves_the_rows_so_a_retry_finishes_the_purge() {
     assert_eq!(retry.sessions, [id]);
     assert_eq!(retry.files, [export]);
 }
+
+#[test]
+fn finish_returns_while_another_holder_still_has_the_hub() {
+    // `dmn run`'s key handler keeps a handle on the hub until the TUI closes; ending the
+    // session must not wait for it.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let held = rec.hub();
+    held.dispatch(Action::Started {
+        label: "held".into(),
+        at: 1_700_000_000,
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(rec.finish(1_700_000_060));
+    });
+    let report = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("finish returned while the hub was still held")
+        .unwrap()
+        .unwrap();
+    assert!(report.session_id.is_some());
+    let store = open_store(&paths).unwrap();
+    let session = store.session(report.session_id.unwrap()).unwrap().unwrap();
+    assert_eq!(session.ended_at, Some(1_700_000_060));
+    drop(held);
+}
