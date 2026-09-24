@@ -93,6 +93,13 @@ impl WavSource {
         (self.spec.sample_rate, self.spec.channels)
     }
 
+    /// True while the reader thread is alive: started, and neither at the end of the file nor
+    /// stopped nor failed. Lets a caller wait for the file without blocking in [`wait`](Self::wait),
+    /// so it can also stop early (`dmn run --replay` quitting on `q`).
+    pub fn is_running(&self) -> bool {
+        self.thread.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     /// Block until the file has been delivered in full (or `stop` was called), then return the
     /// thread's result. Tests and `dmn replay` use this; a live pipeline uses `stop`.
     pub fn wait(&mut self) -> Result<(), AudioError> {
@@ -577,6 +584,30 @@ mod tests {
             rt_elapsed >= Duration::from_millis(450) && rt_elapsed < Duration::from_millis(900),
             "real-time took {rt_elapsed:?} for 0.5 s of audio"
         );
+    }
+
+    #[test]
+    fn is_running_covers_start_to_end_and_an_early_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.wav");
+        write_sine(&path, 16_000, &[0.2], 300.0, 1.0);
+
+        let mut src = WavSource::open(&path, Source::You, Speed::RealTime).unwrap();
+        assert!(!src.is_running(), "not started");
+        let (sink, _frames) = frame_channel(Source::You, 100);
+        src.start(sink).unwrap();
+        assert!(src.is_running());
+        // Stopping a 1 s real-time file after 100 ms returns at once and ends the thread.
+        std::thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        src.stop().unwrap();
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(!src.is_running());
+        assert!(!src.is_finished(), "stopped, not delivered in full");
     }
 
     #[test]

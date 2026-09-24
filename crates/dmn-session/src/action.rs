@@ -118,6 +118,11 @@ pub enum Action {
     },
     /// The fast phase failed (timeout, unreachable, malformed). Anything already shown stays.
     Failed { candidate: u64, error: String },
+    /// `r`: ask the fast phase again for a question already on screen (or queued), with the
+    /// "different angle" note at temperature 0.7. The new fields arrive tagged with the same
+    /// candidate id and replace that question in place, pinned or not; until the new question
+    /// arrives the old Approach stays, dimmed.
+    Regenerate { candidate: u64 },
     /// `p`: pin the live question; new questions queue behind it.
     Pin,
     /// Unpin: the newest queued question (if any) becomes live.

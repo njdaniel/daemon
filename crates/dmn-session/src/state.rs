@@ -56,6 +56,10 @@ pub struct Question {
     pub star: Option<StarCards>,
     pub clarifications: Vec<Clarification>,
     pub progress: Progress,
+    /// `r` was pressed and the new reply has not started yet: the UI dims this question's
+    /// Approach, as it dims the previous one while a new question loads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub regenerating: bool,
 }
 
 impl Question {
@@ -69,6 +73,7 @@ impl Question {
             star: None,
             clarifications: Vec::new(),
             progress: Progress::Streaming,
+            regenerating: false,
         }
     }
 }
@@ -148,6 +153,7 @@ impl Session {
         }
         if let Some(q) = self.question_mut(candidate) {
             q.progress = progress.clone();
+            q.regenerating = false;
         } else if let Some(c) = self.clarification_mut(candidate) {
             c.progress = progress.clone();
         }
@@ -218,6 +224,11 @@ pub fn reduce(s: &mut Session, action: &Action) {
             kind,
         } => {
             let q = Question::new(*candidate, text.clone(), kind.clone());
+            // A regenerated reply replaces its own question where it is, pinned or queued.
+            if let Some(existing) = s.question_mut(*candidate) {
+                *existing = q;
+                return;
+            }
             if s.pinned && s.live.is_some() {
                 s.queued.push(q);
             } else {
@@ -278,10 +289,22 @@ pub fn reduce(s: &mut Session, action: &Action) {
             if s.pending == Some(*candidate) {
                 s.pending = None;
             }
+            // A regenerate the model declined leaves the question as it was.
+            if let Some(q) = s.question_mut(*candidate).filter(|q| q.regenerating) {
+                q.regenerating = false;
+                q.progress = Progress::Done;
+            }
         }
         Action::Failed { candidate, error } => {
             s.counts.failed += 1;
             s.settle(*candidate, &Progress::Failed(error.clone()));
+        }
+        Action::Regenerate { candidate } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                q.regenerating = true;
+                q.progress = Progress::Streaming;
+                s.pending = Some(*candidate);
+            }
         }
         Action::Pin => {
             if s.live.is_some() {

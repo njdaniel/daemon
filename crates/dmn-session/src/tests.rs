@@ -363,3 +363,87 @@ fn started_resets_everything() {
         }
     );
 }
+
+#[test]
+fn regenerate_dims_then_replaces_the_question_in_place() {
+    let mut log = vec![candidate(1, 20.0, "How would you design a rate limiter?")];
+    log.extend(shown(
+        1,
+        "Design a rate limiter",
+        &["token bucket", "redis"],
+    ));
+    let before = Session::replay(&log);
+
+    log.push(Action::Regenerate { candidate: 1 });
+    let waiting = Session::replay(&log);
+    let live = waiting.live.as_ref().expect("still live");
+    assert!(live.regenerating, "the old Approach dims");
+    assert_eq!(live.approach, ["token bucket", "redis"], "and stays");
+    assert_eq!(waiting.pending, Some(1));
+
+    log.extend(shown(
+        1,
+        "Design a rate limiter, differently",
+        &["sliding window"],
+    ));
+    let after = Session::replay(&log);
+    let live = after.live.as_ref().expect("still live");
+    assert_eq!(live.candidate, 1);
+    assert_eq!(live.text, "Design a rate limiter, differently");
+    assert_eq!(live.approach, ["sliding window"]);
+    assert!(!live.regenerating);
+    assert_eq!(after.pending, None);
+    assert_eq!(after.counts.shown, before.counts.shown + 1);
+}
+
+#[test]
+fn regenerating_a_pinned_question_keeps_it_pinned_and_live() {
+    let mut log = vec![candidate(1, 20.0, "q1")];
+    log.extend(shown(1, "First", &["a"]));
+    log.push(Action::Pin);
+    log.push(candidate(2, 60.0, "q2"));
+    log.extend(shown(2, "Second", &["b"]));
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(1, "First again", &["c"]));
+    let s = Session::replay(&log);
+    assert!(s.pinned);
+    let live = s.live.as_ref().expect("live");
+    assert_eq!((live.candidate, live.text.as_str()), (1, "First again"));
+    assert_eq!(s.queued.len(), 1, "the queued question is untouched");
+    assert_eq!(s.queued[0].text, "Second");
+}
+
+#[test]
+fn a_declined_or_failed_regenerate_leaves_the_question_as_it_was() {
+    let mut log = vec![candidate(1, 20.0, "q")];
+    log.extend(shown(1, "Q", &["a", "b"]));
+    for outcome in [
+        Action::Ignored {
+            candidate: 1,
+            reason: IgnoreReason::NotAQuestion,
+            score: 3,
+        },
+        Action::Failed {
+            candidate: 1,
+            error: "timeout".into(),
+        },
+    ] {
+        let mut l = log.clone();
+        l.push(Action::Regenerate { candidate: 1 });
+        l.push(outcome);
+        let s = Session::replay(&l);
+        let live = s.live.as_ref().expect("live");
+        assert!(!live.regenerating);
+        assert_eq!(live.approach, ["a", "b"]);
+        assert_eq!(s.pending, None);
+    }
+}
+
+#[test]
+fn regenerate_of_an_unknown_candidate_changes_nothing() {
+    let mut log = vec![candidate(1, 20.0, "q")];
+    log.extend(shown(1, "Q", &["a"]));
+    let before = Session::replay(&log);
+    log.push(Action::Regenerate { candidate: 9 });
+    assert_eq!(Session::replay(&log), before);
+}
