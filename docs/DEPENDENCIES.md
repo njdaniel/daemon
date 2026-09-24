@@ -26,8 +26,7 @@ One line per crate saying why it is here. Add a line before adding a dependency.
 | `reqwest` feature `blocking` | `dmn-stt` | One-shot model download for `dmn doctor --fetch` without an async runtime; same client crate as `dmn-llm` |
 | `serde_json` feature `preserve_order` (uses `indexmap`, already in the tree via `reqwest`) | `dmn-llm` | Keeps the fast-phase schema's property order. Ollama builds its grammar in that order, so `question` streams before `approach`; with the default sorted map `approach` would come first |
 | `rusqlite` (bundled) | `dmn-store` | SQLite schema + migration runner for sessions, segments, questions, suggestions; bundled SQLite avoids distro version drift (SPEC § Decisions) |
-
-Planned by the spec (add the line when the issue lands): `ratatui`, `crossterm` (#14).
+| `ratatui` (0.29, default features: `crossterm` backend) | `dmn-cli` | The terminal UI's layout, widgets and `TestBackend` snapshot tests (#14). 0.29, not 0.30: 0.30 needs Rust 1.88 and the workspace MSRV is 1.85. `crossterm` 0.28 comes with it and is used through `ratatui::crossterm`, so the two can never disagree on versions |
 
 ## Developer tooling (`tools/`, Python)
 

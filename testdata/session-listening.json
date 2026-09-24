@@ -1,0 +1,56 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    },
+    {
+      "speaker": "interviewer",
+      "start": 18.0,
+      "end": 21.5,
+      "text": "Great. Let me tell you a bit about the team before we start."
+    }
+  ],
+  "partials": [
+    {
+      "speaker": "interviewer",
+      "start": 22.0,
+      "end": 24.0,
+      "text": "We run the platform"
+    }
+  ],
+  "last_interviewer": "Great. Let me tell you a bit about the team before we start.",
+  "live": null,
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    }
+  },
+  "counts": {
+    "candidates": 0,
+    "shown": 0,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  }
+}

@@ -13,6 +13,9 @@ mod doctor;
 mod probe;
 mod replay;
 mod suggest;
+// Rendered from a saved session and tested in #14; `dmn run` draws it live from #15.
+#[cfg_attr(not(test), allow(dead_code))]
+mod tui;
 
 use std::process::ExitCode;
 
