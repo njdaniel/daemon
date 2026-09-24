@@ -9,23 +9,35 @@
 //! Timestamp convention (v1): wall-clock times (`started_at`, `ended_at`, `created_at`) are
 //! INTEGER unix epoch seconds; segment `start_time` / `end_time` are REAL seconds relative to
 //! the session start, mirroring the STT `Segment` shape (SPEC § Transcription).
+//!
+//! v2 (#16) adds what `dmn bench --live` needs to report latency and CPU from a stored session:
+//! per question, the audio time (REAL seconds, the same clock as segment times) at which the
+//! detector emitted it, its question line was produced and its first Approach line was; a
+//! `cpu_samples` table of process CPU time over the session; and the session's ring-buffer
+//! overrun count.
 
 use rusqlite::Connection;
 
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 struct Migration {
     version: i64,
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: V1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: V1,
+    },
+    Migration {
+        version: 2,
+        sql: V2,
+    },
+];
 
 /// The v1 schema: sessions, their transcript segments, the detector's question candidates and
 /// the LLM suggestions per question. `suggestions.payload` is deliberately raw TEXT holding the
@@ -76,11 +88,44 @@ CREATE TABLE suggestions (
 CREATE INDEX idx_suggestions_question ON suggestions(question_id);
 ";
 
+/// v2 (#16): timing and CPU for `dmn bench --live`. Every new question column is nullable, so
+/// rows written by a v1 build read back as "not measured" rather than as zero.
+///
+/// - `questions.emitted_at` / `question_at` / `approach_at`: audio seconds from the session
+///   start (the clock segment times use) at which the detector emitted the candidate, the fast
+///   phase produced its question (or clarification) line, and its first Approach line (or STAR
+///   card). The first showing counts: a regenerate does not move them.
+/// - `cpu_samples`: the process's CPU seconds (`cpu`) at audio time `at` and wall seconds
+///   `wall` since the session started, sampled every few seconds.
+/// - `sessions.overruns`: ring-buffer frames dropped over the session (SPEC § Threading rules).
+const V2: &str = "
+ALTER TABLE sessions ADD COLUMN overruns INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE questions ADD COLUMN emitted_at REAL;
+ALTER TABLE questions ADD COLUMN question_at REAL;
+ALTER TABLE questions ADD COLUMN approach_at REAL;
+
+CREATE TABLE cpu_samples (
+    id          INTEGER PRIMARY KEY,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    at          REAL NOT NULL,
+    wall        REAL NOT NULL,
+    cpu         REAL NOT NULL
+);
+CREATE INDEX idx_cpu_samples_session ON cpu_samples(session_id);
+";
+
 /// Apply every migration newer than the database's `user_version`, each in a transaction.
 pub fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+    migrate_to(conn, SCHEMA_VERSION)
+}
+
+/// Apply the migrations up to and including `target`. Tests use it to build an older database
+/// and check that opening it upgrades the rows already there.
+pub(crate) fn migrate_to(conn: &mut Connection, target: i64) -> Result<(), StoreError> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     for migration in MIGRATIONS {
-        if migration.version <= current {
+        if migration.version <= current || migration.version > target {
             continue;
         }
         let tx = conn.transaction()?;

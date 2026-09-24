@@ -57,6 +57,18 @@ pub enum IgnoreReason {
     SmallTalk,
 }
 
+/// A moment in a candidate's life that `dmn bench --live` times (#16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// The detector emitted the candidate.
+    Emitted,
+    /// The fast phase produced its question line (or a clarification's `↳` line).
+    Question,
+    /// The fast phase produced its first Approach line (or the STAR cards).
+    Approach,
+}
+
 /// One change to the session. Serialised with a `type` tag, one JSON object per action, so an
 /// action log is JSON Lines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +141,20 @@ pub enum Action {
     Unpin,
     /// A status dot changed.
     Status { dot: Dot, health: Health },
+    /// Ring-buffer frames dropped so far, over every capture lane (SPEC § Threading rules: a
+    /// full ring drops the incoming frame and counts it). Shown beside the dots while non-zero.
+    Overruns { total: u64 },
+    /// When candidate `candidate` reached `stage`, in audio seconds from the session start (the
+    /// clock segment times use). For the session log and `dmn bench --live`; the screen does not
+    /// change.
+    Timing {
+        candidate: u64,
+        stage: Stage,
+        at: f64,
+    },
+    /// The process had used `cpu` seconds of CPU at audio time `at`, `wall` seconds after the
+    /// session started. For the session log and `dmn bench --live`; the screen does not change.
+    Cpu { at: f64, wall: f64, cpu: f64 },
     /// The session ends. `at` is unix epoch seconds.
     Ended { at: i64 },
 }

@@ -95,13 +95,15 @@ impl FromSql for Phase {
     }
 }
 
-/// A row of `sessions`. `started_at` / `ended_at` are unix epoch seconds.
+/// A row of `sessions`. `started_at` / `ended_at` are unix epoch seconds; `overruns` is the
+/// ring-buffer frames dropped over the session (schema v2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRow {
     pub id: i64,
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub label: String,
+    pub overruns: i64,
 }
 
 /// A row of `segments`. `start_time` / `end_time` are seconds relative to the session start.
@@ -130,6 +132,43 @@ pub struct QuestionRow {
     pub focus: Option<String>,
     pub pinned: bool,
     pub created_at: i64,
+    /// Audio seconds from the session start (schema v2): when the detector emitted it, when
+    /// its question line and its first Approach line were produced. `None` = not measured.
+    pub emitted_at: Option<f64>,
+    pub question_at: Option<f64>,
+    pub approach_at: Option<f64>,
+}
+
+/// Which moment of a question's life [`Store::mark_question`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// The detector emitted the candidate.
+    Emitted,
+    /// The fast phase produced the question (or clarification) line.
+    Question,
+    /// The fast phase produced the first Approach line (or the STAR cards).
+    Approach,
+}
+
+impl Mark {
+    fn column(self) -> &'static str {
+        match self {
+            Mark::Emitted => "emitted_at",
+            Mark::Question => "question_at",
+            Mark::Approach => "approach_at",
+        }
+    }
+}
+
+/// A row of `cpu_samples` (schema v2): the process's CPU seconds `cpu` at audio time `at` and
+/// wall time `wall`, both seconds since the session started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CpuSampleRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub at: f64,
+    pub wall: f64,
+    pub cpu: f64,
 }
 
 /// A row of `suggestions`: the raw prompt-contract JSON for one phase of one question.
@@ -237,11 +276,27 @@ impl Store {
         Ok(())
     }
 
+    /// Record how many ring-buffer frames the session has dropped so far.
+    pub fn set_session_overruns(&self, id: i64, overruns: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET overruns = ?2 WHERE id = ?1",
+            params![id, overruns],
+        )?;
+        Ok(())
+    }
+
+    /// The newest session's id, if there is one.
+    pub fn latest_session_id(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT max(id) FROM sessions", [], |row| row.get(0))?)
+    }
+
     pub fn session(&self, id: i64) -> Result<Option<SessionRow>, StoreError> {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, started_at, ended_at, label FROM sessions WHERE id = ?1",
+                "SELECT id, started_at, ended_at, label, overruns FROM sessions WHERE id = ?1",
                 [id],
                 session_from_row,
             )
@@ -308,6 +363,52 @@ impl Store {
         Ok(())
     }
 
+    /// Record when `mark` happened for a question, in audio seconds from the session start.
+    /// Only the first time counts: a regenerated reply does not move an earlier showing.
+    pub fn mark_question(&self, id: i64, mark: Mark, at: f64) -> Result<(), StoreError> {
+        let col = mark.column();
+        self.conn.execute(
+            &format!("UPDATE questions SET {col} = coalesce({col}, ?2) WHERE id = ?1"),
+            params![id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Record the process's CPU seconds `cpu` at audio time `at` and wall time `wall`.
+    pub fn insert_cpu_sample(
+        &self,
+        session_id: i64,
+        at: f64,
+        wall: f64,
+        cpu: f64,
+    ) -> Result<i64, StoreError> {
+        self.conn.execute(
+            "INSERT INTO cpu_samples (session_id, at, wall, cpu) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, at, wall, cpu],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// A session's CPU samples in time order.
+    pub fn cpu_samples(&self, session_id: i64) -> Result<Vec<CpuSampleRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, at, wall, cpu FROM cpu_samples
+             WHERE session_id = ?1 ORDER BY wall, id",
+        )?;
+        let rows = stmt
+            .query_map([session_id], |row| {
+                Ok(CpuSampleRow {
+                    id: row.get("id")?,
+                    session_id: row.get("session_id")?,
+                    at: row.get("at")?,
+                    wall: row.get("wall")?,
+                    cpu: row.get("cpu")?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn set_question_pinned(&self, id: i64, pinned: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE questions SET pinned = ?2 WHERE id = ?1",
@@ -319,7 +420,8 @@ impl Store {
     /// All questions of a session, oldest first.
     pub fn questions(&self, session_id: i64) -> Result<Vec<QuestionRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, segment_id, score, text, kind, focus, pinned, created_at
+            "SELECT id, session_id, segment_id, score, text, kind, focus, pinned, created_at,
+                    emitted_at, question_at, approach_at
              FROM questions WHERE session_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt
@@ -435,6 +537,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
         started_at: row.get("started_at")?,
         ended_at: row.get("ended_at")?,
         label: row.get("label")?,
+        overruns: row.get("overruns")?,
     })
 }
 
@@ -462,6 +565,9 @@ fn question_from_row(row: &Row<'_>) -> rusqlite::Result<QuestionRow> {
         focus: row.get("focus")?,
         pinned: row.get("pinned")?,
         created_at: row.get("created_at")?,
+        emitted_at: row.get("emitted_at")?,
+        question_at: row.get("question_at")?,
+        approach_at: row.get("approach_at")?,
     })
 }
 

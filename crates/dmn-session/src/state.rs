@@ -84,6 +84,9 @@ pub struct Status {
     pub mic: Health,
     pub system: Health,
     pub model: Health,
+    /// Ring-buffer frames dropped so far (#16); shown beside the dots while non-zero.
+    #[serde(default)]
+    pub overruns: u64,
 }
 
 /// Running totals, for the status line and the end-of-run summary.
@@ -333,6 +336,9 @@ pub fn reduce(s: &mut Session, action: &Action) {
             };
             *slot = health.clone();
         }
+        Action::Overruns { total } => s.status.overruns = *total,
+        // Measurements for the session log; nothing on screen depends on them.
+        Action::Timing { .. } | Action::Cpu { .. } => {}
     }
 }
 

@@ -1,6 +1,7 @@
 //! Pipeline values → session [`Action`]s. The only place that knows both sides: `dmn-session`
 //! depends on no pipeline crate, and no pipeline crate depends on `dmn-session`.
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dmn_detect::Candidate;
@@ -53,6 +54,78 @@ impl SessionClock {
     pub fn now(&self) -> i64 {
         self.started_at + (self.started.elapsed().as_secs_f64() * self.speed).floor() as i64
     }
+}
+
+/// Audio time now: seconds on the clock segment times use, for [`Action::Timing`] and
+/// [`Action::Cpu`] (#16).
+///
+/// Segment times count the frames a lane's VAD has consumed (20 ms each), which is not the wall
+/// clock: a live stream starts delivering some time after capture starts, and a stalled stream
+/// (a suspended sink) delivers nothing for a while. The clock is therefore an anchor, "at wall
+/// instant `at` the interviewer lane had reached audio time `audio`", that the pipeline moves
+/// forward whenever that lane's frame count advances, and between anchors it runs at `speed` ×
+/// the wall clock. A WAV replay anchors once, at the instant its files start. Cheap to clone; the
+/// anchor is shared.
+#[derive(Debug, Clone)]
+pub struct AudioClock {
+    anchor: Arc<Mutex<(Instant, f64)>>,
+    speed: f64,
+}
+
+impl AudioClock {
+    /// Audio time 0 at `zero`, advancing at `speed` × the wall clock (1.0 for a live call).
+    pub fn new(zero: Instant, speed: f64) -> Self {
+        Self {
+            anchor: Arc::new(Mutex::new((zero, 0.0))),
+            speed: if speed.is_finite() && speed > 0.0 {
+                speed
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// At wall instant `at` the audio had reached `audio` seconds.
+    pub fn anchor(&self, at: Instant, audio: f64) {
+        let mut a = self.anchor.lock().unwrap_or_else(PoisonError::into_inner);
+        *a = (at, audio);
+    }
+
+    /// Audio seconds at wall instant `at`.
+    pub fn at(&self, at: Instant) -> f64 {
+        let (anchored, audio) = *self.anchor.lock().unwrap_or_else(PoisonError::into_inner);
+        let since = if at >= anchored {
+            at.duration_since(anchored).as_secs_f64()
+        } else {
+            -anchored.duration_since(at).as_secs_f64()
+        };
+        audio + since * self.speed
+    }
+
+    /// Audio seconds now.
+    pub fn now(&self) -> f64 {
+        self.at(Instant::now())
+    }
+}
+
+/// CPU seconds this process has used (user + system, every thread), from `/proc/self/stat`.
+/// `None` where that file cannot be read (not Linux). The kernel reports it in `USER_HZ` ticks,
+/// which the proc ABI fixes at 100 per second.
+pub fn process_cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    cpu_seconds_from_stat(&stat)
+}
+
+/// `utime + stime` of a `/proc/<pid>/stat` line, in seconds. The command name (field 2) is in
+/// parentheses and may itself hold spaces or parentheses, so fields are counted from the last
+/// `)`: utime and stime are fields 14 and 15, the 12th and 13th after it.
+pub fn cpu_seconds_from_stat(stat: &str) -> Option<f64> {
+    const USER_HZ: f64 = 100.0;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some((utime + stime) as f64 / USER_HZ)
 }
 
 pub fn speaker(source: dmn_audio::Source) -> Speaker {
@@ -168,5 +241,35 @@ mod tests {
         let live = SessionClock::start(1.0);
         assert!((live.now() - unix_now()).abs() <= 1, "1× is the wall clock");
         assert_eq!(SessionClock::start(f64::NAN).speed, 1.0);
+    }
+
+    #[test]
+    fn the_audio_clock_runs_from_its_latest_anchor() {
+        use std::time::Duration;
+        let zero = Instant::now();
+        let clock = AudioClock::new(zero, 2.0);
+        let t = |ms| zero + Duration::from_millis(ms);
+        assert!((clock.at(t(500)) - 1.0).abs() < 1e-9, "2× from zero");
+        // The stream stalled: at 1.5 s wall only 1.2 s of audio had arrived.
+        clock.anchor(t(1500), 1.2);
+        assert!((clock.at(t(1500)) - 1.2).abs() < 1e-9);
+        assert!((clock.at(t(2000)) - 2.2).abs() < 1e-9, "then 2× again");
+        assert!((clock.at(t(1000)) - 0.2).abs() < 1e-9, "before the anchor");
+        let shared = clock.clone();
+        shared.anchor(t(3000), 3.0);
+        assert!(
+            (clock.at(t(3000)) - 3.0).abs() < 1e-9,
+            "clones share the anchor"
+        );
+        assert!((AudioClock::new(zero, f64::NAN).at(t(1000)) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cpu_seconds_come_from_utime_and_stime() {
+        // A command name with spaces and a parenthesis, as `/proc` allows.
+        let stat = "4242 (dmn (x) y) S 1 4242 4242 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 9 0";
+        assert_eq!(cpu_seconds_from_stat(stat), Some(3.0));
+        assert_eq!(cpu_seconds_from_stat("garbage"), None);
+        assert!(process_cpu_seconds().is_some_and(|s| s >= 0.0));
     }
 }
