@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod bench;
+mod bench_live;
 mod devices;
 mod doctor;
 mod latency;
@@ -69,11 +70,20 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run the copilot in this terminal: live question, Approach, transcript and status.
+    /// Captures the call live (your mic, the call app's output) until q.
     /// Keys: p pin/unpin, r regenerate, m mute mic, q quit
     Run {
         /// Feed the pipeline from two WAV files at 1× instead of live capture
         #[arg(long, num_args = 2, value_names = ["INTERVIEWER", "CANDIDATE"])]
         replay: Option<Vec<std::path::PathBuf>>,
+        /// Live: your mic's PipeWire node.name, or "default"; overrides [audio].mic.
+        /// `dmn devices` lists them
+        #[arg(long, conflicts_with = "replay")]
+        mic: Option<String>,
+        /// Live: the call app's application.name (e.g. Firefox, Chromium), or "" for all system
+        /// audio; overrides [audio].app_stream. `dmn devices` lists the apps playing
+        #[arg(long, conflicts_with = "replay")]
+        app: Option<String>,
         /// Model name; default is [stt].model from the config
         #[arg(long)]
         model: Option<String>,
@@ -105,8 +115,19 @@ enum Command {
         #[arg(long, value_name = "MODEL", conflicts_with = "init")]
         fetch: Option<String>,
     },
-    /// Measure whisper speed and accuracy on fixture interviewer turns
+    /// Measure whisper speed and accuracy on fixture interviewer turns; with --live, report
+    /// question end → Approach latency (p50 / p95) and CPU use from a stored session
     Bench {
+        /// Read the session log instead: latency and CPU of the latest session (or --session)
+        #[arg(long)]
+        live: bool,
+        /// With --live: the session id (`dmn sessions list`); default the latest
+        #[arg(long, requires = "live")]
+        session: Option<i64>,
+        /// With --live: pair candidates with this questions.json; a replay session finds the
+        /// one beside its interviewer file by itself
+        #[arg(long, requires = "live")]
+        questions: Option<std::path::PathBuf>,
         /// Model name; default is [stt].model from the config
         #[arg(long)]
         model: Option<String>,
@@ -297,6 +318,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Some(Command::Run {
             replay,
+            mic,
+            app,
             model,
             threads,
             no_store,
@@ -317,6 +340,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 &paths,
                 &run::Args {
                     replay,
+                    mic,
+                    app,
                     model,
                     threads,
                     no_store,
@@ -335,12 +360,26 @@ fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Some(Command::Bench {
+            live: true,
+            session,
+            questions,
+            ..
+        }) => {
+            print!(
+                "{}",
+                bench_live::run(&paths, &bench_live::Args { session, questions })
+                    .map_err(CliError::Bench)?
+            );
+            Ok(())
+        }
+        Some(Command::Bench {
             model,
             fixture,
             threads,
             turns,
             full_window,
             testdata,
+            ..
         }) => {
             let cfg = Config::load(&paths.config_file)?;
             let args = bench::BenchArgs {

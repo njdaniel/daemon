@@ -15,7 +15,7 @@ use dmn_stt::SttStats;
 use dmn_transcript::{DEFAULT_WINDOW, Segment, timestamp};
 use dmn_vad::WorkerStats;
 
-use crate::pipeline::{Found, Observer, Options, Partials, Pipeline, Report};
+use crate::pipeline::{Found, Input, Observer, Options, Partials, Pipeline, Report};
 use crate::suggest::{Output, Policy};
 
 pub struct Args {
@@ -69,8 +69,10 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         cfg,
         paths,
         &Options {
-            interviewer: args.interviewer.clone(),
-            candidate: args.candidate.clone(),
+            input: Input::Files {
+                interviewer: args.interviewer.clone(),
+                candidate: args.candidate.clone(),
+            },
             speed: args.speed,
             model: args.model.clone(),
             threads: args.threads,

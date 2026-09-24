@@ -1,6 +1,7 @@
-//! The pipeline `dmn replay` and `dmn run --replay` share: two WAVs → VAD → whisper → transcript
-//! bus → detector → fast phase, all dispatched into one session ([`Recorder`]) that is written
-//! to SQLite the way a live call's is.
+//! The pipeline `dmn replay`, `dmn run --replay` and the live `dmn run` share: two audio lanes
+//! (two WAVs, or live PipeWire capture of the mic and the call's output) → VAD → whisper →
+//! transcript bus → detector → fast phase, all dispatched into one session ([`Recorder`]) that
+//! is written to SQLite.
 //!
 //! [`Pipeline::start`] builds and starts every stage; [`Pipeline::run`] is the loop that moves
 //! segments from the bus into the session and the detector, and candidates into the fast phase;
@@ -12,6 +13,12 @@
 //! dispatch straight into the session, mute gates the mic lane's VAD, regenerate goes to the
 //! pipeline thread (which owns the candidates and the transcript window the request needs), and
 //! quit stops the audio sources so the run ends early and cleanly.
+//!
+//! A monitor thread watches the lanes while they run (#16): it counts ring-buffer overruns into
+//! the session, turns live capture state into the mic / system dots, moves the [`AudioClock`]'s
+//! anchor as the interviewer lane consumes frames (so [`Action::Timing`] marks are on the clock
+//! segment times use), and samples the process's CPU time into the session log every few
+//! seconds. `dmn bench --live` reads all of it back from the store.
 
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
@@ -22,12 +29,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use dmn_audio::{AudioSource, FRAME_LEN, FRAME_MS, FrameSink, Source, Speed, WavSource};
+use dmn_audio::{
+    AudioError, AudioSource, CaptureState, CaptureStatus, CaptureTarget, FRAME_LEN, FRAME_MS,
+    FrameSink, PipeWireContext, PipeWireSource, PwRecordSource, Source, Speed, WavSource,
+};
 use dmn_core::recorder::{Recorder, WriterReport, open_store};
+use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
 use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
 use dmn_llm::{CurrentQuestion, Kind};
-use dmn_session::{Action, Dot, Health, SessionHub};
+use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
 use dmn_vad::{EnergyVad, Vad, VadConfig, VadWorker, WorkerStats, event_channel};
@@ -45,6 +56,12 @@ const DEFAULT_CAPACITY_FRAMES: usize = dmn_audio::DEFAULT_CAPACITY_FRAMES;
 
 /// How long the loop waits for a segment before it looks at commands and the stop flag again.
 const TICK: Duration = Duration::from_millis(50);
+
+/// How often the monitor samples the process's CPU time into the session log.
+const CPU_EVERY: Duration = Duration::from_secs(5);
+
+/// How long a live run waits for PipeWire's first registry enumeration.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ring frames per lane. A paced lane (`RealTime` or `Factor`) delivers frames on a wall-clock
 /// schedule like a live call, so the live 2 s ring is enough and the VAD drains it under the
@@ -90,11 +107,52 @@ impl Partials {
     }
 }
 
+/// Where the two lanes' audio comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    /// Two WAV files, paced at [`Options::speed`]: `dmn replay` and `dmn run --replay`.
+    Files {
+        interviewer: PathBuf,
+        candidate: PathBuf,
+    },
+    /// Live capture (#16): `mic` is You, `interviewer` is the call's app output stream (or the
+    /// default sink monitor). Runs until quit.
+    Live {
+        mic: CaptureTarget,
+        interviewer: CaptureTarget,
+    },
+}
+
+impl Input {
+    /// The session label.
+    fn label(&self) -> String {
+        match self {
+            Input::Files {
+                interviewer,
+                candidate,
+            } => format!("replay {} + {}", interviewer.display(), candidate.display()),
+            Input::Live { mic, interviewer } => {
+                format!("live {} + {}", describe(mic), describe(interviewer))
+            }
+        }
+    }
+}
+
+/// A capture target as the session label and the dots' tooltips name it.
+pub fn describe(t: &CaptureTarget) -> String {
+    match t {
+        CaptureTarget::Mic(None) => "mic (default source)".into(),
+        CaptureTarget::Mic(Some(name)) => format!("mic {name}"),
+        CaptureTarget::App { application, .. } => format!("app {application}"),
+        CaptureTarget::SinkMonitor => "all system audio (sink monitor)".into(),
+    }
+}
+
 /// What to run and how.
 pub struct Options {
-    pub interviewer: PathBuf,
-    pub candidate: PathBuf,
+    pub input: Input,
     /// Paces `WavSource` delivery at this many multiples of wall-clock time; 1.0 is a live call.
+    /// A live input always runs at 1.0.
     pub speed: f32,
     pub model: Option<String>,
     pub threads: Option<usize>,
@@ -119,8 +177,10 @@ pub struct Info {
     pub threads: usize,
     pub speed: Speed,
     pub partials: bool,
-    /// The longer of the two files.
+    /// The longer of the two files; zero for a live input, which has no length.
     pub audio: Duration,
+    /// Live capture rather than files.
+    pub live: bool,
 }
 
 /// Runs the detector over the finals as they arrive.
@@ -354,9 +414,45 @@ impl Vad for Gated {
     }
 }
 
+/// A lane's audio source: a file, which ends, or a live capture, which runs until stopped.
+enum Audio {
+    Wav(WavSource),
+    Live {
+        source: Box<dyn AudioSource>,
+        /// The PipeWire capture's state, for the dots; `None` for the `pw-record` fallback.
+        status: Option<Arc<CaptureStatus>>,
+        /// What it captures, for the dots' tooltips.
+        target: String,
+    },
+}
+
+impl Audio {
+    /// Still delivering: a file until its end (or a failure), a live capture until stopped.
+    fn running(&self) -> bool {
+        match self {
+            Audio::Wav(w) => w.is_running(),
+            Audio::Live { .. } => true,
+        }
+    }
+
+    fn start(&mut self, sink: FrameSink) -> Result<(), AudioError> {
+        match self {
+            Audio::Wav(w) => w.start(sink),
+            Audio::Live { source, .. } => source.start(sink),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), AudioError> {
+        match self {
+            Audio::Wav(w) => w.stop(),
+            Audio::Live { source, .. } => source.stop(),
+        }
+    }
+}
+
 struct Lane {
     source: Source,
-    wav: WavSource,
+    audio: Audio,
     vad: VadWorker,
     stt: SttWorker,
 }
@@ -394,6 +490,8 @@ pub struct Pipeline {
     recorder: Recorder,
     hub: Arc<SessionHub>,
     clock: wire::SessionClock,
+    /// Audio time for [`Action::Timing`] and the headless latency report.
+    audio: AudioClock,
     suggester: Option<Suggester>,
     detecting: Detecting,
     flushed: bool,
@@ -423,6 +521,17 @@ impl Pipeline {
         if !opts.speed.is_finite() || opts.speed <= 0.0 {
             return Err(format!("--speed must be a positive number, not {}", opts.speed).into());
         }
+        let live = matches!(opts.input, Input::Live { .. });
+        // CLAUDE.md: never write audio to disk unless `privacy.record_audio` is true. Recording
+        // itself is not built yet, so a config asking for it is refused rather than silently
+        // ignored: whoever set it expects a recording.
+        if live && cfg.privacy.record_audio {
+            return Err(
+                "[privacy].record_audio = true, but recording a live session is not \
+                        built yet; set it to false (the default) to run without recording"
+                    .into(),
+            );
+        }
         // #13: the session log. Opened before any audio moves so a bad database fails at once.
         let store = if opts.no_store {
             None
@@ -433,8 +542,8 @@ impl Pipeline {
             threads: opts.threads.unwrap_or(usize::from(cfg.stt.threads)),
             ..SttConfig::default()
         };
-        // #34: `--speed N` paces delivery at N× wall-clock.
-        let speed = if (opts.speed - 1.0).abs() < f32::EPSILON {
+        // #34: `--speed N` paces delivery at N× wall-clock. A live call is 1× by definition.
+        let speed = if live || (opts.speed - 1.0).abs() < f32::EPSILON {
             Speed::RealTime
         } else {
             Speed::Factor(opts.speed)
@@ -444,28 +553,48 @@ impl Pipeline {
         let segments = bus.subscribe();
         let mic_muted = Arc::new(AtomicBool::new(false));
 
-        // Load both whisper models and spawn every worker first, then start both files back to
-        // back: loading a model takes the better part of a second, and starting each file as
+        // Load both whisper models and spawn every worker first, then start both sources back
+        // to back: loading a model takes the better part of a second, and starting each file as
         // its lane was built put the candidate's audio that far behind the interviewer's.
-        let mut built = Vec::new();
-        for (path, source) in [
-            (&opts.interviewer, Source::Interviewer),
-            (&opts.candidate, Source::You),
-        ] {
-            let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));
-            built.push(build_lane(
-                path, source, speed, &model, &stt_cfg, partials, &bus, gate,
-            )?);
-        }
-        let audio = built
+        let sources = match &opts.input {
+            Input::Files {
+                interviewer,
+                candidate,
+            } => vec![
+                (
+                    Source::Interviewer,
+                    Audio::Wav(WavSource::open(interviewer, Source::Interviewer, speed)?),
+                ),
+                (
+                    Source::You,
+                    Audio::Wav(WavSource::open(candidate, Source::You, speed)?),
+                ),
+            ],
+            Input::Live { mic, interviewer } => live_sources(mic, interviewer),
+        };
+        let audio = sources
             .iter()
-            .map(|(l, _)| l.wav.duration())
+            .filter_map(|(_, a)| match a {
+                Audio::Wav(w) => Some(w.duration()),
+                Audio::Live { .. } => None,
+            })
             .max()
             .unwrap_or_default();
+        let mut built = Vec::new();
+        for (source, audio) in sources {
+            let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));
+            let ring = match &audio {
+                Audio::Wav(w) => ring_frames(w.duration(), speed),
+                Audio::Live { .. } => DEFAULT_CAPACITY_FRAMES,
+            };
+            built.push(build_lane(
+                source, audio, ring, &model, &stt_cfg, partials, &bus, gate,
+            )?);
+        }
         let audio_zero = Instant::now();
         let mut lanes = Vec::new();
         for (mut lane, sink) in built {
-            lane.wav.start(sink)?;
+            lane.audio.start(sink)?;
             lanes.push(lane);
         }
 
@@ -474,29 +603,51 @@ impl Pipeline {
         let recorder = Recorder::start(store, (!opts.no_store).then_some(paths.db_file.as_path()));
         let hub = recorder.hub();
         // Session time runs at the replay speed, so every stored time lines up with the audio.
-        let clock = wire::SessionClock::start(f64::from(opts.speed));
+        let pace = if live { 1.0 } else { f64::from(opts.speed) };
+        let clock = wire::SessionClock::start(pace);
+        let audio_clock = AudioClock::new(audio_zero, pace);
         hub.dispatch(Action::Started {
-            label: format!(
-                "replay {} + {}",
-                opts.interviewer.display(),
-                opts.candidate.display()
-            ),
+            label: opts.input.label(),
             at: clock.started_at(),
         });
-        for dot in [Dot::Mic, Dot::System] {
+        for lane in &lanes {
+            // A file is fine once open; a live capture's dot follows its state (the monitor).
+            let health = match &lane.audio {
+                Audio::Wav(_) | Audio::Live { status: None, .. } => Health::Ok,
+                Audio::Live {
+                    status: Some(_), ..
+                } => Health::Unknown,
+            };
             hub.dispatch(Action::Status {
-                dot,
-                health: Health::Ok,
+                dot: dot(lane.source),
+                health,
             });
         }
 
         let done = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        let finisher = spawn_finisher(lanes, Arc::clone(&hub), &done, &stop);
+        let finisher = spawn_finisher(
+            lanes,
+            Monitor::new(
+                Arc::clone(&hub),
+                audio_clock.clone(),
+                Arc::clone(&mic_muted),
+            ),
+            &done,
+            &stop,
+        );
         let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
         // #12: each candidate goes through the LLM fast phase on its own thread.
-        let suggester = (!opts.no_llm)
-            .then(|| Suggester::start(&cfg.llm, opts.output, opts.policy, Arc::clone(&hub), clock));
+        let suggester = (!opts.no_llm).then(|| {
+            Suggester::start(
+                &cfg.llm,
+                opts.output,
+                opts.policy,
+                Arc::clone(&hub),
+                clock,
+                audio_clock.clone(),
+            )
+        });
         let (commands_tx, commands) = mpsc::channel();
         Ok(Self {
             info: Info {
@@ -505,6 +656,7 @@ impl Pipeline {
                 speed,
                 partials,
                 audio,
+                live,
             },
             audio_zero,
             bus,
@@ -518,6 +670,7 @@ impl Pipeline {
             recorder,
             hub,
             clock,
+            audio: audio_clock,
             suggester,
             detecting: Detecting::new(
                 opts.spec_literal_detector,
@@ -538,9 +691,9 @@ impl Pipeline {
         &self.info
     }
 
-    /// Audio time 0 on the wall clock: the instant both files started.
-    pub fn audio_zero(&self) -> Instant {
-        self.audio_zero
+    /// Audio time: the clock [`Action::Timing`] marks and the headless report use.
+    pub fn audio_clock(&self) -> AudioClock {
+        self.audio.clone()
     }
 
     pub fn hub(&self) -> Arc<SessionHub> {
@@ -617,6 +770,11 @@ impl Pipeline {
                 break;
             };
             self.hub.dispatch(wire::candidate(id, &candidate));
+            self.hub.dispatch(Action::Timing {
+                candidate: id,
+                stage: Stage::Emitted,
+                at: self.audio.now(),
+            });
             if let Some(s) = &self.suggester {
                 s.submit(id, &candidate, self.log.render_window(DEFAULT_WINDOW));
             }
@@ -702,29 +860,149 @@ fn kind(s: &str) -> Option<Kind> {
     serde_json::from_value(serde_json::Value::String(s.to_owned())).ok()
 }
 
-/// Wait for both files to be delivered (or for `stop`), then close each lane in order: the VAD
-/// flushes its open utterance and closes its channel, which ends the whisper worker once it has
-/// drained everything. A truncated WAV or a dead thread fails the command and turns that lane's
-/// dot red, rather than quietly shortening the transcript.
+/// The dot a lane's health shows on.
+fn dot(source: Source) -> Dot {
+    match source {
+        Source::You => Dot::Mic,
+        Source::Interviewer | Source::Unknown => Dot::System,
+    }
+}
+
+/// What a live capture's dot should show: red while disconnected or failed (the dots are the
+/// only place errors appear, SPEC § Transcript & status), grey until frames flow, muted while
+/// the mic is muted, green while streaming.
+pub fn capture_health(
+    state: CaptureState,
+    last_error: Option<String>,
+    target: &str,
+    muted: bool,
+) -> Health {
+    match state {
+        CaptureState::Error => {
+            Health::Error(last_error.unwrap_or_else(|| format!("{target}: capture failed")))
+        }
+        CaptureState::Disconnected => Health::Error(format!("{target} is gone; waiting for it")),
+        _ if muted => Health::Muted,
+        CaptureState::Streaming => Health::Ok,
+        CaptureState::Idle | CaptureState::Connecting => Health::Unknown,
+    }
+}
+
+/// Watches the lanes while they run; see the module docs.
+struct Monitor {
+    hub: Arc<SessionHub>,
+    clock: AudioClock,
+    mic_muted: Arc<AtomicBool>,
+    started: Instant,
+    cpu0: Option<f64>,
+    last_cpu: Option<Instant>,
+    overruns: u64,
+    /// Interviewer frames consumed at the last anchor.
+    anchored_frames: u64,
+}
+
+impl Monitor {
+    fn new(hub: Arc<SessionHub>, clock: AudioClock, mic_muted: Arc<AtomicBool>) -> Self {
+        Self {
+            hub,
+            clock,
+            mic_muted,
+            started: Instant::now(),
+            cpu0: wire::process_cpu_seconds(),
+            last_cpu: None,
+            overruns: 0,
+            anchored_frames: 0,
+        }
+    }
+
+    fn tick(&mut self, lanes: &[Lane]) {
+        let now = Instant::now();
+        let mut overruns = 0;
+        let mut snapshot = None;
+        for lane in lanes {
+            let stats = lane.vad.stats();
+            overruns += stats.overruns;
+            let Audio::Live { status, target, .. } = &lane.audio else {
+                continue;
+            };
+            // Segment times count the frames a lane's VAD consumed; anchor the audio clock to
+            // the interviewer's, whose segments the questions are.
+            if lane.source == Source::Interviewer && stats.frames > self.anchored_frames {
+                self.anchored_frames = stats.frames;
+                let audio = stats.frames as f64 * f64::from(FRAME_MS) / 1000.0;
+                self.clock.anchor(now, audio);
+            }
+            let Some(status) = status else {
+                continue;
+            };
+            let muted = lane.source == Source::You && self.mic_muted.load(Ordering::Acquire);
+            let want = capture_health(status.state(), status.last_error(), target, muted);
+            let snap = snapshot.get_or_insert_with(|| self.hub.snapshot().status);
+            let shown = match dot(lane.source) {
+                Dot::Mic => &snap.mic,
+                Dot::System => &snap.system,
+                Dot::Model => &snap.model,
+            };
+            if *shown != want {
+                self.hub.dispatch(Action::Status {
+                    dot: dot(lane.source),
+                    health: want,
+                });
+            }
+        }
+        if overruns > self.overruns {
+            self.overruns = overruns;
+            self.hub.dispatch(Action::Overruns { total: overruns });
+        }
+        if self
+            .last_cpu
+            .is_none_or(|t| now.duration_since(t) >= CPU_EVERY)
+        {
+            self.sample_cpu(now);
+        }
+    }
+
+    /// One CPU sample into the session log: CPU seconds since the monitor started.
+    fn sample_cpu(&mut self, now: Instant) {
+        self.last_cpu = Some(now);
+        if let (Some(cpu0), Some(cpu)) = (self.cpu0, wire::process_cpu_seconds()) {
+            self.hub.dispatch(Action::Cpu {
+                at: self.clock.at(now),
+                wall: now.duration_since(self.started).as_secs_f64(),
+                cpu: cpu - cpu0,
+            });
+        }
+    }
+}
+
+/// Wait for both files to be delivered (or, live, for `stop`) while the [`Monitor`] watches,
+/// then close each lane in order: the VAD flushes its open utterance and closes its channel,
+/// which ends the whisper worker once it has drained everything. A truncated WAV or a dead
+/// thread fails the command and turns that lane's dot red, rather than quietly shortening the
+/// transcript.
 fn spawn_finisher(
     lanes: Vec<Lane>,
-    hub: Arc<SessionHub>,
+    mut monitor: Monitor,
     done: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
 ) -> Finisher {
     let done = Arc::clone(done);
     let stop = Arc::clone(stop);
     std::thread::spawn(move || {
-        while !stop.load(Ordering::Acquire) && lanes.iter().any(|l| l.wav.is_running()) {
+        while !stop.load(Ordering::Acquire) && lanes.iter().any(|l| l.audio.running()) {
+            monitor.tick(&lanes);
             std::thread::sleep(TICK);
         }
+        monitor.tick(&lanes);
+        monitor.sample_cpu(Instant::now());
+        let hub = Arc::clone(&monitor.hub);
         let stopping = stop.load(Ordering::Acquire);
         let mut stats = Vec::new();
         let mut failures = Vec::new();
         for mut lane in lanes {
             let label = lane.source.label();
             let mut lane_failures = Vec::new();
-            if let Err(e) = lane.wav.stop() {
+            if let Err(e) = lane.audio.stop() {
                 lane_failures.push(format!("{label} audio: {e}"));
             }
             let vad = if stopping {
@@ -746,10 +1024,7 @@ fn spawn_finisher(
             if let Some(first) = lane_failures.first() {
                 // SPEC § Transcript & status: the dots are the only place errors appear.
                 hub.dispatch(Action::Status {
-                    dot: match lane.source {
-                        Source::You => Dot::Mic,
-                        Source::Interviewer | Source::Unknown => Dot::System,
-                    },
+                    dot: dot(lane.source),
                     health: Health::Error(first.clone()),
                 });
             }
@@ -761,20 +1036,74 @@ fn spawn_finisher(
     })
 }
 
-/// Build one lane with its file opened but not started; the returned sink starts it.
+/// The live sources: PipeWire capture of `mic` and `interviewer` on one shared context, or,
+/// when PipeWire cannot be reached, the `pw-record` emergency fallback (SPEC § Decisions), which
+/// can target the mic by name but only the whole sink monitor for the interviewer.
+fn live_sources(mic: &CaptureTarget, interviewer: &CaptureTarget) -> Vec<(Source, Audio)> {
+    let connected = PipeWireContext::connect().and_then(|ctx| {
+        let table = ctx.wait_for_sync(SYNC_TIMEOUT);
+        match table.disconnected {
+            Some(why) => Err(dmn_audio::PipeWireError::Connect(why)),
+            None => Ok(Arc::new(ctx)),
+        }
+    });
+    match connected {
+        Ok(ctx) => [(Source::You, mic), (Source::Interviewer, interviewer)]
+            .into_iter()
+            .map(|(source, target)| {
+                let capture = PipeWireSource::new(Arc::clone(&ctx), source, target.clone());
+                let status = Some(capture.status());
+                (
+                    source,
+                    Audio::Live {
+                        source: Box::new(capture),
+                        status,
+                        target: describe(target),
+                    },
+                )
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "PipeWire unreachable; capturing through pw-record");
+            let mic_name = match mic {
+                CaptureTarget::Mic(Some(name)) => Some(name.as_str()),
+                _ => None,
+            };
+            vec![
+                (
+                    Source::You,
+                    Audio::Live {
+                        source: Box::new(PwRecordSource::new(Source::You, mic_name, false)),
+                        status: None,
+                        target: describe(mic),
+                    },
+                ),
+                (
+                    Source::Interviewer,
+                    Audio::Live {
+                        source: Box::new(PwRecordSource::new(Source::Interviewer, None, true)),
+                        status: None,
+                        target: describe(&CaptureTarget::SinkMonitor),
+                    },
+                ),
+            ]
+        }
+    }
+}
+
+/// Build one lane around its (not yet started) source; the returned sink starts it.
 #[allow(clippy::too_many_arguments)]
 fn build_lane(
-    path: &Path,
     source: Source,
-    speed: Speed,
+    audio: Audio,
+    ring: usize,
     model: &Path,
     stt_cfg: &SttConfig,
     partials: bool,
     bus: &Arc<Bus>,
     mute: Option<Arc<AtomicBool>>,
 ) -> Result<(Lane, FrameSink), Box<dyn Error>> {
-    let wav = WavSource::open(path, source, speed)?;
-    let (sink, frames) = dmn_audio::frame_channel(source, ring_frames(wav.duration(), speed));
+    let (sink, frames) = dmn_audio::frame_channel(source, ring);
     let (tx, rx) = event_channel(EVENT_CAPACITY);
     let mut vad_cfg = VadConfig::default();
     if !partials {
@@ -804,7 +1133,7 @@ fn build_lane(
     Ok((
         Lane {
             source,
-            wav,
+            audio,
             vad,
             stt,
         },
@@ -871,6 +1200,88 @@ mod tests {
             (0..50).all(|_| !vad.is_speech(&loud)),
             "muted, nothing is speech"
         );
+    }
+
+    #[test]
+    fn a_live_capture_dot_follows_its_state() {
+        let t = "app Firefox";
+        assert_eq!(
+            capture_health(CaptureState::Connecting, None, t, false),
+            Health::Unknown
+        );
+        assert_eq!(
+            capture_health(CaptureState::Streaming, None, t, false),
+            Health::Ok
+        );
+        assert_eq!(
+            capture_health(CaptureState::Streaming, None, t, true),
+            Health::Muted
+        );
+        assert_eq!(
+            capture_health(CaptureState::Disconnected, None, t, true),
+            Health::Error("app Firefox is gone; waiting for it".into()),
+            "an error shows even while muted"
+        );
+        assert_eq!(
+            capture_health(CaptureState::Error, Some("format".into()), t, false),
+            Health::Error("format".into())
+        );
+    }
+
+    #[test]
+    fn a_live_input_is_labelled_by_what_it_captures() {
+        let live = Input::Live {
+            mic: CaptureTarget::Mic(None),
+            interviewer: CaptureTarget::interviewer("Firefox"),
+        };
+        assert_eq!(live.label(), "live mic (default source) + app Firefox");
+        assert_eq!(
+            describe(&CaptureTarget::interviewer("")),
+            "all system audio (sink monitor)"
+        );
+        let files = Input::Files {
+            interviewer: "a.wav".into(),
+            candidate: "b.wav".into(),
+        };
+        assert_eq!(files.label(), "replay a.wav + b.wav");
+    }
+
+    #[test]
+    fn a_live_run_refuses_record_audio_rather_than_ignoring_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(&paths.models_dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.privacy.record_audio = true;
+        // A model file must exist for start to get as far as the privacy check.
+        std::fs::write(
+            model_path(&paths.models_dir, Model::from_name(&cfg.stt.model).unwrap()),
+            b"",
+        )
+        .unwrap();
+        let err = Pipeline::start(
+            &cfg,
+            &paths,
+            &Options {
+                input: Input::Live {
+                    mic: CaptureTarget::Mic(None),
+                    interviewer: CaptureTarget::SinkMonitor,
+                },
+                speed: 1.0,
+                model: None,
+                threads: None,
+                partials: Partials::Auto,
+                spec_literal_detector: false,
+                no_llm: true,
+                no_store: true,
+                output: Output::Quiet,
+                policy: Policy::Supersede,
+            },
+        )
+        .err()
+        .expect("refused")
+        .to_string();
+        assert!(err.contains("record_audio"), "{err}");
     }
 
     #[test]

@@ -25,6 +25,7 @@ dmn-detect = { path = "../../crates/dmn-detect" }
 dmn-llm = { path = "../../crates/dmn-llm" }
 dmn-session = { path = "../../crates/dmn-session" }
 dmn-stt = { path = "../../crates/dmn-stt" }
+dmn-store = { path = "../../crates/dmn-store" }
 dmn-transcript = { path = "../../crates/dmn-transcript" }
 dmn-vad = { path = "../../crates/dmn-vad" }
 ratatui = { workspace = true }

@@ -95,6 +95,13 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         spans.push(Span::styled(dot, style));
         spans.push(Span::raw(format!(" {name}{suffix} ")));
     }
+    // #16: ring-buffer overruns (audio dropped because a consumer stalled) show beside the dots,
+    // and only once there are any.
+    if st.overruns > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("●", Style::new().fg(Color::Red)));
+        spans.push(Span::raw(format!(" {} dropped ", st.overruns)));
+    }
     if let Some(d) = detail {
         let used = Line::from(spans.clone()).width();
         let room = usize::from(left.width).saturating_sub(used + 2);
