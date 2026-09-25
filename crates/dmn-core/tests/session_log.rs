@@ -491,3 +491,60 @@ fn timing_cpu_and_overruns_reach_the_store() {
     assert_eq!((sample.cpu, sample.whisper), (4.5, 1.5));
     assert_eq!(store.session(id).unwrap().unwrap().overruns, 2);
 }
+
+#[test]
+fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
+    use dmn_session::{CodingSolutions, Speaker};
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let hub = rec.hub();
+    let asked = |id: u64, start: f64, text: &str| {
+        [
+            Action::Segment {
+                speaker: Speaker::Interviewer,
+                start,
+                end: start + 4.0,
+                text: text.into(),
+                is_final: true,
+                avg_logprob: -0.2,
+            },
+            Action::Candidate {
+                id,
+                speaker: Speaker::Interviewer,
+                start,
+                end: start + 4.0,
+                text: text.into(),
+                score: 5,
+            },
+        ]
+    };
+    hub.dispatch(Action::Started {
+        label: "coding".into(),
+        at: 1_700_000_000,
+    });
+    // What the pipeline dispatches right after `Started`: the config's mode.
+    hub.dispatch(Action::CodingSolutions {
+        mode: CodingSolutions::Hints,
+    });
+    for a in asked(1, 20.0, "Reverse a linked list in place.") {
+        hub.dispatch(a);
+    }
+    // `s` mid-call.
+    hub.dispatch(Action::CodingSolutions {
+        mode: CodingSolutions::Full,
+    });
+    for a in asked(2, 60.0, "Find the median of a stream of integers.") {
+        hub.dispatch(a);
+    }
+    let report = rec.finish(1_700_000_090).unwrap().unwrap();
+    assert_eq!(report.errors, 0);
+    let store = open_store(&paths).unwrap();
+    let modes: Vec<Option<String>> = store
+        .questions(report.session_id.unwrap())
+        .unwrap()
+        .into_iter()
+        .map(|q| q.coding_solutions)
+        .collect();
+    assert_eq!(modes, [Some("hints".into()), Some("full".into())]);
+}

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{Action, Dot, Health, IgnoreReason, Speaker, StarCards};
+use crate::action::{Action, CodingSolutions, Dot, Health, IgnoreReason, Speaker, StarCards};
 
 /// How much transcript the session keeps: the SPEC's prompt window is the last 60 s, and the UI
 /// shows the last two lines, so nothing older is ever read from here.
@@ -122,6 +122,9 @@ pub struct Session {
     pub pending: Option<u64>,
     pub status: Status,
     pub counts: Counts,
+    /// What Deeper Answer may hold for coding questions (#50); shown in the footer.
+    #[serde(default)]
+    pub coding_solutions: CodingSolutions,
 }
 
 impl Session {
@@ -337,6 +340,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
             *slot = health.clone();
         }
         Action::Overruns { total } => s.status.overruns = *total,
+        Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } => {}
     }

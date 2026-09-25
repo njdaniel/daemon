@@ -379,7 +379,7 @@ fn a_v1_database_upgrades_to_v2_keeping_its_rows() {
     }
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     let session = store.session(1).unwrap().unwrap();
     assert_eq!((session.label.as_str(), session.overruns), ("v1", 0));
     let q = &store.questions(1).unwrap()[0];
@@ -395,6 +395,44 @@ fn a_v1_database_upgrades_to_v2_keeping_its_rows() {
             .schema_object_names()
             .unwrap()
             .contains(&"idx_cpu_samples_session".to_string())
+    );
+}
+
+#[test]
+fn a_v2_database_upgrades_to_v3_and_questions_record_their_coding_solutions_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 2).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label) VALUES (1, 1700000000, 'v2');
+             INSERT INTO segments (id, session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob)
+                 VALUES (1, 1, 'interviewer', 12.5, 18.0, 'Reverse a linked list.', 1, -0.2);
+             INSERT INTO questions (id, session_id, segment_id, score, created_at)
+                 VALUES (1, 1, 1, 4, 1700000018);",
+        )
+        .unwrap();
+    }
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(
+        store.questions(1).unwrap()[0].coding_solutions,
+        None,
+        "a v2 row reads back as unknown"
+    );
+
+    store.set_question_coding_solutions(1, "full").unwrap();
+    assert_eq!(
+        store.questions(1).unwrap()[0].coding_solutions.as_deref(),
+        Some("full")
+    );
+    assert!(
+        store.set_question_coding_solutions(1, "solutions").is_err(),
+        "only hints / full are stored"
     );
 }
 

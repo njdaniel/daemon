@@ -215,6 +215,10 @@ impl StoreWriter {
                 })?;
                 self.questions.insert(*id, row);
                 self.report.questions += 1;
+                // #50: the mode in effect when it was detected, so a review of the log shows
+                // what Deeper Answer was allowed to hold even after `s` switched it.
+                self.store
+                    .set_question_coding_solutions(row, self.state.coding_solutions.label())?;
             }
             Action::Question {
                 candidate,
@@ -311,6 +315,9 @@ impl StoreWriter {
             // A regenerate writes through the actions it causes: `Question` updates the same
             // question row and `Answered` adds a second suggestion to it.
             | Action::Regenerate { .. }
+            // The mode lands in the writer's own reduced state; each question row takes it from
+            // there when it is inserted.
+            | Action::CodingSolutions { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

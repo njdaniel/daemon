@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dmn_session::{Action, Dot, Health, Session, Speaker, StarCards};
+use dmn_session::{Action, CodingSolutions, Dot, Health, Session, Speaker, StarCards};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -19,7 +19,15 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 5] = ["listening", "live", "pinned", "loading", "behavioral"];
+const STATES: [&str; 7] = [
+    "listening",
+    "live",
+    "pinned",
+    "loading",
+    "behavioral",
+    "coding",
+    "coding-full",
+];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 
 fn updating() -> bool {
@@ -263,6 +271,34 @@ fn actions(state: &str) -> Vec<Action> {
                 dot: Dot::Mic,
                 health: Health::Muted,
             });
+        }
+        // #50: a coding question under each coding-solutions mode; the footer names the mode.
+        "coding" | "coding-full" => {
+            let mode = if state == "coding" {
+                CodingSolutions::Hints
+            } else {
+                CodingSolutions::Full
+            };
+            a.push(Action::CodingSolutions { mode });
+            a.extend(answered(
+                1,
+                "Given a stream of integers, return the median after each one arrives.",
+                "coding",
+                "two heaps, balancing, O(log n) insert",
+                &[
+                    "Keep a max-heap of the lower half and a min-heap of the upper half.",
+                    "Insert into one heap, then move its top across so the sizes differ by ≤ 1.",
+                    "The median is the larger heap's top, or the mean of both tops.",
+                    "Each insert is O(log n); reading the median is O(1).",
+                ],
+            ));
+            a.push(seg(
+                Speaker::You,
+                31.0,
+                36.0,
+                "So I'd split the numbers into two halves around the median.",
+                true,
+            ));
         }
         other => panic!("no actions for state {other}"),
     }
