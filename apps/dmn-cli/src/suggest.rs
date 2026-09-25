@@ -23,6 +23,11 @@
 //! This module maps between crates: `dmn-llm` knows nothing of `dmn-detect` or `dmn-core`.
 //! Every published field and every outcome is also dispatched into the session (#13), so the
 //! session log gets the same actions a live call's fast phase would produce.
+//!
+//! #54: after the warm-up and before the first question, the thread loads the context
+//! ([`crate::context`]): the stored sources and the job requirements, summarising a new job
+//! description once. Every request then carries the requirements and the chunks retrieved for
+//! its question, and `dmn replay --json` records which chunks went with each candidate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -37,6 +42,8 @@ use dmn_llm::{
     LlmError, OllamaProvider, OllamaSettings, Provider, Suggestion, run_fast_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
+
+use crate::context::{Context, ContextInfo, ContextSource, Retrieval};
 
 /// Where the fast phase's results go besides the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +94,28 @@ pub struct Tally {
     pub regenerated: usize,
     /// Requests cancelled, or never sent, because a newer unpinned question arrived.
     pub superseded: usize,
+    /// What context was loaded (#54).
+    pub context: ContextInfo,
+    /// Retrievals run, and their slowest and total time (staleness check, reload, search).
+    pub retrievals: usize,
+    pub retrieval_slowest: Duration,
+    pub retrieval_total: Duration,
+}
+
+impl Tally {
+    fn retrieved(&mut self, took: Duration) {
+        self.retrievals += 1;
+        self.retrieval_slowest = self.retrieval_slowest.max(took);
+        self.retrieval_total += took;
+    }
+
+    /// Mean time per retrieval.
+    pub fn retrieval_mean(&self) -> Duration {
+        u32::try_from(self.retrievals)
+            .ok()
+            .filter(|&n| n > 0)
+            .map_or(Duration::ZERO, |n| self.retrieval_total / n)
+    }
 }
 
 /// Whether a newer question replaces an older one's request.
@@ -127,6 +156,7 @@ pub struct Suggester {
 impl Suggester {
     /// `clock` stamps each outcome in session time (`--speed` × wall clock); `audio` stamps
     /// when each question and its first Approach line were produced, in audio time (#16).
+    /// `context` is where the sources and job requirements are read from (#54).
     pub fn start(
         llm: &config::Llm,
         output: Output,
@@ -134,19 +164,33 @@ impl Suggester {
         hub: Arc<SessionHub>,
         clock: wire::SessionClock,
         audio: wire::AudioClock,
+        context: ContextSource,
     ) -> Self {
         let llm = llm.clone();
         Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
-            worker(&llm, output, rx, hub, clock, audio, cancel, latest)
+            worker(
+                &llm, output, rx, hub, clock, audio, cancel, latest, &context,
+            )
         })
     }
 
-    /// Serve jobs on `provider` directly, with no warm-up: the tests' way in.
+    /// Serve jobs on `provider` directly, with no warm-up and no context: the tests' way in.
     #[cfg(test)]
     fn start_with<P: Provider + Send + 'static>(
         provider: P,
         policy: Policy,
         hub: Arc<SessionHub>,
+    ) -> Self {
+        Self::start_with_context(provider, policy, hub, Context::empty())
+    }
+
+    /// [`Suggester::start_with`] with `context` already loaded.
+    #[cfg(test)]
+    fn start_with_context<P: Provider + Send + 'static>(
+        provider: P,
+        policy: Policy,
+        hub: Arc<SessionHub>,
+        mut context: Context,
     ) -> Self {
         Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -163,10 +207,13 @@ impl Suggester {
                 cancel,
                 latest,
             };
-            let mut tally = Tally::default();
+            let mut tally = Tally {
+                context: context.info(),
+                ..Tally::default()
+            };
             let mut current = None;
             while let Ok(job) = rx.recv() {
-                let _ = answerer.answer(job, &mut current, &mut tally);
+                let _ = answerer.answer(job, &mut current, &mut context, &mut tally);
             }
             tally
         })
@@ -262,6 +309,7 @@ fn worker(
     audio: wire::AudioClock,
     cancel: &CancellationToken,
     latest: Option<&Latest>,
+    context: &ContextSource,
 ) -> Tally {
     let mut tally = Tally::default();
     let model_down = |why: String| {
@@ -347,6 +395,20 @@ fn worker(
         health: Health::Ok,
     });
 
+    // #54: the sources and job requirements, loaded once before the first question. A new job
+    // description is summarised here, off every question's path; candidates queue meanwhile.
+    let mut context = Context::open(context).unwrap_or_else(|e| {
+        output.warn(&format!("no context: {e}; prompts go without it"));
+        Context::empty()
+    });
+    if let Err(e) = context.ensure_requirements(&rt, &provider, cancel) {
+        output.warn(&format!(
+            "job description not summarised: {e}; prompts go without its requirements"
+        ));
+    }
+    tally.context = context.info();
+    print_context(&context, output);
+
     let answerer = Answerer {
         rt: &rt,
         provider: &provider,
@@ -359,7 +421,7 @@ fn worker(
     };
     let mut current: Option<CurrentQuestion> = None;
     while let Ok(job) = rx.recv() {
-        if let Err(e) = answerer.answer(job, &mut current, &mut tally) {
+        if let Err(e) = answerer.answer(job, &mut current, &mut context, &mut tally) {
             output.warn(&format!(
                 "no suggestions from here on: {e}; transcribing only"
             ));
@@ -403,6 +465,7 @@ impl<P: Provider> Answerer<'_, P> {
         &self,
         job: Job,
         current: &mut Option<CurrentQuestion>,
+        context: &mut Context,
         tally: &mut Tally,
     ) -> Result<(), LlmError> {
         let hub = self.hub;
@@ -438,7 +501,18 @@ impl<P: Provider> Answerer<'_, P> {
             tally.superseded += 1;
             return Ok(());
         }
-        let req = request(&job, current.as_ref());
+        // #54: the requirements every prompt carries, and the chunks for this question (the
+        // question on screen when regenerating). Timed from here, so its cost is visible in the
+        // run summary against the 50 ms the issue allows it.
+        let query = job
+            .regenerate
+            .as_ref()
+            .map_or(job.candidate.text.as_str(), |c| c.question.as_str());
+        let retrieval = context.retrieve(query);
+        tally.retrieved(retrieval.took);
+        let mut req = request(&job, current.as_ref());
+        req.job_requirements = context.requirements().to_vec();
+        req.chunks = retrieval.chunks.clone();
         let started = Instant::now();
         let mut question_at = None;
         let mut first_line_at = None;
@@ -525,6 +599,7 @@ impl<P: Provider> Answerer<'_, P> {
                     clarification,
                     &flags,
                     timing,
+                    &retrieval,
                     self.output,
                 );
                 if clarification {
@@ -543,7 +618,14 @@ impl<P: Provider> Answerer<'_, P> {
                 }
             }
             Ok(FastOutcome::Ignored { reason, score }) => {
-                print_ignored(&job.candidate, reason, score, timing, self.output);
+                print_ignored(
+                    &job.candidate,
+                    reason,
+                    score,
+                    timing,
+                    &retrieval,
+                    self.output,
+                );
                 tally.ignored += 1;
             }
             Err(e @ LlmError::Unreachable { .. }) => {
@@ -568,6 +650,8 @@ impl<P: Provider> Answerer<'_, P> {
                             "text": job.candidate.text,
                             "error": e.to_string(),
                             "total_ms": ms(timing.total),
+                            "chunks": retrieval.json(),
+                            "retrieval_us": us(retrieval.took),
                         })
                     );
                 }
@@ -589,6 +673,59 @@ fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
 
+fn us(d: Duration) -> u64 {
+    d.as_micros() as u64
+}
+
+/// ` · context: resume.md#1, system-design.md#0` for the readable replay line; empty without.
+fn context_note(r: &Retrieval) -> String {
+    if r.refs.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = r
+        .refs
+        .iter()
+        .map(|c| format!("{}#{}", c.file, c.idx))
+        .collect();
+    format!(" · context: {}", names.join(", "))
+}
+
+/// The context loaded for this run: one line for `dmn replay`, one NDJSON record with `--json`.
+fn print_context(context: &Context, output: Output) {
+    let info = context.info();
+    match output {
+        Output::Print { json: true } => println!(
+            "{}",
+            serde_json::json!({
+                "type": "context",
+                "sources": info.sources,
+                "passages": info.passages,
+                "requirements": context.requirements(),
+                "requirements_from": info.from.label(),
+            })
+        ),
+        Output::Print { json: false } => {
+            println!(
+                "context: {} source(s), {} passage(s) searchable; job requirements: {} ({})",
+                info.sources,
+                info.passages,
+                info.requirements,
+                info.from.label()
+            );
+            for r in context.requirements() {
+                println!("  - {r}");
+            }
+        }
+        Output::Quiet => tracing::info!(
+            sources = info.sources,
+            passages = info.passages,
+            requirements = info.requirements,
+            from = info.from.label(),
+            "context loaded"
+        ),
+    }
+}
+
 fn secs(d: Duration) -> String {
     format!("{:.2} s", d.as_secs_f64())
 }
@@ -607,12 +744,14 @@ fn fast_json(s: &Suggestion) -> serde_json::Value {
     v
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_shown(
     c: &Candidate,
     s: &Suggestion,
     clarification: bool,
     flags: &[String],
     t: Timing,
+    r: &Retrieval,
     output: Output,
 ) {
     let Output::Print { json } = output else {
@@ -631,6 +770,8 @@ fn print_shown(
                 "question_ms": t.question.map(ms),
                 "first_line_ms": t.first_line.map(ms),
                 "total_ms": ms(t.total),
+                "chunks": r.json(),
+                "retrieval_us": us(r.took),
             })
         );
         return;
@@ -651,15 +792,23 @@ fn print_shown(
         format!(", cut: {}", flags.join(" "))
     };
     println!(
-        "  => {what} at {}, first line at {}, done at {}{over}{cut}\n     {}",
+        "  => {what} at {}, first line at {}, done at {}{over}{cut}{}\n     {}",
         t.question.map(secs).unwrap_or_else(|| "-".into()),
         t.first_line.map(secs).unwrap_or_else(|| "-".into()),
         secs(t.total),
+        context_note(r),
         fast_json(s)
     );
 }
 
-fn print_ignored(c: &Candidate, reason: IgnoreReason, score: i32, t: Timing, output: Output) {
+fn print_ignored(
+    c: &Candidate,
+    reason: IgnoreReason,
+    score: i32,
+    t: Timing,
+    r: &Retrieval,
+    output: Output,
+) {
     let Output::Print { json } = output else {
         return;
     };
@@ -678,6 +827,8 @@ fn print_ignored(c: &Candidate, reason: IgnoreReason, score: i32, t: Timing, out
                 "reason": reason,
                 "score": score,
                 "total_ms": ms(t.total),
+                "chunks": r.json(),
+                "retrieval_us": us(r.took),
             })
         );
     } else {
@@ -719,6 +870,7 @@ mod tests {
             Arc::clone(&hub),
             wire::SessionClock::start(1.0),
             wire::AudioClock::new(Instant::now(), 1.0),
+            ContextSource::Off,
         );
         for id in [1, 2] {
             hub.dispatch(wire::candidate(id, &candidate()));
@@ -749,6 +901,7 @@ mod tests {
             Arc::new(SessionHub::default()),
             wire::SessionClock::start(1.0),
             wire::AudioClock::new(Instant::now(), 1.0),
+            ContextSource::Off,
         );
         s.submit(1, &candidate(), String::new());
         assert_eq!(
@@ -776,6 +929,7 @@ mod tests {
             Arc::clone(&hub),
             wire::SessionClock::start(1.0),
             wire::AudioClock::new(Instant::now(), 1.0),
+            ContextSource::Off,
         );
         for id in [1, 2, 3] {
             hub.dispatch(wire::candidate(id, &candidate()));
@@ -838,7 +992,9 @@ mod tests {
             }),
         };
         let mut tally = Tally::default();
-        answerer.answer(job, &mut None, &mut tally).unwrap();
+        answerer
+            .answer(job, &mut None, &mut Context::empty(), &mut tally)
+            .unwrap();
 
         let sent = provider.requests();
         assert_eq!(sent.len(), 1);
@@ -951,6 +1107,106 @@ mod tests {
         submit_with_candidate(&s, &hub, 2);
         let tally = s.finish();
         assert_eq!((tally.shown, tally.superseded), (2, 0), "{tally:?}");
+    }
+
+    /// #54: with the context fixtures loaded, every fast-phase prompt carries the job
+    /// requirements, and a question about the resume carries the chunks retrieved for it.
+    #[test]
+    fn every_prompt_carries_the_job_requirements_and_the_retrieved_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::context::fixture_db(dir.path());
+        let bullets = [
+            "Design distributed services in Go or Rust",
+            "Postgres sharding and Redis caching",
+        ];
+        {
+            // The summary is already cached, as it would be after the first session.
+            let store = dmn_store::Store::open(&db).unwrap();
+            let lib = dmn_context::Library::load(&store).unwrap();
+            let hash = &lib.job_description().unwrap().hash;
+            let owned: Vec<String> = bullets.iter().map(|b| (*b).to_string()).collect();
+            store.put_jd_summary(hash, &owned, 1).unwrap();
+        }
+        let context = Context::open(&ContextSource::Db {
+            path: db,
+            write: false,
+        })
+        .unwrap();
+        let provider = slow_reply("Q").with_delay(Duration::ZERO);
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            context,
+        );
+        let kafka = Candidate {
+            text: "Tell me about a time you built something on Kafka.".into(),
+            ..candidate()
+        };
+        let weather = Candidate {
+            text: "How's the weather over there?".into(),
+            ..candidate()
+        };
+        for (id, c) in [(1, candidate()), (2, kafka), (3, weather)] {
+            hub.dispatch(wire::candidate(id, &c));
+            s.submit(id, &c, String::new());
+        }
+        let tally = s.finish();
+        assert_eq!(tally.retrievals, 3);
+        assert_eq!(tally.context.requirements, 2);
+        let sent = provider.requests();
+        assert_eq!(sent.len(), 3);
+        for req in &sent {
+            let user = &req.messages.last().unwrap().content;
+            assert!(user.starts_with("## Job requirements\n"), "{user}");
+            for b in bullets {
+                assert!(user.contains(&format!("- {b}\n")), "{b} missing: {user}");
+            }
+        }
+        let rate = &sent[0].messages.last().unwrap().content;
+        assert!(
+            rate.contains("## Candidate's material\n[1] resume (resume.md): "),
+            "{rate}"
+        );
+        assert!(rate.contains("rate limiter"), "{rate}");
+        let kafka = &sent[1].messages.last().unwrap().content;
+        assert!(
+            kafka.contains("Kafka, with idempotent consumers"),
+            "{kafka}"
+        );
+        let weather = &sent[2].messages.last().unwrap().content;
+        assert!(
+            !weather.contains("## Candidate's material"),
+            "nothing matches small talk: {weather}"
+        );
+    }
+
+    /// #54: with no sources loaded the prompt is exactly the M1 prompt.
+    #[test]
+    fn without_sources_the_prompt_is_the_m1_prompt() {
+        let provider = slow_reply("Q").with_delay(Duration::ZERO);
+        let hub = Arc::new(SessionHub::default());
+        let dir = tempfile::tempdir().unwrap();
+        let context = Context::open(&ContextSource::Db {
+            path: dir.path().join("dmn.sqlite"),
+            write: false,
+        })
+        .unwrap();
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            hub.clone(),
+            context,
+        );
+        hub.dispatch(wire::candidate(1, &candidate()));
+        s.submit(1, &candidate(), "Interviewer: So.".into());
+        assert_eq!(s.finish().shown, 1);
+        let m1 = dmn_llm::fast::fast_chat_request(&FastRequest {
+            transcript: "Interviewer: So.".into(),
+            ..FastRequest::new(candidate().text, candidate().score)
+        });
+        assert_eq!(provider.requests(), [m1]);
     }
 
     #[test]

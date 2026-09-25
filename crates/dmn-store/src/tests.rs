@@ -539,7 +539,7 @@ fn a_v3_database_upgrades_to_v4_keeping_its_sessions_and_gaining_sources() {
     }
 
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     assert_eq!(store.session(1).unwrap().unwrap().label, "v3");
     assert_eq!(store.segments(1).unwrap().len(), 1);
     assert_eq!(store.source_counts().unwrap(), (0, 0));
@@ -671,4 +671,141 @@ fn an_unknown_source_kind_is_rejected_and_nothing_is_half_written() {
         Err(StoreError::Sqlite(_))
     ));
     assert_eq!(store.source_counts().unwrap(), (0, 0));
+}
+
+// --- Job-description summary cache and context reads (v5, #54) ----------------------------------
+
+#[test]
+fn a_v4_database_upgrades_to_v5_keeping_its_sources_and_gaining_the_summary_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sources (id, kind, path, added_at, bytes, tokens)
+                 VALUES (1, 'resume', '/r.md', 1700000000, 10, 4);
+             INSERT INTO chunks (source_id, idx, text, tokens) VALUES (1, 0, 'Rust and Kafka', 4);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(store.source_counts().unwrap(), (1, 1));
+    assert!(
+        store
+            .schema_object_names()
+            .unwrap()
+            .contains(&"jd_summaries".to_string())
+    );
+    assert_eq!(store.jd_summary("abc").unwrap(), None);
+}
+
+#[test]
+fn the_jd_summary_round_trips_by_hash_and_a_new_one_replaces_the_old() {
+    let store = store();
+    let bullets = vec![
+        "Go or Rust services".to_string(),
+        "Postgres sharding,\nRedis caching".to_string(),
+        "   ".to_string(),
+    ];
+    store.put_jd_summary("h1", &bullets, 1).unwrap();
+    assert_eq!(
+        store.jd_summary("h1").unwrap(),
+        Some(vec![
+            "Go or Rust services".to_string(),
+            "Postgres sharding, Redis caching".to_string(),
+        ]),
+        "a newline inside a bullet does not split it; blank bullets are dropped"
+    );
+    store
+        .put_jd_summary("h2", &["Kafka".to_string()], 2)
+        .unwrap();
+    assert_eq!(store.jd_summary("h1").unwrap(), None, "one JD at a time");
+    assert_eq!(
+        store.jd_summary("h2").unwrap(),
+        Some(vec!["Kafka".to_string()])
+    );
+    store
+        .put_jd_summary("h2", &["Kafka streams".to_string()], 3)
+        .unwrap();
+    assert_eq!(
+        store.jd_summary("h2").unwrap(),
+        Some(vec!["Kafka streams".to_string()]),
+        "the same hash is overwritten, not duplicated"
+    );
+}
+
+#[test]
+fn all_chunks_carry_their_source_and_the_signature_moves_on_every_change() {
+    let store = store();
+    let empty = store.sources_signature().unwrap();
+    assert_eq!(empty, crate::SourcesSignature::default());
+    store
+        .replace_source(&doc("resume", "/r.md"), &chunks(&["a", "b"]), true)
+        .unwrap();
+    store
+        .replace_source(&doc("notes", "/n/x.md"), &chunks(&["c"]), false)
+        .unwrap();
+    let all = store.all_chunks().unwrap();
+    let got: Vec<(&str, &str, i64, &str)> = all
+        .iter()
+        .map(|c| (c.kind.as_str(), c.path.as_str(), c.idx, c.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("resume", "/r.md", 0, "a"),
+            ("resume", "/r.md", 1, "b"),
+            ("notes", "/n/x.md", 0, "c"),
+        ]
+    );
+    let two = store.sources_signature().unwrap();
+    assert_eq!((two.sources, two.chunks), (2, 3));
+    // Replacing the resume keeps the counts equal but raises the id.
+    store
+        .replace_source(&doc("resume", "/r.md"), &chunks(&["x", "y"]), true)
+        .unwrap();
+    let replaced = store.sources_signature().unwrap();
+    assert_eq!((replaced.sources, replaced.chunks), (2, 3));
+    assert_ne!(replaced, two, "a replacement is a change");
+}
+
+#[test]
+fn a_read_only_open_reads_the_context_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    assert!(
+        Store::open_read_only(&path).unwrap().is_none(),
+        "no database, no store, and none is created"
+    );
+    assert!(!path.exists());
+    {
+        let rw = Store::open(&path).unwrap();
+        rw.replace_source(&doc("resume", "/r.md"), &chunks(&["a"]), true)
+            .unwrap();
+        rw.put_jd_summary("h", &["Rust".to_string()], 1).unwrap();
+    }
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(ro.all_chunks().unwrap().len(), 1);
+    assert_eq!(ro.jd_summary("h").unwrap(), Some(vec!["Rust".to_string()]));
+    assert!(
+        ro.put_jd_summary("h", &["x".to_string()], 2).is_err(),
+        "read-only means read-only"
+    );
+    assert!(ro.insert_session(&NewSession::new(1, "x")).is_err());
+
+    // An older database is not migrated by a read-only open.
+    let old = dir.path().join("old.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&old).unwrap();
+        crate::migrate::migrate_to(&mut conn, 4).unwrap();
+    }
+    assert!(Store::open_read_only(&old).unwrap().is_none());
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    let v: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 4, "left alone");
 }

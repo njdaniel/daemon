@@ -15,6 +15,10 @@ pub const DEEPER_MAX: usize = 4;
 pub const DEEPER_CHARS: usize = 240;
 /// Not stated in the SPEC; STAR cards get the same per-entry cap as `deeper` so none is a wall.
 pub const STAR_FIELD_CHARS: usize = 240;
+/// SPEC § Context and LLM: the job description is summarised into ≤ 8 requirement bullets (#54).
+pub const REQUIREMENTS_MAX: usize = 8;
+/// Not stated in the SPEC; a requirement bullet gets the `focus` cap, one line of the prompt.
+pub const REQUIREMENT_CHARS: usize = 120;
 
 /// One limit that model output broke. `field` names the place, like `approach[2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +97,25 @@ pub fn limit_list<T>(field: &str, list: &mut Vec<T>, max: usize, flags: &mut Vec
         list.truncate(max);
         flags.push(Flag::new(field, FlagKind::Dropped { from, to: max }));
     }
+}
+
+/// The job-description requirement bullets as every prompt carries them (#54): each one line,
+/// trimmed, its bullet or number removed, blank ones dropped, at most [`REQUIREMENTS_MAX`] of at
+/// most [`REQUIREMENT_CHARS`].
+pub fn limit_requirements(raw: &[String], flags: &mut Vec<Flag>) -> Vec<String> {
+    let mut out: Vec<String> = raw
+        .iter()
+        .map(|r| {
+            let one_line = r.split_whitespace().collect::<Vec<_>>().join(" ");
+            strip_marker(&one_line).to_owned()
+        })
+        .filter(|r| !r.is_empty())
+        .collect();
+    limit_list("requirements", &mut out, REQUIREMENTS_MAX, flags);
+    for (i, r) in out.iter_mut().enumerate() {
+        limit_text(&format!("requirements[{i}]"), r, REQUIREMENT_CHARS, flags);
+    }
+    out
 }
 
 /// One approach line as the UI shows it: trimmed, the model's own numbering or bullet removed
