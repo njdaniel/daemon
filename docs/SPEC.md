@@ -120,7 +120,7 @@ stream.capture.sink=true                                   # only for the sink-m
 
 1. By source (default): mic → You, loopback → Interviewer.
 2. Echo guard: when both sources are active in the same 300 ms and the mic segment's text is a near-duplicate of the loopback segment (ratio ≥ 0.8), drop the mic copy. This handles laptops without echo cancellation.
-3. Single-stream fallback (system audio off, or an in-person interview): all audio is "Unknown" until M2 adds diarization; question detection still runs on all text.
+3. Single-stream fallback (system audio off, or an in-person interview): all audio is "Unknown" until diarization lands (M3/M4; in-person interviews are out of scope for v1, decided 2026-09-25); question detection still runs on all text.
 
 **Verify at M0** (`dmn doctor` checks these and prints a fix for each): `libpipewire-0.3` headers and library present; PipeWire server running and its version; a capture stream with `target.object` set to a `Stream/Output/Audio` node actually receives that app's audio on the user's PipeWire version (`doctor --probe` plays a tone through `pw-play` and captures it back); `pw-record` on PATH for the emergency fallback; mic permission under Flatpak later.
 
@@ -466,9 +466,9 @@ The two decisions most likely to change are the `pipewire` crate's low-level API
 
 **Open questions**
 
-- [ ] Target hardware for the latency numbers: which laptop, CPU-only or GPU (Vulkan/CUDA)? Sets the default model.
+- [ ] Target hardware for the latency numbers: which laptop, CPU-only or GPU (Vulkan/CUDA)? Sets the default model. Partly answered: M1 was measured on the dev box's CPU (Ryzen 7700X, `small.en`, 8 threads: fixture p50 1.78–1.85 s), and GPU whisper on its RTX 4090 beside Ollama is tried and measured in M2 (#61).
 - [x] Default local model: `qwen3.6:35b-a3b` (fast phase 0.95 s on the dev 4090; `llama3.1:8b` misclassified question kind; `qwen3.6:27b` took 3.0 s). Decided 2026-09-21.
-- [ ] Does the app need to work for in-person interviews (single mic, no system audio) in v1, which pulls diarization from M3 into M2?
+- [x] Does the app need to work for in-person interviews (single mic, no system audio) in v1, which pulls diarization from M3 into M2? No: v1 is for online calls with two audio streams; diarization stays in M3/M4. Decided 2026-09-25.
 - [x] Coding-interview mode: show worked solutions in Deeper Answer at all, or only hints and complexity notes? Hints and complexity notes by default; worked solutions on request (`[ui].coding_solutions = "full"`, `dmn run --solutions full`, or `s`), still collapsed until opened. Decided 2026-09-24 (#50).
 - [ ] Session recording (WAVs) off by default is the current call; confirm.
 
