@@ -10,6 +10,9 @@
 //! INTEGER unix epoch seconds; segment `start_time` / `end_time` are REAL seconds relative to
 //! the session start, mirroring the STT `Segment` shape (SPEC § Transcription).
 //!
+//! v3 (#50) records the coding-solutions mode per question; v4 (#53) adds context `sources` and
+//! their `chunks`.
+//!
 //! v2 (#16) adds what `dmn bench --live` needs to report latency and CPU from a stored session:
 //! per question, the audio time (REAL seconds, the same clock as segment times) at which the
 //! detector emitted it, its question line was produced and its first Approach line was; a
@@ -21,7 +24,7 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 struct Migration {
     version: i64,
@@ -40,6 +43,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: V3,
+    },
+    Migration {
+        version: 4,
+        sql: V4,
     },
 ];
 
@@ -127,6 +134,41 @@ CREATE INDEX idx_cpu_samples_session ON cpu_samples(session_id);
 const V3: &str = "
 ALTER TABLE questions ADD COLUMN coding_solutions TEXT
     CHECK (coding_solutions IS NULL OR coding_solutions IN ('hints', 'full'));
+";
+
+/// v4 (#53): context sources and their chunks (SPEC § Context and LLM, Sources).
+///
+/// - `sources`: one row per ingested document. `path` is the absolute path it was read from and
+///   is unique, so re-adding a file replaces its row and chunks. `kind` is one of the four
+///   source kinds; resume and job description are single documents, notes and stories are one
+///   row per file of their folder. `added_at` is unix seconds; `bytes` the file size read;
+///   `tokens` the approximate token count of the extracted text. Ids are `AUTOINCREMENT`: `dmn
+///   sources rm <id>` takes them from `dmn sources list`, and a re-added file must not inherit
+///   the id a stale listing still shows.
+/// - `chunks`: the extracted text cut into overlapping windows of about 300 tokens, in order
+///   (`idx` from 0). Deleting a source deletes its chunks. Nothing here references a session, so
+///   `dmn sessions purge` leaves sources alone.
+const V4: &str = "
+CREATE TABLE sources (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL
+                CHECK (kind IN ('resume', 'job_description', 'notes', 'stories')),
+    path        TEXT NOT NULL UNIQUE,
+    added_at    INTEGER NOT NULL,
+    bytes       INTEGER NOT NULL,
+    tokens      INTEGER NOT NULL
+);
+CREATE INDEX idx_sources_kind ON sources(kind);
+
+CREATE TABLE chunks (
+    id          INTEGER PRIMARY KEY,
+    source_id   INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    idx         INTEGER NOT NULL,
+    text        TEXT NOT NULL,
+    tokens      INTEGER NOT NULL,
+    UNIQUE (source_id, idx)
+);
+CREATE INDEX idx_chunks_source ON chunks(source_id);
 ";
 
 /// Apply every migration newer than the database's `user_version`, each in a transaction.

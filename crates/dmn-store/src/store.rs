@@ -247,7 +247,7 @@ pub struct NewSuggestion {
 /// The database handle. Opening (or creating) a database runs pending migrations, so every
 /// `Store` sees the current schema. Foreign keys are always enforced.
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Store {

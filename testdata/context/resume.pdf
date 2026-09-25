@@ -1,0 +1,88 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 2745 >>
+stream
+BT
+/F1 10 Tf
+12 TL
+54 750 Td
+(Alex Morgan) Tj T*
+() Tj T*
+(Senior Backend Engineer. Fictional person; this resume is a test fixture for dmn sources.) Tj T*
+() Tj T*
+(Summary) Tj T*
+() Tj T*
+(Backend engineer with eight years of experience building and running distributed systems) Tj T*
+(  at scale. Comfortable owning a service end to end: design, capacity planning, on-call) Tj T*
+(  and the postmortem afterwards. Prefers boring technology, clear interfaces and) Tj T*
+(  measurable outcomes.) Tj T*
+() Tj T*
+(Experience) Tj T*
+() Tj T*
+(Staff Software Engineer, Northwind Payments \(2021 to present\)) Tj T*
+() Tj T*
+(- Designed a global rate limiter for the public API using token buckets in regional Redis) Tj T*
+(  clusters with a local in-process cache, cutting p99 latency of the limit check from 9 ms) Tj T*
+(  to under 1 ms while serving two billion requests a day.) Tj T*
+(- Led the migration of the ledger from a single Postgres primary to a sharded cluster) Tj T*
+(  keyed by merchant, with dual writes, backfill and a verified cutover that had zero data) Tj T*
+(  loss.) Tj T*
+(- Introduced service level objectives for checkout and an error-budget policy that the) Tj T*
+(  product and platform teams both signed off on; paging volume fell by half within two) Tj T*
+(  quarters.) Tj T*
+(- Mentored four engineers, two of whom were promoted; ran the backend interview loop.) Tj T*
+() Tj T*
+(Senior Software Engineer, Contoso Logistics \(2017 to 2021\)) Tj T*
+() Tj T*
+(- Built the shipment event pipeline on Kafka, with idempotent consumers, a dead-letter) Tj T*
+(  topic and replay tooling, processing forty thousand events a second at peak.) Tj T*
+(- Rewrote the route-planning service from a nightly batch into a streaming job, so) Tj T*
+(  dispatchers saw updated estimates within a minute instead of the next morning.) Tj T*
+(- Owned the on-call rotation for three services and wrote the runbooks the team still) Tj T*
+(  uses.) Tj T*
+(- Reduced cloud spend by 30 percent by right-sizing clusters and moving cold data to) Tj T*
+(  object storage with lifecycle rules.) Tj T*
+() Tj T*
+(Software Engineer, Fabrikam Studio \(2015 to 2017\)) Tj T*
+() Tj T*
+(- Shipped the first version of the public REST API and its OAuth flow.) Tj T*
+(- Added integration tests and a staging environment, which turned weekly releases into) Tj T*
+(  daily ones.) Tj T*
+() Tj T*
+(Skills) Tj T*
+() Tj T*
+(Languages: Go, Rust, Python, SQL. Data: Postgres, Redis, Kafka, ClickHouse.) Tj T*
+(  Infrastructure: Kubernetes, Terraform, AWS. Practices: service level objectives,) Tj T*
+(  incident review, capacity planning, zero-downtime migrations.) Tj T*
+() Tj T*
+(Education) Tj T*
+() Tj T*
+(BSc in Computer Science, State University, 2015.) Tj T*
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000212 00000 n 
+0000000338 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+3134
+%%EOF
