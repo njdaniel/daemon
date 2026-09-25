@@ -876,6 +876,7 @@ pub fn capture_health(
     last_error: Option<String>,
     target: &str,
     muted: bool,
+    all_audio: bool,
 ) -> Health {
     match state {
         CaptureState::Error => {
@@ -883,6 +884,9 @@ pub fn capture_health(
         }
         CaptureState::Disconnected => Health::Error(format!("{target} is gone; waiting for it")),
         _ if muted => Health::Muted,
+        // SPEC § Audio capture: the sink-monitor fallback shows a "capturing all system audio"
+        // badge, so a misspelled or absent app never passes for the call.
+        CaptureState::Streaming if all_audio => Health::AllAudio,
         CaptureState::Streaming => Health::Ok,
         CaptureState::Idle | CaptureState::Connecting => Health::Unknown,
     }
@@ -940,7 +944,13 @@ impl Monitor {
                 continue;
             };
             let muted = lane.source == Source::You && self.mic_muted.load(Ordering::Acquire);
-            let want = capture_health(status.state(), status.last_error(), target, muted);
+            let want = capture_health(
+                status.state(),
+                status.last_error(),
+                target,
+                muted,
+                status.capturing_all_system_audio(),
+            );
             let snap = snapshot.get_or_insert_with(|| self.hub.snapshot().status);
             let shown = match dot(lane.source) {
                 Dot::Mic => &snap.mic,
@@ -1211,25 +1221,35 @@ mod tests {
     fn a_live_capture_dot_follows_its_state() {
         let t = "app Firefox";
         assert_eq!(
-            capture_health(CaptureState::Connecting, None, t, false),
+            capture_health(CaptureState::Connecting, None, t, false, false),
             Health::Unknown
         );
         assert_eq!(
-            capture_health(CaptureState::Streaming, None, t, false),
+            capture_health(CaptureState::Streaming, None, t, false, false),
             Health::Ok
         );
         assert_eq!(
-            capture_health(CaptureState::Streaming, None, t, true),
+            capture_health(CaptureState::Streaming, None, t, true, false),
             Health::Muted
         );
         assert_eq!(
-            capture_health(CaptureState::Disconnected, None, t, true),
+            capture_health(CaptureState::Disconnected, None, t, true, false),
             Health::Error("app Firefox is gone; waiting for it".into()),
             "an error shows even while muted"
         );
         assert_eq!(
-            capture_health(CaptureState::Error, Some("format".into()), t, false),
+            capture_health(CaptureState::Error, Some("format".into()), t, false, false),
             Health::Error("format".into())
+        );
+        assert_eq!(
+            capture_health(CaptureState::Streaming, None, t, false, true),
+            Health::AllAudio,
+            "the app was not found, so the sink monitor stands in and says so"
+        );
+        assert_eq!(
+            capture_health(CaptureState::Streaming, None, t, true, true),
+            Health::Muted,
+            "mute is the user's own choice and wins"
         );
     }
 

@@ -36,6 +36,10 @@ pub enum Health {
     Unknown,
     Ok,
     Muted,
+    /// Streaming, but from the default sink monitor: every sound the machine plays, not just the
+    /// call app, because the app was not found or none was chosen. The SPEC's "capturing all
+    /// system audio" badge.
+    AllAudio,
     Error(String),
 }
 

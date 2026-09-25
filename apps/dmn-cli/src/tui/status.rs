@@ -82,6 +82,7 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
             Health::Ok => ("●", Style::new().fg(Color::Green), ""),
             Health::Unknown => ("○", Style::new().fg(Color::DarkGray), ""),
             Health::Muted => ("○", Style::new().fg(Color::Yellow), " muted"),
+            Health::AllAudio => ("●", Style::new().fg(Color::Yellow), ": all audio"),
             Health::Error(why) => {
                 // The dots are the only place errors appear (SPEC § Transcript & status); the
                 // first error's reason stands in for the window's tooltip.
