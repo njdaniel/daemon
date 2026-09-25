@@ -22,7 +22,7 @@ pub mod wer;
 pub mod worker;
 
 pub use filter::{Dropped, FilterConfig, should_drop};
-pub use model::{Model, download_model, model_path};
+pub use model::{Model, download_file, download_model, model_path};
 pub use transcriber::{Backend, SttConfig, Transcriber, Transcript};
 pub use wer::word_error_rate;
 pub use worker::{Speech, SttStats, SttWorker, SttWorkerConfig};

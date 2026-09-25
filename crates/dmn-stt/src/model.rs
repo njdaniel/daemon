@@ -124,17 +124,36 @@ pub fn download_model_with(
     model: Model,
     base_url: &str,
     deadline: Duration,
+    progress: impl FnMut(u64, u64),
+) -> Result<PathBuf, SttError> {
+    download_file(
+        &model_path(models_dir, model),
+        &model.url(base_url),
+        model.size_bytes(),
+        deadline,
+        progress,
+    )
+}
+
+/// Download `url` to `dest` the way [`download_model`] does: stream to a per-process
+/// `<file>.part.<pid>`, rename only once `expected` bytes arrived, leave a finished file of the
+/// right size alone. Any model file uses it, not only whisper's (#62: the Silero VAD model).
+pub fn download_file(
+    dest: &Path,
+    url: &str,
+    expected: u64,
+    deadline: Duration,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, SttError> {
-    let dest = model_path(models_dir, model);
-    let expected = model.size_bytes();
+    let dest = dest.to_path_buf();
     if std::fs::metadata(&dest).is_ok_and(|m| m.len() == expected) {
         return Ok(dest);
     }
-    std::fs::create_dir_all(models_dir).map_err(|source| io(models_dir, source))?;
-    sweep_stale_partials(models_dir, model);
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|source| io(dir, source))?;
+    sweep_partials_of(&dest, STALE_PARTIAL_AGE);
 
-    let url = model.url(base_url);
+    let url = url.to_owned();
     let fail = |reason: String| SttError::Download {
         url: url.clone(),
         reason,
@@ -155,7 +174,7 @@ pub fn download_model_with(
     // Per-process scratch name: two `dmn doctor --fetch` runs at once must not write to the same
     // file. The rename at the end is atomic, so the loser simply overwrites with identical bytes.
     // `Partial` removes it on every error path; a crash is covered by the sweep above.
-    let part = Partial::new(dest.with_extension(format!("bin.part.{}", std::process::id())));
+    let part = Partial::new(part_path(&dest, std::process::id()));
     let mut out = File::create(part.path()).map_err(|source| io(part.path(), source))?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done: u64 = 0;
@@ -216,16 +235,36 @@ impl Drop for Partial {
     }
 }
 
+/// `<dest>.part.<pid>`: the scratch file a download of `dest` streams into.
+fn part_path(dest: &Path, pid: u32) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!("{name}.part.{pid}"))
+}
+
 /// Delete `<model>.bin.part.*` files older than [`STALE_PARTIAL_AGE`]. A `Drop` cannot run after
 /// SIGKILL or a power cut, so leftovers are reclaimed the next time the same model is fetched.
+#[cfg(test)]
 fn sweep_stale_partials(models_dir: &Path, model: Model) {
     sweep_stale_partials_older_than(models_dir, model, STALE_PARTIAL_AGE);
 }
 
 /// [`sweep_stale_partials`] with the age threshold injected; tests pass zero.
+#[cfg(test)]
 fn sweep_stale_partials_older_than(models_dir: &Path, model: Model, max_age: Duration) {
-    let prefix = format!("{}.part.", model.file_name());
-    let Ok(entries) = std::fs::read_dir(models_dir) else {
+    sweep_partials_of(&model_path(models_dir, model), max_age);
+}
+
+/// Delete `<dest>.part.*` files next to `dest` that are older than `max_age`.
+fn sweep_partials_of(dest: &Path, max_age: Duration) {
+    let Some(file_name) = dest.file_name() else {
+        return;
+    };
+    let prefix = format!("{}.part.", file_name.to_string_lossy());
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
