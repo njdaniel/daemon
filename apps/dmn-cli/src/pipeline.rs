@@ -429,11 +429,14 @@ enum Audio {
 }
 
 impl Audio {
-    /// Still delivering: a file until its end (or a failure), a live capture until stopped.
+    /// Still delivering: a file until its end (or a failure), a live capture until stopped. A
+    /// `PipeWireSource` never finishes on its own; the `pw-record` fallback does when its child
+    /// exits or its reader fails, and then the run ends and reports why, instead of looking
+    /// healthy with no audio.
     fn running(&self) -> bool {
         match self {
             Audio::Wav(w) => w.is_running(),
-            Audio::Live { .. } => true,
+            Audio::Live { source, .. } => !source.is_finished(),
         }
     }
 
@@ -1220,6 +1223,37 @@ mod tests {
         assert!(
             (0..50).all(|_| !vad.is_speech(&loud)),
             "muted, nothing is speech"
+        );
+    }
+
+    /// A live source that has already ended, like a `pw-record` child that exited.
+    struct Ended;
+
+    impl AudioSource for Ended {
+        fn source(&self) -> Source {
+            Source::Interviewer
+        }
+        fn start(&mut self, _sink: FrameSink) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn stop(&mut self) -> Result<(), AudioError> {
+            Ok(())
+        }
+        fn is_finished(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_live_source_that_ends_on_its_own_stops_the_run() {
+        let audio = Audio::Live {
+            source: Box::new(Ended),
+            status: None,
+            target: "all system audio (pw-record)".into(),
+        };
+        assert!(
+            !audio.running(),
+            "a dead fallback must not look like a live call"
         );
     }
 
