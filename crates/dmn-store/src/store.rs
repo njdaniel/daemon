@@ -294,6 +294,13 @@ impl Store {
         Ok(Self { conn })
     }
 
+    /// How long this connection waits for another connection's write before failing with
+    /// `SQLITE_BUSY` (2 s from `open`). The fast phase's context reader sets zero on a
+    /// question's path, where a busy database means "check again next question", not a wait.
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<(), StoreError> {
+        Ok(self.conn.busy_timeout(timeout)?)
+    }
+
     /// The schema version the database is at (`user_version`).
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         Ok(self

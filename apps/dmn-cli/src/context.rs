@@ -20,6 +20,9 @@ use dmn_core::wire;
 use dmn_llm::{CancellationToken, LlmError, Provider, summarise_job_description};
 use dmn_store::Store;
 
+/// How long caching a new summary may wait for the session writer (at load, not per question).
+const CACHE_WRITE_WAIT: Duration = Duration::from_secs(2);
+
 /// Where the context comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextSource {
@@ -151,19 +154,35 @@ impl Context {
             ..Self::default()
         };
         ctx.read_cached_requirements()?;
+        // From here on the connection is read on a question's path, where the session writer's
+        // commits must not add a wait: a busy database is checked again next question instead.
+        // Measured on `dmn replay`: with the 2 s busy timeout, 10 of 18 retrievals waited
+        // 82–133 ms on the writer; the search itself takes 80–420 µs.
+        if let Some(store) = &ctx.store {
+            store
+                .set_busy_timeout(Duration::ZERO)
+                .map_err(|e| e.to_string())?;
+        }
         Ok(ctx)
     }
 
     /// Take the requirements from the cache when this job description has been summarised.
+    /// Nothing changes when the cache cannot be read.
     fn read_cached_requirements(&mut self) -> Result<(), String> {
-        self.requirements.clear();
-        self.from = RequirementsFrom::None;
         let (Some(store), Some(jd)) = (&self.store, self.library.job_description()) else {
+            self.requirements.clear();
+            self.from = RequirementsFrom::None;
             return Ok(());
         };
-        if let Some(bullets) = store.jd_summary(&jd.hash).map_err(|e| e.to_string())? {
-            self.requirements = bullets;
-            self.from = RequirementsFrom::Cached;
+        match store.jd_summary(&jd.hash).map_err(|e| e.to_string())? {
+            Some(bullets) => {
+                self.requirements = bullets;
+                self.from = RequirementsFrom::Cached;
+            }
+            None => {
+                self.requirements.clear();
+                self.from = RequirementsFrom::None;
+            }
         }
         Ok(())
     }
@@ -196,9 +215,17 @@ impl Context {
             Ok(r) => {
                 if self.write
                     && let Some(store) = &self.store
-                    && let Err(e) = store.put_jd_summary(&hash, &r.bullets, wire::unix_now())
                 {
-                    tracing::warn!("job requirements not cached: {e}");
+                    // Off every question's path: this write may wait for the session writer.
+                    let cached = store
+                        .set_busy_timeout(CACHE_WRITE_WAIT)
+                        .and_then(|()| store.put_jd_summary(&hash, &r.bullets, wire::unix_now()));
+                    if let Err(e) = cached {
+                        tracing::warn!("job requirements not cached: {e}");
+                    }
+                    if let Err(e) = store.set_busy_timeout(Duration::ZERO) {
+                        tracing::warn!("context reader may now wait on the session writer: {e}");
+                    }
                 }
                 self.requirements = r.bullets;
                 self.from = RequirementsFrom::Summarised;
@@ -218,7 +245,8 @@ impl Context {
 
     /// Reload the library if the stored sources changed since it was loaded. A new job
     /// description's requirements are taken from the cache if it was summarised before; it is
-    /// never summarised here, on a question's path: the next session does that.
+    /// never summarised here, on a question's path: the next session does that. Never waits:
+    /// while the session writer holds the file, the check is skipped until the next question.
     fn refresh(&mut self) {
         let Some(store) = &self.store else {
             return;
@@ -234,17 +262,17 @@ impl Context {
                         if new != old
                             && let Err(e) = self.read_cached_requirements()
                         {
-                            tracing::warn!("job requirements not reloaded: {e}");
+                            tracing::debug!("job requirements not reloaded yet: {e}");
                         }
                         tracing::info!(
                             passages = self.library.passages(),
                             "context reloaded: the sources changed"
                         );
                     }
-                    Err(e) => tracing::warn!("context not reloaded: {e}"),
+                    Err(e) => tracing::debug!("context not reloaded yet: {e}"),
                 }
             }
-            Err(e) => tracing::warn!("context staleness check failed: {e}"),
+            Err(e) => tracing::debug!("context staleness check skipped: {e}"),
         }
     }
 
@@ -450,5 +478,27 @@ mod tests {
         .unwrap();
         let r = ctx.retrieve("Tell me about Erlang");
         assert_eq!(r.refs.first().map(|c| c.file.as_str()), Some("erlang.md"));
+    }
+
+    #[test]
+    fn retrieval_never_waits_on_the_session_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture_db(dir.path());
+        let mut ctx = Context::open(&ContextSource::Db {
+            path: db.clone(),
+            write: true,
+        })
+        .unwrap();
+        // Another connection mid-commit, as the session writer is between segments.
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let r = ctx.retrieve("How would you design a rate limiter?");
+        assert!(
+            r.took < Duration::from_millis(50),
+            "{:?} while the file was locked",
+            r.took
+        );
+        assert!(!r.chunks.is_empty(), "the loaded library still answers");
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 }
