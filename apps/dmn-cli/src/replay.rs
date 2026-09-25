@@ -25,6 +25,7 @@ pub struct Args {
     pub speed: f32,
     pub model: Option<String>,
     pub threads: Option<usize>,
+    pub vad_close_ms: Option<u16>,
     pub partials: Partials,
     /// Print the merged transcript at the end.
     pub transcript: bool,
@@ -76,6 +77,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             speed: args.speed,
             model: args.model.clone(),
             threads: args.threads,
+            vad_close_ms: args.vad_close_ms,
             partials: args.partials,
             spec_literal_detector: args.spec_literal_detector,
             no_llm: args.no_llm,

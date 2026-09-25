@@ -124,11 +124,11 @@ stream.capture.sink=true                                   # only for the sink-m
 
 **Verify at M0** (`dmn doctor` checks these and prints a fix for each): `libpipewire-0.3` headers and library present; PipeWire server running and its version; a capture stream with `target.object` set to a `Stream/Output/Audio` node actually receives that app's audio on the user's PipeWire version (`doctor --probe` plays a tone through `pw-play` and captures it back); `pw-record` on PATH for the emergency fallback; mic permission under Flatpak later.
 
-**Latency budget for this stage**: 10 ms PipeWire quantum, 20 ms VAD frames, VAD decision on 300 ms of trailing silence for a pause and 700 ms for utterance end, so an utterance reaches STT within about 0.75 s of the speaker stopping.
+**Latency budget for this stage**: 10 ms PipeWire quantum, 20 ms VAD frames, VAD decision on 300 ms of trailing silence for a pause and 500 ms for utterance end (`[stt].vad_close_ms`; 700 ms until #16's tuning missed the 2.0 s p50 live), so an utterance reaches STT within about 0.55 s of the speaker stopping.
 
 ## Transcription and question detection
 
-STT runs per utterance, not per fixed chunk: the VAD closes an utterance after 700 ms of silence (or at 12 s, whichever comes first) and whisper transcribes it whole, with the previous utterance's text passed as prompt for continuity. Partial results every 1 s keep the transcript strip moving while a long utterance is still open.
+STT runs per utterance, not per fixed chunk: the VAD closes an utterance after 500 ms of silence (or at 12 s, whichever comes first) and whisper transcribes it whole, with the previous utterance's text passed as prompt for continuity. Partial results every 1 s keep the transcript strip moving while a long utterance is still open.
 
 **STT worker**
 
@@ -293,6 +293,7 @@ engine = "whisper.cpp"
 model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "energy"                       # energy | silero (M2)
+vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict

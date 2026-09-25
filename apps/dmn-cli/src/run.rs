@@ -53,6 +53,7 @@ pub struct Args {
     pub app: Option<String>,
     pub model: Option<String>,
     pub threads: Option<usize>,
+    pub vad_close_ms: Option<u16>,
     pub no_store: bool,
     pub headless: bool,
     /// Live: stop after this many seconds, as if `q` had been pressed.
@@ -143,6 +144,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             speed: 1.0,
             model: args.model.clone(),
             threads: args.threads,
+            vad_close_ms: args.vad_close_ms,
             partials: Partials::Auto,
             spec_literal_detector: false,
             no_llm: false,
@@ -504,6 +506,7 @@ mod tests {
             app: app.map(str::to_owned),
             model: None,
             threads: None,
+            vad_close_ms: None,
             no_store: true,
             headless: false,
             duration: None,

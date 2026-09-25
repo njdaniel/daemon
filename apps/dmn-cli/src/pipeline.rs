@@ -156,6 +156,8 @@ pub struct Options {
     pub speed: f32,
     pub model: Option<String>,
     pub threads: Option<usize>,
+    /// Trailing silence that ends an utterance, over `[stt].vad_close_ms`.
+    pub vad_close_ms: Option<u16>,
     pub partials: Partials,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
@@ -549,6 +551,8 @@ impl Pipeline {
             Speed::Factor(opts.speed)
         };
         let partials = opts.partials.enabled(speed);
+        let vad_close =
+            Duration::from_millis(u64::from(opts.vad_close_ms.unwrap_or(cfg.stt.vad_close_ms)));
         let bus = Arc::new(Bus::new());
         let segments = bus.subscribe();
         let mic_muted = Arc::new(AtomicBool::new(false));
@@ -588,7 +592,7 @@ impl Pipeline {
                 Audio::Live { .. } => DEFAULT_CAPACITY_FRAMES,
             };
             built.push(build_lane(
-                source, audio, ring, &model, &stt_cfg, partials, &bus, gate,
+                source, audio, ring, &model, &stt_cfg, vad_close, partials, &bus, gate,
             )?);
         }
         let audio_zero = Instant::now();
@@ -1114,6 +1118,7 @@ fn build_lane(
     ring: usize,
     model: &Path,
     stt_cfg: &SttConfig,
+    vad_close: Duration,
     partials: bool,
     bus: &Arc<Bus>,
     mute: Option<Arc<AtomicBool>>,
@@ -1121,6 +1126,7 @@ fn build_lane(
     let (sink, frames) = dmn_audio::frame_channel(source, ring);
     let (tx, rx) = event_channel(EVENT_CAPACITY);
     let mut vad_cfg = VadConfig::default();
+    vad_cfg.segmenter.close = vad_close;
     if !partials {
         vad_cfg.segmenter.partial_every = None;
     }
@@ -1295,6 +1301,7 @@ mod tests {
                 speed: 1.0,
                 model: None,
                 threads: None,
+                vad_close_ms: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
                 no_llm: true,

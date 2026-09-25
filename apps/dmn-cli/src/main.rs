@@ -90,6 +90,9 @@ enum Command {
         /// Decoder threads; default is [stt].threads from the config
         #[arg(long)]
         threads: Option<usize>,
+        /// Silence (ms) that ends an utterance; default is [stt].vad_close_ms (700)
+        #[arg(long)]
+        vad_close_ms: Option<u16>,
         /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
         #[arg(long)]
         no_store: bool,
@@ -178,6 +181,9 @@ enum Command {
         /// Decoder threads; default is [stt].threads from the config
         #[arg(long)]
         threads: Option<usize>,
+        /// Silence (ms) that ends an utterance; default is [stt].vad_close_ms (700)
+        #[arg(long)]
+        vad_close_ms: Option<u16>,
         /// Transcribe the 1 s partials of an open utterance: on, since --speed always paces
         #[arg(long, value_enum, default_value_t = pipeline::Partials::Auto)]
         partials: pipeline::Partials,
@@ -292,6 +298,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             speed,
             model,
             threads,
+            vad_close_ms,
             partials,
             transcript,
             json,
@@ -310,6 +317,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     speed,
                     model,
                     threads,
+                    vad_close_ms,
                     partials,
                     transcript,
                     json,
@@ -326,6 +334,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             app,
             model,
             threads,
+            vad_close_ms,
             no_store,
             headless,
             duration,
@@ -349,6 +358,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     app,
                     model,
                     threads,
+                    vad_close_ms,
                     no_store,
                     headless,
                     duration,
