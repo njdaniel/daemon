@@ -53,3 +53,18 @@ Several popular Piper voices are not safe to redistribute from, so do not switch
 ## Replay
 
 `dmn replay <interviewer.wav> <candidate.wav>` feeds both tracks through the real pipeline. That arrives with issue #9. The recall and precision harness in `eval/` (issue #10) compares detected questions against `questions.json`.
+
+## Context sources (`context/`, #53)
+
+Small fictional documents for `dmn sources` and, later, retrieval (#54). Nothing in them is about
+a real person or company, and they are checked into git.
+
+| File | Kind | What it exercises |
+| --- | --- | --- |
+| `context/resume.md` | resume | Markdown; about 430 words, so more than one 300-token chunk |
+| `context/resume.pdf` | resume | The same resume as a one-page text PDF, generated from `resume.md` by `python3 tools/fixtures/context_pdf.py` (stdlib only, deterministic) |
+| `context/job-description.txt` | job_description | Plain text |
+| `context/notes/` | notes | A folder of two notes, one `.md` and one `.txt` |
+
+Refusals (empty, unsupported, non-UTF-8, broken or image-only PDFs) are built in tempdirs by the
+tests rather than committed.

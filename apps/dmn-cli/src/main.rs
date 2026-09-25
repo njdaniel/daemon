@@ -2,7 +2,8 @@
 //!
 //! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
 //! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4), `replay` (#9),
-//! `sessions list|export|purge` (#13), `run --replay` (#15). Later: live `run`, `sources`.
+//! `sessions list|export|purge` (#13), `run --replay` (#15), live `run` (#16),
+//! `sources add|list|rm` (#53).
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -16,6 +17,7 @@ mod pipeline;
 mod probe;
 mod replay;
 mod run;
+mod sources;
 mod suggest;
 mod tui;
 
@@ -52,6 +54,8 @@ enum CliError {
     Run(String),
     #[error(transparent)]
     Sessions(#[from] dmn_core::recorder::RecorderError),
+    #[error(transparent)]
+    Sources(#[from] sources::SourcesError),
     /// A command-line value clap could not check on its own.
     #[error("{0}")]
     Usage(String),
@@ -170,6 +174,11 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         action: SessionsAction,
+    },
+    /// Add, list or remove context sources: resume, job description, notes, stories
+    Sources {
+        #[command(subcommand)]
+        action: sources::SourcesAction,
     },
     /// Run two fixture WAVs through the real pipeline and print labelled transcript segments
     Replay {
@@ -378,6 +387,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             .map_err(|e| CliError::Run(e.to_string()))
         }
         Some(Command::Sessions { action }) => sessions(&paths, action),
+        Some(Command::Sources { action }) => Ok(sources::run(&paths, action)?),
         Some(Command::Config {
             action: ConfigAction::Show,
         }) => {

@@ -332,6 +332,40 @@ async fn purge_removes_rows_and_files() {
 }
 
 #[test]
+fn purge_all_leaves_context_sources_alone() {
+    // #53: sources and chunks belong to the user's documents, not to any session.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let store = open_store(&paths).unwrap();
+    let session = store
+        .insert_session(&dmn_store::NewSession::new(1_700_000_000, "call"))
+        .unwrap();
+    store
+        .replace_source(
+            &dmn_store::NewSourceDoc {
+                kind: "resume".into(),
+                path: "/home/me/resume.pdf".into(),
+                added_at: 1_700_000_000,
+                bytes: 10,
+                tokens: 4,
+            },
+            &[dmn_store::NewChunk {
+                text: "Built a rate limiter.".into(),
+                tokens: 4,
+            }],
+            true,
+        )
+        .unwrap();
+    drop(store);
+
+    let report = recorder::purge(&paths, PurgeTarget::All).unwrap();
+    assert_eq!(report.sessions, [session]);
+    let store = open_store(&paths).unwrap();
+    assert!(store.session_ids().unwrap().is_empty());
+    assert_eq!(store.source_counts().unwrap(), (1, 1));
+}
+
+#[test]
 fn purge_all_leaves_files_that_are_not_a_sessions_alone() {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::under(dir.path());
