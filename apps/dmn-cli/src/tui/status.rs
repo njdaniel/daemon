@@ -82,6 +82,7 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
             Health::Ok => ("●", Style::new().fg(Color::Green), ""),
             Health::Unknown => ("○", Style::new().fg(Color::DarkGray), ""),
             Health::Muted => ("○", Style::new().fg(Color::Yellow), " muted"),
+            Health::AllAudio => ("●", Style::new().fg(Color::Yellow), ": all audio"),
             Health::Error(why) => {
                 // The dots are the only place errors appear (SPEC § Transcript & status); the
                 // first error's reason stands in for the window's tooltip.
@@ -94,6 +95,13 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(dot, style));
         spans.push(Span::raw(format!(" {name}{suffix} ")));
+    }
+    // #16: ring-buffer overruns (audio dropped because a consumer stalled) show beside the dots,
+    // and only once there are any.
+    if st.overruns > 0 {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("●", Style::new().fg(Color::Red)));
+        spans.push(Span::raw(format!(" {} dropped ", st.overruns)));
     }
     if let Some(d) = detail {
         let used = Line::from(spans.clone()).width();

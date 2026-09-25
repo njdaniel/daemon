@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use dmn_session::{Action, Session, SessionHub, Speaker, reduce};
-use dmn_store::{NewQuestion, NewSegment, NewSession, NewSuggestion, Phase, Store, StoreError};
+use dmn_session::{Action, Session, SessionHub, Speaker, Stage, reduce};
+use dmn_store::{
+    Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, NewSuggestion, Phase, Store,
+    StoreError,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::paths::Paths;
@@ -263,6 +266,41 @@ impl StoreWriter {
                     && let Some(row) = self.live_row()
                 {
                     self.store.set_question_pinned(row, false)?;
+                }
+            }
+            Action::Timing {
+                candidate,
+                stage,
+                at,
+            } => {
+                let row = self.question_row(*candidate)?;
+                let mark = match stage {
+                    Stage::Emitted => Mark::Emitted,
+                    Stage::Question => Mark::Question,
+                    Stage::Approach => Mark::Approach,
+                };
+                self.store.mark_question(row, mark, *at)?;
+            }
+            Action::Cpu {
+                at,
+                wall,
+                cpu,
+                whisper,
+            } => {
+                if let Some(session_id) = self.session_id {
+                    self.store.insert_cpu_sample(&NewCpuSample {
+                        session_id,
+                        at: *at,
+                        wall: *wall,
+                        cpu: *cpu,
+                        whisper: *whisper,
+                    })?;
+                }
+            }
+            Action::Overruns { total } => {
+                if let Some(id) = self.session_id {
+                    self.store
+                        .set_session_overruns(id, i64::try_from(*total).unwrap_or(i64::MAX))?;
                 }
             }
             Action::Focus { .. }

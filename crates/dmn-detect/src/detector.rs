@@ -21,7 +21,9 @@ pub struct Candidate {
     pub start: Duration,
     pub end: Duration,
     /// The question sentence, not the whole line: "Sorry about that. Where were we. Let's switch
-    /// gears. Suppose your p99 doubled..." hands the LLM the "Suppose..." part.
+    /// gears. Suppose your p99 doubled..." hands the LLM the "Suppose..." part. A short question
+    /// ([`SHORT_QUESTION_WORDS`]) keeps the sentence before it: "Imagine you join us and find
+    /// the pipeline half-migrated. What do you do?"
     pub text: String,
     /// The whole line the question was found in, for context.
     pub line: String,
@@ -78,6 +80,9 @@ impl Following {
 
 /// The silence that counts as a hand-back to the candidate (docs/SPEC.md).
 pub const FOLLOW_SILENCE: Duration = Duration::from_millis(1500);
+
+/// A question sentence of at most this many words carries the sentence before it (#16).
+pub const SHORT_QUESTION_WORDS: usize = 6;
 
 /// One sentence's score and the cues behind it.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,20 +143,20 @@ impl Detector {
         // no small-talk word. A short sentence inside a small-talk line is chatter too; a long one
         // is not, so a technical question that happens to share a line with an aside still counts.
         let line_chatter = is_small_talk(line);
-        let mut best: Option<Scored> = None;
+        let mut best: Option<(usize, Scored)> = None;
         for s in &sentences {
             let scored = self.score_sentence(s, source, following, handoff, line_chatter);
             let better = match &best {
                 // A later sentence wins a tie: an interviewer who chats and then asks is asking
                 // the last thing, and that is the line the LLM should answer.
-                Some(prev) => scored.score >= prev.score,
+                Some((_, prev)) => scored.score >= prev.score,
                 None => true,
             };
             if better {
-                best = Some(scored);
+                best = Some((s.index, scored));
             }
         }
-        let best = best?;
+        let (index, mut best) = best?;
         if self.cfg.require_question_form && !best.cues.iter().any(|c| c.is_question_form()) {
             return None;
         }
@@ -161,7 +166,20 @@ impl Detector {
         if self.cfg.small_talk_vetoes && best.cues.contains(&Cue::SmallTalk) {
             return None;
         }
-        (best.score >= self.cfg.effective_threshold()).then_some(best)
+        if best.score < self.cfg.effective_threshold() {
+            return None;
+        }
+        // #16: a question this short leans on the sentence before it ("Imagine you join us and
+        // find the main pipeline half-migrated. What do you do?"). On its own the LLM read
+        // "What do you do?" as no question at all, so the candidate carries its setup too.
+        if index > 0
+            && sentence::words(&best.text).len() <= SHORT_QUESTION_WORDS
+            && let Some(setup) = sentences.get(index - 1)
+            && !is_small_talk(setup.text)
+        {
+            best.text = format!("{} {}", setup.text, best.text);
+        }
+        Some(best)
     }
 
     fn score_sentence(
@@ -282,6 +300,28 @@ mod tests {
                 .is_none(),
             "a rhetorical tag is not a question"
         );
+    }
+
+    #[test]
+    fn a_short_question_carries_the_sentence_that_sets_it_up() {
+        let c = detect(
+            "Imagine you join us and in your first month you discover that our main pipeline is \
+             half-migrated. What do you do?",
+        )
+        .expect("a question");
+        assert_eq!(
+            c.text,
+            "Imagine you join us and in your first month you discover that our main pipeline is \
+             half-migrated. What do you do?"
+        );
+        // A question that stands on its own stays alone.
+        let c = detect("Right, good. How would you shard the counters across regions?")
+            .expect("a question");
+        assert_eq!(c.text, "How would you shard the counters across regions?");
+        // Chatter is not a setup.
+        let c = detect("Sorry, someone was at the door. How would you handle that?")
+            .expect("a question");
+        assert_eq!(c.text, "How would you handle that?");
     }
 
     #[test]

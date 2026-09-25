@@ -6,7 +6,7 @@ use std::io::Write;
 use serde::Serialize;
 
 use crate::error::StoreError;
-use crate::store::{QuestionRow, SegmentRow, SessionRow, Store, SuggestionRow};
+use crate::store::{CpuSampleRow, QuestionRow, SegmentRow, SessionRow, Store, SuggestionRow};
 
 /// One line of the export. The `type` tag tells readers which table the row came from.
 #[derive(Serialize)]
@@ -16,6 +16,7 @@ enum ExportLine {
     Segment(SegmentRow),
     Question(QuestionRow),
     Suggestion(SuggestionRow),
+    Cpu(CpuSampleRow),
 }
 
 impl Store {
@@ -45,6 +46,11 @@ impl Store {
             self.suggestions_for_session(session_id)?
                 .into_iter()
                 .map(ExportLine::Suggestion),
+        );
+        lines.extend(
+            self.cpu_samples(session_id)?
+                .into_iter()
+                .map(ExportLine::Cpu),
         );
 
         let mut written = 0;

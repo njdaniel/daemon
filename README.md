@@ -54,13 +54,17 @@ No wall of text while you're trying to listen to another human.
 The `dmn` CLI currently includes:
 
 ```text
-dmn doctor
-dmn doctor --init
+dmn doctor [--init | --probe | --fetch small.en]
 dmn config show
 dmn devices
+dmn run [--mic NODE] [--app APP]          # live: your mic + the call's audio, until q
+dmn run --replay INTERVIEWER.wav CANDIDATE.wav [--headless]
+dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
+dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
+dmn sessions list | export ID | purge ID|all
 ```
 
-Additional commands such as `run`, `sources`, `replay`, and `bench` are planned as the live pipeline lands.
+`dmn sources` (context documents) arrives with M2.
 
 ## Quick start
 
@@ -109,6 +113,45 @@ The default config lives at:
 ```text
 ~/.config/dmn/config.toml
 ```
+
+### Use headphones
+
+Daemon tells you and the interviewer apart by where the audio comes from: your microphone is
+**You**, the call app's output is **Interviewer**. Nothing listens for voices, so that split only
+holds while each voice reaches Daemon through one path.
+
+With headphones it does. With speakers, the interviewer's voice plays out loud and your
+microphone picks it up again. Daemon then hears every interviewer sentence twice, once on the
+call's stream and once on your mic, and the mic copy is transcribed as **You**:
+
+- The interviewer's words show up in your transcript lines, and go to the model as if you had
+  said them.
+- The detector scores only Interviewer lines, so it does not answer the echo itself, but every
+  interviewer sentence now looks answered at once (a You line right after it is one of the
+  detector's cues for a question), so statements get flagged as questions more often.
+
+The echo guard (`[audio].echo_guard`, dropping mic text that duplicates the call within 300 ms)
+is planned for M2 and is not active yet. Until then:
+
+- Wear headphones, or earbuds, for any call you run Daemon beside.
+- A laptop or conference speakerphone with hardware echo cancellation helps, but check it (below)
+  before relying on it.
+
+To check your setup:
+
+```bash
+dmn devices              # your mic (* = default) and the apps playing audio right now
+dmn doctor --probe       # plays a quiet 440 Hz tone and captures it back through the app stream,
+                         # the sink monitor and pw-record (about 3 s of sound)
+dmn run                  # talk for a few seconds, then play a video with speech:
+                         # the video should show as Interviewer only, never as You
+```
+
+If the call's speech shows up as **You** in `dmn run`, the mic is hearing your speakers: switch to
+headphones. If nothing shows as **Interviewer**, name the call app with `--app` (the
+`application.name` from `dmn devices`, e.g. `--app Firefox`), or `--app ""` to capture all system
+audio. Run `dmn bench --live` after a call to see its latency and CPU use; the status line's red
+**N dropped** means audio was lost because the machine fell behind.
 
 ## Development
 

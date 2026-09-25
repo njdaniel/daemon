@@ -526,6 +526,7 @@ dependencies = [
  "dmn-detect",
  "dmn-llm",
  "dmn-session",
+ "dmn-store",
  "dmn-stt",
  "dmn-transcript",
  "dmn-vad",

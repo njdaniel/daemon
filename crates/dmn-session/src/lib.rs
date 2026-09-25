@@ -16,7 +16,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use action::{Action, Dot, Health, IgnoreReason, Speaker, StarCards};
+pub use action::{Action, Dot, Health, IgnoreReason, Speaker, Stage, StarCards};
 pub use hub::{DEFAULT_ACTION_CAPACITY, SessionHub};
 pub use state::{
     Clarification, Counts, Line, Progress, Question, Session, Status, TRANSCRIPT_WINDOW_S,

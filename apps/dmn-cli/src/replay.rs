@@ -15,7 +15,7 @@ use dmn_stt::SttStats;
 use dmn_transcript::{DEFAULT_WINDOW, Segment, timestamp};
 use dmn_vad::WorkerStats;
 
-use crate::pipeline::{Found, Observer, Options, Partials, Pipeline, Report};
+use crate::pipeline::{Found, Input, Observer, Options, Partials, Pipeline, Report};
 use crate::suggest::{Output, Policy};
 
 pub struct Args {
@@ -25,6 +25,7 @@ pub struct Args {
     pub speed: f32,
     pub model: Option<String>,
     pub threads: Option<usize>,
+    pub vad_close_ms: Option<u16>,
     pub partials: Partials,
     /// Print the merged transcript at the end.
     pub transcript: bool,
@@ -69,11 +70,14 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         cfg,
         paths,
         &Options {
-            interviewer: args.interviewer.clone(),
-            candidate: args.candidate.clone(),
+            input: Input::Files {
+                interviewer: args.interviewer.clone(),
+                candidate: args.candidate.clone(),
+            },
             speed: args.speed,
             model: args.model.clone(),
             threads: args.threads,
+            vad_close_ms: args.vad_close_ms,
             partials: args.partials,
             spec_literal_detector: args.spec_literal_detector,
             no_llm: args.no_llm,
@@ -280,7 +284,8 @@ pub fn print_summary(report: &Report, audio: Duration) {
     for (source, vad, stt) in stats {
         println!(
             "{:<12} {:>3} finals, {:>4} partials ({} stale skipped), {} dropped (empty {}, low confidence {}, phrase {}), \
-             whisper {} total / {} slowest, VAD {} utterances, {} overruns, {} events dropped",
+             whisper {} total / {} slowest, VAD {} frames, {} utterances, {} overruns, \
+             {} events dropped",
             source.label(),
             stt.finals,
             stt.partials,
@@ -291,6 +296,7 @@ pub fn print_summary(report: &Report, audio: Duration) {
             stt.dropped_phrase,
             pretty(Duration::from_millis(stt.inference_ms)),
             pretty(Duration::from_millis(stt.slowest_ms)),
+            vad.frames,
             vad.utterances,
             vad.overruns,
             vad.dropped_events,

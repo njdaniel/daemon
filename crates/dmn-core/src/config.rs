@@ -73,6 +73,11 @@ pub struct Stt {
     pub model: String,
     pub threads: u16,
     pub vad: Vad,
+    /// Trailing silence that ends an utterance, in ms. Every ms here is a ms of question-end →
+    /// Approach latency; too short splits questions at a pause. #16 measured the fixtures at 1×
+    /// (8 threads): 700 → p50 1.96 s, 600 → 2.01 s, 500 → 1.78–1.85 s with recall 0.97 and
+    /// precision 0.83 (`just eval`); live session 5 at 700 missed the 2.0 s p50 by 0.11 s.
+    pub vad_close_ms: u16,
 }
 
 impl Default for Stt {
@@ -85,6 +90,7 @@ impl Default for Stt {
             // 1.95 s at 8. The final whisper pass is the stage threads move.
             threads: 8,
             vad: Vad::Energy,
+            vad_close_ms: 500,
         }
     }
 }
@@ -251,6 +257,7 @@ engine = "whisper.cpp"
 model = "small.en"                   # under ~/.cache/dmn/models/; `dmn doctor --fetch small.en`
 threads = 8                          # whisper threads per lane; the final pass is most of the 2 s budget
 vad = "energy"                       # energy | silero (M2)
+vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -374,6 +381,7 @@ engine = "whisper.cpp"
 model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "energy"                       # energy | silero (M2)
+vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -426,7 +434,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 22, "spec example has 22 keys: {keys:?}");
+        assert_eq!(keys.len(), 23, "spec example has 23 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

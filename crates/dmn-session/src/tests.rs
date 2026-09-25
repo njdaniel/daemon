@@ -468,3 +468,43 @@ fn regenerate_of_an_unknown_candidate_changes_nothing() {
     log.push(Action::Regenerate { candidate: 9 });
     assert_eq!(Session::replay(&log), before);
 }
+
+#[test]
+fn measurements_change_nothing_on_screen_and_overruns_show_in_the_status() {
+    let mut log = vec![candidate(1, 20.0, "q")];
+    log.extend(shown(1, "Q", &["a"]));
+    let before = Session::replay(&log);
+    log.push(Action::Timing {
+        candidate: 1,
+        stage: Stage::Approach,
+        at: 25.3,
+    });
+    log.push(Action::Cpu {
+        at: 25.0,
+        wall: 25.0,
+        cpu: 3.1,
+        whisper: 1.2,
+    });
+    assert_eq!(Session::replay(&log), before, "timing and CPU are log-only");
+
+    log.push(Action::Overruns { total: 3 });
+    assert_eq!(Session::replay(&log).status.overruns, 3);
+
+    // A log of the new actions survives JSON Lines like every other action.
+    let text: Vec<String> = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap())
+        .collect();
+    let back: Vec<Action> = text
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(back, log);
+}
+
+#[test]
+fn a_status_saved_before_overruns_existed_still_loads() {
+    let old = r#"{"mic":{"state":"ok"},"system":{"state":"ok"},"model":{"state":"unknown"}}"#;
+    let status: Status = serde_json::from_str(old).unwrap();
+    assert_eq!(status.overruns, 0);
+}

@@ -8,23 +8,29 @@
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
 //!
-//! Only `--replay <interviewer.wav> <candidate.wav>` at 1× is wired in #15; live PipeWire
-//! capture is exercised with #16. `--headless` runs the same pipeline with no terminal and
+//! With no flags it captures the call live (#16): the mic as You and the call's app output as the
+//! Interviewer, from `[audio].mic` / `[audio].app_stream` or `--mic` / `--app` (`dmn devices`
+//! lists the names), until `q`. `--replay <interviewer.wav> <candidate.wav>` feeds the same
+//! pipeline from files at 1× instead (#15), and `--headless` runs a replay with no terminal and
 //! prints how long each scripted question took to reach the screen (#15's latency criterion).
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use dmn_audio::CaptureTarget;
+use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths};
 use dmn_session::Session;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::watch;
 
 use crate::latency::{self, Screen, Seen};
-use crate::pipeline::{Controls, Found, Observer, Options, Partials, Pipeline, Quiet, Report};
+use crate::pipeline::{
+    Controls, Found, Input, Observer, Options, Partials, Pipeline, Quiet, Report,
+};
 use crate::replay;
 use crate::suggest::{Output, Policy};
 use crate::tui;
@@ -38,12 +44,20 @@ const FRAME: Duration = Duration::from_millis(33);
 const SAMPLE: Duration = Duration::from_millis(10);
 
 pub struct Args {
-    /// `--replay <interviewer.wav> <candidate.wav>`.
+    /// `--replay <interviewer.wav> <candidate.wav>`; `None` captures live.
     pub replay: Option<(PathBuf, PathBuf)>,
+    /// Live: the mic's `node.name` (or "default"), over `[audio].mic`.
+    pub mic: Option<String>,
+    /// Live: the call app's `application.name` ("" for all system audio), over
+    /// `[audio].app_stream`.
+    pub app: Option<String>,
     pub model: Option<String>,
     pub threads: Option<usize>,
+    pub vad_close_ms: Option<u16>,
     pub no_store: bool,
     pub headless: bool,
+    /// Live: stop after this many seconds, as if `q` had been pressed.
+    pub duration: Option<u64>,
 }
 
 /// A key the TUI acts on.
@@ -87,23 +101,50 @@ pub fn press(k: Key, controls: &Controls) -> bool {
     false
 }
 
+/// The live input from the config and the `--mic` / `--app` overrides.
+pub fn live_input(cfg: &Config, args: &Args) -> Result<Input, String> {
+    if !cfg.audio.system_audio && args.app.is_none() {
+        return Err(
+            "[audio].system_audio = false, but dmn run needs the call's audio for the \
+                    interviewer: set it to true, or name the call's app with --app"
+                .into(),
+        );
+    }
+    Ok(Input::Live {
+        mic: CaptureTarget::mic(args.mic.as_deref().unwrap_or(&cfg.audio.mic)),
+        interviewer: CaptureTarget::interviewer(
+            args.app.as_deref().unwrap_or(&cfg.audio.app_stream),
+        ),
+    })
+}
+
 pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error>> {
-    let Some((interviewer, candidate)) = args.replay.clone() else {
-        return Err("live capture is not wired into `dmn run` yet (#16); \
-                    run a fixture with `dmn run --replay <interviewer.wav> <candidate.wav>`"
-            .into());
+    if args.headless && args.replay.is_none() && args.duration.is_none() {
+        return Err("--headless needs --replay, or --duration for a live capture".into());
+    }
+    let (input, questions) = match args.replay.clone() {
+        Some((interviewer, candidate)) => {
+            let questions = interviewer.parent().map(|d| d.join("questions.json"));
+            (
+                Input::Files {
+                    interviewer,
+                    candidate,
+                },
+                questions,
+            )
+        }
+        None => (live_input(cfg, args)?, None),
     };
-    let questions = interviewer.parent().map(|d| d.join("questions.json"));
     let pipeline = Pipeline::start(
         cfg,
         paths,
         &Options {
-            interviewer,
-            candidate,
+            input,
             // #15: `--replay` runs at 1×, like the call it stands in for.
             speed: 1.0,
             model: args.model.clone(),
             threads: args.threads,
+            vad_close_ms: args.vad_close_ms,
             partials: Partials::Auto,
             spec_literal_detector: false,
             no_llm: false,
@@ -114,7 +155,24 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         },
     )?;
     let audio = pipeline.info().audio;
-    let report = if args.headless {
+    let live = pipeline.info().live;
+    if let Some(secs) = args.duration {
+        let controls = pipeline.controls();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            controls.quit();
+        });
+    }
+    let report = if live && args.headless {
+        // A live capture with no terminal, until --duration: the session log holds the timing.
+        let (report, Quiet) = join(spawn(pipeline, Quiet, false))?;
+        replay::print_summary(&report, report.wall);
+        replay::print_downstream(&report, paths);
+        if let Some(id) = report.session.and_then(|s| s.session_id) {
+            println!("latency      dmn bench --live --session {id}");
+        }
+        report
+    } else if args.headless {
         let (report, rows) = headless(pipeline, questions.as_deref())?;
         replay::print_summary(&report, audio);
         replay::print_downstream(&report, paths);
@@ -128,10 +186,20 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     } else {
         let report = interactive(pipeline)?;
         // At 1× the audio delivered is the wall time, up to the file's length: `q` can end the
-        // run early, and after the audio ends the TUI stays up until `q`.
-        replay::print_summary(&report, audio.min(report.wall));
+        // run early, and after the audio ends the TUI stays up until `q`. A live call's audio is
+        // its wall time.
+        let delivered = if live {
+            report.wall
+        } else {
+            audio.min(report.wall)
+        };
+        replay::print_summary(&report, delivered);
         replay::print_downstream(&report, paths);
-        if report.stopped {
+        if live {
+            if let Some(id) = report.session.and_then(|s| s.session_id) {
+                println!("latency      dmn bench --live --session {id}");
+            }
+        } else if report.stopped {
             println!("stopped      with q before the audio ended");
         }
         report
@@ -195,6 +263,10 @@ fn ui_loop(
 ) -> Result<(), Box<dyn Error>> {
     let mut dirty = true;
     loop {
+        // `--duration` (or anything else) stopped the run: close as `q` would.
+        if controls.is_stopped() {
+            return Ok(());
+        }
         if dirty || session.has_changed().unwrap_or(false) {
             // Clone out of the channel so the hub is never blocked behind a draw.
             let s = session.borrow_and_update().clone();
@@ -221,13 +293,13 @@ fn ui_loop(
 
 /// Records, on the pipeline thread, when each candidate's final arrived and when it was emitted.
 struct Emitted {
-    zero: Instant,
+    clock: AudioClock,
     seen: BTreeMap<u64, Seen>,
 }
 
 impl Observer for Emitted {
     fn candidate(&mut self, id: u64, found: &Found) {
-        let now = self.zero.elapsed().as_secs_f64();
+        let now = self.clock.now();
         self.seen.insert(
             id,
             Seen {
@@ -251,12 +323,14 @@ fn headless(
     pipeline: Pipeline,
     questions: Option<&std::path::Path>,
 ) -> Result<(Report, Timed), Box<dyn Error>> {
-    let zero = pipeline.audio_zero();
+    // The audio clock the session log's timing marks use, so `dmn bench --live` reads the same
+    // times back from the stored session.
+    let clock = pipeline.audio_clock();
     let mut session = pipeline.hub().watch();
     let worker = spawn(
         pipeline,
         Emitted {
-            zero,
+            clock: clock.clone(),
             seen: BTreeMap::new(),
         },
         false,
@@ -264,7 +338,7 @@ fn headless(
     let mut screen = Screen::default();
     while !worker.is_finished() {
         if session.has_changed().unwrap_or(false) {
-            let now = zero.elapsed().as_secs_f64();
+            let now = clock.now();
             screen.observe(&session.borrow_and_update(), now);
         }
         std::thread::sleep(SAMPLE);
@@ -272,7 +346,7 @@ fn headless(
     // The worker can finish between a sample and the next `is_finished` check; take the last
     // state so a reply that landed in that gap is not reported as missed (its time is then
     // at most one sample late).
-    let now = zero.elapsed().as_secs_f64();
+    let now = clock.now();
     screen.observe(&session.borrow_and_update(), now);
     let (report, mut emitted) = join(worker)?;
     screen.apply(&mut emitted.seen);
@@ -415,22 +489,68 @@ mod tests {
     }
 
     #[test]
-    fn live_capture_is_a_clear_error_naming_the_flag() {
+    fn overruns_show_on_the_status_line_only_once_there_are_any() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        let status_line = |s: &str| s.lines().last().unwrap_or_default().to_owned();
+        assert!(!status_line(&screen(&hub.snapshot())).contains("dropped"));
+        hub.dispatch(Action::Overruns { total: 3 });
+        let s = screen(&hub.snapshot());
+        assert!(status_line(&s).contains("3 dropped"), "{s}");
+    }
+
+    fn args(mic: Option<&str>, app: Option<&str>) -> Args {
+        Args {
+            replay: None,
+            mic: mic.map(str::to_owned),
+            app: app.map(str::to_owned),
+            model: None,
+            threads: None,
+            vad_close_ms: None,
+            no_store: true,
+            headless: false,
+            duration: None,
+        }
+    }
+
+    #[test]
+    fn headless_without_a_replay_needs_a_duration() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::under(dir.path());
         let err = run(
             &Config::default(),
-            &paths,
+            &Paths::under(dir.path()),
             &Args {
-                replay: None,
-                model: None,
-                threads: None,
-                no_store: true,
-                headless: false,
+                headless: true,
+                ..args(None, None)
             },
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("--replay"), "{err}");
+        assert!(err.contains("--duration"), "{err}");
+    }
+
+    #[test]
+    fn live_capture_follows_the_config_and_the_flags_override_it() {
+        let cfg = Config::default();
+        assert_eq!(
+            live_input(&cfg, &args(None, None)).unwrap(),
+            Input::Live {
+                mic: CaptureTarget::Mic(None),
+                interviewer: CaptureTarget::interviewer(&cfg.audio.app_stream),
+            }
+        );
+        assert_eq!(
+            live_input(&cfg, &args(Some("alsa_input.usb-mic"), Some(""))).unwrap(),
+            Input::Live {
+                mic: CaptureTarget::Mic(Some("alsa_input.usb-mic".into())),
+                interviewer: CaptureTarget::SinkMonitor,
+            },
+            "--app '' captures all system audio"
+        );
+        let mut no_system = Config::default();
+        no_system.audio.system_audio = false;
+        let err = live_input(&no_system, &args(None, None)).unwrap_err();
+        assert!(err.contains("--app"), "{err}");
+        assert!(live_input(&no_system, &args(None, Some("chrome"))).is_ok());
     }
 }

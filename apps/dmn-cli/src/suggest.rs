@@ -36,7 +36,7 @@ use dmn_llm::{
     CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason,
     LlmError, OllamaProvider, OllamaSettings, Provider, Suggestion, run_fast_phase,
 };
-use dmn_session::{Action, Dot, Health, SessionHub};
+use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
 /// Where the fast phase's results go besides the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,17 +125,19 @@ pub struct Suggester {
 }
 
 impl Suggester {
-    /// `clock` stamps each outcome in session time (`--speed` × wall clock).
+    /// `clock` stamps each outcome in session time (`--speed` × wall clock); `audio` stamps
+    /// when each question and its first Approach line were produced, in audio time (#16).
     pub fn start(
         llm: &config::Llm,
         output: Output,
         policy: Policy,
         hub: Arc<SessionHub>,
         clock: wire::SessionClock,
+        audio: wire::AudioClock,
     ) -> Self {
         let llm = llm.clone();
         Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
-            worker(&llm, output, rx, hub, clock, cancel, latest)
+            worker(&llm, output, rx, hub, clock, audio, cancel, latest)
         })
     }
 
@@ -156,6 +158,7 @@ impl Suggester {
                 provider: &provider,
                 hub,
                 clock: wire::SessionClock::start(1.0),
+                audio: wire::AudioClock::new(Instant::now(), 1.0),
                 output: Output::Quiet,
                 cancel,
                 latest,
@@ -249,12 +252,14 @@ impl Suggester {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     llm: &config::Llm,
     output: Output,
     rx: &mpsc::Receiver<Job>,
     hub: &SessionHub,
     clock: wire::SessionClock,
+    audio: wire::AudioClock,
     cancel: &CancellationToken,
     latest: Option<&Latest>,
 ) -> Tally {
@@ -347,6 +352,7 @@ fn worker(
         provider: &provider,
         hub,
         clock,
+        audio,
         output,
         cancel,
         latest,
@@ -371,6 +377,8 @@ struct Answerer<'a, P: Provider> {
     provider: &'a P,
     hub: &'a SessionHub,
     clock: wire::SessionClock,
+    /// Stamps [`Action::Timing`] for the session log (#16).
+    audio: wire::AudioClock,
     output: Output,
     cancel: &'a CancellationToken,
     /// `Some` under [`Policy::Supersede`].
@@ -434,19 +442,39 @@ impl<P: Provider> Answerer<'_, P> {
         let started = Instant::now();
         let mut question_at = None;
         let mut first_line_at = None;
+        let mut approach_marked = false;
+        let audio = &self.audio;
+        // #16: when the question line and the first Approach line (or the STAR cards) were
+        // produced, in audio time, for the session log. The store keeps the first showing, so a
+        // regeneration's marks change nothing there.
+        let mark = |stage: Stage| Action::Timing {
+            candidate: job.id,
+            stage,
+            at: audio.now(),
+        };
         let result = self
             .rt
             .block_on(run_fast_phase(self.provider, &req, token.clone(), |e| {
-                match e {
+                let timing = match e {
                     FastEvent::Question { .. } | FastEvent::Clarification { .. } => {
+                        let first = question_at.is_none();
                         question_at.get_or_insert_with(|| started.elapsed());
+                        first.then(|| mark(Stage::Question))
                     }
-                    FastEvent::ApproachLine { .. } => {
-                        first_line_at.get_or_insert_with(|| started.elapsed());
+                    FastEvent::ApproachLine { .. } | FastEvent::Star(_) => {
+                        if matches!(e, FastEvent::ApproachLine { .. }) {
+                            first_line_at.get_or_insert_with(|| started.elapsed());
+                        }
+                        let first = !approach_marked;
+                        approach_marked = true;
+                        first.then(|| mark(Stage::Approach))
                     }
-                    FastEvent::Focus { .. } | FastEvent::Star(_) => {}
-                }
+                    FastEvent::Focus { .. } => None,
+                };
                 hub.dispatch(wire::fast_event(job.id, &e));
+                if let Some(t) = timing {
+                    hub.dispatch(t);
+                }
             }));
         if let Some(latest) = self.latest {
             *latest.inflight() = None;
@@ -690,6 +718,7 @@ mod tests {
             Policy::AnswerAll,
             Arc::clone(&hub),
             wire::SessionClock::start(1.0),
+            wire::AudioClock::new(Instant::now(), 1.0),
         );
         for id in [1, 2] {
             hub.dispatch(wire::candidate(id, &candidate()));
@@ -719,6 +748,7 @@ mod tests {
             Policy::AnswerAll,
             Arc::new(SessionHub::default()),
             wire::SessionClock::start(1.0),
+            wire::AudioClock::new(Instant::now(), 1.0),
         );
         s.submit(1, &candidate(), String::new());
         assert_eq!(
@@ -745,6 +775,7 @@ mod tests {
             Policy::Supersede,
             Arc::clone(&hub),
             wire::SessionClock::start(1.0),
+            wire::AudioClock::new(Instant::now(), 1.0),
         );
         for id in [1, 2, 3] {
             hub.dispatch(wire::candidate(id, &candidate()));
@@ -777,6 +808,7 @@ mod tests {
             provider: &provider,
             hub: &hub,
             clock: wire::SessionClock::start(1.0),
+            audio: wire::AudioClock::new(Instant::now(), 1.0),
             output: Output::Quiet,
             cancel: &cancel,
             latest: None,

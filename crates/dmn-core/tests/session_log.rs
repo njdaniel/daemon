@@ -423,3 +423,71 @@ fn finish_returns_while_another_holder_still_has_the_hub() {
     assert_eq!(session.ended_at, Some(1_700_000_060));
     drop(held);
 }
+
+#[test]
+fn timing_cpu_and_overruns_reach_the_store() {
+    use dmn_session::{Speaker, Stage};
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let hub = rec.hub();
+    let q = "How would you design a rate limiter?";
+    for a in [
+        Action::Started {
+            label: "timed".into(),
+            at: 1_700_000_000,
+        },
+        Action::Segment {
+            speaker: Speaker::Interviewer,
+            start: 20.0,
+            end: 24.5,
+            text: q.into(),
+            is_final: true,
+            avg_logprob: -0.2,
+        },
+        Action::Candidate {
+            id: 1,
+            speaker: Speaker::Interviewer,
+            start: 20.0,
+            end: 24.5,
+            text: q.into(),
+            score: 5,
+        },
+        Action::Timing {
+            candidate: 1,
+            stage: Stage::Emitted,
+            at: 25.9,
+        },
+        Action::Timing {
+            candidate: 1,
+            stage: Stage::Question,
+            at: 26.5,
+        },
+        Action::Timing {
+            candidate: 1,
+            stage: Stage::Approach,
+            at: 26.8,
+        },
+        Action::Cpu {
+            at: 25.0,
+            wall: 25.0,
+            cpu: 4.5,
+            whisper: 1.5,
+        },
+        Action::Overruns { total: 2 },
+    ] {
+        hub.dispatch(a);
+    }
+    let report = rec.finish(1_700_000_030).unwrap().unwrap();
+    assert_eq!(report.errors, 0);
+    let store = open_store(&paths).unwrap();
+    let id = report.session_id.unwrap();
+    let row = &store.questions(id).unwrap()[0];
+    assert_eq!(
+        (row.emitted_at, row.question_at, row.approach_at),
+        (Some(25.9), Some(26.5), Some(26.8))
+    );
+    let sample = &store.cpu_samples(id).unwrap()[0];
+    assert_eq!((sample.cpu, sample.whisper), (4.5, 1.5));
+    assert_eq!(store.session(id).unwrap().unwrap().overruns, 2);
+}

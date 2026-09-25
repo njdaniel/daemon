@@ -57,12 +57,18 @@ fn question_with_suggestion(store: &Store, session_id: i64, segment_id: i64) -> 
 }
 
 #[test]
-fn fresh_db_migrates_to_v1() {
+fn fresh_db_migrates_to_the_current_schema() {
     let store = store();
     assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
     let objects = store.schema_object_names().unwrap();
-    for table in ["sessions", "segments", "questions", "suggestions"] {
+    for table in [
+        "sessions",
+        "segments",
+        "questions",
+        "suggestions",
+        "cpu_samples",
+    ] {
         assert!(
             objects.contains(&table.to_string()),
             "missing table {table}"
@@ -346,4 +352,103 @@ fn delete_session_removes_its_rows_and_compact_drops_the_text_from_the_file() {
         !bytes.windows(marker.len()).any(|w| w == marker),
         "deleted text is not left in free pages"
     );
+}
+
+#[test]
+fn a_v1_database_upgrades_to_v2_keeping_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    // A database a v1 build wrote: schema v1 only, one session with a question.
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label) VALUES (1, 1700000000, 'v1');
+             INSERT INTO segments (id, session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob)
+                 VALUES (1, 1, 'interviewer', 12.5, 18.0, 'How would you shard it?', 1, -0.2);
+             INSERT INTO questions (id, session_id, segment_id, score, created_at)
+                 VALUES (1, 1, 1, 4, 1700000018);",
+        )
+        .unwrap();
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 1);
+    }
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 2);
+    let session = store.session(1).unwrap().unwrap();
+    assert_eq!((session.label.as_str(), session.overruns), ("v1", 0));
+    let q = &store.questions(1).unwrap()[0];
+    assert_eq!(q.score, 4);
+    assert_eq!(
+        (q.emitted_at, q.question_at, q.approach_at),
+        (None, None, None),
+        "a v1 row reads back as not measured, not as zero"
+    );
+    assert!(store.cpu_samples(1).unwrap().is_empty());
+    assert!(
+        store
+            .schema_object_names()
+            .unwrap()
+            .contains(&"idx_cpu_samples_session".to_string())
+    );
+}
+
+#[test]
+fn question_marks_keep_the_first_time_and_cpu_samples_round_trip() {
+    let store = store();
+    let (session_id, segment_id) = session_with_segment(&store);
+    let q = question_with_suggestion(&store, session_id, segment_id);
+    store.mark_question(q, Mark::Emitted, 18.05).unwrap();
+    store.mark_question(q, Mark::Question, 18.7).unwrap();
+    store.mark_question(q, Mark::Approach, 19.1).unwrap();
+    // A regenerate produces the lines again later; the first showing stands.
+    store.mark_question(q, Mark::Question, 40.0).unwrap();
+    store.mark_question(q, Mark::Approach, 40.5).unwrap();
+    let row = &store.questions(session_id).unwrap()[0];
+    assert_eq!(
+        (row.emitted_at, row.question_at, row.approach_at),
+        (Some(18.05), Some(18.7), Some(19.1))
+    );
+
+    for (t, cpu, whisper) in [(5.0, 0.4, 0.0), (10.0, 0.9, 0.3)] {
+        store
+            .insert_cpu_sample(&NewCpuSample {
+                session_id,
+                at: t,
+                wall: t,
+                cpu,
+                whisper,
+            })
+            .unwrap();
+    }
+    let cpu = store.cpu_samples(session_id).unwrap();
+    assert_eq!(cpu.len(), 2);
+    assert_eq!(
+        (cpu[1].at, cpu[1].wall, cpu[1].cpu, cpu[1].whisper),
+        (10.0, 10.0, 0.9, 0.3)
+    );
+
+    store.set_session_overruns(session_id, 3).unwrap();
+    assert_eq!(store.session(session_id).unwrap().unwrap().overruns, 3);
+    assert_eq!(store.latest_session_id().unwrap(), Some(session_id));
+
+    // The export carries the new fields and the samples.
+    let mut out = Vec::new();
+    store.export_session_jsonl(session_id, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("\"approach_at\":19.1"), "{text}");
+    assert_eq!(text.matches("\"type\":\"cpu\"").count(), 2, "{text}");
+    // Deleting the session removes its samples too.
+    store.delete_session(session_id).unwrap();
+    assert!(store.cpu_samples(session_id).unwrap().is_empty());
+}
+
+#[test]
+fn no_session_means_no_latest() {
+    assert_eq!(store().latest_session_id().unwrap(), None);
 }

@@ -460,6 +460,24 @@ fn tui_behavioral_shows_star_cards_a_clarification_and_error_dots() {
 }
 
 #[test]
+fn tui_the_sink_monitor_fallback_shows_an_all_audio_badge() {
+    let mut actions = actions("listening");
+    actions.push(Action::Status {
+        dot: Dot::System,
+        health: Health::AllAudio,
+    });
+    let buf = render(&Session::replay(&actions), (100, 30));
+    let screen = text(&buf);
+    assert!(screen.contains("● system: all audio"), "{screen}");
+    let (x, y) = row_containing(&buf, "● system: all audio");
+    assert_eq!(
+        buf[(x, y)].fg,
+        Color::Yellow,
+        "amber, not the green of an app stream"
+    );
+}
+
+#[test]
 fn tui_nothing_overflows_its_width_at_either_size() {
     for state in STATES {
         for size in SIZES {
