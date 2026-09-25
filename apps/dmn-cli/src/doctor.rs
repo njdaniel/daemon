@@ -290,6 +290,35 @@ pub fn whisper_model(models_dir: &Path, model: &str) -> Check {
     }
 }
 
+/// `[stt].vad = "silero"` (#62): the model file is there and is exactly the pinned release (size
+/// and SHA-256), so a missing or wrong file fails here, with the fix, instead of at `dmn run`.
+pub fn silero_model(models_dir: &Path) -> Check {
+    let file = dmn_vad::silero::model_path(models_dir);
+    match dmn_vad::silero::verify_model(&file) {
+        Ok(()) => Check::pass("silero model", file.display().to_string()),
+        Err(dmn_vad::SileroError::Missing { .. }) => Check::fail(
+            "silero model",
+            format!("{} missing ([stt].vad = \"silero\")", file.display()),
+            "dmn doctor --fetch silero",
+        ),
+        Err(dmn_vad::SileroError::Mismatch { size, sha256, .. }) => Check::fail(
+            "silero model",
+            format!(
+                "{} is {size} bytes, sha256 {sha256}; expected {} bytes, sha256 {}",
+                file.display(),
+                dmn_vad::silero::MODEL_SIZE,
+                dmn_vad::silero::MODEL_SHA256
+            ),
+            format!("rm {} && dmn doctor --fetch silero", file.display()),
+        ),
+        Err(e) => Check::fail(
+            "silero model",
+            e.to_string(),
+            format!("rm {} && dmn doctor --fetch silero", file.display()),
+        ),
+    }
+}
+
 /// Two checks: the server answers, and the configured model is pulled.
 pub fn ollama(h: &dyn Http, base_url: &str, model: &str) -> Vec<Check> {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
@@ -520,6 +549,9 @@ pub fn run_all(
         pipewire_tools(r),
         whisper_model(&paths.models_dir, &cfg.stt.model),
     ];
+    if cfg.stt.vad == dmn_core::config::Vad::Silero {
+        checks.push(silero_model(&paths.models_dir));
+    }
     match cfg.llm.provider {
         Provider::Ollama => checks.extend(ollama(h, &cfg.llm.base_url, &cfg.llm.model)),
         Provider::OpenAI | Provider::Anthropic => {
@@ -631,6 +663,27 @@ mod tests {
         let some = pipewire_tools(&FakeRunner::default().on_path(&["pw-record"]));
         assert!(!some.ok && !some.required);
         assert!(some.detail.contains("pw-play pw-dump"));
+    }
+
+    #[test]
+    fn silero_check_fails_clearly_on_a_missing_or_wrong_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = silero_model(dir.path());
+        assert!(!missing.ok && missing.required);
+        assert_eq!(missing.fix.as_deref(), Some("dmn doctor --fetch silero"));
+        std::fs::write(dmn_vad::silero::model_path(dir.path()), b"not a model").unwrap();
+        let wrong = silero_model(dir.path());
+        assert!(!wrong.ok, "{}", wrong.detail);
+        assert!(wrong.detail.contains("sha256"), "{}", wrong.detail);
+        assert!(
+            wrong
+                .fix
+                .as_deref()
+                .unwrap()
+                .ends_with("dmn doctor --fetch silero"),
+            "{:?}",
+            wrong.fix
+        );
     }
 
     #[test]

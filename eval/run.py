@@ -114,7 +114,9 @@ def fingerprint(args) -> str:
     """What replay's output depends on: the flags passed to it, the source tree (HEAD plus any
     uncommitted diff) and the user's config file. A cached run is reused only when all match."""
     h = hashlib.sha256()
-    h.update(repr((args.speed, args.model, args.threads, args.spec_literal, args.vad_close_ms)).encode())
+    h.update(
+        repr((args.speed, args.model, args.threads, args.spec_literal, args.vad_close_ms, args.vad)).encode()
+    )
     for cmd in (["git", "rev-parse", "HEAD"], ["git", "diff", "HEAD"]):
         out = subprocess.run(cmd, cwd=REPO, capture_output=True, check=False)
         h.update(out.stdout)
@@ -155,6 +157,8 @@ def replay(fixture: str, cache: Path, args) -> list[dict]:
         cmd += ["--threads", str(args.threads)]
     if args.vad_close_ms:
         cmd += ["--vad-close-ms", str(args.vad_close_ms)]
+    if args.vad:
+        cmd += ["--vad", args.vad]
     if args.spec_literal:
         cmd += ["--spec-literal-detector"]
 
@@ -250,6 +254,7 @@ def main() -> int:
     p.add_argument("--model", help="whisper model; default is [stt].model")
     p.add_argument("--threads", type=int, help="decoder threads")
     p.add_argument("--vad-close-ms", type=int, help="silence (ms) that ends an utterance; default [stt].vad_close_ms")
+    p.add_argument("--vad", choices=("energy", "silero"), help="voice activity detector; default [stt].vad")
     p.add_argument("--reuse", action="store_true", help="reuse cached replay output when present")
     p.add_argument("--compare", action="store_true", help="also score the SPEC's literal cue table")
     p.add_argument("--spec-literal", action="store_true", help="score only the SPEC's literal table")

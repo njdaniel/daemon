@@ -33,6 +33,7 @@ use dmn_audio::{
     AudioError, AudioSource, CaptureState, CaptureStatus, CaptureTarget, FRAME_LEN, FRAME_MS,
     FrameSink, PipeWireContext, PipeWireSource, PwRecordSource, Source, Speed, WavSource,
 };
+use dmn_core::config::Vad as VadChoice;
 use dmn_core::recorder::{Recorder, WriterReport, open_store};
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
@@ -41,7 +42,9 @@ use dmn_llm::{CurrentQuestion, Kind};
 use dmn_session::{Action, CodingSolutions, Dot, Health, SessionHub, Stage};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
-use dmn_vad::{EnergyVad, Vad, VadConfig, VadWorker, WorkerStats, event_channel};
+use dmn_vad::{
+    EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
+};
 
 use crate::suggest::{Output, Policy, Suggester, Tally};
 
@@ -158,6 +161,8 @@ pub struct Options {
     pub threads: Option<usize>,
     /// Trailing silence that ends an utterance, over `[stt].vad_close_ms`.
     pub vad_close_ms: Option<u16>,
+    /// Which VAD decides speech, over `[stt].vad` (#62).
+    pub vad: Option<VadChoice>,
     pub partials: Partials,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
@@ -180,6 +185,8 @@ pub struct Options {
 pub struct Info {
     pub model: String,
     pub threads: usize,
+    /// "energy" or "silero".
+    pub vad: &'static str,
     pub speed: Speed,
     pub partials: bool,
     /// The longer of the two files; zero for a live input, which has no length.
@@ -411,7 +418,7 @@ impl Controls {
 /// utterance closes after the usual hangover and no new one starts. The inner VAD still sees
 /// every frame, so its noise floor stays current for when the mic is unmuted.
 struct Gated {
-    inner: EnergyVad,
+    inner: Box<dyn Vad>,
     muted: Arc<AtomicBool>,
 }
 
@@ -566,6 +573,17 @@ impl Pipeline {
         let partials = opts.partials.enabled(speed);
         let vad_close =
             Duration::from_millis(u64::from(opts.vad_close_ms.unwrap_or(cfg.stt.vad_close_ms)));
+        // #62: Silero's model is checked before any audio moves, so a missing or wrong file is
+        // one clear error naming `dmn doctor --fetch silero`, not a failure mid-call.
+        let vad_choice = opts.vad.unwrap_or(cfg.stt.vad);
+        let silero = match vad_choice {
+            VadChoice::Energy => None,
+            VadChoice::Silero => {
+                let path = dmn_vad::silero::model_path(&paths.models_dir);
+                dmn_vad::silero::verify_model(&path)?;
+                Some(path)
+            }
+        };
         let bus = Arc::new(Bus::new());
         let segments = bus.subscribe();
         let mic_muted = Arc::new(AtomicBool::new(false));
@@ -605,7 +623,16 @@ impl Pipeline {
                 Audio::Live { .. } => DEFAULT_CAPACITY_FRAMES,
             };
             built.push(build_lane(
-                source, audio, ring, &model, &stt_cfg, vad_close, partials, &bus, gate,
+                source,
+                audio,
+                ring,
+                &model,
+                &stt_cfg,
+                vad_close,
+                silero.as_deref(),
+                partials,
+                &bus,
+                gate,
             )?);
         }
         let audio_zero = Instant::now();
@@ -674,6 +701,10 @@ impl Pipeline {
             info: Info {
                 model: name,
                 threads: stt_cfg.threads,
+                vad: match vad_choice {
+                    VadChoice::Energy => "energy",
+                    VadChoice::Silero => "silero",
+                },
                 speed,
                 partials,
                 audio,
@@ -1136,6 +1167,7 @@ fn build_lane(
     model: &Path,
     stt_cfg: &SttConfig,
     vad_close: Duration,
+    silero: Option<&Path>,
     partials: bool,
     bus: &Arc<Bus>,
     mute: Option<Arc<AtomicBool>>,
@@ -1159,13 +1191,14 @@ fn build_lane(
         },
         &source.label().to_lowercase(),
     )?;
-    let energy = EnergyVad::new(vad_cfg.energy.clone());
+    // Each lane gets its own Silero session: the model carries recurrent state per stream.
+    let inner: Box<dyn Vad> = match silero {
+        Some(path) => Box::new(SileroVad::load(path, SileroVadConfig::default())?),
+        None => Box::new(EnergyVad::new(vad_cfg.energy.clone())),
+    };
     let vad: Box<dyn Vad> = match mute {
-        Some(muted) => Box::new(Gated {
-            inner: energy,
-            muted,
-        }),
-        None => Box::new(energy),
+        Some(muted) => Box::new(Gated { inner, muted }),
+        None => inner,
     };
     let vad = VadWorker::spawn_with(frames, vad, &vad_cfg.segmenter, tx)?;
     Ok((
@@ -1228,7 +1261,7 @@ mod tests {
         let loud = [0.5f32; FRAME_LEN];
         let muted = Arc::new(AtomicBool::new(false));
         let mut vad = Gated {
-            inner: EnergyVad::new(VadConfig::default().energy),
+            inner: Box::new(EnergyVad::new(VadConfig::default().energy)),
             muted: Arc::clone(&muted),
         };
         let heard = (0..50).any(|_| vad.is_speech(&loud));
@@ -1350,6 +1383,7 @@ mod tests {
                 model: None,
                 threads: None,
                 vad_close_ms: None,
+                vad: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
                 no_llm: true,

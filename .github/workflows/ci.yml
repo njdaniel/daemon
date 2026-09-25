@@ -49,6 +49,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: just fixtures-fetch
+      # Silero VAD model (#62): 2.3 MB, pinned to a release tag and checked by size and SHA-256
+      # by `dmn doctor --fetch silero` itself, so dmn-vad's Silero fixture tests run here too.
+      - name: Cache Silero VAD model
+        id: silero
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/dmn/models/silero_vad.onnx
+          key: silero-vad-v6.2.1-1a153a22f450
+      - name: Fetch Silero VAD model
+        if: steps.silero.outputs.cache-hit != 'true'
+        run: cargo run -p dmn-cli -- doctor --fetch silero || test -f ~/.cache/dmn/models/silero_vad.onnx
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
