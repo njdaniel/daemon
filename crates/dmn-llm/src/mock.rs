@@ -22,6 +22,8 @@ pub enum Step {
 #[derive(Debug, Clone)]
 pub struct MockProvider {
     script: Vec<Step>,
+    /// Replies for the second, third, ... request; the last one repeats.
+    then: Vec<Vec<Step>>,
     delay: Duration,
     requests: Arc<Mutex<Vec<ChatRequest>>>,
 }
@@ -31,24 +33,22 @@ impl MockProvider {
     pub fn new(script: Vec<Step>) -> Self {
         Self {
             script,
+            then: Vec::new(),
             delay: Duration::ZERO,
             requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Reply with `value` serialised as JSON, streamed in chunks of a few characters, then `Done`.
-    /// Chunks are cut on `char` boundaries, so every delta is valid UTF-8 and the concatenation
-    /// is byte-exact.
     pub fn json(value: &serde_json::Value) -> Self {
-        const CHARS_PER_CHUNK: usize = 7;
-        let text = value.to_string();
-        let chars: Vec<char> = text.chars().collect();
-        let mut script: Vec<Step> = chars
-            .chunks(CHARS_PER_CHUNK)
-            .map(|c| Step::Text(c.iter().collect()))
-            .collect();
-        script.push(Step::Done);
-        Self::new(script)
+        Self::new(json_script(value))
+    }
+
+    /// Reply to the next request with `value` instead of repeating the first script, e.g. a
+    /// retry that must see a different answer.
+    pub fn then_json(mut self, value: &serde_json::Value) -> Self {
+        self.then.push(json_script(value));
+        self
     }
 
     /// Sleep this long before each step, to exercise cancellation and timeouts.
@@ -63,6 +63,19 @@ impl MockProvider {
     }
 }
 
+/// `value` as JSON in chunks of a few characters, then `Done`. Chunks are cut on `char`
+/// boundaries, so every delta is valid UTF-8 and the concatenation is byte-exact.
+fn json_script(value: &serde_json::Value) -> Vec<Step> {
+    const CHARS_PER_CHUNK: usize = 7;
+    let chars: Vec<char> = value.to_string().chars().collect();
+    let mut script: Vec<Step> = chars
+        .chunks(CHARS_PER_CHUNK)
+        .map(|c| Step::Text(c.iter().collect()))
+        .collect();
+    script.push(Step::Done);
+    script
+}
+
 impl Provider for MockProvider {
     fn name(&self) -> &'static str {
         "mock"
@@ -74,11 +87,20 @@ impl Provider for MockProvider {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<DeltaStream<'a>, LlmError>> {
         let timeout = req.timeout;
+        let mut nth = 0;
         if let Ok(mut r) = self.requests.lock() {
+            nth = r.len();
             r.push(req);
         }
         let delay = self.delay;
-        let steps = self.script.clone();
+        let steps = match nth.checked_sub(1) {
+            None => self.script.clone(),
+            Some(i) => self
+                .then
+                .get(i.min(self.then.len().saturating_sub(1)))
+                .cloned()
+                .unwrap_or_else(|| self.script.clone()),
+        };
         Box::pin(async move {
             let inner = futures_util::stream::iter(steps).then(move |step| async move {
                 if !delay.is_zero() {

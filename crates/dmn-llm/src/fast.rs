@@ -94,6 +94,9 @@ pub struct FastAssembler {
     approach_items: usize,
     star: Option<Star>,
     flags: Vec<Flag>,
+    /// What the detector proposed and what is on screen, for [`FastAssembler::echoed`].
+    guard: Option<(String, String)>,
+    echoed: bool,
 }
 
 impl FastAssembler {
@@ -112,11 +115,28 @@ impl FastAssembler {
             approach_items: 0,
             star: None,
             flags: Vec::new(),
+            guard: None,
+            echoed: false,
         }
+    }
+
+    /// Hold back a reply whose `question` restates the question already on screen instead of
+    /// what the Interviewer just said (`candidate`). Live session 5: "Design a ride-sharing
+    /// matching system" came back as the Slack question from the `## Current question` section,
+    /// and its Approach answered Slack. A clarification is exempt: it is about the current
+    /// question by definition.
+    pub fn with_echo_guard(mut self, candidate: &str, current: &str) -> Self {
+        self.guard = Some((candidate.to_owned(), current.to_owned()));
+        self
     }
 
     pub fn ignored(&self) -> Option<IgnoreReason> {
         self.ignored
+    }
+
+    /// The reply restated the current question instead of the new one; nothing was released.
+    pub fn echoed(&self) -> bool {
+        self.echoed
     }
 
     fn clarifies(&self) -> bool {
@@ -125,7 +145,7 @@ impl FastAssembler {
 
     /// Feed one completed JSON value; returns the events it releases, in order.
     pub fn push(&mut self, ev: JsonEvent) -> Vec<FastEvent> {
-        if self.ignored.is_some() {
+        if self.ignored.is_some() || self.echoed {
             return Vec::new();
         }
         let mut released = Vec::new();
@@ -187,6 +207,14 @@ impl FastAssembler {
         self.held.extend(released);
         match (self.is_question, self.kind, &self.question) {
             (Some(true), Some(kind), Some(q)) => {
+                if kind != Kind::Clarification
+                    && let Some((candidate, current)) = &self.guard
+                    && echoes(q, candidate, current)
+                {
+                    self.echoed = true;
+                    self.held.clear();
+                    return Vec::new();
+                }
                 self.started = true;
                 let head = if self.clarifies() {
                     FastEvent::Clarification { text: q.clone() }
@@ -243,6 +271,29 @@ impl FastAssembler {
     }
 }
 
+/// Content words of a question: lowercase, alphanumeric, longer than two characters.
+fn content_words(s: &str) -> std::collections::HashSet<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 2)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Share of the smaller word set found in the other (0.0–1.0).
+fn overlap(a: &str, b: &str) -> f64 {
+    let (a, b) = (content_words(a), content_words(b));
+    let small = a.len().min(b.len());
+    if small == 0 {
+        return 0.0;
+    }
+    a.intersection(&b).count() as f64 / small as f64
+}
+
+/// `question` is the current question again and not what the Interviewer just said.
+fn echoes(question: &str, candidate: &str, current: &str) -> bool {
+    overlap(question, current) >= 0.6 && overlap(question, candidate) < 0.3
+}
+
 /// Run the fast phase for `req` on `provider`, publishing each [`FastEvent`] through `on_event`
 /// the moment it is known. See the module doc for the gating and error rules.
 pub async fn run_fast_phase<P, F>(
@@ -255,22 +306,18 @@ where
     P: Provider + ?Sized,
     F: FnMut(FastEvent),
 {
-    let mut stream = provider.chat(fast_chat_request(req), cancel).await?;
-    let mut parser = IncrementalObject::new();
-    let mut asm = FastAssembler::new(req.current.is_some());
-    while let Some(item) = stream.next().await {
-        let delta = item?;
-        for ev in parser.feed(&delta.text) {
-            for fe in asm.push(ev) {
-                on_event(fe);
-            }
-        }
-        if asm.ignored().is_some() || parser.is_closed() || delta.done {
-            break;
-        }
+    let mut asm = attempt(provider, req, cancel.clone(), &mut on_event, true).await?;
+    if asm.echoed() {
+        // Nothing was shown. Ask again without the `## Current question` section the model
+        // copied; the transcript still carries the context.
+        tracing::warn!(
+            candidate = %req.candidate,
+            "fast phase: reply restated the current question; retrying without it"
+        );
+        let mut again = req.clone();
+        again.current = None;
+        asm = attempt(provider, &again, cancel, &mut on_event, false).await?;
     }
-    // Dropping the stream closes the connection, so an ignored candidate stops generating.
-    drop(stream);
     let outcome = asm
         .finish(req.score)
         .map_err(|detail| LlmError::MalformedStream {
@@ -297,6 +344,40 @@ where
         ),
     }
     Ok(outcome)
+}
+
+/// One streamed request, fed through a [`FastAssembler`] until it is decided.
+async fn attempt<P, F>(
+    provider: &P,
+    req: &FastRequest,
+    cancel: CancellationToken,
+    on_event: &mut F,
+    guard: bool,
+) -> Result<FastAssembler, LlmError>
+where
+    P: Provider + ?Sized,
+    F: FnMut(FastEvent),
+{
+    let mut stream = provider.chat(fast_chat_request(req), cancel).await?;
+    let mut parser = IncrementalObject::new();
+    let mut asm = FastAssembler::new(req.current.is_some());
+    if guard && let Some(cur) = &req.current {
+        asm = asm.with_echo_guard(&req.candidate, &cur.question);
+    }
+    while let Some(item) = stream.next().await {
+        let delta = item?;
+        for ev in parser.feed(&delta.text) {
+            for fe in asm.push(ev) {
+                on_event(fe);
+            }
+        }
+        if asm.ignored().is_some() || asm.echoed() || parser.is_closed() || delta.done {
+            break;
+        }
+    }
+    // Dropping the stream closes the connection, so an ignored candidate stops generating.
+    drop(stream);
+    Ok(asm)
 }
 
 #[cfg(test)]
@@ -526,6 +607,78 @@ mod tests {
             panic!("{outcome:?}");
         };
         assert!(clarification);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_restates_the_current_question_is_retried_without_it() {
+        // Live session 5: the new line was a ride-sharing question; the model returned the
+        // Slack question from `## Current question` and answered that.
+        let slack = "How would you design a chat app like Slack for a company with 50,000 people?";
+        let echo = json!({
+            "is_question": true,
+            "kind": "system_design",
+            "question": slack,
+            "focus": "real-time messaging",
+            "approach": ["Use websockets per client.", "Shard channels.", "Fan out on write."]
+        });
+        let right = json!({
+            "is_question": true,
+            "kind": "system_design",
+            "question": "How would you design a ride-sharing matching system?",
+            "focus": "geo indexing, matching latency",
+            "approach": ["Index drivers by geohash.", "Match nearest available.", "Lock the driver."]
+        });
+        let mock = MockProvider::json(&echo).then_json(&right);
+        let mut req = FastRequest::new("Design a ride-sharing device matching system.", 5);
+        req.current = Some(CurrentQuestion {
+            question: slack.into(),
+            kind: Kind::SystemDesign,
+        });
+        let (events, outcome, _) = run(&mock, &req).await;
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| format!("{e:?}").contains("Slack")
+                    || format!("{e:?}").contains("websockets")),
+            "nothing from the echoed reply reached the screen: {events:?}"
+        );
+        assert_eq!(
+            events[0].1,
+            FastEvent::Question {
+                question: "How would you design a ride-sharing matching system?".into(),
+                kind: Kind::SystemDesign,
+            }
+        );
+        assert!(
+            matches!(outcome, Ok(FastOutcome::Shown { .. })),
+            "{outcome:?}"
+        );
+        let sent = mock.requests();
+        assert_eq!(sent.len(), 2, "one retry");
+        let retry = &sent[1].messages[1].content;
+        assert!(
+            !retry.contains("## Current question"),
+            "the retry leaves out the section the model copied: {retry}"
+        );
+    }
+
+    #[test]
+    fn the_echo_guard_spares_a_repeated_question_and_a_real_new_one() {
+        let slack = "How would you design a chat app like Slack?";
+        assert!(echoes(
+            slack,
+            "Design a ride-sharing matching system.",
+            slack
+        ));
+        assert!(
+            !echoes(slack, "How do you design a chat app like slack?", slack),
+            "the interviewer asking the same question again is not an echo"
+        );
+        assert!(!echoes(
+            "How would you design a ride-sharing system?",
+            "Design a ride sharing device.",
+            slack
+        ));
     }
 
     #[tokio::test]
