@@ -204,6 +204,60 @@ where
     })
 }
 
+/// How much of a non-2xx response body is read for the error message.
+pub(crate) const ERROR_BODY_CAP: usize = 4096;
+
+/// Read up to [`ERROR_BODY_CAP`] bytes of a non-2xx body under the same token and deadline
+/// as the rest of the request. Whatever arrived before cancel / deadline is returned, so a
+/// stalled error response still surfaces as `HttpStatus` within the phase budget.
+pub(crate) async fn error_body_within(
+    resp: reqwest::Response,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> String {
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    let read = async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            body.extend_from_slice(&chunk);
+            if body.len() >= ERROR_BODY_CAP {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {}
+        () = tokio::time::sleep_until(deadline) => {}
+        () = read => {}
+    }
+    body.truncate(ERROR_BODY_CAP);
+    String::from_utf8_lossy(&body).chars().take(300).collect()
+}
+
+/// Drive `send` (connect, request, response headers) under the same cancellation token and
+/// absolute deadline the body stream will use, so no part of a request is unguarded.
+pub(crate) async fn send_within(
+    provider: &'static str,
+    url: &str,
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<reqwest::Response, LlmError> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(LlmError::Cancelled),
+        () = tokio::time::sleep_until(deadline) => Err(LlmError::Timeout(timeout)),
+        r = send => r.map_err(|e| LlmError::Unreachable {
+            provider,
+            url: url.to_owned(),
+            detail: e.to_string(),
+        }),
+    }
+}
+
 type Inner<'a> = Pin<Box<dyn Stream<Item = Result<Delta, LlmError>> + Send + 'a>>;
 
 struct Guarded<'a> {
