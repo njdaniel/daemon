@@ -31,6 +31,9 @@ pub struct OllamaSettings {
     pub model: String,
     /// Ollama `keep_alive` duration string ("30m", "1h", "-1" for forever).
     pub keep_alive: String,
+    /// `options.num_ctx` on every request, warm-up included, so the model loads once at this
+    /// size (#61). `None` leaves the server's `OLLAMA_CONTEXT_LENGTH`.
+    pub num_ctx: Option<u32>,
 }
 
 impl Default for OllamaSettings {
@@ -39,6 +42,7 @@ impl Default for OllamaSettings {
             base_url: "http://localhost:11434".to_owned(),
             model: "qwen3.6:35b-a3b".to_owned(),
             keep_alive: DEFAULT_KEEP_ALIVE.to_owned(),
+            num_ctx: None,
         }
     }
 }
@@ -49,6 +53,7 @@ pub struct OllamaProvider {
     base_url: String,
     model: String,
     keep_alive: String,
+    num_ctx: Option<u32>,
 }
 
 impl OllamaProvider {
@@ -68,6 +73,7 @@ impl OllamaProvider {
             base_url: base_url.trim_end_matches('/').to_owned(),
             model: model.into(),
             keep_alive: DEFAULT_KEEP_ALIVE.to_owned(),
+            num_ctx: None,
         })
     }
 
@@ -77,13 +83,20 @@ impl OllamaProvider {
     pub fn from_settings(settings: &OllamaSettings) -> Result<Self, LlmError> {
         Ok(
             Self::new(settings.base_url.clone(), settings.model.clone())?
-                .with_keep_alive(settings.keep_alive.clone()),
+                .with_keep_alive(settings.keep_alive.clone())
+                .with_num_ctx(settings.num_ctx),
         )
     }
 
     /// Ollama `keep_alive` duration string ("30m", "1h", "-1" for forever). Default "30m".
     pub fn with_keep_alive(mut self, keep_alive: impl Into<String>) -> Self {
         self.keep_alive = keep_alive.into();
+        self
+    }
+
+    /// Ask for this context window (`options.num_ctx`); `None` or `Some(0)` leaves the server's.
+    pub fn with_num_ctx(mut self, num_ctx: Option<u32>) -> Self {
+        self.num_ctx = num_ctx.filter(|n| *n > 0);
         self
     }
 
@@ -115,19 +128,28 @@ impl OllamaProvider {
         if let Some(schema) = &req.schema {
             body["format"] = schema.clone();
         }
+        if let Some(n) = self.num_ctx {
+            body["options"]["num_ctx"] = n.into();
+        }
         body
     }
 
     /// The `warm_up` request body: empty messages load the model and apply `keep_alive` without
-    /// generating. Carries `think: false` like every other request. Public so tests can assert it.
+    /// generating. Carries `think: false` like every other request, and the same `num_ctx`, so the
+    /// model is loaded once at the size every later request asks for. Public so tests can assert
+    /// it.
     pub fn build_warm_up_body(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": [],
             "stream": false,
             "think": false,
             "keep_alive": self.keep_alive,
-        })
+        });
+        if let Some(n) = self.num_ctx {
+            body["options"] = serde_json::json!({ "num_ctx": n });
+        }
+        body
     }
 }
 
@@ -491,11 +513,38 @@ mod tests {
             base_url: "http://10.0.0.2:11434/".into(),
             model: "other".into(),
             keep_alive: "1h".into(),
+            num_ctx: None,
         };
         let p = OllamaProvider::from_settings(&custom).unwrap();
         assert_eq!(p.model(), "other");
         assert_eq!(p.base_url, "http://10.0.0.2:11434");
         assert_eq!(p.build_warm_up_body()["keep_alive"], "1h");
+    }
+
+    #[test]
+    fn num_ctx_goes_on_every_request_and_the_warm_up_or_nowhere() {
+        let req = ChatRequest::new(vec![Message::user("hi")]);
+        let plain = provider();
+        assert!(plain.build_body(&req)["options"].get("num_ctx").is_none());
+        assert!(plain.build_warm_up_body().get("options").is_none());
+
+        let sized = provider().with_num_ctx(Some(8192));
+        assert_eq!(sized.build_body(&req)["options"]["num_ctx"], 8192);
+        assert!(
+            sized.build_body(&req)["options"]["temperature"].is_number(),
+            "temperature stays"
+        );
+        assert_eq!(
+            sized.build_warm_up_body()["options"]["num_ctx"],
+            8192,
+            "the warm-up loads the model at the same size, so the first question does not reload it"
+        );
+
+        let zero = provider().with_num_ctx(Some(0));
+        assert!(
+            zero.build_body(&req)["options"].get("num_ctx").is_none(),
+            "0 = server default"
+        );
     }
 
     /// Needs Ollama on localhost with `qwen3.6:35b-a3b` pulled: `cargo test -p dmn-llm -- --ignored`.

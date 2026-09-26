@@ -57,6 +57,8 @@ pub struct Args {
     pub vad_close_ms: Option<u16>,
     /// `--vad`, over `[stt].vad` (#62).
     pub vad: Option<dmn_core::config::Vad>,
+    /// `--device` (#61), over `[stt].device`.
+    pub device: Option<dmn_core::config::SttDevice>,
     pub no_store: bool,
     pub headless: bool,
     /// Live: stop after this many seconds, as if `q` had been pressed.
@@ -175,6 +177,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             threads: args.threads,
             vad_close_ms: args.vad_close_ms,
             vad: args.vad,
+            device: args.device,
             partials: Partials::Auto,
             spec_literal_detector: false,
             no_llm: false,
@@ -187,6 +190,10 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     )?;
     let audio = pipeline.info().audio;
     let live = pipeline.info().live;
+    if args.headless {
+        // With no screen, the status line's whisper device goes to stdout (#61).
+        println!("whisper      {}", pipeline.info().stt_device);
+    }
     if let Some(secs) = args.duration {
         let controls = pipeline.controls();
         std::thread::spawn(move || {
@@ -573,6 +580,7 @@ mod tests {
             threads: None,
             vad_close_ms: None,
             vad: None,
+            device: None,
             no_store: true,
             headless: false,
             duration: None,

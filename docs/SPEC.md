@@ -296,6 +296,7 @@ model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "silero"                       # silero | energy (#63: fixtures and keyboard noise)
 vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
+device = "cpu"                       # cpu | gpu | auto: where whisper runs (gpu needs --features vulkan|cuda)
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -308,6 +309,7 @@ api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
 fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
+num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
 [ui]
 always_on_top = true
@@ -468,7 +470,7 @@ The two decisions most likely to change are the `pipewire` crate's low-level API
 
 **Open questions**
 
-- [ ] Target hardware for the latency numbers: which laptop, CPU-only or GPU (Vulkan/CUDA)? Sets the default model. Partly answered: M1 was measured on the dev box's CPU (Ryzen 7700X, `small.en`, 8 threads: fixture p50 1.78–1.85 s), and GPU whisper on its RTX 4090 beside Ollama is tried and measured in M2 (#61).
+- [ ] Target hardware for the latency numbers: which laptop, CPU-only or GPU (Vulkan/CUDA)? Sets the default model. Partly answered: M1 was measured on the dev box's CPU (Ryzen 7700X, `small.en`, 8 threads: fixture p50 1.78–1.85 s). #61 measured GPU whisper on its RTX 4090 beside `qwen3.6:35b-a3b` (sysdesign at 1×, context loaded, energy VAD at 500 ms): the LLM at Ollama's 65k context leaves 0.3–0.8 GB of VRAM, too little for whisper, and CPU whisper gives p50 1.72–1.83 s / p95 3.3–4.2 s; with `[llm].num_ctx = 8192` the LLM fits entirely and one whisper context fits beside it, so a Vulkan build puts the interviewer's lane on the GPU (`[stt].device = "auto"`): p50 1.34–1.36 s / p95 1.68–1.73 s, about 1 CPU core less. Defaults stay CPU (`device = "cpu"`, `num_ctx = 0`) so a CPU-only laptop and CI need nothing; the GPU setup is a README recipe. Still open: the target laptop without a discrete GPU.
 - [x] Default local model: `qwen3.6:35b-a3b` (fast phase 0.95 s on the dev 4090; `llama3.1:8b` misclassified question kind; `qwen3.6:27b` took 3.0 s). Decided 2026-09-21.
 - [x] Does the app need to work for in-person interviews (single mic, no system audio) in v1, which pulls diarization from M3 into M2? No: v1 is for online calls with two audio streams; diarization stays in M3/M4. Decided 2026-09-25.
 - [x] Coding-interview mode: show worked solutions in Deeper Answer at all, or only hints and complexity notes? Hints and complexity notes by default; worked solutions on request (`[ui].coding_solutions = "full"`, `dmn run --solutions full`, or `s`), still collapsed until opened. Decided 2026-09-24 (#50).

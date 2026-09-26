@@ -794,6 +794,49 @@ fn tui_behavioral_shows_star_cards_a_clarification_and_error_dots() {
 }
 
 #[test]
+fn tui_the_status_line_says_which_device_transcribes() {
+    let with = |device: &str, fallback: bool| {
+        let mut actions = actions("listening");
+        actions.push(Action::Transcriber {
+            device: device.into(),
+            fallback,
+        });
+        render(&Session::replay(&actions), (100, 30))
+    };
+    let gpu = text(&with(
+        "GPU NVIDIA GeForce RTX 4090 (Vulkan0, 1.9 of 25.8 GB free)",
+        false,
+    ));
+    assert!(gpu.contains(" stt gpu "), "{gpu}");
+    let cpu = text(&with("CPU", false));
+    assert!(
+        cpu.contains(" stt cpu ") && !cpu.contains("no gpu"),
+        "{cpu}"
+    );
+
+    let buf = with("CPU (fallback: Vulkan0 failed: out of device memory)", true);
+    let (x, y) = row_containing(&buf, "stt cpu (no gpu)");
+    assert_eq!(buf[(x, y)].fg, Color::Yellow, "a fallback is amber");
+
+    // Beside a local LLM the usual split: the interviewer's lane on the GPU, yours on the CPU.
+    let mixed = text(&with(
+        "GPU NVIDIA GeForce RTX 4090 (Vulkan0, 1.2 of 26.0 GB free); CPU (fallback: Vulkan0 has \
+         0.33 GB free, whisper needs 1.16 GB)",
+        true,
+    ));
+    assert!(
+        mixed.contains(" stt gpu+cpu ") && !mixed.contains("no gpu"),
+        "{mixed}"
+    );
+
+    let none = text(&render(&load("listening"), (100, 30)));
+    assert!(
+        !none.contains(" stt "),
+        "nothing before the models load: {none}"
+    );
+}
+
+#[test]
 fn tui_the_sink_monitor_fallback_shows_an_all_audio_badge() {
     let mut actions = actions("listening");
     actions.push(Action::Status {

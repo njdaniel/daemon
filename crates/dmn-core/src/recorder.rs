@@ -416,6 +416,8 @@ impl StoreWriter {
             | Action::SwapStory { .. }
             // Which provider answered is status-line state, like the dots (#59).
             | Action::Provider { .. }
+            // Where whisper runs is status-line state too (#61).
+            | Action::Transcriber { .. }
             // #63: both halves of a split question keep their question rows, as every candidate
             // does; the link is screen state and stays in the action log.
             | Action::Continues { .. }

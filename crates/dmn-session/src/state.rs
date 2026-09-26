@@ -342,6 +342,12 @@ pub struct Status {
     /// The provider answering (#59); `None` until the suggester has one (and in M1 logs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderLabel>,
+    /// Where whisper transcribes (#61); empty until the models are loaded (and in older logs).
+    #[serde(default)]
+    pub stt: String,
+    /// A GPU was asked for and the CPU runs instead.
+    #[serde(default)]
+    pub stt_fallback: bool,
 }
 
 /// Running totals, for the status line and the end-of-run summary.
@@ -746,6 +752,10 @@ pub fn reduce(s: &mut Session, action: &Action) {
         }
         Action::Overruns { total } => s.status.overruns = *total,
         Action::Provider { label } => s.status.provider = Some(label.clone()),
+        Action::Transcriber { device, fallback } => {
+            s.status.stt.clone_from(device);
+            s.status.stt_fallback = *fallback;
+        }
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}

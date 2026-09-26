@@ -375,6 +375,10 @@ pub enum Action {
     /// Mic finals the echo guard has dropped so far as copies of the loopback (#60, SPEC §
     /// Audio capture). For the session log and `dmn bench --live`; the screen does not change.
     EchoDropped { total: u64 },
+    /// Where whisper transcribes (#61), once the models are loaded: `device` is a short label
+    /// ("GPU NVIDIA GeForce RTX 4090 (Vulkan0, …)", "CPU"); `fallback` says a GPU was asked for
+    /// and the CPU runs instead. Shown on the status line.
+    Transcriber { device: String, fallback: bool },
     /// When candidate `candidate` reached `stage`, in audio seconds from the session start (the
     /// clock segment times use). For the session log and `dmn bench --live`; the screen does not
     /// change.

@@ -16,12 +16,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod filter;
+pub mod gpu;
 pub mod model;
 pub mod transcriber;
 pub mod wer;
 pub mod worker;
 
 pub use filter::{Dropped, FilterConfig, should_drop};
+pub use gpu::{DeviceChoice, GpuDevice, Placement, gpu_devices};
 pub use model::{Model, download_file, download_model, model_path};
 pub use transcriber::{Backend, SttConfig, Transcriber, Transcript};
 pub use wer::word_error_rate;

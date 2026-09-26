@@ -8,6 +8,7 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+use crate::gpu::{DeviceChoice, Placement, gpu_devices, resolve};
 use crate::{SAMPLE_RATE, SttError};
 
 /// Segments below this mean token log-probability are flagged; SPEC drops them in #9.
@@ -49,9 +50,9 @@ impl Backend {
 pub struct SttConfig {
     /// Decoder threads (`[stt].threads`).
     pub threads: usize,
-    /// Offload to the GPU backend when one is compiled in. On the dev box the LLM holds most of
-    /// the VRAM, so CPU is the expected configuration.
-    pub use_gpu: bool,
+    /// Where to run (`[stt].device`, #61). A GPU asked for and unavailable, or failing to load,
+    /// falls back to the CPU with a warning; [`Transcriber::placement`] says where it ended up.
+    pub device: DeviceChoice,
     /// Shrink the encoder window to the utterance instead of whisper's fixed 30 s. The encoder
     /// then costs time in proportion to the audio, which is what makes a 6 s question fit the
     /// 2 s end-to-end budget on CPU. See [`audio_ctx_for`].
@@ -62,7 +63,7 @@ impl Default for SttConfig {
     fn default() -> Self {
         Self {
             threads: 4,
-            use_gpu: Backend::compiled() != Backend::Cpu,
+            device: DeviceChoice::Auto,
             trim_audio_ctx: true,
         }
     }
@@ -98,34 +99,80 @@ pub struct Transcriber {
     ctx: WhisperContext,
     state: WhisperState,
     cfg: SttConfig,
+    placement: Placement,
 }
 
 impl Transcriber {
-    /// Load a ggml model. whisper.cpp's own logging is routed into `tracing` so it never writes
-    /// to the terminal the TUI owns.
+    /// Load a ggml model on the device `cfg.device` resolves to (see [`crate::gpu`]). A GPU that
+    /// is missing, too full for the model ([`crate::gpu::fits`], checked first because ggml
+    /// aborts the process on a failed GPU allocation), or failing to load it falls back to the
+    /// CPU with a warning rather than failing the run. whisper.cpp's own logging is routed into
+    /// `tracing` so it never writes to the terminal the TUI owns.
     pub fn load(model_file: &Path, cfg: SttConfig) -> Result<Self, SttError> {
         let shown = model_file.display().to_string();
         if !model_file.is_file() {
             return Err(SttError::ModelMissing(shown));
         }
         whisper_rs::install_logging_hooks();
-        let mut params = WhisperContextParameters::default();
-        params.use_gpu(cfg.use_gpu);
-        let ctx = WhisperContext::new_with_params(model_file, params).map_err(|source| {
-            SttError::Load {
-                path: shown.clone(),
-                source,
+        let devices = match cfg.device {
+            DeviceChoice::Cpu => Vec::new(),
+            DeviceChoice::Gpu | DeviceChoice::Auto => gpu_devices(),
+        };
+        let model_bytes = std::fs::metadata(model_file).map_or(0, |m| m.len());
+        let wanted = match resolve(cfg.device, Backend::compiled(), &devices) {
+            // Reported free memory first, then a real allocation of what the load needs: a
+            // failed allocation returns here, where the load itself would abort the process.
+            Placement::Gpu(device) => match crate::gpu::fits(&device, model_bytes) {
+                Err(why) => Placement::Cpu { reason: Some(why) },
+                Ok(())
+                    if !crate::gpu::probe(
+                        device.ordinal,
+                        model_bytes + crate::gpu::state_bytes(model_bytes),
+                    ) =>
+                {
+                    Placement::Cpu {
+                        reason: Some(format!(
+                            "{} could not allocate whisper's memory",
+                            device.name
+                        )),
+                    }
+                }
+                Ok(()) => Placement::Gpu(device),
+            },
+            cpu => cpu,
+        };
+        let ((ctx, state), placement) =
+            with_fallback(wanted, |gpu| load_on(model_file, &shown, gpu))?;
+        // `auto` means "the GPU if it has room": whatever kept it off, it falls back quietly.
+        if cfg.device == DeviceChoice::Auto
+            && let Placement::Cpu { reason: Some(why) } = &placement
+        {
+            tracing::info!(model = %shown, reason = %why, "whisper on the CPU (auto)");
+        }
+        let placement = placement.for_choice(cfg.device);
+        match &placement {
+            Placement::Cpu {
+                reason: Some(why), ..
+            } => {
+                tracing::warn!(model = %shown, reason = %why, "whisper on the CPU: GPU unavailable");
             }
-        })?;
-        let state = ctx.create_state().map_err(|source| SttError::Load {
-            path: shown,
-            source,
-        })?;
-        Ok(Self { ctx, state, cfg })
+            p => tracing::info!(model = %shown, device = %p.label(), "whisper loaded"),
+        }
+        Ok(Self {
+            ctx,
+            state,
+            cfg,
+            placement,
+        })
     }
 
     pub fn config(&self) -> &SttConfig {
         &self.cfg
+    }
+
+    /// Where this transcriber runs.
+    pub fn placement(&self) -> &Placement {
+        &self.placement
     }
 
     /// Transcribe one utterance (16 kHz mono f32). `prompt` is the previous utterance's text.
@@ -215,6 +262,51 @@ impl Transcriber {
     }
 }
 
+/// One model context and its inference state, on the GPU with ordinal `gpu` or on the CPU.
+fn load_on(
+    model_file: &Path,
+    shown: &str,
+    gpu: Option<i32>,
+) -> Result<(WhisperContext, WhisperState), SttError> {
+    let mut params = WhisperContextParameters::default();
+    params.use_gpu(gpu.is_some());
+    params.gpu_device(gpu.unwrap_or(0));
+    let ctx =
+        WhisperContext::new_with_params(model_file, params).map_err(|source| SttError::Load {
+            path: shown.to_owned(),
+            source,
+        })?;
+    let state = ctx.create_state().map_err(|source| SttError::Load {
+        path: shown.to_owned(),
+        source,
+    })?;
+    Ok((ctx, state))
+}
+
+/// Try `wanted`; if it is a GPU and `load` fails there, load on the CPU instead and record why.
+/// A CPU load that fails is the caller's error. Split out so the fallback is tested without a GPU.
+fn with_fallback<T>(
+    wanted: Placement,
+    mut load: impl FnMut(Option<i32>) -> Result<T, SttError>,
+) -> Result<(T, Placement), SttError> {
+    match wanted {
+        Placement::Gpu(device) => match load(Some(device.ordinal)) {
+            Ok(t) => Ok((t, Placement::Gpu(device))),
+            Err(e) => {
+                let reason = format!("{} failed: {e}", device.name);
+                let t = load(None)?;
+                Ok((
+                    t,
+                    Placement::Cpu {
+                        reason: Some(reason),
+                    },
+                ))
+            }
+        },
+        cpu => Ok((load(None)?, cpu)),
+    }
+}
+
 /// Assemble a [`Transcript`] from whisper's text and token log-probability sum. Split out so the
 /// scoring rule is testable without running inference.
 fn transcript_from(text: &str, logprob_sum: f32, n_tokens: usize) -> Transcript {
@@ -263,14 +355,67 @@ mod tests {
     fn cpu_is_the_default_backend_without_gpu_features() {
         assert_eq!(Backend::compiled(), Backend::Cpu);
         let c = SttConfig::default();
-        assert!(!c.use_gpu && c.trim_audio_ctx && c.threads == 4);
+        assert!(c.trim_audio_ctx && c.threads == 4);
+        // `Auto` in a CPU-only build resolves to the CPU without a warning.
+        assert_eq!(
+            crate::gpu::resolve(c.device, Backend::compiled(), &crate::gpu_devices()),
+            Placement::Cpu { reason: None }
+        );
     }
 
     #[test]
     #[cfg(any(feature = "cuda", feature = "vulkan"))]
-    fn gpu_features_default_to_the_gpu() {
+    fn gpu_features_are_compiled_in() {
         assert_ne!(Backend::compiled(), Backend::Cpu);
-        assert!(SttConfig::default().use_gpu);
+    }
+
+    fn gpu(ordinal: i32) -> Placement {
+        Placement::Gpu(crate::GpuDevice {
+            ordinal,
+            name: "Vulkan0".into(),
+            description: "RTX 4090".into(),
+            integrated: false,
+            free_bytes: 1,
+            total_bytes: 1,
+        })
+    }
+
+    fn load_error() -> SttError {
+        SttError::Io {
+            path: "gpu".into(),
+            source: std::io::Error::other("out of device memory"),
+        }
+    }
+
+    #[test]
+    fn a_gpu_that_fails_to_load_falls_back_to_the_cpu_and_says_why() {
+        let mut tried = Vec::new();
+        let (got, placement) = with_fallback(gpu(0), |g| {
+            tried.push(g);
+            match g {
+                Some(_) => Err(load_error()),
+                None => Ok("cpu model"),
+            }
+        })
+        .unwrap();
+        assert_eq!(got, "cpu model");
+        assert_eq!(tried, [Some(0), None], "GPU first, then the CPU");
+        assert!(placement.is_fallback(), "{placement:?}");
+        let label = placement.label();
+        assert!(
+            label.contains("Vulkan0 failed") && label.contains("out of device memory"),
+            "{label}"
+        );
+    }
+
+    #[test]
+    fn a_working_gpu_is_kept_and_a_cpu_failure_is_an_error() {
+        let (_, placement) = with_fallback(gpu(1), Ok::<_, SttError>).unwrap();
+        assert!(placement.is_gpu());
+        let err = with_fallback(Placement::Cpu { reason: None }, |_| {
+            Err::<(), _>(load_error())
+        });
+        assert!(err.is_err(), "no device left to fall back to");
     }
 
     #[test]

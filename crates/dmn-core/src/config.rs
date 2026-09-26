@@ -88,6 +88,18 @@ pub struct Stt {
     /// / precision 1.00; 400 → 1.83 s / 1.82 s, recall 0.96 / precision 0.94. 400 is the close
     /// that keeps both fixtures inside the 2.0 s p50.
     pub vad_close_ms: u16,
+    /// Where whisper runs (#61): `cpu`, `gpu` (a GPU build's device, else the CPU with a
+    /// warning), or `auto` (the GPU when there is one, quietly the CPU otherwise).
+    pub device: SttDevice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SttDevice {
+    #[default]
+    Cpu,
+    Gpu,
+    Auto,
 }
 
 impl Default for Stt {
@@ -101,6 +113,7 @@ impl Default for Stt {
             threads: 8,
             vad: Vad::Silero,
             vad_close_ms: 400,
+            device: SttDevice::Cpu,
         }
     }
 }
@@ -147,6 +160,10 @@ pub struct Llm {
     /// The slow phase's deadline (#55; SPEC: 20 s). `0` turns the slow phase off: the six
     /// sections are never asked for, and the model serves only the fast phase.
     pub slow_timeout_ms: u64,
+    /// Ollama context window dmn asks for (`options.num_ctx`, #61); `0` leaves the server's own
+    /// (`OLLAMA_CONTEXT_LENGTH`). A value different from the server's makes Ollama reload the
+    /// model when another client used the default in between.
+    pub num_ctx: u32,
 }
 
 impl Default for Llm {
@@ -161,6 +178,7 @@ impl Default for Llm {
             answer_length: AnswerLength::Concise,
             fast_timeout_ms: 4000,
             slow_timeout_ms: 20000,
+            num_ctx: 0,
         }
     }
 }
@@ -284,6 +302,7 @@ model = "small.en"                   # under ~/.cache/dmn/models/; `dmn doctor -
 threads = 8                          # whisper threads per lane; the final pass is most of the 2 s budget
 vad = "silero"                       # silero | energy; silero needs `dmn doctor --fetch silero`
 vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
+device = "cpu"                       # cpu | gpu | auto: where whisper runs (gpu needs --features vulkan|cuda)
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -296,6 +315,7 @@ api_key_env = ""                     # NAME of an env var holding the key; never
 answer_length = "concise"            # concise (5 lines) | minimal (3 lines)
 fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # the six expandable sections; 0 turns the slow phase off
+num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
 [ui]
 always_on_top = true
@@ -469,6 +489,7 @@ model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "silero"                       # silero | energy (#63: fixtures and keyboard noise)
 vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
+device = "cpu"                       # cpu | gpu | auto: where whisper runs (gpu needs --features vulkan|cuda)
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -481,6 +502,7 @@ api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
 fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
+num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
 [ui]
 always_on_top = true
@@ -522,7 +544,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 24, "spec example has 24 keys: {keys:?}");
+        assert_eq!(keys.len(), 26, "spec example has 26 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

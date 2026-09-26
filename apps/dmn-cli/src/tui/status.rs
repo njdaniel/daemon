@@ -102,6 +102,27 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         spans.push(Span::styled("●", Style::new().fg(Color::Red)));
         spans.push(Span::raw(format!(" {} dropped ", st.overruns)));
     }
+    // #61: which device transcribes. `gpu+cpu` is the usual split beside a local LLM: the
+    // interviewer's lane on the GPU, yours on the CPU. Amber only when a GPU was asked for and
+    // no lane got one (the reason is in the log and the replay header).
+    if !st.stt.is_empty() {
+        let on_gpu = st.stt.contains("GPU ");
+        let on_cpu = st.stt.split("; ").any(|lane| lane.starts_with("CPU"));
+        let device = match (on_gpu, on_cpu) {
+            (true, true) => "gpu+cpu",
+            (true, false) => "gpu",
+            _ => "cpu",
+        };
+        let (text, style) = if st.stt_fallback && !on_gpu {
+            (
+                format!(" stt {device} (no gpu) "),
+                Style::new().fg(Color::Yellow),
+            )
+        } else {
+            (format!(" stt {device} "), Style::new().fg(Color::DarkGray))
+        };
+        spans.push(Span::styled(text, style));
+    }
     // An error's reason first (red); otherwise, when transcript text leaves the machine, the
     // SPEC § Providers notice in words (amber) for as long as it does.
     let note = detail.map(|d| (d, Color::Red)).or_else(|| {

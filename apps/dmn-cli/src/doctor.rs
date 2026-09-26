@@ -421,6 +421,47 @@ pub fn gpu_backend(r: &dyn Runner) -> Check {
     .optional()
 }
 
+/// Where whisper would run under `[stt].device` (#61), and every GPU this build can see. A GPU
+/// asked for and unavailable fails this (optional) check with the reason; the run itself still
+/// falls back to the CPU.
+pub fn whisper_device(
+    choice: dmn_core::config::SttDevice,
+    devices: &[dmn_stt::GpuDevice],
+) -> Check {
+    let placement = dmn_stt::gpu::resolve(
+        crate::pipeline::device_choice(choice),
+        dmn_stt::Backend::compiled(),
+        devices,
+    );
+    let seen = if devices.is_empty() {
+        "no GPU visible to this build".to_owned()
+    } else {
+        let list: Vec<String> = devices
+            .iter()
+            .map(|d| {
+                let kind = if d.integrated { ", integrated" } else { "" };
+                format!("{}{kind}", d.label())
+            })
+            .collect();
+        format!("GPUs: {}", list.join("; "))
+    };
+    let setting = format!("{choice:?}").to_lowercase();
+    let detail = format!(
+        "[stt].device = {setting} → whisper on {}; {seen}",
+        placement.label()
+    );
+    let check = if placement.is_fallback() {
+        Check::fail(
+            "whisper device",
+            detail,
+            "build with --features vulkan (or cuda), or set [stt].device = \"cpu\"",
+        )
+    } else {
+        Check::pass("whisper device", detail)
+    };
+    check.optional()
+}
+
 // ---- privacy --------------------------------------------------------------------------------
 
 /// Where the configured LLM endpoint actually is. `provider = "ollama"` says nothing about
@@ -559,6 +600,7 @@ pub fn run_all(
         }
     }
     checks.push(gpu_backend(r));
+    checks.push(whisper_device(cfg.stt.device, &dmn_stt::gpu_devices()));
     Report { header, checks }
 }
 
@@ -788,6 +830,39 @@ mod tests {
         assert!(c.detail.contains("nvidia-smi present"));
         assert!(c.detail.contains("vulkaninfo missing"));
         assert!(c.detail.contains("without cuda/vulkan"));
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "cuda", feature = "vulkan")))]
+    fn whisper_device_says_where_whisper_runs_and_flags_a_gpu_it_cannot_have() {
+        use dmn_core::config::SttDevice;
+        let cpu = whisper_device(SttDevice::Cpu, &[]);
+        assert!(cpu.ok && !cpu.required, "{cpu:?}");
+        assert!(
+            cpu.detail.contains("device = cpu → whisper on CPU"),
+            "{}",
+            cpu.detail
+        );
+
+        let gpu = whisper_device(SttDevice::Gpu, &[]);
+        assert!(
+            !gpu.ok && !gpu.required,
+            "a GPU it cannot have is a warning, not a failure"
+        );
+        assert!(
+            gpu.detail.contains("without a GPU backend"),
+            "{}",
+            gpu.detail
+        );
+        assert!(
+            gpu.fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("--features vulkan")
+        );
+
+        let auto = whisper_device(SttDevice::Auto, &[]);
+        assert!(auto.ok, "auto on a CPU build is simply the CPU: {auto:?}");
     }
 
     #[test]

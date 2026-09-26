@@ -46,7 +46,10 @@ use dmn_core::{Config, Paths, wire};
 use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
 use dmn_llm::{CurrentQuestion, Kind};
 use dmn_session::{Action, CodingSolutions, Dot, Health, Section, SessionHub, Stage};
-use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
+use dmn_stt::{
+    DeviceChoice, Model, Placement, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber,
+    model_path,
+};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, EchoGuard, Segment, TranscriptLog, Verdict};
 use dmn_vad::{
     EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
@@ -194,6 +197,8 @@ pub struct Options {
     pub vad_close_ms: Option<u16>,
     /// Which VAD decides speech, over `[stt].vad` (#62).
     pub vad: Option<VadChoice>,
+    /// Where whisper runs (#61), over `[stt].device`.
+    pub device: Option<dmn_core::config::SttDevice>,
     pub partials: Partials,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
@@ -216,6 +221,8 @@ pub struct Options {
 pub struct Info {
     pub model: String,
     pub threads: usize,
+    /// Where whisper runs, as [`placement_summary`] words it (#61).
+    pub stt_device: String,
     /// "energy" or "silero".
     pub vad: &'static str,
     pub speed: Speed,
@@ -741,6 +748,7 @@ impl Pipeline {
         };
         let stt_cfg = SttConfig {
             threads: opts.threads.unwrap_or(usize::from(cfg.stt.threads)),
+            device: device_choice(opts.device.unwrap_or(cfg.stt.device)),
             ..SttConfig::default()
         };
         // #34: `--speed N` paces delivery at N× wall-clock. A live call is 1× by definition.
@@ -766,6 +774,13 @@ impl Pipeline {
         let bus = Arc::new(Bus::new());
         let segments = bus.subscribe();
         let mic_muted = Arc::new(AtomicBool::new(false));
+
+        // #61: whisper may take GPU memory. Load the local LLM first, so that if it (re)loads —
+        // a `num_ctx` different from what is loaded, or a cold start — it sizes itself against a
+        // GPU whisper has not claimed yet, rather than pushing more of itself onto the CPU.
+        if !opts.no_llm && stt_cfg.device != DeviceChoice::Cpu {
+            warm_local_llm(&cfg.llm);
+        }
 
         // Load both whisper models and spawn every worker first, then start both sources back
         // to back: loading a model takes the better part of a second, and starting each file as
@@ -794,8 +809,12 @@ impl Pipeline {
             })
             .max()
             .unwrap_or_default();
+        // The interviewer lane is built first on purpose (#61): its finals are on the question
+        // → Approach path, so when the GPU has room for only one whisper context it gets it,
+        // and the candidate's lane falls back to the CPU. `live_sources` lists the mic first, so
+        // the order is enforced here for every input.
         let mut built = Vec::new();
-        for (source, audio) in sources {
+        for (source, audio) in interviewer_first(sources) {
             let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));
             let ring = match &audio {
                 Audio::Wav(w) => ring_frames(w.duration(), speed),
@@ -814,9 +833,11 @@ impl Pipeline {
                 gate,
             )?);
         }
+        let placements: Vec<Placement> = built.iter().map(|(_, _, p)| p.clone()).collect();
+        let stt_device = placement_summary(&placements);
         let audio_zero = Instant::now();
         let mut lanes = Vec::new();
-        for (mut lane, sink) in built {
+        for (mut lane, sink, _) in built {
             lane.audio.start(sink)?;
             lanes.push(lane);
         }
@@ -836,6 +857,11 @@ impl Pipeline {
         // In the log from the start, so every stored question records the mode it ran under.
         hub.dispatch(Action::CodingSolutions {
             mode: opts.coding_solutions.unwrap_or(cfg.ui.coding_solutions),
+        });
+        // #61: where whisper ended up, for the status line; a GPU that fell back says so.
+        hub.dispatch(Action::Transcriber {
+            device: stt_device.clone(),
+            fallback: placements.iter().any(Placement::is_fallback),
         });
         for lane in &lanes {
             // A file is fine once open; a live capture's dot follows its state (the monitor).
@@ -887,6 +913,7 @@ impl Pipeline {
             info: Info {
                 model: name,
                 threads: stt_cfg.threads,
+                stt_device,
                 vad: match vad_choice {
                     VadChoice::Energy => "energy",
                     VadChoice::Silero => "silero",
@@ -1487,7 +1514,7 @@ fn build_lane(
     partials: bool,
     bus: &Arc<Bus>,
     mute: Option<Arc<AtomicBool>>,
-) -> Result<(Lane, FrameSink), Box<dyn Error>> {
+) -> Result<(Lane, FrameSink, Placement), Box<dyn Error>> {
     let (sink, frames) = dmn_audio::frame_channel(source, ring);
     let (tx, rx) = event_channel(EVENT_CAPACITY);
     let mut vad_cfg = VadConfig::default();
@@ -1496,6 +1523,7 @@ fn build_lane(
         vad_cfg.segmenter.partial_every = None;
     }
     let transcriber = Transcriber::load(model, stt_cfg.clone())?;
+    let placement = transcriber.placement().clone();
     let publisher = Arc::clone(bus);
     let stt = SttWorker::spawn(
         Box::new(transcriber),
@@ -1525,12 +1553,104 @@ fn build_lane(
             stt,
         },
         sink,
+        placement,
     ))
+}
+
+/// Block until the configured Ollama model is loaded (#61). A failure is only logged: the
+/// suggester's own warm-up reports it on the model dot. Remote providers use no local GPU.
+fn warm_local_llm(llm: &dmn_core::config::Llm) {
+    if llm.provider != dmn_core::config::Provider::Ollama {
+        return;
+    }
+    let warmed = wire::provider(llm)
+        .map_err(|e| e.to_string())
+        .and_then(|p| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(p.warm_up())
+                .map_err(|e| e.to_string())
+        });
+    match warmed {
+        Ok(()) => tracing::info!(model = %llm.model, "LLM loaded before GPU whisper"),
+        Err(e) => tracing::warn!(error = %e, "LLM warm-up before GPU whisper failed"),
+    }
+}
+
+/// `[stt].device` in `dmn-stt`'s terms (`dmn-stt` does not depend on `dmn-core`).
+pub fn device_choice(d: dmn_core::config::SttDevice) -> DeviceChoice {
+    match d {
+        dmn_core::config::SttDevice::Cpu => DeviceChoice::Cpu,
+        dmn_core::config::SttDevice::Gpu => DeviceChoice::Gpu,
+        dmn_core::config::SttDevice::Auto => DeviceChoice::Auto,
+    }
+}
+
+/// The interviewer's lane before the candidate's, whatever order `sources` came in.
+fn interviewer_first<T>(mut sources: Vec<(Source, T)>) -> Vec<(Source, T)> {
+    sources.sort_by_key(|(source, _)| *source != Source::Interviewer);
+    sources
+}
+
+/// One line for where the lanes' whisper runs: the shared placement when both lanes agree (the
+/// usual case), else each lane's.
+fn placement_summary(placements: &[Placement]) -> String {
+    match placements {
+        [] => String::new(),
+        [first, rest @ ..] if rest.iter().all(|p| p.same_device(first)) => first.label(),
+        all => all
+            .iter()
+            .map(Placement::label)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_lanes_on_the_same_device_read_as_one() {
+        let cpu = Placement::Cpu { reason: None };
+        assert_eq!(placement_summary(&[cpu.clone(), cpu.clone()]), "CPU");
+        let fell_back = Placement::Cpu {
+            reason: Some("Vulkan0 failed: out of memory".into()),
+        };
+        assert_eq!(
+            placement_summary(&[cpu, fell_back]),
+            "CPU; CPU (fallback: Vulkan0 failed: out of memory)"
+        );
+        assert_eq!(placement_summary(&[]), "");
+
+        // Two lanes on one GPU: free memory differs after the first load, the device does not.
+        let gpu = |free: u64| {
+            Placement::Gpu(dmn_stt::GpuDevice {
+                ordinal: 0,
+                name: "Vulkan0".into(),
+                description: "RTX 4090".into(),
+                integrated: false,
+                free_bytes: free,
+                total_bytes: 25_800_000_000,
+            })
+        };
+        let both = placement_summary(&[gpu(2_600_000_000), gpu(1_300_000_000)]);
+        assert!(!both.contains("; "), "one device, one label: {both}");
+    }
+
+    #[test]
+    fn the_interviewer_lane_is_built_first_whatever_the_input_order() {
+        // `live_sources` lists the mic first; the GPU must still go to the interviewer's lane.
+        let live = vec![(Source::You, "mic"), (Source::Interviewer, "app")];
+        assert_eq!(
+            interviewer_first(live),
+            [(Source::Interviewer, "app"), (Source::You, "mic")]
+        );
+        let files = vec![(Source::Interviewer, "i.wav"), (Source::You, "c.wav")];
+        assert_eq!(interviewer_first(files.clone()), files);
+    }
 
     #[test]
     fn echo_retraction_closes_the_copys_partial_and_keeps_nothing() {
@@ -1951,6 +2071,7 @@ mod tests {
                 threads: None,
                 vad_close_ms: None,
                 vad: None,
+                device: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
                 no_llm: true,

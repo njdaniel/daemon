@@ -82,6 +82,24 @@ impl From<VadArg> for dmn_core::config::Vad {
     }
 }
 
+/// `--device` (#61): where whisper runs, over `[stt].device`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceArg {
+    Cpu,
+    Gpu,
+    Auto,
+}
+
+impl From<DeviceArg> for dmn_core::config::SttDevice {
+    fn from(d: DeviceArg) -> Self {
+        match d {
+            DeviceArg::Cpu => dmn_core::config::SttDevice::Cpu,
+            DeviceArg::Gpu => dmn_core::config::SttDevice::Gpu,
+            DeviceArg::Auto => dmn_core::config::SttDevice::Auto,
+        }
+    }
+}
+
 /// Daemon: a Linux-native interview copilot.
 #[derive(Parser, Debug)]
 #[command(name = "dmn", version, about, long_about = None)]
@@ -120,6 +138,9 @@ enum Command {
         /// Voice activity detector; default is [stt].vad (energy)
         #[arg(long, value_enum)]
         vad: Option<VadArg>,
+        /// Where whisper runs; default is [stt].device. gpu needs a --features vulkan|cuda build
+        #[arg(long, value_enum)]
+        device: Option<DeviceArg>,
         /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
         #[arg(long)]
         no_store: bool,
@@ -182,6 +203,9 @@ enum Command {
         /// Use whisper's fixed 30 s encoder window instead of trimming it to each utterance
         #[arg(long)]
         full_window: bool,
+        /// Where whisper runs; default is [stt].device. gpu needs a --features vulkan|cuda build
+        #[arg(long, value_enum)]
+        device: Option<DeviceArg>,
         /// Directory holding the fixtures
         #[arg(long, default_value = "testdata")]
         testdata: std::path::PathBuf,
@@ -224,6 +248,9 @@ enum Command {
         /// Voice activity detector; default is [stt].vad (energy)
         #[arg(long, value_enum)]
         vad: Option<VadArg>,
+        /// Where whisper runs; default is [stt].device. gpu needs a --features vulkan|cuda build
+        #[arg(long, value_enum)]
+        device: Option<DeviceArg>,
         /// Transcribe the 1 s partials of an open utterance: on, since --speed always paces
         #[arg(long, value_enum, default_value_t = pipeline::Partials::Auto)]
         partials: pipeline::Partials,
@@ -340,6 +367,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             threads,
             vad_close_ms,
             vad,
+            device,
             partials,
             transcript,
             json,
@@ -360,6 +388,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     threads,
                     vad_close_ms,
                     vad: vad.map(Into::into),
+                    device: device.map(Into::into),
                     partials,
                     transcript,
                     json,
@@ -378,6 +407,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             threads,
             vad_close_ms,
             vad,
+            device,
             no_store,
             headless,
             duration,
@@ -408,6 +438,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     threads,
                     vad_close_ms,
                     vad: vad.map(Into::into),
+                    device: device.map(Into::into),
                     no_store,
                     headless,
                     duration,
@@ -450,6 +481,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             turns,
             full_window,
             testdata,
+            device,
             ..
         }) => {
             let cfg = Config::load(&paths.config_file)?;
@@ -459,6 +491,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 threads: threads.unwrap_or(usize::from(cfg.stt.threads)),
                 turns,
                 trim_audio_ctx: !full_window,
+                device: device.map(Into::into).unwrap_or(cfg.stt.device),
                 testdata,
                 models_dir: paths.models_dir.clone(),
             };

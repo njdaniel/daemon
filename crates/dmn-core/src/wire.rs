@@ -334,6 +334,8 @@ pub fn provider(llm: &Llm) -> Result<Arc<dyn Provider>, LlmError> {
         config::Provider::Ollama => Arc::new(OllamaProvider::from_settings(&OllamaSettings {
             base_url: llm.endpoint(),
             model: llm.model.clone(),
+            // #61: a context window smaller than the server's frees VRAM for GPU whisper.
+            num_ctx: (llm.num_ctx > 0).then_some(llm.num_ctx),
             ..OllamaSettings::default()
         })?),
         config::Provider::OpenAI => Arc::new(OpenAiProvider::new(
@@ -365,6 +367,7 @@ pub fn same_provider(a: &Llm, b: &Llm) -> bool {
         && a.endpoint() == b.endpoint()
         && a.model == b.model
         && a.api_key_env == b.api_key_env
+        && a.num_ctx == b.num_ctx
 }
 
 #[cfg(test)]
