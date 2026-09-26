@@ -759,6 +759,8 @@ impl Pipeline {
                     path: paths.db_file.clone(),
                     write: !opts.no_store,
                 },
+                // #59: `[llm]` changes in the config file swap the provider between requests.
+                Some(paths.config_file.clone()),
             )
         });
         let (commands_tx, commands) = mpsc::channel();

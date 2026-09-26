@@ -14,7 +14,11 @@
 //! in [`FastRequest`]. #55 adds the [`slow`] phase: after the fast phase has answered, a second
 //! request fills the six expandable sections, each published ([`SlowField`]) as its field
 //! completes, cut in Rust, within a 20 s deadline; its caller cancels it whenever a new question
-//! needs the model. The OpenAI-compatible and Anthropic providers arrive with M2.
+//! needs the model. #59 adds the remote providers: [`openai`] (OpenAI-compatible chat
+//! completions — OpenAI, OpenRouter, vLLM, LM Studio) and [`anthropic`] (tool use with the
+//! schema), both streaming SSE ([`sse`]) into the same incremental parser, and both taking the
+//! API key only as a header from the env var `[llm].api_key_env` names — never logged, never in
+//! a `Debug` impl.
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:
@@ -27,23 +31,30 @@
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod anthropic;
 pub mod fast;
 pub mod limits;
 pub mod mock;
 pub mod ndjson;
 pub mod ollama;
+pub mod openai;
 pub mod prompt;
 mod provider;
 pub mod requirements;
 pub mod schema;
 pub mod slow;
+pub mod sse;
 pub mod stream_json;
+#[cfg(test)]
+mod testserver;
 
+pub use anthropic::AnthropicProvider;
 pub use fast::{FastEvent, FastOutcome, IgnoreReason, run_fast_phase};
 pub use futures_util::future::BoxFuture;
 pub use futures_util::stream::BoxStream;
 pub use mock::MockProvider;
 pub use ollama::{OllamaProvider, OllamaSettings};
+pub use openai::OpenAiProvider;
 pub use prompt::{CurrentQuestion, FastRequest, StoryText};
 pub use provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard, guard_until,

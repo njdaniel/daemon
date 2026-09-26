@@ -166,6 +166,15 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// The config-file spelling, for logs, notices and the TUI's model dot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Ollama => "ollama",
+            Provider::OpenAI => "openai",
+            Provider::Anthropic => "anthropic",
+        }
+    }
+
     /// True when transcript text is sent off the machine. Settings and `dmn doctor` say so in words.
     pub fn is_remote(self) -> bool {
         !matches!(self, Provider::Ollama)
@@ -360,18 +369,78 @@ impl Config {
 
     /// Read the API key from the env var named in `[llm].api_key_env`. `None` when unset or empty.
     pub fn api_key(&self) -> Option<ApiKey> {
-        self.api_key_from(|name| std::env::var(name).ok())
+        self.llm.api_key()
     }
 
     /// Same as [`Config::api_key`] with the environment lookup injected (tests use a closure).
     pub fn api_key_from(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<ApiKey> {
-        if self.llm.api_key_env.is_empty() {
+        self.llm.api_key_from(lookup)
+    }
+}
+
+impl Llm {
+    /// The API key from the env var `api_key_env` names. `None` when unset or empty.
+    pub fn api_key(&self) -> Option<ApiKey> {
+        self.api_key_from(|name| std::env::var(name).ok())
+    }
+
+    /// Same as [`Llm::api_key`] with the environment lookup injected (tests use a closure).
+    pub fn api_key_from(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<ApiKey> {
+        if self.api_key_env.is_empty() {
             return None;
         }
-        lookup(&self.llm.api_key_env)
+        lookup(&self.api_key_env)
             .filter(|v| !v.is_empty())
             .map(ApiKey::new)
     }
+
+    /// The URL the provider talks to: `base_url`, or the provider's public API while
+    /// `base_url` is still the Ollama default (an `[llm]` that only says `provider =
+    /// "anthropic"` means Anthropic's API, not localhost:11434).
+    pub fn endpoint(&self) -> String {
+        let ollama_default = self.base_url.trim_end_matches('/') == Llm::default().base_url;
+        match self.provider {
+            Provider::OpenAI if ollama_default => "https://api.openai.com".into(),
+            Provider::Anthropic if ollama_default => "https://api.anthropic.com".into(),
+            _ => self.base_url.clone(),
+        }
+    }
+
+    /// Transcript text leaves this machine (SPEC § Providers): a remote provider, or an
+    /// endpoint whose host is not a loopback name or address. `dmn doctor` also resolves the
+    /// host for its report; this is the quick check `dmn run` and `dmn config show` use.
+    pub fn leaves_machine(&self) -> bool {
+        self.provider.is_remote() || !is_loopback_url(&self.endpoint())
+    }
+
+    /// The sentence `dmn run` and `dmn config show` print when text leaves the machine.
+    pub fn privacy_notice(&self) -> Option<String> {
+        self.leaves_machine().then(|| {
+            format!(
+                "transcript text, retrieved chunks and the session summary leave this machine: \
+                 [llm].provider = \"{}\" at {}",
+                self.provider.as_str(),
+                self.endpoint()
+            )
+        })
+    }
+}
+
+/// `http://localhost:11434`, `http://127.0.0.1`, `http://[::1]:8080` and the like.
+fn is_loopback_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => authority.split(':').next().unwrap_or(authority),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -546,5 +615,47 @@ keep_transcripts = true
         assert!(!key.to_string().contains("secret"));
         assert!(!c.to_toml().unwrap().contains("secret"));
         assert!(!format!("{c:?}").contains("secret"));
+    }
+
+    #[test]
+    fn remote_providers_and_other_hosts_say_text_leaves_the_machine() {
+        let ollama = Llm::default();
+        assert!(!ollama.leaves_machine());
+        assert!(ollama.privacy_notice().is_none());
+        for url in [
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434/",
+            "http://LOCALHOST:1234",
+        ] {
+            let l = Llm {
+                base_url: url.into(),
+                ..Llm::default()
+            };
+            assert!(!l.leaves_machine(), "{url}");
+        }
+        let lan = Llm {
+            base_url: "http://gpu-box.lan:11434".into(),
+            ..Llm::default()
+        };
+        assert!(lan.leaves_machine());
+
+        let anthropic = Llm {
+            provider: Provider::Anthropic,
+            ..Llm::default()
+        };
+        assert_eq!(anthropic.endpoint(), "https://api.anthropic.com");
+        let notice = anthropic.privacy_notice().expect("remote");
+        assert!(notice.contains("leave this machine"), "{notice}");
+        assert!(notice.contains("anthropic"), "{notice}");
+
+        // A local OpenAI-compatible server (LM Studio) is still a remote API by provider, as
+        // the SPEC words it; the notice says where the text goes.
+        let lm_studio = Llm {
+            provider: Provider::OpenAI,
+            base_url: "http://localhost:1234".into(),
+            ..Llm::default()
+        };
+        assert_eq!(lm_studio.endpoint(), "http://localhost:1234");
+        assert!(lm_studio.leaves_machine());
     }
 }

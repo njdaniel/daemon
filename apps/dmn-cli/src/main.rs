@@ -423,6 +423,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }) => {
             let cfg = Config::load(&paths.config_file)?;
             tracing::debug!(provider = ?cfg.llm.provider, "config show");
+            // SPEC § Providers: in words, as a TOML comment so the output still parses.
+            if let Some(notice) = cfg.llm.privacy_notice() {
+                println!("# NOTE: {notice}");
+            }
             print!("{}", cfg.to_toml()?);
             Ok(())
         }
