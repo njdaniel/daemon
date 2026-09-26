@@ -1,5 +1,5 @@
 ## Now fill the expandable sections for the question on screen
-The question and its Approach above are already on screen: add depth, do not repeat them. This reply has only these fields:
+The question and its Approach above are already on screen: add depth, do not repeat them. Fill these fields:
 - deeper: up to 4 entries {label, text}, the substance behind the Approach (mechanisms, numbers, reasoning). label is a heading of one to four words; text is at most two sentences.
 - followups: up to 5 questions the Interviewer is likely to ask next, one line each.
 - tradeoffs: up to 5 rows {option, pro, con} for the main choices in the answer, one short phrase each. An empty list when the question has none.

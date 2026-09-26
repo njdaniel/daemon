@@ -638,7 +638,9 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
     hub.dispatch(Action::SlowStarted { candidate: 1 });
     let result = run_slow_phase(&provider, &req, CancellationToken::new(), |f| {
         fields.apply(&f);
-        hub.dispatch(wire::slow_field(1, &f));
+        if let Some(a) = wire::slow_field(1, &f) {
+            hub.dispatch(a);
+        }
     })
     .await;
     hub.dispatch(wire::slow_ended(1, &result, &fields, false, 1_700_000_030));
@@ -671,4 +673,68 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
     assert_eq!(payload["deeper"][0]["label"], "Eviction");
     assert_eq!(payload["followups"][0], "What about a thundering herd?");
     assert!(payload.get("solution").is_none());
+}
+
+#[tokio::test]
+async fn summary_lines_and_promises_survive_the_store_the_export_and_the_action_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let mut log_rx = rec.hub().subscribe();
+    let watch = rec.hub().watch();
+    drive(&rec, &config_with_key_env()).await;
+    let hub = rec.hub();
+    // #57: question 1's line, written once it was answered, with the promise made in it.
+    hub.dispatch(Action::Summary {
+        candidate: 1,
+        line: "00:02 rate limiter — covered token bucket; promised to return to clock skew".into(),
+        promise: Some("clock skew".into()),
+        at: 1_700_000_200,
+    });
+    hub.dispatch(wire::segment(&seg(
+        Source::You,
+        50.0,
+        54.0,
+        "Back to clock skew: NTP keeps it small.",
+        true,
+    )));
+    let report = rec.finish(1_700_000_600).unwrap().unwrap();
+    assert_eq!(report.errors, 0, "{report:?}");
+
+    let mut recorded = Vec::new();
+    while let Ok(a) = log_rx.try_recv() {
+        recorded.push(a);
+    }
+    let parsed: Vec<Action> = recorded
+        .iter()
+        .map(|a| serde_json::from_str(&serde_json::to_string(a).unwrap()).unwrap())
+        .collect();
+    let replayed = Session::replay(&parsed);
+    assert_eq!(replayed, watch.borrow().clone());
+    assert_eq!(replayed.summary.len(), 1);
+    assert!(replayed.promises[0].mentioned, "the You segment covered it");
+
+    let id = report.session_id.unwrap();
+    let store = open_store(&paths).unwrap();
+    let rows = store.summaries(id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].promise.as_deref(), Some("clock skew"));
+    assert!(
+        rows[0].mentioned,
+        "the covered promise is stored as covered"
+    );
+    let (export, _) = recorder::export(&paths, id).unwrap();
+    let text = std::fs::read_to_string(export).unwrap();
+    let line = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v["type"] == "summary")
+        .expect("the export carries the summary line");
+    assert!(
+        line["line"]
+            .as_str()
+            .unwrap()
+            .starts_with("00:02 rate limiter")
+    );
+    assert_eq!(line["mentioned"], true);
 }

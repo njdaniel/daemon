@@ -8,7 +8,8 @@
 //! suggestions), the [`Store`] handle and the JSONL export. Schema v2 (#16) adds per-question
 //! timing, CPU samples and the overrun count for `dmn bench --live`. Schema v4 (#53) adds the
 //! context `sources` and their `chunks`; v5 (#54) caches the job-description summary by content
-//! hash. Session summaries arrive with M2's session memory. [`Store::open_read_only`] lets a
+//! hash; v6 (#57) keeps the session memory: a summary line per answered question and the
+//! promises made in them. [`Store::open_read_only`] lets a
 //! `--no-store` run read the context without writing anything.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
@@ -19,6 +20,7 @@ mod export;
 mod migrate;
 mod sources;
 mod store;
+mod summaries;
 #[cfg(test)]
 mod tests;
 
@@ -31,3 +33,4 @@ pub use store::{
     CpuSampleRow, Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, NewSuggestion, Phase,
     QuestionRow, SegmentRow, SessionRow, Source, Store, SuggestionRow,
 };
+pub use summaries::{NewSummary, SummaryRow};

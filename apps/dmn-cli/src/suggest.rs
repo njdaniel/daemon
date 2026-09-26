@@ -38,8 +38,17 @@
 //! [`Policy::Supersede`] only questions still on screen (live, or queued behind a pin) get one,
 //! the live question first. `dmn replay` ([`Policy::AnswerAll`]) fills every question's sections,
 //! finishing the ones still waiting after the last candidate.
+//!
+//! #57, session memory: every answered question gets one summary line ([`Action::Summary`]). A
+//! question is summarised once the candidate has answered it, so the work rides on the next
+//! question's slow phase: the pipeline hands each candidate the question on screen and what the
+//! candidate said since it was asked ([`Answered`]), and that slow phase returns the line and any
+//! promise ("I'll come back to clock skew") with no extra request. A question whose line never
+//! comes that way (the slow phase is off, cut, or the session ended first) gets a fallback line
+//! from its own text ([`dmn_context::memory::fallback`]). Every fast and slow request carries the
+//! session's last 8 lines.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
@@ -51,8 +60,8 @@ use dmn_llm::fast::FAST_PHASE_TIMEOUT;
 use dmn_llm::schema::Star;
 use dmn_llm::{
     CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason, Kind,
-    LlmError, OllamaProvider, OllamaSettings, Provider, SlowFields, SlowOutcome, SlowRequest,
-    Suggestion, run_fast_phase, run_slow_phase,
+    LlmError, OllamaProvider, OllamaSettings, PreviousAnswer, Provider, SlowFields, SlowOutcome,
+    SlowRequest, Suggestion, run_fast_phase, run_slow_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
@@ -92,6 +101,62 @@ struct Job {
     transcript: String,
     /// `r`: the question on screen to answer again from a different angle.
     regenerate: Option<CurrentQuestion>,
+    /// #57: the question on screen when this candidate arrived, and the candidate's answer to it.
+    answered: Option<Answered>,
+}
+
+/// A shown question and what the candidate said while it was on screen (#57): what the next
+/// question's slow phase summarises. Built by the pipeline, which has the whole transcript.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answered {
+    /// Its candidate id.
+    pub id: u64,
+    pub question: String,
+    pub focus: String,
+    /// When it was asked, in audio seconds from the session start.
+    pub at: f64,
+    /// The candidate's words since then, oldest first.
+    pub answer: String,
+}
+
+/// A shown question, as far as its summary line needs it (#57).
+#[derive(Debug, Clone, PartialEq)]
+struct Asked {
+    id: u64,
+    question: String,
+    focus: String,
+    at: f64,
+}
+
+impl From<&Answered> for Asked {
+    fn from(a: &Answered) -> Self {
+        Self {
+            id: a.id,
+            question: a.question.clone(),
+            focus: a.focus.clone(),
+            at: a.at,
+        }
+    }
+}
+
+/// Which shown questions still owe their summary line (#57).
+#[derive(Debug, Default)]
+struct Memory {
+    shown: Vec<Asked>,
+    summarised: HashSet<u64>,
+}
+
+impl Memory {
+    fn shown(&mut self, job: &SlowJob) {
+        if !self.shown.iter().any(|a| a.id == job.id) {
+            self.shown.push(Asked {
+                id: job.id,
+                question: job.question.clone(),
+                focus: job.focus.clone(),
+                at: job.start,
+            });
+        }
+    }
 }
 
 /// How the fast phase went over the whole run.
@@ -123,6 +188,9 @@ pub struct Tally {
     pub slow_dropped: usize,
     /// Longest completed slow phase, request start to close.
     pub slow_slowest: Duration,
+    /// #57: summary lines written, and how many of them were fallbacks (no model line).
+    pub summaries: usize,
+    pub summary_fallbacks: usize,
 }
 
 impl Tally {
@@ -218,6 +286,8 @@ struct SlowJob {
     ready: Instant,
     /// Attempts cut short by a newer job.
     restarts: usize,
+    /// #57: the question shown before this one, to summarise along the way.
+    answered: Option<Answered>,
 }
 
 pub struct Suggester {
@@ -328,9 +398,22 @@ impl Suggester {
         }
     }
 
-    /// Queue candidate `id` for the fast phase. Never blocks the pipeline loop. Under
-    /// [`Policy::Supersede`], unless the session is pinned, this cancels the request in flight.
+    /// [`Suggester::submit_after`] with nothing answered before: the tests' way in.
+    #[cfg(test)]
     pub fn submit(&self, id: u64, candidate: &Candidate, transcript: String) {
+        self.submit_after(id, candidate, transcript, None);
+    }
+
+    /// Queue candidate `id` for the fast phase, with the question on screen and the candidate's
+    /// answer to it for session memory (#57). Never blocks the pipeline loop. Under
+    /// [`Policy::Supersede`], unless the session is pinned, this cancels the request in flight.
+    pub fn submit_after(
+        &self,
+        id: u64,
+        candidate: &Candidate,
+        transcript: String,
+        answered: Option<Answered>,
+    ) {
         if let Some(latest) = &self.latest {
             latest.newest.fetch_max(id, Ordering::AcqRel);
             if !self.hub.snapshot().pinned
@@ -344,6 +427,7 @@ impl Suggester {
             candidate: candidate.clone(),
             transcript,
             regenerate: None,
+            answered,
         });
     }
 
@@ -360,6 +444,7 @@ impl Suggester {
             candidate: candidate.clone(),
             transcript,
             regenerate: Some(current),
+            answered: None,
         });
     }
 
@@ -535,6 +620,7 @@ fn serve<P: Provider>(
 ) -> Result<(), LlmError> {
     let mut current: Option<CurrentQuestion> = None;
     let mut pending: VecDeque<SlowJob> = VecDeque::new();
+    let mut memory = Memory::default();
     let mut closed = false;
     loop {
         let job = match ch.rx.try_recv() {
@@ -549,9 +635,9 @@ fn serve<P: Provider>(
             Some(job) => job,
             None => {
                 if let (Some(timeout), Some(mut next)) =
-                    (slow, answerer.next_slow(&mut pending, tally))
+                    (slow, answerer.next_slow(&mut pending, &mut memory, tally))
                 {
-                    if answerer.run_slow(&mut next, timeout, ch.gate, context, tally)
+                    if answerer.run_slow(&mut next, timeout, ch.gate, context, &mut memory, tally)
                         == SlowRun::Interrupted
                     {
                         pending.push_front(next);
@@ -560,6 +646,16 @@ fn serve<P: Provider>(
                 }
                 if closed {
                     tally.slow_dropped += pending.len();
+                    // Every shown question still without its line gets its fallback now.
+                    let owed: Vec<Asked> = memory
+                        .shown
+                        .iter()
+                        .filter(|a| !memory.summarised.contains(&a.id))
+                        .cloned()
+                        .collect();
+                    for asked in &owed {
+                        answerer.summarise(asked, None, &mut memory, tally);
+                    }
                     return Ok(());
                 }
                 match ch.rx.recv() {
@@ -572,12 +668,33 @@ fn serve<P: Provider>(
             }
         };
         ch.gate.taken();
-        if let Some(next) = answerer.answer(job, &mut current, context, tally)?
-            && slow.is_some()
-        {
-            // A regeneration replaces its question's earlier slow job.
-            pending.retain(|p| p.id != next.id);
+        let carried = job.answered.clone();
+        let Some(mut next) = answerer.answer(job, &mut current, context, tally)? else {
+            // No slow phase from this job (ignored, a clarification, superseded, failed). While
+            // its previous question is still on screen the next job carries it again. If the
+            // screen moved on (a question that showed, then failed), nothing will: write that
+            // question's fallback line now rather than at the end of the session.
+            if let Some(prev) = carried
+                && answerer.hub.snapshot().live.map(|q| q.candidate) != Some(prev.id)
+            {
+                answerer.summarise(&Asked::from(&prev), None, &mut memory, tally);
+            }
+            continue;
+        };
+        memory.shown(&next);
+        if slow.is_some() {
+            // A regeneration replaces its question's earlier slow job, and takes over the
+            // summary that job still owed.
+            if let Some(at) = pending.iter().position(|p| p.id == next.id)
+                && let Some(old) = pending.remove(at)
+                && next.answered.is_none()
+            {
+                next.answered = old.answered;
+            }
             pending.push_back(next);
+        } else if let Some(prev) = next.answered.take() {
+            // No slow phase to write it: the previous question's fallback line, now.
+            answerer.summarise(&Asked::from(&prev), None, &mut memory, tally);
         }
     }
 }
@@ -672,6 +789,8 @@ impl<P: Provider> Answerer<'_, P> {
         let mut req = request(&job, current.as_ref());
         req.job_requirements = context.requirements().to_vec();
         req.chunks = retrieval.chunks.clone();
+        // #57: the session's last 8 summary lines.
+        req.summary = hub.snapshot().summary_for_prompt();
         let started = Instant::now();
         let mut question_at = None;
         let mut first_line_at = None;
@@ -788,6 +907,8 @@ impl<P: Provider> Answerer<'_, P> {
                             star: suggestion.star.clone(),
                             ready: Instant::now(),
                             restarts: 0,
+                            // A regenerate re-asks the same question: nothing new was answered.
+                            answered: job.answered.clone().filter(|a| a.id != job.id),
                         });
                     }
                 }
@@ -839,7 +960,12 @@ impl<P: Provider> Answerer<'_, P> {
     /// The next slow phase to run, or `None` when there is none (or the run was stopped). Under
     /// [`Policy::Supersede`] only questions still on screen count, the live one first; the rest
     /// are dropped. `dmn replay` takes them in order.
-    fn next_slow(&self, pending: &mut VecDeque<SlowJob>, tally: &mut Tally) -> Option<SlowJob> {
+    fn next_slow(
+        &self,
+        pending: &mut VecDeque<SlowJob>,
+        memory: &mut Memory,
+        tally: &mut Tally,
+    ) -> Option<SlowJob> {
         if self.cancel.is_cancelled() {
             tally.slow_dropped += pending.len();
             pending.clear();
@@ -852,9 +978,16 @@ impl<P: Provider> Answerer<'_, P> {
         let live = session.live.as_ref().map(|q| q.candidate);
         let on_screen =
             |id: u64| live == Some(id) || session.queued.iter().any(|q| q.candidate == id);
-        let before = pending.len();
-        pending.retain(|p| on_screen(p.id));
-        tally.slow_dropped += before - pending.len();
+        let (keep, dropped): (VecDeque<SlowJob>, VecDeque<SlowJob>) = std::mem::take(pending)
+            .into_iter()
+            .partition(|p| on_screen(p.id));
+        *pending = keep;
+        tally.slow_dropped += dropped.len();
+        // #57: a dropped slow phase would have summarised the question before it; write that
+        // question's fallback line now rather than at the end of the session.
+        for prev in dropped.iter().filter_map(|p| p.answered.as_ref()) {
+            self.summarise(&Asked::from(prev), None, memory, tally);
+        }
         let at = pending
             .iter()
             .position(|p| Some(p.id) == live)
@@ -871,6 +1004,7 @@ impl<P: Provider> Answerer<'_, P> {
         timeout: Duration,
         gate: &SlowGate,
         context: &mut Context,
+        memory: &mut Memory,
         tally: &mut Tally,
     ) -> SlowRun {
         let hub = self.hub;
@@ -898,6 +1032,17 @@ impl<P: Provider> Answerer<'_, P> {
         req.coding = wire::coding_mode(hub.snapshot().coding_solutions);
         req.chunk_files = retrieval.refs.iter().map(|r| r.file.clone()).collect();
         req.timeout = timeout;
+        // #57: the session's summary lines, and the previous question to summarise if it still
+        // owes its line.
+        req.context.summary = hub.snapshot().summary_for_prompt();
+        req.previous = job
+            .answered
+            .as_ref()
+            .filter(|a| !memory.summarised.contains(&a.id))
+            .map(|a| PreviousAnswer {
+                question: a.question.clone(),
+                answer: a.answer.clone(),
+            });
 
         hub.dispatch(Action::SlowStarted { candidate: job.id });
         let waited = job.ready.elapsed();
@@ -909,7 +1054,9 @@ impl<P: Provider> Answerer<'_, P> {
             .block_on(run_slow_phase(self.provider, &req, token.clone(), |f| {
                 arrived.push((f.name(), started.elapsed()));
                 fields.apply(&f);
-                hub.dispatch(wire::slow_field(job.id, &f));
+                if let Some(action) = wire::slow_field(job.id, &f) {
+                    hub.dispatch(action);
+                }
             }));
         *gate.inflight() = None;
         let took = started.elapsed();
@@ -962,7 +1109,93 @@ impl<P: Provider> Answerer<'_, P> {
                 self.output,
             );
         }
+        // #57: the previous question's line, from what this phase wrote (or its fallback).
+        if let Some(prev) = &job.answered {
+            self.summarise(&Asked::from(prev), Some(&fields), memory, tally);
+        }
         SlowRun::Finished
+    }
+
+    /// Write `asked`'s one summary line (#57): the model's summary and promise from `fields`
+    /// when it gave one, else the fallback from the question itself. Once per question.
+    fn summarise(
+        &self,
+        asked: &Asked,
+        fields: Option<&SlowFields>,
+        memory: &mut Memory,
+        tally: &mut Tally,
+    ) {
+        if !memory.summarised.insert(asked.id) {
+            return;
+        }
+        let model = fields
+            .and_then(|f| f.summary.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let mut flags = Vec::new();
+        // A promise only counts with the summary it came with.
+        let promise = model
+            .and(fields.and_then(|f| f.promise.as_deref()))
+            .map(|p| {
+                dmn_llm::limits::limit_line(
+                    "promise",
+                    p,
+                    dmn_llm::limits::PROMISE_CHARS,
+                    &mut flags,
+                )
+            })
+            .filter(|p| !p.is_empty());
+        let text = model.map_or_else(
+            || dmn_context::memory::fallback(&asked.question, &asked.focus),
+            str::to_owned,
+        );
+        let line = dmn_llm::limits::summary_line(
+            &dmn_context::memory::clock(asked.at),
+            &text,
+            promise.as_deref(),
+            &mut flags,
+        );
+        tally.summaries += 1;
+        if model.is_none() {
+            tally.summary_fallbacks += 1;
+        }
+        print_summary(
+            asked,
+            &line,
+            promise.as_deref(),
+            model.is_some(),
+            self.output,
+        );
+        self.hub.dispatch(Action::Summary {
+            candidate: asked.id,
+            line,
+            promise,
+            at: self.clock.now(),
+        });
+    }
+}
+
+/// A summary line as `dmn replay` prints it (#57). Its JSON type is `memory`: `summary` is the
+/// run's closing record, which `eval/run.py` reads.
+fn print_summary(asked: &Asked, line: &str, promise: Option<&str>, model: bool, output: Output) {
+    let Output::Print { json } = output else {
+        return;
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "memory",
+                "candidate": asked.id,
+                "question": asked.question,
+                "line": line,
+                "promise": promise,
+                "from": if model { "model" } else { "fallback" },
+            })
+        );
+    } else {
+        let from = if model { "" } else { " (fallback)" };
+        println!("  ~~ summary{from}: {line}");
     }
 }
 
@@ -1369,6 +1602,7 @@ mod tests {
                 question: "How would you design a rate limiter?".into(),
                 kind: dmn_llm::Kind::SystemDesign,
             }),
+            answered: None,
         };
         let mut tally = Tally::default();
         answerer
@@ -1805,6 +2039,7 @@ mod tests {
             candidate: candidate(),
             transcript: String::new(),
             regenerate: None,
+            answered: None,
         };
         let req = request(&job, None);
         assert!(!req.regenerate);
@@ -1827,5 +2062,221 @@ mod tests {
             v,
             serde_json::json!({"question": "q", "kind": "coding", "focus": "f", "approach": ["a"]})
         );
+    }
+
+    // --- Session memory (#57) ----------------------------------------------------------------
+
+    fn you_said(start: f64, text: &str) -> Action {
+        Action::Segment {
+            speaker: dmn_session::Speaker::You,
+            start,
+            end: start + 5.0,
+            text: text.into(),
+            is_final: true,
+            avg_logprob: -0.2,
+        }
+    }
+
+    fn answered_1(answer: &str) -> Answered {
+        Answered {
+            id: 1,
+            question: "Q1".into(),
+            focus: "tradeoffs".into(),
+            at: 1.0,
+            answer: answer.into(),
+        }
+    }
+
+    #[test]
+    fn a_promise_made_in_one_answer_shows_on_the_next_question_until_it_is_covered() {
+        let mut summarising = slow_json_reply();
+        summarising["summary"] = serde_json::json!("rate limiter — covered token bucket");
+        summarising["promise"] = serde_json::json!("clock skew");
+        // Request 1: fast Q1. 2: its slow phase (nothing answered yet). 3: fast Q2. 4: Q2's
+        // slow phase, which summarises the answer to Q1.
+        let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
+            .then_json(&slow_json_reply())
+            .then_json(&fast_json_reply("Q2", "system_design"))
+            .then_json(&summarising);
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        hub.dispatch(wire::candidate(1, &candidate()));
+        s.submit_after(1, &candidate(), String::new(), None);
+        assert!(wait_for(&hub, Duration::from_secs(5), |_| provider
+            .requests()
+            .len()
+            == 2));
+        assert!(
+            !provider.requests()[1].messages[1]
+                .content
+                .contains("Previous question"),
+            "nothing answered before Q1"
+        );
+        let answer = "Token bucket per key. I'll come back to clock skew.";
+        hub.dispatch(you_said(5.0, answer));
+
+        hub.dispatch(wire::candidate(2, &candidate()));
+        s.submit_after(2, &candidate(), String::new(), Some(answered_1(answer)));
+        let item = "Come back to clock skew: you said you would";
+        assert!(
+            wait_for(&hub, Duration::from_secs(5), |s| s
+                .live
+                .as_ref()
+                .is_some_and(
+                    |q| q.candidate == 2 && q.sections.mention.contains(&item.into())
+                )),
+            "the promise shows on Q2: {:?}",
+            hub.snapshot().live.map(|q| q.sections.mention)
+        );
+        let slow2 = &provider.requests()[3].messages[1].content;
+        assert!(
+            slow2.contains("## Previous question and the candidate's answer"),
+            "{slow2}"
+        );
+        assert!(
+            slow2.contains("Candidate said: Token bucket per key."),
+            "{slow2}"
+        );
+        let session = hub.snapshot();
+        assert_eq!(
+            session.summary[0].line,
+            "00:01 rate limiter — covered token bucket; promised to return to clock skew"
+        );
+
+        // Covering it closes it.
+        hub.dispatch(you_said(40.0, "Back to clock skew: NTP keeps it small."));
+        let session = hub.snapshot();
+        assert!(session.promises[0].mentioned);
+        assert!(
+            !session
+                .live
+                .unwrap()
+                .sections
+                .mention
+                .contains(&item.into())
+        );
+
+        let tally = s.finish();
+        assert_eq!(
+            (tally.summaries, tally.summary_fallbacks),
+            (2, 1),
+            "Q1 from the model; Q2, never followed, from the fallback: {tally:?}"
+        );
+        let session = hub.snapshot();
+        assert_eq!(session.summary.len(), 2, "one line per answered question");
+        assert_eq!(session.summary[1].line, "00:01 Q2 — asked about tradeoffs");
+    }
+
+    #[test]
+    fn every_prompt_carries_the_last_eight_summary_lines() {
+        let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q11", "system_design"))
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        for id in 1..=10u64 {
+            hub.dispatch(Action::Summary {
+                candidate: id,
+                line: format!("{id:02}:00 topic {id} — covered it"),
+                promise: None,
+                at: 1,
+            });
+        }
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        hub.dispatch(wire::candidate(11, &candidate()));
+        s.submit(11, &candidate(), String::new());
+        s.finish();
+        let sent = provider.requests();
+        assert_eq!(sent.len(), 2, "fast and slow");
+        for req in &sent {
+            let user = &req.messages[1].content;
+            assert!(user.contains("## Session so far"), "{user}");
+            assert!(!user.contains("topic 2 —"), "only the last 8: {user}");
+            for id in 3..=10 {
+                assert!(user.contains(&format!("topic {id} —")), "{user}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_the_slow_phase_off_every_answered_question_still_gets_its_line() {
+        let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
+            .then_json(&fast_json_reply("Q2", "system_design"));
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with(provider, Policy::AnswerAll, Arc::clone(&hub));
+        hub.dispatch(wire::candidate(1, &candidate()));
+        s.submit(1, &candidate(), String::new());
+        assert!(wait_for(&hub, Duration::from_secs(5), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.candidate == 1)));
+        hub.dispatch(wire::candidate(2, &candidate()));
+        s.submit_after(
+            2,
+            &candidate(),
+            String::new(),
+            Some(answered_1("Hash map.")),
+        );
+        let tally = s.finish();
+        assert_eq!(
+            (tally.summaries, tally.summary_fallbacks),
+            (2, 2),
+            "{tally:?}"
+        );
+        let lines: Vec<String> = hub.snapshot().summary.into_iter().map(|l| l.line).collect();
+        assert_eq!(
+            lines,
+            [
+                "00:01 Q1 — asked about tradeoffs",
+                "00:01 Q2 — asked about tradeoffs"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_question_that_shows_then_fails_writes_the_previous_line_at_once() {
+        // Q1 is on screen. Q2's question shows, then its reply breaks off: no slow phase will
+        // summarise Q1, so its fallback line is written now, not at the end of the session.
+        let mut broken = dmn_llm::mock::json_script(&fast_json_reply("Q2", "system_design"));
+        let cut = broken.len() / 2;
+        broken.truncate(cut);
+        broken.push(dmn_llm::mock::Step::Error("model crashed".into()));
+        let provider =
+            dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design")).then(broken);
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with(provider, Policy::AnswerAll, Arc::clone(&hub));
+        hub.dispatch(wire::candidate(1, &candidate()));
+        s.submit(1, &candidate(), String::new());
+        assert!(wait_for(&hub, Duration::from_secs(5), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.candidate == 1)));
+        hub.dispatch(wire::candidate(2, &candidate()));
+        s.submit_after(
+            2,
+            &candidate(),
+            String::new(),
+            Some(answered_1("Hash map.")),
+        );
+        assert!(
+            wait_for(&hub, Duration::from_secs(5), |s| s
+                .summary
+                .iter()
+                .any(|l| l.candidate == 1)),
+            "Q1's line is written once Q2 fails, before the session ends"
+        );
+        assert_eq!(hub.snapshot().live.unwrap().candidate, 2, "Q2 showed");
+        let tally = s.finish();
+        assert_eq!(tally.failed, 1, "{tally:?}");
     }
 }

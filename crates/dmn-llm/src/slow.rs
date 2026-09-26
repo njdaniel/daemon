@@ -15,6 +15,14 @@
 //! marks the rest (SPEC: "on timeout the UI keeps the previous section content and shows a small
 //! 'slow' tag").
 //!
+//! #57, session memory: when the candidate has answered an earlier question (the question shown
+//! before this one), the request carries that question and what the candidate said, and the
+//! reply adds a one-line `summary` of the answer and the `promise` the candidate made, if any
+//! ("I'll come back to clock skew"). They are published as [`SlowField::Summary`] and
+//! [`SlowField::Promise`], after the six sections, and belong to the earlier question: the
+//! caller turns them into its session summary line. The slow phase is the only place a question's
+//! answer is summarised, so session memory costs no extra request.
+//!
 //! The system prompt is the fast phase's own, word for word, and the user message starts as the
 //! fast phase's does; only the instructions after it differ. Ollama keeps the last prompt's KV
 //! cache, so a slow request between two questions leaves the next fast request's shared prefix
@@ -33,6 +41,7 @@ use crate::schema::{Deeper, Example, Kind, ResumeContext, Star, Tradeoff, slow_s
 use crate::stream_json::{IncrementalObject, JsonEvent};
 
 const INSTRUCTIONS: &str = include_str!("../prompts/slow.md");
+const SUMMARY_INSTRUCTIONS: &str = include_str!("../prompts/summary.md");
 
 /// SPEC § Providers: "Timeouts: fast phase 4 s, slow phase 20 s".
 pub const SLOW_PHASE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -44,6 +53,15 @@ pub enum CodingMode {
     #[default]
     Hints,
     Full,
+}
+
+/// The question shown before this one and what the candidate said while it was on screen: what
+/// the slow phase summarises for session memory (#57).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreviousAnswer {
+    pub question: String,
+    /// The candidate's own words, oldest first.
+    pub answer: String,
 }
 
 /// Everything the slow phase is asked about: the question on screen as the fast phase left it,
@@ -64,6 +82,8 @@ pub struct SlowRequest {
     /// The file of each chunk in `context.chunks`, in order: the only sources `resume_context`
     /// may cite.
     pub chunk_files: Vec<String>,
+    /// The earlier question to summarise (#57); `None` asks for no summary.
+    pub previous: Option<PreviousAnswer>,
     pub timeout: Duration,
 }
 
@@ -78,8 +98,17 @@ impl SlowRequest {
             star: None,
             coding: CodingMode::Hints,
             chunk_files: Vec::new(),
+            previous: None,
             timeout: SLOW_PHASE_TIMEOUT,
         }
+    }
+
+    /// A summary of the previous answer is asked for, and accepted, only when there is one with
+    /// something the candidate said.
+    pub fn wants_summary(&self) -> bool {
+        self.previous
+            .as_ref()
+            .is_some_and(|p| !p.answer.trim().is_empty())
     }
 
     /// A worked solution is asked for, and accepted, only for a coding question in `full` mode.
@@ -148,12 +177,24 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
             star.situation, star.task, star.action, star.result
         ));
     }
+    if let Some(prev) = req.previous.as_ref().filter(|_| req.wants_summary()) {
+        user.push_str(&format!(
+            "\n## Previous question and the candidate's answer\nPrevious question: {}\nCandidate said: {}\n",
+            prev.question.trim(),
+            prev.answer.trim()
+        ));
+    }
     user.push('\n');
     user.push_str(INSTRUCTIONS.trim_end());
     user.push('\n');
     let note = kind_note(req);
     if !note.is_empty() {
         user.push_str(note);
+        user.push('\n');
+    }
+    if req.wants_summary() {
+        user.push('\n');
+        user.push_str(SUMMARY_INSTRUCTIONS.trim_end());
         user.push('\n');
     }
     vec![
@@ -165,7 +206,7 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
 /// The request the slow phase sends: messages, the slow schema, temperature 0, its deadline.
 pub fn slow_chat_request(req: &SlowRequest) -> ChatRequest {
     ChatRequest::new(slow_messages(req))
-        .with_schema(slow_schema(req.wants_solution()))
+        .with_schema(slow_schema(req.wants_solution(), req.wants_summary()))
         .with_temperature(0.0)
         .with_timeout(req.timeout)
 }
@@ -182,6 +223,10 @@ pub enum SlowField {
     ResumeContext(Vec<ResumeContext>),
     /// Coding in `full` mode only; part of Deeper Answer.
     Solution(Example),
+    /// #57: one line on how the previous question was answered (not a section).
+    Summary(String),
+    /// #57: what the candidate promised to come back to in that answer; empty when nothing.
+    Promise(String),
 }
 
 impl SlowField {
@@ -195,6 +240,8 @@ impl SlowField {
             SlowField::Mention(_) => "mention",
             SlowField::ResumeContext(_) => "resume_context",
             SlowField::Solution(_) => "solution",
+            SlowField::Summary(_) => "summary",
+            SlowField::Promise(_) => "promise",
         }
     }
 }
@@ -216,6 +263,10 @@ pub struct SlowFields {
     pub resume_context: Option<Vec<ResumeContext>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub solution: Option<Example>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub promise: Option<String>,
 }
 
 impl SlowFields {
@@ -229,6 +280,8 @@ impl SlowFields {
             SlowField::Mention(v) => self.mention = Some(v),
             SlowField::ResumeContext(v) => self.resume_context = Some(v),
             SlowField::Solution(v) => self.solution = Some(v),
+            SlowField::Summary(v) => self.summary = Some(v),
+            SlowField::Promise(v) => self.promise = Some(v),
         }
     }
 
@@ -266,6 +319,7 @@ const SECTIONS: [&str; 6] = [
 #[derive(Debug)]
 pub struct SlowAssembler {
     wants_solution: bool,
+    wants_summary: bool,
     chunk_files: Vec<String>,
     fields: SlowFields,
     flags: Vec<Flag>,
@@ -276,6 +330,7 @@ impl SlowAssembler {
     pub fn new(req: &SlowRequest) -> Self {
         Self {
             wants_solution: req.wants_solution(),
+            wants_summary: req.wants_summary(),
             chunk_files: req.chunk_files.clone(),
             fields: SlowFields::default(),
             flags: Vec::new(),
@@ -359,6 +414,29 @@ impl SlowAssembler {
                 let v: Example = self.parse("solution", value);
                 let code = limits::limit_code("solution.code", v, limits::SOLUTION_LINES, flags)?;
                 SlowField::Solution(code)
+            }
+            "summary" | "promise" if !self.wants_summary => {
+                // Nothing was answered yet: a summary here would be made up.
+                self.flags.push(Flag::new(key.clone(), FlagKind::Rejected));
+                return None;
+            }
+            "summary" => {
+                let v: String = self.parse("summary", value);
+                SlowField::Summary(limits::limit_line(
+                    "summary",
+                    &v,
+                    limits::SUMMARY_CHARS,
+                    flags,
+                ))
+            }
+            "promise" => {
+                let v: String = self.parse("promise", value);
+                SlowField::Promise(limits::limit_line(
+                    "promise",
+                    &v,
+                    limits::PROMISE_CHARS,
+                    flags,
+                ))
             }
             _ => return None,
         };
@@ -503,6 +581,85 @@ mod tests {
         assert!(outcome.fields.solution.is_none());
     }
 
+    fn with_summary(mut v: serde_json::Value) -> serde_json::Value {
+        v["summary"] = json!("two sum —\n covered the hash map, one pass, O(n)");
+        v["promise"] = json!("the sorted-input variant");
+        v
+    }
+
+    #[tokio::test]
+    async fn a_previous_answer_is_summarised_after_the_sections() {
+        let mock = MockProvider::json(&with_summary(reply()));
+        let mut req = request(Kind::SystemDesign);
+        req.previous = Some(PreviousAnswer {
+            question: "Find two numbers that add up to a target.".into(),
+            answer: "I'd use a hash map in one pass. I'll come back to the sorted-input variant."
+                .into(),
+        });
+        let (events, outcome) = run(&mock, &req).await;
+        let names: Vec<&str> = events.iter().map(|(_, f)| f.name()).collect();
+        assert_eq!(names[6..], ["summary", "promise"], "{names:?}");
+        assert_eq!(
+            events[6].1,
+            SlowField::Summary("two sum — covered the hash map, one pass, O(n)".into()),
+            "one line"
+        );
+        assert_eq!(
+            events[7].1,
+            SlowField::Promise("the sorted-input variant".into())
+        );
+        let outcome = outcome.unwrap();
+        assert!(outcome.missing.is_empty(), "not sections: never missing");
+        assert_eq!(
+            outcome.fields.promise.as_deref(),
+            Some("the sorted-input variant")
+        );
+
+        let sent = &mock.requests()[0];
+        assert_eq!(sent.schema, Some(slow_schema(false, true)));
+        let user = &sent.messages[1].content;
+        assert!(
+            user.contains("## Previous question and the candidate's answer"),
+            "{user}"
+        );
+        assert!(
+            user.contains("Candidate said: I'd use a hash map"),
+            "{user}"
+        );
+        assert!(
+            user.contains("promise:"),
+            "the summary instructions ride along"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_nothing_answered_yet_no_summary_is_asked_for_or_kept() {
+        let mock = MockProvider::json(&with_summary(reply()));
+        let mut req = request(Kind::SystemDesign);
+        // A previous question the candidate said nothing to counts as none.
+        req.previous = Some(PreviousAnswer {
+            question: "Q".into(),
+            answer: "  ".into(),
+        });
+        let (events, outcome) = run(&mock, &req).await;
+        assert!(
+            events
+                .iter()
+                .all(|(_, f)| !matches!(f, SlowField::Summary(_) | SlowField::Promise(_))),
+            "{events:?}"
+        );
+        let sent = &mock.requests()[0];
+        assert_eq!(sent.schema, Some(slow_schema(false, false)));
+        assert!(!sent.messages[1].content.contains("Previous question"));
+        let flags = outcome.unwrap().flags;
+        assert!(
+            flags
+                .iter()
+                .any(|f| f.field == "summary" && f.kind == FlagKind::Rejected),
+            "{flags:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_request_shares_the_fast_prompt_and_adds_the_question_on_screen() {
         let mock = MockProvider::json(&reply());
@@ -511,7 +668,7 @@ mod tests {
         let sent = &mock.requests()[0];
         assert_eq!(sent.timeout, SLOW_PHASE_TIMEOUT);
         assert_eq!(sent.temperature, 0.0);
-        assert_eq!(sent.schema, Some(slow_schema(false)));
+        assert_eq!(sent.schema, Some(slow_schema(false, false)));
         assert_eq!(
             sent.messages[0].content,
             prompt::system_prompt(None),
@@ -552,7 +709,11 @@ mod tests {
                 .any(|f| f.field == "solution" && f.kind == FlagKind::Rejected)
         );
         let sent = &mock.requests()[0];
-        assert_eq!(sent.schema, Some(slow_schema(false)), "not even asked for");
+        assert_eq!(
+            sent.schema,
+            Some(slow_schema(false, false)),
+            "not even asked for"
+        );
         assert!(
             sent.messages[1]
                 .content
@@ -577,7 +738,7 @@ mod tests {
         };
         assert_eq!(solution.code.lines().count(), SOLUTION_LINES);
         assert_eq!(solution.language, "python");
-        assert_eq!(mock.requests()[0].schema, Some(slow_schema(true)));
+        assert_eq!(mock.requests()[0].schema, Some(slow_schema(true, false)));
         assert!(outcome.unwrap().fields.solution.is_some());
     }
 

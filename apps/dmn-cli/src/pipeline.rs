@@ -47,7 +47,7 @@ use dmn_vad::{
 };
 
 use crate::context::ContextSource;
-use crate::suggest::{Output, Policy, Suggester, Tally};
+use crate::suggest::{Answered, Output, Policy, Suggester, Tally};
 
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
 /// but an unpaced replay hands the VAD a whole interview in seconds, so this holds every
@@ -60,6 +60,30 @@ const DEFAULT_CAPACITY_FRAMES: usize = dmn_audio::DEFAULT_CAPACITY_FRAMES;
 
 /// How long the loop waits for a segment before it looks at commands and the stop flag again.
 const TICK: Duration = Duration::from_millis(50);
+
+/// How much of an answer the slow phase reads to summarise it (#57), in characters: its start
+/// and its end when it runs longer, since a promise ("I'll come back to...") can come anywhere.
+const ANSWER_CHARS: usize = 2400;
+
+/// The candidate's (`You`) finals that start in `[from, to)`, joined, cut to [`ANSWER_CHARS`]
+/// (its first and last halves) when longer.
+fn answer_between(finals: &[Segment], from: Duration, to: Duration) -> String {
+    let text = finals
+        .iter()
+        .filter(|s| s.source == Source::You && s.start >= from && s.start < to)
+        .map(|s| s.text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= ANSWER_CHARS {
+        return text;
+    }
+    let half = ANSWER_CHARS / 2;
+    let head: String = chars[..half].iter().collect();
+    let tail: String = chars[chars.len() - half..].iter().collect();
+    format!("{} … {}", head.trim_end(), tail.trim_start())
+}
 
 /// How often the monitor samples the process's CPU time into the session log.
 const CPU_EVERY: Duration = Duration::from_secs(5);
@@ -841,10 +865,30 @@ impl Pipeline {
                 at: self.audio.now(),
             });
             if let Some(s) = &self.suggester {
-                s.submit(id, &candidate, self.log.render_window(DEFAULT_WINDOW));
+                let answered = self.answered(&candidate);
+                s.submit_after(
+                    id,
+                    &candidate,
+                    self.log.render_window(DEFAULT_WINDOW),
+                    answered,
+                );
             }
             self.known.insert(id, candidate);
         }
+    }
+
+    /// #57, session memory: the question on screen as `next` arrives, and what the candidate
+    /// has said since it was asked. The next question's slow phase summarises it.
+    fn answered(&self, next: &Candidate) -> Option<Answered> {
+        let live = self.hub.snapshot().live?;
+        let asked = self.known.get(&live.candidate)?.start;
+        Some(Answered {
+            id: live.candidate,
+            question: live.text,
+            focus: live.focus,
+            at: asked.as_secs_f64(),
+            answer: answer_between(self.log.finals(), asked, next.start),
+        })
     }
 
     fn command(&mut self, cmd: Command) {
@@ -1252,6 +1296,38 @@ mod tests {
         );
         assert!(Partials::On.enabled(Speed::Fast));
         assert!(!Partials::Off.enabled(Speed::RealTime));
+    }
+
+    #[test]
+    fn an_answer_is_the_candidates_words_between_two_questions() {
+        let seg = |source, start: u64, text: &str| Segment {
+            source,
+            start: Duration::from_secs(start),
+            end: Duration::from_secs(start + 3),
+            text: text.into(),
+            is_final: true,
+            avg_logprob: -0.2,
+        };
+        let finals = [
+            seg(Source::You, 5, "Before the question."),
+            seg(Source::Interviewer, 10, "Design a cache."),
+            seg(Source::You, 14, "LRU in front of Redis."),
+            seg(Source::Interviewer, 20, "Mm-hm."),
+            seg(Source::You, 22, " I'll come back to eviction. "),
+            seg(Source::You, 40, "After the next question."),
+        ];
+        let from = Duration::from_secs(10);
+        let to = Duration::from_secs(35);
+        assert_eq!(
+            answer_between(&finals, from, to),
+            "LRU in front of Redis. I'll come back to eviction."
+        );
+        assert_eq!(answer_between(&finals, to, from), "", "an empty range");
+
+        let long = [seg(Source::You, 12, &"word ".repeat(1000))];
+        let cut = answer_between(&long, from, to);
+        assert!(cut.chars().count() <= ANSWER_CHARS + 3, "{}", cut.len());
+        assert!(cut.contains(" … "), "its start and its end are kept");
     }
 
     #[test]

@@ -809,3 +809,82 @@ fn a_read_only_open_reads_the_context_and_writes_nothing() {
         .unwrap();
     assert_eq!(v, 4, "left alone");
 }
+
+// --- Session memory (schema v6, #57) -----------------------------------------------------------
+
+#[test]
+fn a_v5_database_upgrades_to_v6_and_keeps_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 5).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label) VALUES (1, 1700000000, 'v5');
+             INSERT INTO segments (id, session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob)
+                 VALUES (1, 1, 'interviewer', 12.5, 18.0, 'Design a cache.', 1, -0.2);
+             INSERT INTO questions (id, session_id, segment_id, score, created_at)
+                 VALUES (1, 1, 1, 4, 1700000018);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.questions(1).unwrap().len(), 1, "earlier rows kept");
+    assert!(store.summaries(1).unwrap().is_empty());
+    assert!(
+        store
+            .schema_object_names()
+            .unwrap()
+            .contains(&"idx_summaries_session".to_string())
+    );
+}
+
+#[test]
+fn a_question_has_one_summary_line_its_promise_can_be_marked_and_export_carries_it() {
+    let store = store();
+    let (session_id, segment_id) = session_with_segment(&store);
+    let question_id = question_with_suggestion(&store, session_id, segment_id);
+    let new = crate::NewSummary {
+        session_id,
+        question_id,
+        line: "00:12 rate limiter — covered token bucket".into(),
+        promise: Some("clock skew".into()),
+        created_at: 1_700_000_100,
+    };
+    let id = store.put_summary(&new).unwrap();
+    // Summarised again: the line is replaced, not duplicated.
+    let again = store
+        .put_summary(&crate::NewSummary {
+            line: "00:12 rate limiter — covered token bucket, Redis".into(),
+            ..new.clone()
+        })
+        .unwrap();
+    assert_eq!(again, id);
+    store.set_promise_mentioned(question_id).unwrap();
+    let rows = store.summaries(session_id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].line,
+        "00:12 rate limiter — covered token bucket, Redis"
+    );
+    assert_eq!(rows[0].promise.as_deref(), Some("clock skew"));
+    assert!(rows[0].mentioned);
+
+    let mut out = Vec::new();
+    store.export_session_jsonl(session_id, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    let summary: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["type"] == "summary")
+        .collect();
+    assert_eq!(summary.len(), 1, "{text}");
+    assert_eq!(summary[0]["promise"], "clock skew");
+
+    // Purging the session takes its memory with it.
+    assert!(store.delete_session(session_id).unwrap());
+    assert!(store.summaries(session_id).unwrap().is_empty());
+}

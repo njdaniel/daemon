@@ -313,6 +313,17 @@ pub enum Action {
         payload: String,
         at: i64,
     },
+    /// #57, session memory: the one summary line for question `candidate`, written once the
+    /// candidate has answered it ("03:12 rate limiter — covered token bucket, Redis, fail-open;
+    /// promised to return to clock skew"), and what they promised to come back to, if anything.
+    /// An open promise shows in Things I Should Mention on every later question until a You
+    /// segment covers it. `at` is unix epoch seconds.
+    Summary {
+        candidate: u64,
+        line: String,
+        promise: Option<String>,
+        at: i64,
+    },
     /// `r`: ask the fast phase again for a question already on screen (or queued), with the
     /// "different angle" note at temperature 0.7. The new fields arrive tagged with the same
     /// candidate id and replace that question in place, pinned or not; until the new question

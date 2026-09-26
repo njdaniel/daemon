@@ -1,5 +1,5 @@
-//! JSONL export of one session: every segment, question and suggestion as one JSON object per
-//! line (`~/.local/share/dmn/sessions/<id>.jsonl`, SPEC § Privacy and storage).
+//! JSONL export of one session: every segment, question, suggestion and summary line (#57) as one
+//! JSON object per line (`~/.local/share/dmn/sessions/<id>.jsonl`, SPEC § Privacy and storage).
 
 use std::io::Write;
 
@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::error::StoreError;
 use crate::store::{CpuSampleRow, QuestionRow, SegmentRow, SessionRow, Store, SuggestionRow};
+use crate::summaries::SummaryRow;
 
 /// One line of the export. The `type` tag tells readers which table the row came from.
 #[derive(Serialize)]
@@ -17,6 +18,7 @@ enum ExportLine {
     Question(QuestionRow),
     Suggestion(SuggestionRow),
     Cpu(CpuSampleRow),
+    Summary(SummaryRow),
 }
 
 impl Store {
@@ -51,6 +53,11 @@ impl Store {
             self.cpu_samples(session_id)?
                 .into_iter()
                 .map(ExportLine::Cpu),
+        );
+        lines.extend(
+            self.summaries(session_id)?
+                .into_iter()
+                .map(ExportLine::Summary),
         );
 
         let mut written = 0;
