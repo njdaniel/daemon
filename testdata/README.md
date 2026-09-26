@@ -10,7 +10,7 @@ in `tools/fixtures/scripts/`, so anyone can regenerate or redistribute them.
 | `behavioral/` | 9:13 | 28 | 12 | STAR prompts ("Tell me about a time…", "Describe…", "Give me an example…") with short follow-ups |
 | `mixed/` | 9:03 | 32 | 10 | Small talk, "can you hear me okay?", rhetorical "…right?" lines that are not questions, hand-offs ("Let's switch gears"), and 6–7 s silences |
 | `continuous/` | 7:38 | 42 | 16 | #63: two-person speech with 0.4–0.6 s gaps; questions split mid-sentence by 0.9 s pauses (`||` in the script), so the VAD closes an utterance inside the question; fillers and restarts ("So, uh, how would you, um…", "What did you, uh, what did you…"); a clarifying question from the candidate; back-to-back interviewer statements; and a reverse-questions close ("Do you have any questions for me?") |
-| `es/` | 10:44 | 33 | 12 | #77: the same shape as `mixed/`, spoken in Spanish (system design with a clarification, STAR prompts, a knowledge and a coding question, a rhetorical "¿verdad?", a hand-off, a reverse-questions close). `questions.json` and `turns.json` hold the English reference in `text` and the Spanish words in `spoken`, so the pipeline is scored on whisper's translation: `python3 eval/run.py --fixture es --language auto --model small` |
+| `es/` | 10:45 | 35 | 13 | #77: the same shape as `mixed/`, spoken in Spanish (system design with a clarification, STAR prompts, a knowledge and a coding question, a rhetorical "¿verdad?", a hand-off, a reverse-questions close). `questions.json` and `turns.json` hold the English reference in `text` and the Spanish words in `spoken`, so the pipeline is scored on whisper's translation: `python3 eval/run.py --fixture es --language auto --model small` |
 
 ```
 testdata/
