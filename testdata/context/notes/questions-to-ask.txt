@@ -1,0 +1,7 @@
+Questions to ask the interviewer (fictional notes; a test fixture for dmn sources)
+
+What does on-call look like for this team, and how many pages a week is normal?
+Which system is the team most worried about for the next year, and why?
+How are design decisions written down and reviewed?
+What would a strong first ninety days look like in this role?
+How does the team decide between building something and buying it?

@@ -490,3 +490,185 @@ fn question_marks_keep_the_first_time_and_cpu_samples_round_trip() {
 fn no_session_means_no_latest() {
     assert_eq!(store().latest_session_id().unwrap(), None);
 }
+
+// --- Context sources (v4, #53) -----------------------------------------------------------------
+
+fn doc(kind: &str, path: &str) -> crate::NewSourceDoc {
+    crate::NewSourceDoc {
+        kind: kind.into(),
+        path: path.into(),
+        added_at: 1_700_000_000,
+        bytes: 1234,
+        tokens: 400,
+    }
+}
+
+fn chunks(texts: &[&str]) -> Vec<crate::NewChunk> {
+    texts
+        .iter()
+        .map(|t| crate::NewChunk {
+            text: (*t).into(),
+            tokens: 3,
+        })
+        .collect()
+}
+
+#[test]
+fn a_v3_database_upgrades_to_v4_keeping_its_sessions_and_gaining_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label) VALUES (1, 1700000000, 'v3');
+             INSERT INTO segments (id, session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob)
+                 VALUES (1, 1, 'interviewer', 1.0, 2.0, 'Tell me about yourself.', 1, -0.2);",
+        )
+        .unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(!names.contains(&"sources".to_string()), "v3 has no sources");
+    }
+
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.session(1).unwrap().unwrap().label, "v3");
+    assert_eq!(store.segments(1).unwrap().len(), 1);
+    assert_eq!(store.source_counts().unwrap(), (0, 0));
+    let objects = store.schema_object_names().unwrap();
+    for name in ["sources", "chunks", "idx_sources_kind", "idx_chunks_source"] {
+        assert!(objects.contains(&name.to_string()), "missing {name}");
+    }
+    store
+        .replace_source(&doc("resume", "/r.md"), &chunks(&["a", "b"]), true)
+        .unwrap();
+    assert_eq!(store.source_counts().unwrap(), (1, 2));
+}
+
+#[test]
+fn a_source_round_trips_with_its_chunks_in_order() {
+    let store = store();
+    let w = store
+        .replace_source(
+            &doc("notes", "/n/a.md"),
+            &chunks(&["one", "two", "three"]),
+            false,
+        )
+        .unwrap();
+    assert!(w.replaced.is_empty());
+    let all = store.sources().unwrap();
+    assert_eq!(all.len(), 1);
+    let s = &all[0];
+    assert_eq!(
+        (
+            s.id,
+            s.kind.as_str(),
+            s.path.as_str(),
+            s.bytes,
+            s.tokens,
+            s.chunks
+        ),
+        (w.id, "notes", "/n/a.md", 1234, 400, 3)
+    );
+    let texts: Vec<(i64, String)> = store
+        .source_chunks(w.id)
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.idx, c.text))
+        .collect();
+    assert_eq!(
+        texts,
+        [(0, "one".into()), (1, "two".into()), (2, "three".into())]
+    );
+}
+
+#[test]
+fn re_adding_a_path_replaces_its_chunks() {
+    let store = store();
+    let first = store
+        .replace_source(&doc("notes", "/n/a.md"), &chunks(&["old", "old"]), false)
+        .unwrap();
+    let second = store
+        .replace_source(&doc("notes", "/n/a.md"), &chunks(&["new"]), false)
+        .unwrap();
+    assert_eq!(second.replaced.len(), 1);
+    assert_eq!(second.replaced[0].id, first.id);
+    assert_ne!(second.id, first.id, "a stale id never names the new source");
+    assert_eq!(store.source_counts().unwrap(), (1, 1));
+    assert_eq!(store.source_chunks(second.id).unwrap()[0].text, "new");
+    assert!(store.source_chunks(first.id).unwrap().is_empty());
+}
+
+#[test]
+fn a_single_document_kind_replaces_the_previous_one_and_folders_accumulate() {
+    let store = store();
+    store
+        .replace_source(&doc("resume", "/old.pdf"), &chunks(&["x"]), true)
+        .unwrap();
+    store
+        .replace_source(&doc("notes", "/n/a.md"), &chunks(&["x"]), false)
+        .unwrap();
+    store
+        .replace_source(&doc("notes", "/n/b.md"), &chunks(&["x"]), false)
+        .unwrap();
+    let w = store
+        .replace_source(&doc("resume", "/new.md"), &chunks(&["y"]), true)
+        .unwrap();
+    assert_eq!(w.replaced.len(), 1);
+    assert_eq!(w.replaced[0].path, "/old.pdf");
+    let paths: Vec<String> = store
+        .sources()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.path)
+        .collect();
+    assert_eq!(
+        paths,
+        ["/n/a.md", "/n/b.md", "/new.md"],
+        "kind order, then path"
+    );
+}
+
+#[test]
+fn deleting_a_source_deletes_its_chunks_and_nothing_else() {
+    let store = store();
+    let a = store
+        .replace_source(&doc("notes", "/n/a.md"), &chunks(&["1", "2"]), false)
+        .unwrap();
+    store
+        .replace_source(&doc("notes", "/n/b.md"), &chunks(&["3"]), false)
+        .unwrap();
+    assert!(store.delete_source(a.id).unwrap());
+    assert!(!store.delete_source(a.id).unwrap(), "already gone");
+    assert_eq!(store.source_counts().unwrap(), (1, 1));
+}
+
+#[test]
+fn deleting_sessions_leaves_sources_alone() {
+    let store = store();
+    let (session_id, _) = session_with_segment(&store);
+    store
+        .replace_source(&doc("resume", "/r.md"), &chunks(&["a"]), true)
+        .unwrap();
+    assert!(store.delete_session(session_id).unwrap());
+    store.compact().unwrap();
+    assert_eq!(store.source_counts().unwrap(), (1, 1));
+}
+
+#[test]
+fn an_unknown_source_kind_is_rejected_and_nothing_is_half_written() {
+    let store = store();
+    assert!(matches!(
+        store.replace_source(&doc("diary", "/d.md"), &chunks(&["a"]), false),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert_eq!(store.source_counts().unwrap(), (0, 0));
+}

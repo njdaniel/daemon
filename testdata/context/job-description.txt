@@ -1,0 +1,27 @@
+Senior Backend Engineer, Platform Team (fictional company; test fixture for dmn sources)
+
+About the role
+We are looking for a senior backend engineer to join the platform team that runs our public
+API, the payment ledger and the event pipeline behind them. You will design services that
+handle millions of requests a minute, own them in production and help the rest of engineering
+build on top of them safely.
+
+What you will do
+- Design and build distributed services in Go or Rust, with clear APIs and strong guarantees.
+- Own reliability: service level objectives, alerting, on-call and blameless incident review.
+- Scale our data layer: Postgres sharding, caching with Redis, and streaming with Kafka.
+- Lead zero-downtime migrations and schema changes across teams.
+- Mentor engineers and raise the bar for design reviews and code reviews.
+
+What we are looking for
+- Six or more years building backend systems that run at scale in production.
+- Deep experience with at least one relational database and one message queue.
+- A track record of improving reliability and cost, backed by numbers.
+- Clear written communication; you write design documents people actually read.
+- Experience with rate limiting, idempotency and exactly-once or effectively-once processing
+  is a strong plus.
+
+How we work
+Small teams, written decisions, and a weekly production review. We interview with one system
+design round, one coding round, one behavioral round and a conversation with the hiring
+manager.

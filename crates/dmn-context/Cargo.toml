@@ -8,6 +8,12 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+dmn-store = { path = "../dmn-store" }
+# Pure-Rust PDF text extraction (lopdf underneath); no C bindings, no OCR (#53).
+pdf-extract = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
