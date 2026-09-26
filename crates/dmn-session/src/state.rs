@@ -10,6 +10,7 @@ use crate::action::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason, Section,
     SectionState, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
 };
+use crate::memory::{self, Promise, SummaryLine};
 
 /// How much transcript the session keeps: the SPEC's prompt window is the last 60 s, and the UI
 /// shows the last two lines, so nothing older is ever read from here.
@@ -185,6 +186,44 @@ impl Sections {
         };
     }
 
+    /// Things I Should Mention with every open promise first (#57), each once. They come on top
+    /// of the slow phase's own items: a promise is the candidate's, not the model's.
+    fn add_promises(&mut self, promises: &[Promise]) {
+        let items: Vec<String> = promises
+            .iter()
+            .filter(|p| !p.mentioned)
+            .map(Promise::mention_item)
+            .filter(|i| !self.mention.contains(i))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.mention.splice(0..0, items);
+        self.settle_mention();
+    }
+
+    /// A promise was covered: its item goes.
+    fn drop_promise(&mut self, promise: &Promise) {
+        let item = promise.mention_item();
+        let before = self.mention.len();
+        self.mention.retain(|i| *i != item);
+        if self.mention.len() != before {
+            self.settle_mention();
+        }
+    }
+
+    /// A decided Mention row follows its content: shown when it has some, hidden when not. A row
+    /// still loading, slow or failed keeps its state.
+    fn settle_mention(&mut self) {
+        let has = self.has_content(Section::Mention);
+        let state = &mut self.states.mention;
+        match state {
+            SectionState::Empty if has => *state = SectionState::Done,
+            SectionState::Done if !has => *state = SectionState::Empty,
+            _ => {}
+        }
+    }
+
     /// A new (or restarted) slow phase: every section is loading again, content kept.
     fn start(&mut self) {
         self.started = true;
@@ -338,6 +377,12 @@ pub struct Session {
     /// What Deeper Answer may hold for coding questions (#50); shown in the footer.
     #[serde(default)]
     pub coding_solutions: CodingSolutions,
+    /// #57, session memory: one line per answered question, in question order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary: Vec<SummaryLine>,
+    /// #57: what the candidate promised to come back to, open or since covered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promises: Vec<Promise>,
 }
 
 impl Session {
@@ -348,6 +393,20 @@ impl Session {
             reduce(&mut s, a);
         }
         s
+    }
+
+    /// The last [`memory::PROMPT_LINES`] summary lines, oldest first: what every prompt carries.
+    pub fn summary_for_prompt(&self) -> Vec<String> {
+        let skip = self.summary.len().saturating_sub(memory::PROMPT_LINES);
+        self.summary[skip..]
+            .iter()
+            .map(|l| l.line.clone())
+            .collect()
+    }
+
+    /// Every question on screen: the live one and those queued behind a pin.
+    fn questions_mut(&mut self) -> impl Iterator<Item = &mut Question> {
+        self.live.iter_mut().chain(self.queued.iter_mut())
     }
 
     /// The question (live or queued) a candidate's fast-phase fields belong to.
@@ -434,6 +493,23 @@ pub fn reduce(s: &mut Session, action: &Action) {
             if *speaker == Speaker::Interviewer {
                 s.last_interviewer = Some(text.clone());
             }
+            if *speaker == Speaker::You {
+                let kept: Vec<Promise> = s
+                    .promises
+                    .iter_mut()
+                    .filter(|p| !p.mentioned && memory::covers(&p.text, text))
+                    .map(|p| {
+                        p.mentioned = true;
+                        p.clone()
+                    })
+                    .collect();
+                for p in &kept {
+                    s.questions_mut().for_each(|q| {
+                        q.sections.drop_promise(p);
+                        q.settle_open();
+                    });
+                }
+            }
             s.transcript.push(line);
             let latest = s.transcript.iter().map(|l| l.end).fold(*end, f64::max);
             s.transcript
@@ -460,6 +536,8 @@ pub fn reduce(s: &mut Session, action: &Action) {
                 *existing = q;
                 return;
             }
+            // #57: a new question starts with the promises still open.
+            q.sections.add_promises(&s.promises);
             if s.pinned && s.live.is_some() {
                 s.queued.push(q);
             } else {
@@ -536,9 +614,46 @@ pub fn reduce(s: &mut Session, action: &Action) {
             }
         }
         Action::Slow { candidate, field } => {
+            let promises = s.promises.clone();
             if let Some(q) = s.question_mut(*candidate) {
                 q.sections.set(field);
+                if matches!(field, SlowField::Mention { .. }) {
+                    q.sections.add_promises(&promises);
+                }
                 q.settle_open();
+            }
+        }
+        Action::Summary {
+            candidate,
+            line,
+            promise,
+            ..
+        } => {
+            match s.summary.iter_mut().find(|l| l.candidate == *candidate) {
+                Some(existing) => existing.line = line.clone(),
+                None => {
+                    let at = s.summary.partition_point(|l| l.candidate < *candidate);
+                    s.summary.insert(
+                        at,
+                        SummaryLine {
+                            candidate: *candidate,
+                            line: line.clone(),
+                        },
+                    );
+                }
+            }
+            let text = promise.as_deref().map(str::trim).unwrap_or_default();
+            if !text.is_empty() && !s.promises.iter().any(|p| p.candidate == *candidate) {
+                let promise = Promise {
+                    candidate: *candidate,
+                    text: text.to_owned(),
+                    mentioned: false,
+                };
+                // It shows on the questions after the one it was made in.
+                for q in s.questions_mut().filter(|q| q.candidate != *candidate) {
+                    q.sections.add_promises(std::slice::from_ref(&promise));
+                }
+                s.promises.push(promise);
             }
         }
         Action::SlowEnded { candidate, end, .. } => {

@@ -193,7 +193,12 @@ fn fast_schema_base() -> serde_json::Value {
 /// coding question in `full` mode, because it is the longest field. Every field is required (an
 /// empty list or empty code is a valid answer), so the reply always closes with every section
 /// decided.
-pub fn slow_schema(with_solution: bool) -> serde_json::Value {
+///
+/// With `with_summary` (#57: the candidate has answered an earlier question), `summary` and
+/// `promise` follow the sections: one line on how that answer went, and the topic the candidate
+/// promised to come back to (empty when none). They come after the sections so they never delay
+/// what is on screen.
+pub fn slow_schema(with_solution: bool, with_summary: bool) -> serde_json::Value {
     use crate::limits::{DEEPER_MAX, LIST_MAX};
     let string_list = |max: usize| serde_json::json!({ "type": "array", "items": { "type": "string" }, "maxItems": max });
     let code = serde_json::json!({
@@ -250,6 +255,16 @@ pub fn slow_schema(with_solution: bool) -> serde_json::Value {
         },
         "required": ["deeper", "followups", "tradeoffs", "example", "mention", "resume_context"]
     });
+    if with_summary {
+        if let Some(props) = schema["properties"].as_object_mut() {
+            props.insert("summary".into(), serde_json::json!({ "type": "string" }));
+            props.insert("promise".into(), serde_json::json!({ "type": "string" }));
+        }
+        if let Some(required) = schema["required"].as_array_mut() {
+            required.push("summary".into());
+            required.push("promise".into());
+        }
+    }
     if with_solution {
         if let Some(props) = schema["properties"].as_object_mut() {
             props.insert("solution".into(), code);
@@ -276,7 +291,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            keys(&slow_schema(false)),
+            keys(&slow_schema(false, false)),
             [
                 "deeper",
                 "followups",
@@ -286,7 +301,7 @@ mod tests {
                 "resume_context"
             ]
         );
-        let full = slow_schema(true);
+        let full = slow_schema(true, false);
         assert_eq!(keys(&full).last().map(String::as_str), Some("solution"));
         assert!(
             full["required"]
@@ -294,7 +309,24 @@ mod tests {
                 .unwrap()
                 .contains(&"solution".into())
         );
-        assert!(!slow_schema(false).to_string().contains("solution"));
+        assert!(!slow_schema(false, false).to_string().contains("solution"));
+        assert!(!slow_schema(false, false).to_string().contains("summary"));
+    }
+
+    #[test]
+    fn the_summary_follows_the_sections_and_precedes_a_solution() {
+        let keys: Vec<String> = slow_schema(true, true)["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys[5..],
+            ["resume_context", "summary", "promise", "solution"]
+        );
+        let required = slow_schema(false, true)["required"].clone();
+        assert!(required.as_array().unwrap().contains(&"promise".into()));
     }
 
     #[test]

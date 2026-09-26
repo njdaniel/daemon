@@ -244,8 +244,9 @@ fn code_block(e: &dmn_llm::schema::Example) -> CodeBlock {
     }
 }
 
-/// One slow-phase field for candidate `id` (#55).
-pub fn slow_field(id: u64, field: &dmn_llm::SlowField) -> Action {
+/// One slow-phase field for candidate `id` (#55), or `None` for the summary and promise (#57):
+/// those are about the previous question and become one [`Action::Summary`] when the phase ends.
+pub fn slow_field(id: u64, field: &dmn_llm::SlowField) -> Option<Action> {
     use dmn_llm::SlowField as L;
     let field = match field {
         L::Deeper(items) => SlowField::Deeper {
@@ -288,11 +289,12 @@ pub fn slow_field(id: u64, field: &dmn_llm::SlowField) -> Action {
         L::Solution(code) => SlowField::Solution {
             code: code_block(code),
         },
+        L::Summary(_) | L::Promise(_) => return None,
     };
-    Action::Slow {
+    Some(Action::Slow {
         candidate: id,
         field,
-    }
+    })
 }
 
 /// How candidate `id`'s slow phase ended, with the fields that arrived (for the store). `stopped`
@@ -331,7 +333,7 @@ mod tests {
         let a = slow_field(3, &dmn_llm::SlowField::Solution(example.clone()));
         assert_eq!(
             a,
-            Action::Slow {
+            Some(Action::Slow {
                 candidate: 3,
                 field: SlowField::Solution {
                     code: CodeBlock {
@@ -339,7 +341,12 @@ mod tests {
                         code: "x = 1".into(),
                     }
                 }
-            }
+            })
+        );
+        assert_eq!(
+            slow_field(3, &dmn_llm::SlowField::Summary("x".into())),
+            None,
+            "a summary is about the previous question, not a section of this one"
         );
         let mut fields = dmn_llm::SlowFields::default();
         fields.apply(&dmn_llm::SlowField::Example(Some(example)));
