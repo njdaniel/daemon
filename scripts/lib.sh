@@ -6,7 +6,7 @@ PROCESS="$ROOT/docs/PROCESS.md"
 
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "$1 is required"; }
-need gh; need jq; need claude
+need gh; need jq  # each script checks for its own model CLI (claude, agy)
 
 # model_id <sonnet|opus|fable>
 model_id() {
