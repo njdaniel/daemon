@@ -28,7 +28,18 @@
 //! ([`crate::context`]): the stored sources and the job requirements, summarising a new job
 //! description once. Every request then carries the requirements and the chunks retrieved for
 //! its question, and `dmn replay --json` records which chunks went with each candidate.
+//!
+//! #55, the slow phase: once a question is shown, a second request fills its six expandable
+//! sections. The fast phase always wins the model. Ollama serves one request at a time
+//! (`OLLAMA_NUM_PARALLEL=1`), so a slow request in flight (up to 20 s) would hold the next
+//! question's fast phase behind it. Every job handed to the thread therefore cancels the slow
+//! request in flight first ([`SlowGate`]), and the thread runs a slow phase only when no job is
+//! waiting. An interrupted slow phase goes back in line and starts again later; under
+//! [`Policy::Supersede`] only questions still on screen (live, or queued behind a pin) get one,
+//! the live question first. `dmn replay` ([`Policy::AnswerAll`]) fills every question's sections,
+//! finishing the ones still waiting after the last candidate.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
@@ -37,9 +48,11 @@ use std::time::{Duration, Instant};
 use dmn_core::{config, wire};
 use dmn_detect::Candidate;
 use dmn_llm::fast::FAST_PHASE_TIMEOUT;
+use dmn_llm::schema::Star;
 use dmn_llm::{
-    CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason,
-    LlmError, OllamaProvider, OllamaSettings, Provider, Suggestion, run_fast_phase,
+    CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason, Kind,
+    LlmError, OllamaProvider, OllamaSettings, Provider, SlowFields, SlowOutcome, SlowRequest,
+    Suggestion, run_fast_phase, run_slow_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
@@ -100,6 +113,16 @@ pub struct Tally {
     pub retrievals: usize,
     pub retrieval_slowest: Duration,
     pub retrieval_total: Duration,
+    /// #55: slow phases that filled every section, that hit the deadline, that failed.
+    pub slow_done: usize,
+    pub slow_timed_out: usize,
+    pub slow_failed: usize,
+    /// Slow phases cut short because a new candidate needed the model, and started again.
+    pub slow_restarts: usize,
+    /// Shown questions whose slow phase never ran: superseded, or the run was stopped.
+    pub slow_dropped: usize,
+    /// Longest completed slow phase, request start to close.
+    pub slow_slowest: Duration,
 }
 
 impl Tally {
@@ -144,6 +167,59 @@ impl Latest {
     }
 }
 
+/// What lets a new job reach a slow phase in flight (#55): how many jobs were handed over but not
+/// yet taken, and the slow request's token.
+///
+/// A sender bumps `waiting` and then cancels `inflight`; the thread publishes a slow request's
+/// token and then reads `waiting`. So a job handed over while a slow phase is starting either
+/// finds its token and cancels it, or is seen by the thread before the request is sent.
+#[derive(Default)]
+struct SlowGate {
+    waiting: AtomicU64,
+    inflight: Mutex<Option<CancellationToken>>,
+}
+
+impl SlowGate {
+    fn inflight(&self) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
+        self.inflight.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A job is on its way: stop the slow phase, if one is running.
+    fn arriving(&self) {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        if let Some(token) = self.inflight().as_ref() {
+            token.cancel();
+        }
+    }
+
+    /// The thread took a job.
+    fn taken(&self) {
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn job_waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// A shown question whose slow phase is still to run (#55).
+struct SlowJob {
+    id: u64,
+    /// What the Interviewer said (the candidate text) and where it starts in the audio.
+    said: String,
+    start: f64,
+    transcript: String,
+    question: String,
+    kind: Kind,
+    focus: String,
+    approach: Vec<String>,
+    star: Option<Star>,
+    /// When its fast phase finished.
+    ready: Instant,
+    /// Attempts cut short by a newer job.
+    restarts: usize,
+}
+
 pub struct Suggester {
     tx: mpsc::Sender<Job>,
     cancel: CancellationToken,
@@ -151,6 +227,7 @@ pub struct Suggester {
     hub: Arc<SessionHub>,
     /// `Some` under [`Policy::Supersede`].
     latest: Option<Arc<Latest>>,
+    gate: Arc<SlowGate>,
 }
 
 impl Suggester {
@@ -167,32 +244,33 @@ impl Suggester {
         context: ContextSource,
     ) -> Self {
         let llm = llm.clone();
-        Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
-            worker(
-                &llm, output, rx, hub, clock, audio, cancel, latest, &context,
-            )
+        Self::spawn(policy, hub, move |ch| {
+            worker(&llm, output, clock, audio, &ch, &context)
         })
     }
 
-    /// Serve jobs on `provider` directly, with no warm-up and no context: the tests' way in.
+    /// Serve jobs on `provider` directly, with no warm-up, no context and no slow phase: the
+    /// tests' way in.
     #[cfg(test)]
     fn start_with<P: Provider + Send + 'static>(
         provider: P,
         policy: Policy,
         hub: Arc<SessionHub>,
     ) -> Self {
-        Self::start_with_context(provider, policy, hub, Context::empty())
+        Self::start_with_context(provider, policy, hub, Context::empty(), None)
     }
 
-    /// [`Suggester::start_with`] with `context` already loaded.
+    /// [`Suggester::start_with`] with `context` already loaded, and the slow phase on when
+    /// `slow` gives its deadline.
     #[cfg(test)]
     fn start_with_context<P: Provider + Send + 'static>(
         provider: P,
         policy: Policy,
         hub: Arc<SessionHub>,
         mut context: Context,
+        slow: Option<Duration>,
     ) -> Self {
-        Self::spawn(policy, hub, move |rx, hub, latest, cancel| {
+        Self::spawn(policy, hub, move |ch| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -200,21 +278,18 @@ impl Suggester {
             let answerer = Answerer {
                 rt: &rt,
                 provider: &provider,
-                hub,
+                hub: ch.hub,
                 clock: wire::SessionClock::start(1.0),
                 audio: wire::AudioClock::new(Instant::now(), 1.0),
                 output: Output::Quiet,
-                cancel,
-                latest,
+                cancel: ch.cancel,
+                latest: ch.latest,
             };
             let mut tally = Tally {
                 context: context.info(),
                 ..Tally::default()
             };
-            let mut current = None;
-            while let Ok(job) = rx.recv() {
-                let _ = answerer.answer(job, &mut current, &mut context, &mut tally);
-            }
+            let _ = serve(&answerer, &ch, slow, &mut context, &mut tally);
             tally
         })
     }
@@ -222,26 +297,34 @@ impl Suggester {
     fn spawn(
         policy: Policy,
         hub: Arc<SessionHub>,
-        serve: impl FnOnce(
-            &mpsc::Receiver<Job>,
-            &SessionHub,
-            Option<&Latest>,
-            &CancellationToken,
-        ) -> Tally
-        + Send
-        + 'static,
+        serve: impl FnOnce(Channels<'_>) -> Tally + Send + 'static,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = CancellationToken::new();
         let latest = (policy == Policy::Supersede).then(|| Arc::new(Latest::default()));
-        let (token, shared, worker_hub) = (cancel.clone(), latest.clone(), Arc::clone(&hub));
-        let handle = std::thread::spawn(move || serve(&rx, &worker_hub, shared.as_deref(), &token));
+        let gate = Arc::new(SlowGate::default());
+        let (token, shared, worker_hub, worker_gate) = (
+            cancel.clone(),
+            latest.clone(),
+            Arc::clone(&hub),
+            Arc::clone(&gate),
+        );
+        let handle = std::thread::spawn(move || {
+            serve(Channels {
+                rx: &rx,
+                hub: &worker_hub,
+                latest: shared.as_deref(),
+                cancel: &token,
+                gate: &worker_gate,
+            })
+        });
         Self {
             tx,
             cancel,
             handle,
             hub,
             latest,
+            gate,
         }
     }
 
@@ -281,6 +364,8 @@ impl Suggester {
     }
 
     fn send(&self, job: Job) {
+        // #55: the fast phase always wins the model; a slow phase in flight stops first.
+        self.gate.arriving();
         // A send only fails once the worker has exited, which it does only after the sender
         // drops or the run is stopped; nothing to do then.
         let _ = self.tx.send(job);
@@ -299,18 +384,25 @@ impl Suggester {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the serving thread shares with the [`Suggester`] that spawned it.
+struct Channels<'a> {
+    rx: &'a mpsc::Receiver<Job>,
+    hub: &'a SessionHub,
+    /// `Some` under [`Policy::Supersede`].
+    latest: Option<&'a Latest>,
+    cancel: &'a CancellationToken,
+    gate: &'a SlowGate,
+}
+
 fn worker(
     llm: &config::Llm,
     output: Output,
-    rx: &mpsc::Receiver<Job>,
-    hub: &SessionHub,
     clock: wire::SessionClock,
     audio: wire::AudioClock,
-    cancel: &CancellationToken,
-    latest: Option<&Latest>,
+    ch: &Channels<'_>,
     context: &ContextSource,
 ) -> Tally {
+    let (rx, hub, cancel) = (ch.rx, ch.hub, ch.cancel);
     let mut tally = Tally::default();
     let model_down = |why: String| {
         hub.dispatch(Action::Status {
@@ -417,20 +509,86 @@ fn worker(
         audio,
         output,
         cancel,
-        latest,
+        latest: ch.latest,
     };
-    let mut current: Option<CurrentQuestion> = None;
-    while let Ok(job) = rx.recv() {
-        if let Err(e) = answerer.answer(job, &mut current, &mut context, &mut tally) {
-            output.warn(&format!(
-                "no suggestions from here on: {e}; transcribing only"
-            ));
-            model_down(e.to_string());
-            skip_all(&mut tally, "LLM unavailable");
-            return tally;
-        }
+    // `[llm].slow_timeout_ms = 0` turns the slow phase off.
+    let slow = (llm.slow_timeout_ms > 0).then(|| Duration::from_millis(llm.slow_timeout_ms));
+    if let Err(e) = serve(&answerer, ch, slow, &mut context, &mut tally) {
+        output.warn(&format!(
+            "no suggestions from here on: {e}; transcribing only"
+        ));
+        model_down(e.to_string());
+        skip_all(&mut tally, "LLM unavailable");
     }
     tally
+}
+
+/// Serve jobs until the sender drops (or the run is stopped). A job waiting always goes first;
+/// the slow phase (when `slow` gives its deadline) runs only while none is. `Err` only for an
+/// unreachable provider, after which nothing more is sent.
+fn serve<P: Provider>(
+    answerer: &Answerer<'_, P>,
+    ch: &Channels<'_>,
+    slow: Option<Duration>,
+    context: &mut Context,
+    tally: &mut Tally,
+) -> Result<(), LlmError> {
+    let mut current: Option<CurrentQuestion> = None;
+    let mut pending: VecDeque<SlowJob> = VecDeque::new();
+    let mut closed = false;
+    loop {
+        let job = match ch.rx.try_recv() {
+            Ok(job) => Some(job),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                closed = true;
+                None
+            }
+        };
+        let job = match job {
+            Some(job) => job,
+            None => {
+                if let (Some(timeout), Some(mut next)) =
+                    (slow, answerer.next_slow(&mut pending, tally))
+                {
+                    if answerer.run_slow(&mut next, timeout, ch.gate, context, tally)
+                        == SlowRun::Interrupted
+                    {
+                        pending.push_front(next);
+                    }
+                    continue;
+                }
+                if closed {
+                    tally.slow_dropped += pending.len();
+                    return Ok(());
+                }
+                match ch.rx.recv() {
+                    Ok(job) => job,
+                    Err(_) => {
+                        closed = true;
+                        continue;
+                    }
+                }
+            }
+        };
+        ch.gate.taken();
+        if let Some(next) = answerer.answer(job, &mut current, context, tally)?
+            && slow.is_some()
+        {
+            // A regeneration replaces its question's earlier slow job.
+            pending.retain(|p| p.id != next.id);
+            pending.push_back(next);
+        }
+    }
+}
+
+/// How one slow-phase attempt went, for [`serve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlowRun {
+    /// It ended (filled, timed out, failed, or the run was stopped): done with this question.
+    Finished,
+    /// A new job needed the model: try again later.
+    Interrupted,
 }
 
 /// Runs one job at a time against a provider (Ollama in `dmn`, a `MockProvider` in tests).
@@ -459,15 +617,16 @@ fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
 }
 
 impl<P: Provider> Answerer<'_, P> {
-    /// Answer one job and dispatch everything it produced. `Err` only for an unreachable
-    /// provider, after which nothing more is sent.
+    /// Answer one job and dispatch everything it produced. Returns the slow phase to run for a
+    /// question it put on screen (#55). `Err` only for an unreachable provider, after which
+    /// nothing more is sent.
     fn answer(
         &self,
         job: Job,
         current: &mut Option<CurrentQuestion>,
         context: &mut Context,
         tally: &mut Tally,
-    ) -> Result<(), LlmError> {
+    ) -> Result<Option<SlowJob>, LlmError> {
         let hub = self.hub;
         if self.cancel.is_cancelled() {
             hub.dispatch(Action::Failed {
@@ -475,7 +634,7 @@ impl<P: Provider> Answerer<'_, P> {
                 error: "stopped".into(),
             });
             tally.skipped += 1;
-            return Ok(());
+            return Ok(None);
         }
         let regenerating = job.regenerate.is_some();
         // Publish this request's token before looking at `newest`: `submit` bumps `newest`
@@ -499,7 +658,7 @@ impl<P: Provider> Answerer<'_, P> {
                 error: SUPERSEDED.into(),
             });
             tally.superseded += 1;
-            return Ok(());
+            return Ok(None);
         }
         // #54: the requirements every prompt carries, and the chunks for this question (the
         // question on screen when regenerating). Timed from here, so its cost is visible in the
@@ -563,7 +722,7 @@ impl<P: Provider> Answerer<'_, P> {
                 error: SUPERSEDED.into(),
             });
             tally.superseded += 1;
-            return Ok(());
+            return Ok(None);
         }
         hub.dispatch(wire::outcome(job.id, &result, self.clock.now()));
         // SPEC § Transcript & status: a failed request turns the model dot red with its reason
@@ -586,6 +745,7 @@ impl<P: Provider> Answerer<'_, P> {
             first_line: first_line_at,
             total: started.elapsed(),
         };
+        let mut slow = None;
         match result {
             Ok(FastOutcome::Shown {
                 suggestion,
@@ -613,6 +773,21 @@ impl<P: Provider> Answerer<'_, P> {
                         *current = Some(CurrentQuestion {
                             question: suggestion.question.clone(),
                             kind,
+                        });
+                        // #55: a question on screen gets its sections filled next. A
+                        // clarification attaches to the question above it and gets none.
+                        slow = Some(SlowJob {
+                            id: job.id,
+                            said: job.candidate.text.clone(),
+                            start: job.candidate.start.as_secs_f64(),
+                            transcript: job.transcript.clone(),
+                            question: suggestion.question.clone(),
+                            kind,
+                            focus: suggestion.focus.clone(),
+                            approach: suggestion.approach.clone(),
+                            star: suggestion.star.clone(),
+                            ready: Instant::now(),
+                            restarts: 0,
                         });
                     }
                 }
@@ -658,8 +833,212 @@ impl<P: Provider> Answerer<'_, P> {
                 tally.failed += 1;
             }
         }
-        Ok(())
+        Ok(slow)
     }
+
+    /// The next slow phase to run, or `None` when there is none (or the run was stopped). Under
+    /// [`Policy::Supersede`] only questions still on screen count, the live one first; the rest
+    /// are dropped. `dmn replay` takes them in order.
+    fn next_slow(&self, pending: &mut VecDeque<SlowJob>, tally: &mut Tally) -> Option<SlowJob> {
+        if self.cancel.is_cancelled() {
+            tally.slow_dropped += pending.len();
+            pending.clear();
+            return None;
+        }
+        if self.latest.is_none() {
+            return pending.pop_front();
+        }
+        let session = self.hub.snapshot();
+        let live = session.live.as_ref().map(|q| q.candidate);
+        let on_screen =
+            |id: u64| live == Some(id) || session.queued.iter().any(|q| q.candidate == id);
+        let before = pending.len();
+        pending.retain(|p| on_screen(p.id));
+        tally.slow_dropped += before - pending.len();
+        let at = pending
+            .iter()
+            .position(|p| Some(p.id) == live)
+            .or_else(|| pending.len().checked_sub(1))?;
+        pending.remove(at)
+    }
+
+    /// One slow-phase attempt for `job`, dispatching each section as it arrives. Interrupted
+    /// (and nothing ended in the session) when a job needs the model; then `job` runs again
+    /// later from the start.
+    fn run_slow(
+        &self,
+        job: &mut SlowJob,
+        timeout: Duration,
+        gate: &SlowGate,
+        context: &mut Context,
+        tally: &mut Tally,
+    ) -> SlowRun {
+        let hub = self.hub;
+        // Publish the token, then look for a waiting job: see [`SlowGate`].
+        let token = self.cancel.child_token();
+        *gate.inflight() = Some(token.clone());
+        if gate.job_waiting() {
+            *gate.inflight() = None;
+            return SlowRun::Interrupted;
+        }
+        // Retrieve again with the question and its focus: a better query than the candidate
+        // text the fast phase had (#54).
+        let retrieval = context.retrieve(&format!("{} {}", job.question, job.focus));
+        tally.retrieved(retrieval.took);
+        let mut req = SlowRequest::new(job.question.clone(), job.kind);
+        req.context = FastRequest {
+            transcript: job.transcript.clone(),
+            job_requirements: context.requirements().to_vec(),
+            chunks: retrieval.chunks.clone(),
+            ..FastRequest::new(job.said.clone(), 0)
+        };
+        req.focus = job.focus.clone();
+        req.approach = job.approach.clone();
+        req.star = job.star.clone();
+        req.coding = wire::coding_mode(hub.snapshot().coding_solutions);
+        req.chunk_files = retrieval.refs.iter().map(|r| r.file.clone()).collect();
+        req.timeout = timeout;
+
+        hub.dispatch(Action::SlowStarted { candidate: job.id });
+        let waited = job.ready.elapsed();
+        let started = Instant::now();
+        let mut fields = SlowFields::default();
+        let mut arrived: Vec<(&'static str, Duration)> = Vec::new();
+        let result = self
+            .rt
+            .block_on(run_slow_phase(self.provider, &req, token.clone(), |f| {
+                arrived.push((f.name(), started.elapsed()));
+                fields.apply(&f);
+                hub.dispatch(wire::slow_field(job.id, &f));
+            }));
+        *gate.inflight() = None;
+        let took = started.elapsed();
+        let stopped = self.cancel.is_cancelled();
+        if matches!(result, Err(LlmError::Cancelled)) && token.is_cancelled() && !stopped {
+            // A job needs the model. What arrived stays on screen; the phase starts over.
+            job.restarts += 1;
+            tally.slow_restarts += 1;
+            return SlowRun::Interrupted;
+        }
+        hub.dispatch(wire::slow_ended(
+            job.id,
+            &result,
+            &fields,
+            stopped,
+            self.clock.now(),
+        ));
+        match &result {
+            Ok(_) => {
+                tally.slow_done += 1;
+                tally.slow_slowest = tally.slow_slowest.max(took);
+            }
+            Err(LlmError::Cancelled) if stopped => tally.slow_dropped += 1,
+            Err(LlmError::Timeout(_)) => {
+                tally.slow_timed_out += 1;
+                self.output.warn(&format!(
+                    "slow phase for {:?} hit its {} deadline; {} section(s) arrived",
+                    job.question,
+                    secs(timeout),
+                    arrived.len()
+                ));
+            }
+            Err(e) => {
+                tally.slow_failed += 1;
+                self.output
+                    .warn(&format!("slow phase failed for {:?}: {e}", job.question));
+            }
+        }
+        if !stopped {
+            print_slow(
+                job,
+                &result,
+                &fields,
+                SlowTiming {
+                    waited,
+                    took,
+                    arrived: &arrived,
+                },
+                &retrieval,
+                self.output,
+            );
+        }
+        SlowRun::Finished
+    }
+}
+
+/// When a slow phase's sections arrived, for `dmn replay`.
+struct SlowTiming<'a> {
+    /// From its fast phase finishing to this (the last) attempt starting.
+    waited: Duration,
+    /// This attempt, request to close.
+    took: Duration,
+    /// Each section, from the request.
+    arrived: &'a [(&'static str, Duration)],
+}
+
+fn print_slow(
+    job: &SlowJob,
+    result: &Result<SlowOutcome, LlmError>,
+    fields: &SlowFields,
+    t: SlowTiming<'_>,
+    r: &Retrieval,
+    output: Output,
+) {
+    let Output::Print { json } = output else {
+        return;
+    };
+    let (outcome, error) = match result {
+        Ok(_) => ("done", None),
+        Err(LlmError::Timeout(_)) => ("slow", None),
+        Err(e) => ("failed", Some(e.to_string())),
+    };
+    let flags: Vec<String> = match result {
+        Ok(o) => o.flags.iter().map(|f| f.field.clone()).collect(),
+        Err(_) => Vec::new(),
+    };
+    if json {
+        let field_ms: serde_json::Map<String, serde_json::Value> = t
+            .arrived
+            .iter()
+            .map(|(name, at)| ((*name).to_owned(), ms(*at).into()))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "slow",
+                "outcome": outcome,
+                "start": job.start,
+                "text": job.said,
+                "question": job.question,
+                "kind": job.kind,
+                "fields": fields.to_json(),
+                "flags": flags,
+                "error": error,
+                "field_ms": field_ms,
+                "total_ms": ms(t.took),
+                "wait_ms": ms(t.waited),
+                "restarts": job.restarts,
+                "chunks": r.json(),
+            })
+        );
+        return;
+    }
+    let restarts = match job.restarts {
+        0 => String::new(),
+        n => format!(", {n} restart(s)"),
+    };
+    let cut = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(", cut: {}", flags.join(" "))
+    };
+    println!(
+        "  .. slow phase {outcome} in {} ({} after the fast phase{restarts}){cut}{}\n     {}",
+        secs(t.took),
+        secs(t.waited),
+        context_note(r),
+        fields.to_json()
+    );
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1058,6 +1437,214 @@ mod tests {
         s.submit(id, &candidate(), String::new());
     }
 
+    // --- Slow phase (#55) --------------------------------------------------------------------
+
+    fn fast_json_reply(question: &str, kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "is_question": true,
+            "kind": kind,
+            "question": question,
+            "focus": "tradeoffs",
+            "approach": ["Clarify scope.", "Pick the data model.", "Name the failure modes."]
+        })
+    }
+
+    fn slow_json_reply() -> serde_json::Value {
+        serde_json::json!({
+            "deeper": [{"label": "Core", "text": "Shard by key."}],
+            "followups": ["What if a shard is hot?"],
+            "tradeoffs": [{"option": "Sharding", "pro": "scales", "con": "rebalancing"}],
+            "example": {"language": "text", "code": "10k QPS per shard"},
+            "mention": ["Name the SLO."],
+            "resume_context": []
+        })
+    }
+
+    /// The slow reply's first field, then a stall of `stall`: a slow phase still running.
+    fn stalled_slow_script(stall: Duration) -> Vec<dmn_llm::mock::Step> {
+        let reply = slow_json_reply().to_string();
+        let deeper_closes = reply.find("\"followups\"").unwrap();
+        // Chunks are 7 characters: stall on the first chunk wholly after `deeper`'s value.
+        let mut script = dmn_llm::mock::json_script(&slow_json_reply());
+        script.insert(deeper_closes.div_ceil(7), dmn_llm::mock::Step::Pause(stall));
+        script
+    }
+
+    /// Wait until `done` holds for the session, or `limit` passes.
+    fn wait_for(
+        hub: &SessionHub,
+        limit: Duration,
+        done: impl Fn(&dmn_session::Session) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if done(&hub.snapshot()) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done(&hub.snapshot())
+    }
+
+    #[test]
+    fn a_running_slow_phase_never_delays_the_next_fast_phase() {
+        // Request 1: fast for candidate 1. Request 2: its slow phase, which stalls for 10 s.
+        // Request 3: fast for candidate 2. Then every slow phase answers at once.
+        let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
+            .then(stalled_slow_script(Duration::from_secs(10)))
+            .then_json(&fast_json_reply("Q2", "system_design"))
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        submit_with_candidate(&s, &hub, 1);
+        assert!(
+            wait_for(&hub, Duration::from_secs(2), |_| provider.requests().len()
+                == 2),
+            "the slow phase for 1 is in flight"
+        );
+        let asked = Instant::now();
+        submit_with_candidate(&s, &hub, 2);
+        assert!(
+            wait_for(&hub, Duration::from_secs(2), |s| s
+                .live
+                .as_ref()
+                .is_some_and(|q| q.candidate == 2)),
+            "candidate 2's question never showed"
+        );
+        let waited = asked.elapsed();
+        assert!(
+            waited < Duration::from_millis(500),
+            "the fast phase waited {waited:?} behind a slow phase stalled for 10 s"
+        );
+        let tally = s.finish();
+        assert_eq!(tally.slow_restarts, 1, "{tally:?}");
+        assert_eq!(
+            tally.slow_done, 2,
+            "replay fills both, 1 again from the start: {tally:?}"
+        );
+        let live = hub.snapshot().live.unwrap();
+        assert_eq!(live.sections.followups, ["What if a shard is hot?"]);
+        assert_eq!(
+            *live.sections.state(dmn_session::Section::Tradeoffs),
+            dmn_session::SectionState::Done
+        );
+        assert_eq!(
+            *live.sections.state(dmn_session::Section::ResumeContext),
+            dmn_session::SectionState::Empty,
+            "nothing to cite, so the row is hidden"
+        );
+    }
+
+    #[test]
+    fn a_superseded_questions_slow_phase_is_cancelled_and_dropped() {
+        let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
+            .then(stalled_slow_script(Duration::from_secs(10)))
+            .then_json(&fast_json_reply("Q2", "system_design"))
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        submit_with_candidate(&s, &hub, 1);
+        assert!(wait_for(&hub, Duration::from_secs(2), |_| provider
+            .requests()
+            .len()
+            == 2));
+        submit_with_candidate(&s, &hub, 2);
+        let t = Instant::now();
+        let tally = s.finish();
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert_eq!(
+            (tally.slow_restarts, tally.slow_dropped, tally.slow_done),
+            (1, 1, 1),
+            "1's slow phase cut short and then dropped; 2's filled: {tally:?}"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            4,
+            "1's slow phase is never asked again"
+        );
+        assert_eq!(hub.snapshot().live.unwrap().candidate, 2);
+    }
+
+    #[test]
+    fn a_timed_out_slow_phase_keeps_what_arrived_and_marks_the_rest_slow() {
+        let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
+            .then(stalled_slow_script(Duration::from_secs(10)));
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_context(
+            provider,
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_millis(400)),
+        );
+        submit_with_candidate(&s, &hub, 1);
+        let tally = s.finish();
+        assert_eq!(tally.slow_timed_out, 1, "{tally:?}");
+        let sections = hub.snapshot().live.unwrap().sections;
+        use dmn_session::{Section, SectionState};
+        assert_eq!(
+            sections.deeper.len(),
+            1,
+            "the field before the stall arrived"
+        );
+        assert_eq!(*sections.state(Section::Deeper), SectionState::Done);
+        for s in [Section::Followups, Section::Example, Section::ResumeContext] {
+            assert_eq!(*sections.state(s), SectionState::Slow, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn the_coding_mode_on_screen_decides_whether_a_solution_is_asked_for() {
+        let solution = serde_json::json!({
+            "deeper": [{"label": "Insight", "text": "Use a hash map."}],
+            "followups": [], "tradeoffs": [], "mention": [], "resume_context": [],
+            "example": {"language": "python", "code": "seen = {}"},
+            "solution": {"language": "python", "code": "def two_sum(a, t):\n    return []"}
+        });
+        for (mode, asked) in [
+            (dmn_session::CodingSolutions::Hints, false),
+            (dmn_session::CodingSolutions::Full, true),
+        ] {
+            let provider = dmn_llm::MockProvider::json(&fast_json_reply("Two sum?", "coding"))
+                .then_json(&solution);
+            let hub = Arc::new(SessionHub::default());
+            hub.dispatch(Action::CodingSolutions { mode });
+            let s = Suggester::start_with_context(
+                provider.clone(),
+                Policy::AnswerAll,
+                Arc::clone(&hub),
+                Context::empty(),
+                Some(Duration::from_secs(20)),
+            );
+            submit_with_candidate(&s, &hub, 1);
+            s.finish();
+            let slow = &provider.requests()[1];
+            assert_eq!(
+                slow.schema
+                    .as_ref()
+                    .unwrap()
+                    .to_string()
+                    .contains("solution"),
+                asked,
+                "{mode:?}"
+            );
+            let sections = hub.snapshot().live.unwrap().sections;
+            assert_eq!(sections.solution.is_some(), asked, "{mode:?}");
+        }
+    }
+
     #[test]
     fn a_newer_unpinned_question_cancels_the_one_in_flight_and_skips_the_queue() {
         let hub = Arc::new(SessionHub::default());
@@ -1139,6 +1726,7 @@ mod tests {
             Policy::AnswerAll,
             Arc::clone(&hub),
             context,
+            None,
         );
         let kafka = Candidate {
             text: "Tell me about a time you built something on Kafka.".into(),
@@ -1198,6 +1786,7 @@ mod tests {
             Policy::AnswerAll,
             hub.clone(),
             context,
+            None,
         );
         hub.dispatch(wire::candidate(1, &candidate()));
         s.submit(1, &candidate(), "Interviewer: So.".into());

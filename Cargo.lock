@@ -661,6 +661,7 @@ dependencies = [
  "dmn-transcript",
  "dmn-vad",
  "ratatui",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "thiserror",

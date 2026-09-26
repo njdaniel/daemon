@@ -136,6 +136,8 @@ pub struct Llm {
     pub api_key_env: String,
     pub answer_length: AnswerLength,
     pub fast_timeout_ms: u64,
+    /// The slow phase's deadline (#55; SPEC: 20 s). `0` turns the slow phase off: the six
+    /// sections are never asked for, and the model serves only the fast phase.
     pub slow_timeout_ms: u64,
 }
 
@@ -276,7 +278,7 @@ base_url = "http://localhost:11434"
 api_key_env = ""                     # NAME of an env var holding the key; never the key itself
 answer_length = "concise"            # concise (5 lines) | minimal (3 lines)
 fast_timeout_ms = 4000
-slow_timeout_ms = 20000
+slow_timeout_ms = 20000              # the six expandable sections; 0 turns the slow phase off
 
 [ui]
 always_on_top = true
@@ -401,7 +403,7 @@ base_url = "http://localhost:11434"
 api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
 fast_timeout_ms = 4000
-slow_timeout_ms = 20000
+slow_timeout_ms = 20000              # 0 turns the slow phase off
 
 [ui]
 always_on_top = true
