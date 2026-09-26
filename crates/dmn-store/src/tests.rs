@@ -23,6 +23,7 @@ fn session_with_segment(store: &Store) -> (i64, i64) {
             text: "How would you design a rate limiter?".to_string(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         })
         .unwrap();
     (session_id, segment_id)
@@ -136,6 +137,7 @@ fn segment_round_trip() {
             text: "I'd start with a token bucket.".to_string(),
             is_final: true,
             avg_logprob: -0.1,
+            language: None,
         })
         .unwrap();
 
@@ -277,6 +279,7 @@ fn foreign_keys_are_enforced() {
         text: "nobody said this".to_string(),
         is_final: true,
         avg_logprob: -0.3,
+        language: None,
     });
     assert!(matches!(orphan, Err(StoreError::Sqlite(_))));
 
@@ -335,6 +338,7 @@ fn delete_session_removes_its_rows_and_compact_drops_the_text_from_the_file() {
             text: "purge-me-marker-7f3a".to_string(),
             is_final: true,
             avg_logprob: -0.1,
+            language: None,
         })
         .unwrap();
     assert_eq!(store.session_ids().unwrap(), [keep, gone]);
@@ -871,6 +875,55 @@ fn a_v6_database_upgrades_to_v7_and_sessions_record_echo_guard_drops() {
     assert!(
         text.contains("\"echo_dropped\":3"),
         "the export carries it: {text}"
+    );
+}
+
+#[test]
+fn a_v7_database_upgrades_to_v8_and_segments_record_their_language() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label) VALUES (1, 1700000000, 'v7');
+             INSERT INTO segments (session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob)
+             VALUES (1, 'interviewer', 1.0, 3.0, 'How would you design it?', 1, -0.2);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let old = &store.segments(1).unwrap()[0];
+    assert_eq!(
+        (old.text.as_str(), old.language.as_deref()),
+        ("How would you design it?", None),
+        "a v7 row keeps its text and reads back with no language"
+    );
+    // #77: a segment transcribed under `[stt].language = "auto"` names what whisper heard.
+    let id = store
+        .insert_segment(&NewSegment {
+            session_id: 1,
+            source: Source::Interviewer,
+            start_time: 5.0,
+            end_time: 8.0,
+            text: "And if Redis goes down?".into(),
+            is_final: true,
+            avg_logprob: -0.3,
+            language: Some("es".into()),
+        })
+        .unwrap();
+    let rows = store.segments(1).unwrap();
+    let new = rows.iter().find(|r| r.id == id).unwrap();
+    assert_eq!(new.language.as_deref(), Some("es"));
+    let mut out = Vec::new();
+    store.export_session_jsonl(1, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("\"language\":\"es\"") && !text.contains("\"language\":null"),
+        "the export carries the language and omits it where there is none: {text}"
     );
 }
 

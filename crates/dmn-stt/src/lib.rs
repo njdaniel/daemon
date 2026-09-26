@@ -5,7 +5,9 @@
 //! Output: [`Segment`](dmn_transcript::Segment)s published through the callback the caller hands
 //! [`SttWorker::spawn`] (in the pipeline, `dmn-transcript`'s bus): one partial per second while
 //! an utterance is open, then the final that replaces them. Hallucinations and low-confidence
-//! text are dropped and counted ([`filter`]).
+//! text are dropped and counted ([`filter`]). With `[stt].language` other than `en` (#77) a
+//! multilingual model detects each utterance's language and its text arrives translated to
+//! English; the segment carries the detected language.
 //! Owns: one worker thread and one `WhisperState` per source (inference serialised per state),
 //! and the ggml model files under the models directory the caller passes in (`dmn` passes
 //! `~/.cache/dmn/models/`).
@@ -25,7 +27,7 @@ pub mod worker;
 pub use filter::{Dropped, FilterConfig, should_drop};
 pub use gpu::{DeviceChoice, GpuDevice, Placement, gpu_devices};
 pub use model::{Model, download_file, download_model, model_path};
-pub use transcriber::{Backend, SttConfig, Transcriber, Transcript};
+pub use transcriber::{Backend, Language, SttConfig, Transcriber, Transcript};
 pub use wer::word_error_rate;
 pub use worker::{Speech, SttStats, SttWorker, SttWorkerConfig};
 
@@ -38,6 +40,14 @@ pub enum SttError {
     UnknownModel(String),
     #[error("model file {0} is missing; fix: dmn doctor --fetch <model>")]
     ModelMissing(String),
+    #[error(
+        "unknown language {0:?}; use \"en\", \"auto\" (detect and translate to English), or an ISO 639-1 code whisper knows (es, de, fr, ...)"
+    )]
+    UnknownLanguage(String),
+    #[error(
+        "whisper model {model} is English-only and cannot detect or translate; set [stt].model to small, medium or large-v3-turbo (dmn doctor --fetch <model>), or [stt].language to \"en\""
+    )]
+    ModelIsEnglishOnly { model: String },
     #[error("cannot load whisper model {path}: {source}")]
     Load {
         path: String,

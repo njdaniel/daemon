@@ -296,6 +296,7 @@ mod tests {
                     text: text.into(),
                     is_final: true,
                     avg_logprob: -0.2,
+                    language: None,
                 })
                 .unwrap();
             let q = store

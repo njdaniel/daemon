@@ -76,6 +76,7 @@ fn candidates(fixture: &str, cfg: DetectConfig) -> (Vec<Turn>, Vec<Option<Candid
             text: turn.text.clone(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         };
         out.push(detector.observe(&segment, following));
     }
@@ -216,6 +217,7 @@ fn scoring_a_line_is_far_inside_the_100_ms_budget() {
             text: t.text.clone(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         })
         .collect();
     let started = std::time::Instant::now();

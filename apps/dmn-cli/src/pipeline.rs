@@ -199,6 +199,8 @@ pub struct Options {
     pub vad: Option<VadChoice>,
     /// Where whisper runs (#61), over `[stt].device`.
     pub device: Option<dmn_core::config::SttDevice>,
+    /// The audio's language (#77), over `[stt].language`.
+    pub language: Option<dmn_core::config::SttLanguage>,
     pub partials: Partials,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
@@ -225,6 +227,8 @@ pub struct Info {
     pub stt_device: String,
     /// "energy" or "silero".
     pub vad: &'static str,
+    /// `[stt].language` as configured: "en", "auto" or a code (#77).
+    pub language: String,
     pub speed: Speed,
     pub partials: bool,
     /// The longer of the two files; zero for a live input, which has no length.
@@ -718,7 +722,8 @@ impl Pipeline {
     /// Build every stage, then start both files together, the session, and the fast phase.
     pub fn start(cfg: &Config, paths: &Paths, opts: &Options) -> Result<Self, Box<dyn Error>> {
         let name = opts.model.clone().unwrap_or_else(|| cfg.stt.model.clone());
-        let model = model_path(&paths.models_dir, Model::from_name(&name)?);
+        let model_id = Model::from_name(&name)?;
+        let model = model_path(&paths.models_dir, model_id);
         if !model.is_file() {
             return Err(format!(
                 "whisper model {} is missing; fix: dmn doctor --fetch {name}",
@@ -726,6 +731,15 @@ impl Pipeline {
             )
             .into());
         }
+        // #77: anything but English needs a multilingual model; refused here, before any audio
+        // moves, with the fix, rather than per utterance.
+        let language = language_choice(
+            &opts
+                .language
+                .clone()
+                .unwrap_or_else(|| cfg.stt.language.clone()),
+        )?;
+        language.check(model_id)?;
         if !opts.speed.is_finite() || opts.speed <= 0.0 {
             return Err(format!("--speed must be a positive number, not {}", opts.speed).into());
         }
@@ -749,6 +763,7 @@ impl Pipeline {
         let stt_cfg = SttConfig {
             threads: opts.threads.unwrap_or(usize::from(cfg.stt.threads)),
             device: device_choice(opts.device.unwrap_or(cfg.stt.device)),
+            language: language.clone(),
             ..SttConfig::default()
         };
         // #34: `--speed N` paces delivery at N× wall-clock. A live call is 1× by definition.
@@ -918,6 +933,7 @@ impl Pipeline {
                     VadChoice::Energy => "energy",
                     VadChoice::Silero => "silero",
                 },
+                language: language.label().to_owned(),
                 speed,
                 partials,
                 audio,
@@ -1580,6 +1596,14 @@ fn warm_local_llm(llm: &dmn_core::config::Llm) {
 }
 
 /// `[stt].device` in `dmn-stt`'s terms (`dmn-stt` does not depend on `dmn-core`).
+/// `[stt].language` / `--language` as `dmn-stt` understands it (#77): the config checks the
+/// shape, whisper's own list decides whether it knows the code.
+pub fn language_choice(
+    l: &dmn_core::config::SttLanguage,
+) -> Result<dmn_stt::Language, dmn_stt::SttError> {
+    dmn_stt::Language::parse(l.label())
+}
+
 pub fn device_choice(d: dmn_core::config::SttDevice) -> DeviceChoice {
     match d {
         dmn_core::config::SttDevice::Cpu => DeviceChoice::Cpu,
@@ -1661,6 +1685,7 @@ mod tests {
             text: "How would you".into(),
             is_final: false,
             avg_logprob: -0.2,
+            language: None,
         };
         let copy = Segment {
             end: Duration::from_secs(12),
@@ -1689,6 +1714,7 @@ mod tests {
             text: text.into(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         }
     }
 
@@ -1905,6 +1931,7 @@ mod tests {
             text: text.into(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         };
         let finals = [
             seg(Source::You, 5, "Before the question."),
@@ -2072,6 +2099,7 @@ mod tests {
                 vad_close_ms: None,
                 vad: None,
                 device: None,
+                language: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
                 no_llm: true,

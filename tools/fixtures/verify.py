@@ -124,9 +124,10 @@ def check(fixture: Path, quiet: bool = False) -> tuple[list[str], list[str]]:
             errors.append(f"turn {t['i']}: other track at {cross:.1f} dBFS during this turn (crosstalk)")
 
     questions = json.loads((fixture / "questions.json").read_text())
-    expected = [
-        {"t": t["t"], "end": t["end"], "text": t["text"], "kind": t["kind"]} for t in turns if t["is_question"]
-    ]
+    # #77: a fixture in another language also carries the spoken words beside the English
+    # reference, on questions and turns alike.
+    keys = ("t", "end", "text", "kind", "spoken")
+    expected = [{k: t[k] for k in keys if k in t} for t in turns if t["is_question"]]
     if questions != expected:
         errors.append("questions.json does not match the is_question turns in turns.json")
 

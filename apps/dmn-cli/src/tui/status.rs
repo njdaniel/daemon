@@ -123,6 +123,13 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         };
         spans.push(Span::styled(text, style));
     }
+    // #77: what whisper heard, when it was not English (the transcript text is translated).
+    if !st.language.is_empty() && st.language != "en" {
+        spans.push(Span::styled(
+            format!(" {}→en ", st.language),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
     // An error's reason first (red); otherwise, when transcript text leaves the machine, the
     // SPEC § Providers notice in words (amber) for as long as it does.
     let note = detail.map(|d| (d, Color::Red)).or_else(|| {

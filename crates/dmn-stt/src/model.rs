@@ -13,6 +13,16 @@
 //! | ggml-medium.en.bin | 1533774781 | cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356 |
 //! | ggml-large-v3-turbo.bin | 1624555275 | 1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69 |
 //!
+//! The multilingual files (#77: they detect the language and can translate to English; the
+//! `.en` files cannot), read from the same tree 2026-09-26:
+//!
+//! | file | bytes | sha256 |
+//! | --- | --- | --- |
+//! | ggml-tiny.bin | 77691713 | be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21 |
+//! | ggml-base.bin | 147951465 | 60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe |
+//! | ggml-small.bin | 487601967 | 1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b |
+//! | ggml-medium.bin | 1533763059 | 6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208 |
+//!
 //! The download is checked by size, which catches the realistic failure (a truncated or HTML
 //! error body); the hashes are recorded for manual checks rather than adding a hash crate.
 
@@ -43,7 +53,7 @@ pub fn deadline_for(model: Model) -> Duration {
 }
 
 /// Comma-separated list for error messages.
-pub const KNOWN_NAMES: &str = "tiny.en, base.en, small.en, medium.en, large-v3-turbo";
+pub const KNOWN_NAMES: &str = "tiny.en, base.en, small.en, medium.en (English only); tiny, base, small, medium, large-v3-turbo (multilingual)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
@@ -51,17 +61,35 @@ pub enum Model {
     BaseEn,
     SmallEn,
     MediumEn,
+    /// Multilingual (#77).
+    Tiny,
+    Base,
+    Small,
+    Medium,
     LargeV3Turbo,
 }
 
 impl Model {
-    pub const ALL: [Model; 5] = [
+    pub const ALL: [Model; 9] = [
         Model::TinyEn,
         Model::BaseEn,
         Model::SmallEn,
         Model::MediumEn,
+        Model::Tiny,
+        Model::Base,
+        Model::Small,
+        Model::Medium,
         Model::LargeV3Turbo,
     ];
+
+    /// The `.en` files transcribe English only: they have no language detection and cannot
+    /// translate, so `[stt].language` other than `en` needs a multilingual model (#77).
+    pub fn is_english_only(self) -> bool {
+        matches!(
+            self,
+            Model::TinyEn | Model::BaseEn | Model::SmallEn | Model::MediumEn
+        )
+    }
 
     /// Parse the config / CLI name (`small.en`).
     pub fn from_name(name: &str) -> Result<Self, SttError> {
@@ -77,6 +105,10 @@ impl Model {
             Model::BaseEn => "base.en",
             Model::SmallEn => "small.en",
             Model::MediumEn => "medium.en",
+            Model::Tiny => "tiny",
+            Model::Base => "base",
+            Model::Small => "small",
+            Model::Medium => "medium",
             Model::LargeV3Turbo => "large-v3-turbo",
         }
     }
@@ -92,6 +124,10 @@ impl Model {
             Model::BaseEn => 147_964_211,
             Model::SmallEn => 487_614_201,
             Model::MediumEn => 1_533_774_781,
+            Model::Tiny => 77_691_713,
+            Model::Base => 147_951_465,
+            Model::Small => 487_601_967,
+            Model::Medium => 1_533_763_059,
             Model::LargeV3Turbo => 1_624_555_275,
         }
     }
@@ -313,8 +349,14 @@ mod tests {
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
         );
         assert_eq!(m.url("http://x/"), "http://x/ggml-small.en.bin");
-        let err = Model::from_name("small").unwrap_err();
+        let err = Model::from_name("smallish").unwrap_err();
         assert!(err.to_string().contains("small.en"), "{err}");
+        // #77: the multilingual files are known too, and only the `.en` ones are English-only.
+        let multi = Model::from_name("small").unwrap();
+        assert_eq!(multi.file_name(), "ggml-small.bin");
+        assert!(!multi.is_english_only() && m.is_english_only());
+        assert!(!Model::LargeV3Turbo.is_english_only());
+        assert_eq!(Model::ALL.len(), 9);
     }
 
     /// Serve one HTTP response on a local port; returns the base URL.

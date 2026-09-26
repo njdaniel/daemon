@@ -54,7 +54,7 @@ No wall of text while you're trying to listen to another human.
 The `dmn` CLI currently includes:
 
 ```text
-dmn doctor [--init | --probe | --fetch small.en]
+dmn doctor [--init | --probe | --fetch small.en|small|silero]
 dmn config show
 dmn devices
 dmn run [--mic NODE] [--app APP]          # live: your mic + the call's audio, until q
@@ -129,6 +129,28 @@ num_ctx = 8192       # Ollama context dmn asks for; frees the VRAM whisper needs
 `stt gpu+cpu` when the interviewer's lane is on the GPU and yours on the CPU (the usual split
 on a 24 GB card). Changing `num_ctx` makes Ollama reload the model (about 6 s), and any other
 tool that uses Ollama's default context reloads it again (about 11 s).
+
+#### Interviews in another language
+
+Whisper's `.en` models only transcribe English. For a call held in another language, fetch a
+multilingual model and switch the language mode:
+
+```
+dmn doctor --fetch small
+```
+
+```toml
+[stt]
+model = "small"       # or medium / large-v3-turbo; the .en files cannot translate
+language = "auto"     # detect each utterance's language and translate it to English; or a code such as "es"
+```
+
+Both lanes then arrive in English (whisper translates as it transcribes), so questions are
+detected, answered and shown exactly as for an English call; the transcript tags what was heard
+(`Interviewer (es→en):`) and the status line shows `es→en`. `--language` on `dmn run`, `dmn
+replay` and `dmn bench` overrides the config for one run. Keep `language = "en"` with `small.en`
+for English calls: the multilingual `small` is a little less accurate on English and pays a
+detection step per utterance.
 
 ### Initialize and inspect your system
 

@@ -91,6 +91,12 @@ pub struct Stt {
     /// Where whisper runs (#61): `cpu`, `gpu` (a GPU build's device, else the CPU with a
     /// warning), or `auto` (the GPU when there is one, quietly the CPU otherwise).
     pub device: SttDevice,
+    /// The audio's language (#77): `en` (English only, the default and the M1 path), `auto` (a
+    /// multilingual model detects each utterance's language and translates its text to
+    /// English) or an ISO 639-1 code such as `es` (translate from that language, no
+    /// detection). Anything but `en` needs a multilingual model, `small`, `medium` or
+    /// `large-v3-turbo`, not a `.en` file; `dmn doctor` checks the pair.
+    pub language: SttLanguage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -100,6 +106,67 @@ pub enum SttDevice {
     Cpu,
     Gpu,
     Auto,
+}
+
+/// `[stt].language` (#77), written as the plain string `en`, `auto` or a language code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(try_from = "String", into = "String")]
+pub enum SttLanguage {
+    #[default]
+    English,
+    Auto,
+    /// An ISO 639-1 code (`es`, `de`, ...). Whether whisper knows it is checked when the model
+    /// loads, so this layer only insists on the shape.
+    Code(String),
+}
+
+impl SttLanguage {
+    /// The config spelling.
+    pub fn label(&self) -> &str {
+        match self {
+            SttLanguage::English => "en",
+            SttLanguage::Auto => "auto",
+            SttLanguage::Code(code) => code,
+        }
+    }
+
+    pub fn is_english(&self) -> bool {
+        matches!(self, SttLanguage::English)
+    }
+}
+
+impl TryFrom<String> for SttLanguage {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for SttLanguage {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        match s {
+            "en" => Ok(SttLanguage::English),
+            "auto" => Ok(SttLanguage::Auto),
+            code if (2..=3).contains(&code.len())
+                && code.bytes().all(|b| b.is_ascii_lowercase()) =>
+            {
+                Ok(SttLanguage::Code(code.to_owned()))
+            }
+            other => Err(format!(
+                "[stt].language {other:?} is not \"en\", \"auto\" or a two-letter language code such as \"es\""
+            )),
+        }
+    }
+}
+
+impl From<SttLanguage> for String {
+    fn from(l: SttLanguage) -> Self {
+        l.label().to_owned()
+    }
 }
 
 impl Default for Stt {
@@ -114,6 +181,7 @@ impl Default for Stt {
             vad: Vad::Silero,
             vad_close_ms: 400,
             device: SttDevice::Cpu,
+            language: SttLanguage::English,
         }
     }
 }
@@ -303,6 +371,7 @@ threads = 8                          # whisper threads per lane; the final pass 
 vad = "silero"                       # silero | energy; silero needs `dmn doctor --fetch silero`
 vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
 device = "cpu"                       # cpu | gpu | auto: where whisper runs (gpu needs --features vulkan|cuda)
+language = "en"                      # en | auto | es, de, ...: auto detects and translates to English; needs a multilingual model (small)
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -490,6 +559,7 @@ threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "silero"                       # silero | energy (#63: fixtures and keyboard noise)
 vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
 device = "cpu"                       # cpu | gpu | auto: where whisper runs (gpu needs --features vulkan|cuda)
+language = "en"                      # en | auto | es, de, ...: auto detects and translates to English; needs a multilingual model (small)
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -530,6 +600,26 @@ keep_transcripts = true
     }
 
     #[test]
+    fn stt_language_parses_en_auto_and_codes_and_rejects_the_rest() {
+        assert_eq!("en".parse::<SttLanguage>().unwrap(), SttLanguage::English);
+        assert_eq!("auto".parse::<SttLanguage>().unwrap(), SttLanguage::Auto);
+        assert_eq!(
+            " es ".parse::<SttLanguage>().unwrap(),
+            SttLanguage::Code("es".into())
+        );
+        for bad in ["", "spanish", "ES", "e1", "auto-detect"] {
+            assert!(bad.parse::<SttLanguage>().is_err(), "{bad:?} parsed");
+        }
+        let cfg = Config::from_toml("[stt]\nlanguage = \"auto\"\n", "test").unwrap();
+        assert_eq!(cfg.stt.language, SttLanguage::Auto);
+        assert!(cfg.to_toml().unwrap().contains("language = \"auto\""));
+        assert!(
+            Config::from_toml("[stt]\nlanguage = \"Spanish\"\n", "test").is_err(),
+            "a bad language is a config error"
+        );
+    }
+
+    #[test]
     fn every_spec_key_is_known() {
         // deny_unknown_fields plus a full parse proves each spec key maps to a struct field.
         let value: toml::Value = toml::from_str(SPEC_EXAMPLE).unwrap();
@@ -544,7 +634,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 26, "spec example has 26 keys: {keys:?}");
+        assert_eq!(keys.len(), 27, "spec example has 27 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

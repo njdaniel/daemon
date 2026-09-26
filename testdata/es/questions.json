@@ -1,0 +1,93 @@
+[
+  {
+    "t": 12.185,
+    "end": 32.139,
+    "text": "Yes, loud and clear. Sorry for the delay, my previous meeting ran a few minutes long. I am Marta and I work on the platform team. This interview is a mixed round: we will do some system design, some questions about your experience and one coding question. At the end you will have time for your questions. Does that sound good to you?",
+    "kind": "small_talk",
+    "spoken": "Sí, alto y claro. Perdona el retraso, la reunión anterior se me alargó unos minutos. Soy Marta y trabajo en el equipo de plataforma. Esta entrevista es una ronda mixta: haremos un poco de diseño de sistemas, algunas preguntas sobre tu experiencia y una pregunta de código. Al final tendrás tiempo para tus preguntas. ¿Te parece bien?"
+  },
+  {
+    "t": 38.696,
+    "end": 46.098,
+    "text": "Let's start with something concrete. How would you design a rate limiter for a public API that is deployed in several regions of the world?",
+    "kind": "system_design",
+    "spoken": "Empecemos con algo concreto. ¿Cómo diseñarías un rate limiter para una API pública que está desplegada en varias regiones del mundo?"
+  },
+  {
+    "t": 95.637,
+    "end": 99.904,
+    "text": "Good. And what if the cache goes down in a whole region, not just on one node?",
+    "kind": "clarification",
+    "spoken": "Bien. ¿Y si la caché se cae en toda una región, no solo en un nodo?"
+  },
+  {
+    "t": 143.138,
+    "end": 149.355,
+    "text": "Where would you put the limiter within the request path? And does anything change if the API is behind a CDN?",
+    "kind": "system_design",
+    "spoken": "¿Dónde pondrías el limitador dentro de la ruta de la petición? ¿Y cambia algo si la API está detrás de un CDN?"
+  },
+  {
+    "t": 181.193,
+    "end": 190.546,
+    "text": "Very good. Now I want to talk about your experience. Tell me about a time when you did not agree with a technical decision of your team. What did you do and how did it end?",
+    "kind": "behavioral",
+    "spoken": "Muy bien. Ahora quiero hablar de tu experiencia. Cuéntame de una vez que no estuviste de acuerdo con una decisión técnica de tu equipo. ¿Qué hiciste y cómo terminó?"
+  },
+  {
+    "t": 243.505,
+    "end": 247.011,
+    "text": "And what would you have done if he had said no after seeing the test?",
+    "kind": "clarification",
+    "spoken": "¿Y qué habrías hecho si él hubiera dicho que no después de ver la prueba?"
+  },
+  {
+    "t": 276.601,
+    "end": 281.402,
+    "text": "Describe to me a situation in which a project of yours went badly. What happened and what did you learn?",
+    "kind": "behavioral",
+    "spoken": "Descríbeme una situación en la que un proyecto tuyo salió mal. ¿Qué pasó y qué aprendiste?"
+  },
+  {
+    "t": 337.715,
+    "end": 346.876,
+    "text": "Okay. Now a more theoretical question. What is the difference between optimistic locking and pessimistic locking in a database, and when would you choose each one?",
+    "kind": "knowledge",
+    "spoken": "Bueno. Ahora una pregunta más teórica. ¿Qué diferencia hay entre el bloqueo optimista y el bloqueo pesimista en una base de datos, y cuándo elegirías cada uno?"
+  },
+  {
+    "t": 406.847,
+    "end": 410.272,
+    "text": "How would you find the ten most frequent URLs in that file?",
+    "kind": "coding",
+    "spoken": "¿Cómo encontrarías las diez URL más frecuentes de ese archivo?"
+  },
+  {
+    "t": 456.967,
+    "end": 460.844,
+    "text": "And what if the file is spread across one hundred machines instead of on a single disk?",
+    "kind": "clarification",
+    "spoken": "¿Y si el archivo está repartido entre cien máquinas en vez de en un solo disco?"
+  },
+  {
+    "t": 512.386,
+    "end": 519.219,
+    "text": "I am interested in how you use feature flags and canary deployments. How do you release a risky change in the backend safely?",
+    "kind": "knowledge",
+    "spoken": "Me interesa cómo usas los feature flags y los despliegues canary. ¿Cómo sacas de forma segura un cambio arriesgado en el backend?"
+  },
+  {
+    "t": 565.24,
+    "end": 568.671,
+    "text": "Last question about you. Why do you want to leave your current position?",
+    "kind": "behavioral",
+    "spoken": "Última pregunta sobre ti. ¿Por qué quieres dejar tu puesto actual?"
+  },
+  {
+    "t": 597.871,
+    "end": 602.725,
+    "text": "That makes sense. Well, that is everything from my side. Do you have any questions for me?",
+    "kind": "small_talk",
+    "spoken": "Tiene sentido. Bueno, por mi parte eso es todo. ¿Tienes alguna pregunta para mí?"
+  }
+]

@@ -1,6 +1,6 @@
 # Fixtures
 
-Four mock interviews, each as two time-aligned 16 kHz mono 16-bit WAVs (interviewer, candidate) plus
+Five mock interviews, each as two time-aligned 16 kHz mono 16-bit WAVs (interviewer, candidate) plus
 the timing files the eval harness scores against. They are synthesised with Piper TTS from the scripts
 in `tools/fixtures/scripts/`, so anyone can regenerate or redistribute them.
 
@@ -10,16 +10,18 @@ in `tools/fixtures/scripts/`, so anyone can regenerate or redistribute them.
 | `behavioral/` | 9:13 | 28 | 12 | STAR prompts ("Tell me about a time…", "Describe…", "Give me an example…") with short follow-ups |
 | `mixed/` | 9:03 | 32 | 10 | Small talk, "can you hear me okay?", rhetorical "…right?" lines that are not questions, hand-offs ("Let's switch gears"), and 6–7 s silences |
 | `continuous/` | 7:38 | 42 | 16 | #63: two-person speech with 0.4–0.6 s gaps; questions split mid-sentence by 0.9 s pauses (`||` in the script), so the VAD closes an utterance inside the question; fillers and restarts ("So, uh, how would you, um…", "What did you, uh, what did you…"); a clarifying question from the candidate; back-to-back interviewer statements; and a reverse-questions close ("Do you have any questions for me?") |
+| `es/` | 10:44 | 33 | 12 | #77: the same shape as `mixed/`, spoken in Spanish (system design with a clarification, STAR prompts, a knowledge and a coding question, a rhetorical "¿verdad?", a hand-off, a reverse-questions close). `questions.json` and `turns.json` hold the English reference in `text` and the Spanish words in `spoken`, so the pipeline is scored on whisper's translation: `python3 eval/run.py --fixture es --language auto --model small` |
 
 ```
 testdata/
   <fixture>/
     interviewer.wav   candidate.wav    ignored by git; see "Getting the WAVs"
-    questions.json                     every real question: [{"t", "end", "text", "kind"}]
-    turns.json                         every turn: [{"i", "speaker", "t", "end", "is_question", "kind", "text"}]
+    questions.json                     every real question: [{"t", "end", "text", "kind"}], plus "spoken" for a fixture in another language (#77)
+    turns.json                         every turn: [{"i", "speaker", "t", "end", "is_question", "kind", "text"}], plus "spoken" likewise
     script.md                          readable transcript with timestamps
   fixtures-v1.sha256                   checksum of the release tarball for sysdesign, behavioral, mixed
   fixtures-v2.sha256                   checksum of the release tarball for continuous (#63)
+  fixtures-v3.sha256                   checksum of the release tarball for es (#77)
 ```
 
 - **Timing.** `t` and `end` are seconds from the start of the WAV. They come from the synthesised audio, not from estimates. A question's span is the whole interviewer turn, preamble included, so `end` is the moment the interviewer stops talking, which is where the 2 s latency budget starts.
@@ -31,11 +33,11 @@ testdata/
 The WAVs are about 20 MB each and are not in git. Choose one way to get them:
 
 ```
-just fixtures-fetch   # download the fixtures-v1 and fixtures-v2 release assets, check their sha256, unpack here (CI uses this)
+just fixtures-fetch   # download the fixtures-v1, -v2 and -v3 release assets, check their sha256, unpack here (CI uses this)
 just fixtures         # regenerate locally with Piper (about 10 s per fixture on the dev box), then verify
 ```
 
-Regeneration is byte-identical on the same machine and package versions. Piper samples noise inside its ONNX graph, so `tools/fixtures/generate.py` seeds ONNX Runtime per fixture and voice. Each release holds only the fixtures it adds: `fixtures-v1` the first three, `fixtures-v2` `continuous/` (#63), so adding a fixture never changes an existing tarball or its checksum. If a script edit changes existing audio, publish a new `fixtures-vN` release for it and update its `.sha256` file and the recipe to match.
+Regeneration is byte-identical on the same machine and package versions. Piper samples noise inside its ONNX graph, so `tools/fixtures/generate.py` seeds ONNX Runtime per fixture and voice. Each release holds only the fixtures it adds: `fixtures-v1` the first three, `fixtures-v2` `continuous/` (#63), `fixtures-v3` `es/` (#77), so adding a fixture never changes an existing tarball or its checksum. If a script edit changes existing audio, publish a new `fixtures-vN` release for it and update its `.sha256` file and the recipe to match.
 
 ## Voices and licences
 
@@ -43,6 +45,8 @@ Regeneration is byte-identical on the same machine and package versions. Piper s
 | --- | --- | --- | --- |
 | Interviewer | `en_US-norman-medium` | Public-domain recordings, trained from scratch | Public domain |
 | Candidate | `en_US-ljspeech-medium` | [LJ Speech](https://keithito.com/LJ-Speech-Dataset/), trained from scratch | Public domain |
+| Interviewer (`es/`) | `es_ES-davefx-medium` | [OHF-Voice datasets](https://github.com/OHF-Voice/voice-datasets) | CC0 |
+| Candidate (`es/`) | `es_MX-ald-medium` | [Ald Mexican Spanish speech dataset](https://huggingface.co/datasets/rmcpantoja/Ald_Mexican_Spanish_speech_dataset) | Unlicense |
 
 Piper's code and the `rhasspy/piper-voices` repository are MIT licensed. The voice model cards give the licences above.
 

@@ -74,6 +74,7 @@ fn seg(speaker: Speaker, start: f64, end: f64, text: &str, is_final: bool) -> Ac
         text: text.into(),
         is_final,
         avg_logprob: -0.2,
+        language: None,
     }
 }
 
@@ -791,6 +792,41 @@ fn tui_behavioral_shows_star_cards_a_clarification_and_error_dots() {
     assert_eq!(buf[(x, y)].fg, Color::Red);
     assert!(screen.contains("model: ollama unreachable"), "{screen}");
     assert!(screen.contains("mic muted"), "{screen}");
+}
+
+#[test]
+fn tui_the_status_line_names_a_detected_language_other_than_english() {
+    // #77: the last final's language, once whisper reports one; partials never set it.
+    let heard = |language: Option<&str>, is_final: bool| {
+        let mut actions = actions("listening");
+        actions.push(Action::Segment {
+            speaker: Speaker::Interviewer,
+            start: 1.0,
+            end: 3.0,
+            text: "How would you design it?".into(),
+            is_final,
+            avg_logprob: -0.2,
+            language: language.map(str::to_owned),
+        });
+        text(&render(&Session::replay(&actions), (100, 30)))
+    };
+    assert!(
+        heard(Some("es"), true).contains(" es→en "),
+        "{}",
+        heard(Some("es"), true)
+    );
+    assert!(
+        !heard(Some("en"), true).contains("→en"),
+        "English is not tagged"
+    );
+    assert!(
+        !heard(None, true).contains("→en"),
+        "the English-only path shows nothing"
+    );
+    assert!(
+        !heard(Some("de"), false).contains("→en"),
+        "a partial's guess is not shown"
+    );
 }
 
 #[test]

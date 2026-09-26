@@ -59,6 +59,8 @@ pub struct Args {
     pub vad: Option<dmn_core::config::Vad>,
     /// `--device` (#61), over `[stt].device`.
     pub device: Option<dmn_core::config::SttDevice>,
+    /// `--language` (#77), over `[stt].language`.
+    pub language: Option<dmn_core::config::SttLanguage>,
     pub no_store: bool,
     pub headless: bool,
     /// Live: stop after this many seconds, as if `q` had been pressed.
@@ -178,6 +180,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             vad_close_ms: args.vad_close_ms,
             vad: args.vad,
             device: args.device,
+            language: args.language.clone(),
             partials: Partials::Auto,
             spec_literal_detector: false,
             no_llm: false,
@@ -581,6 +584,7 @@ mod tests {
             vad_close_ms: None,
             vad: None,
             device: None,
+            language: None,
             no_store: true,
             headless: false,
             duration: None,

@@ -26,6 +26,7 @@ fn seg(source: Source, start: f64, end: f64, text: &str, is_final: bool) -> Segm
         text: text.into(),
         is_final,
         avg_logprob: -0.2,
+        language: None,
     }
 }
 
@@ -595,6 +596,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
             text: q.into(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         },
         Action::Candidate {
             id: 1,
@@ -659,6 +661,7 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
                 text: text.into(),
                 is_final: true,
                 avg_logprob: -0.2,
+                language: None,
             },
             Action::Candidate {
                 id,
@@ -725,6 +728,7 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
             text: asked.into(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         },
         Action::Candidate {
             id: 1,

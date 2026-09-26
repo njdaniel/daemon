@@ -12,6 +12,7 @@ fn seg(speaker: Speaker, start: f64, end: f64, text: &str, is_final: bool) -> Ac
         text: text.into(),
         is_final,
         avg_logprob: -0.2,
+        language: None,
     }
 }
 

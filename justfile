@@ -37,7 +37,7 @@ fixtures *names:
     cd tools && uv run python fixtures/verify.py {{names}}
 
 # Download the fixture WAVs from their releases when any are missing (CI uses this):
-# fixtures-v1 holds sysdesign, behavioral and mixed; fixtures-v2 adds continuous (#63)
+# fixtures-v1 holds sysdesign, behavioral and mixed; fixtures-v2 adds continuous (#63); fixtures-v3 adds es (#77)
 fixtures-fetch:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -61,6 +61,7 @@ fixtures-fetch:
     }
     fetch fixtures-v1 sysdesign behavioral mixed
     fetch fixtures-v2 continuous
+    fetch fixtures-v3 es
 
 # Offline eval: recall / precision / latency on the fixtures
 eval:

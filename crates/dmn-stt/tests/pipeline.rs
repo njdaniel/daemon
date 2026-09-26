@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use dmn_audio::{AudioSource, FRAME_MS, Source, Speed, WavSource, frame_channel};
 use dmn_stt::{
-    Model, SttConfig, SttWorker, SttWorkerConfig, Transcriber, model_path, word_error_rate,
+    Language, Model, SttConfig, SttWorker, SttWorkerConfig, Transcriber, model_path,
+    word_error_rate,
 };
 use dmn_transcript::{Segment, TranscriptLog};
 use dmn_vad::{VadConfig, VadWorker, event_channel};
@@ -61,6 +62,16 @@ fn overlap(a: &str, b: &str) -> f64 {
 
 /// Run one speaker's WAV through the real pipeline and return the finals in order.
 fn transcribe_lane(wav_path: &Path, source: Source, model: &Path) -> Vec<Segment> {
+    transcribe_lane_in(wav_path, source, model, Language::English)
+}
+
+/// [`transcribe_lane`] under a language mode (#77).
+fn transcribe_lane_in(
+    wav_path: &Path,
+    source: Source,
+    model: &Path,
+    language: Language,
+) -> Vec<Segment> {
     let mut wav = WavSource::open(wav_path, source, Speed::Fast).expect("open fixture");
     // Unpaced: the ring must hold the whole file or the producer outruns the VAD.
     let ring = (wav.duration().as_millis() / u128::from(FRAME_MS)) as usize + 100;
@@ -71,6 +82,7 @@ fn transcribe_lane(wav_path: &Path, source: Source, model: &Path) -> Vec<Segment
         model,
         SttConfig {
             threads: 8,
+            language,
             ..SttConfig::default()
         },
     )
@@ -187,6 +199,72 @@ fn the_interviewer_lane_transcribes_every_scripted_question_in_order() {
     assert!(
         mean_wer < 0.25,
         "mean WER {mean_wer:.3} over matched questions"
+    );
+}
+
+#[test]
+#[ignore = "needs the es fixture WAVs (just fixtures-fetch) and the multilingual model (dmn doctor --fetch small)"]
+fn the_spanish_interviewer_lane_arrives_in_english_with_es_detected() {
+    // #77: `language = "auto"` with the multilingual `small`: every final names the language
+    // whisper heard and its text is English, matched against the script's English reference.
+    let fixture = testdata().join("es");
+    let wav = fixture.join("interviewer.wav");
+    let model = model_path(&models_dir(), Model::Small);
+    assert!(
+        wav.is_file(),
+        "missing {}: run just fixtures-fetch",
+        wav.display()
+    );
+    assert!(
+        model.is_file(),
+        "missing {}: run dmn doctor --fetch small",
+        model.display()
+    );
+    let questions: Vec<serde_json::Value> =
+        serde_json::from_reader(std::fs::File::open(fixture.join("questions.json")).expect("open"))
+            .expect("parse questions.json");
+    let segments = transcribe_lane_in(&wav, Source::Interviewer, &model, Language::Auto);
+    let finals: Vec<&Segment> = segments.iter().filter(|s| !s.text.is_empty()).collect();
+    assert!(!finals.is_empty(), "the lane produced no transcript");
+    let es = finals
+        .iter()
+        .filter(|s| s.language.as_deref() == Some("es"))
+        .count();
+    assert!(
+        es * 10 >= finals.len() * 9,
+        "only {es} of {} finals were detected as Spanish: {:?}",
+        finals.len(),
+        finals
+            .iter()
+            .map(|s| (s.language.clone(), s.text.clone()))
+            .collect::<Vec<_>>()
+    );
+    // The English reference of each question should surface in some transcript line: the
+    // bar is lower than the English fixtures' because the text is whisper's translation.
+    let mut matched = 0usize;
+    for q in &questions {
+        let text = q["text"].as_str().expect("question text");
+        if finals.iter().any(|s| overlap(text, &s.text) >= 0.4) {
+            matched += 1;
+        } else {
+            println!("no line matched: {text}");
+        }
+    }
+    println!(
+        "matched {matched}/{} questions; {es}/{} finals detected as es",
+        questions.len(),
+        finals.len()
+    );
+    assert!(
+        matched * 10 >= questions.len() * 8,
+        "only {matched} of {} scripted questions were found in translation",
+        questions.len()
+    );
+    assert!(
+        finals
+            .iter()
+            .all(|s| s.render().contains("(es→en)") || s.language.as_deref() != Some("es")),
+        "a Spanish final is tagged in its transcript line"
     );
 }
 
