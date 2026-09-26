@@ -942,6 +942,38 @@ fn tui_the_star_block_names_its_story_in_the_header() {
 }
 
 #[test]
+fn tui_the_model_dot_names_the_provider_and_a_remote_one_says_text_leaves() {
+    let label = |name: &str, remote| dmn_session::ProviderLabel {
+        name: name.into(),
+        model: "m".into(),
+        remote,
+    };
+    let mut actions = actions("listening");
+    actions.push(Action::Status {
+        dot: Dot::Model,
+        health: Health::Ok,
+    });
+    actions.push(Action::Provider {
+        label: label("ollama", false),
+    });
+    let screen = text(&render(&Session::replay(&actions), (100, 30)));
+    assert!(screen.contains("● ollama"), "{screen}");
+    assert!(!screen.contains("leaves this machine"), "{screen}");
+
+    actions.push(Action::Provider {
+        label: label("anthropic", true),
+    });
+    let buf = render(&Session::replay(&actions), (100, 30));
+    let screen = text(&buf);
+    assert!(screen.contains("● anthropic"), "{screen}");
+    let (x, y) = row_containing(&buf, "transcript leaves this machine");
+    assert_eq!(buf[(x, y)].fg, Color::Yellow);
+    // At 80 columns the notice still fits beside the dots.
+    let narrow = text(&render(&Session::replay(&actions), (80, 24)));
+    assert!(narrow.contains("leaves this machine"), "{narrow}");
+}
+
+#[test]
 fn tui_nothing_overflows_its_width_at_either_size() {
     for state in STATES {
         for size in SIZES {

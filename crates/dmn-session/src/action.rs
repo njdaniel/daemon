@@ -43,6 +43,17 @@ pub enum Health {
     Error(String),
 }
 
+/// Which LLM provider answers, for the model dot (#59).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderLabel {
+    /// The config spelling: `ollama`, `openai` or `anthropic`.
+    pub name: String,
+    pub model: String,
+    /// Transcript text leaves this machine (SPEC § Providers): a remote provider, or Ollama on
+    /// another host.
+    pub remote: bool,
+}
+
 /// STAR cards for a behavioral question (SPEC § AI Assistance).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarCards {
@@ -350,6 +361,9 @@ pub enum Action {
     Unpin,
     /// A status dot changed.
     Status { dot: Dot, health: Health },
+    /// The LLM provider now answering (#59): at start and after a config reload switched it.
+    /// The model dot is named after it, and a remote one says transcript text leaves the machine.
+    Provider { label: ProviderLabel },
     /// Ring-buffer frames dropped so far, over every capture lane (SPEC § Threading rules: a
     /// full ring drops the incoming frame and counts it). Shown beside the dots while non-zero.
     Overruns { total: u64 },

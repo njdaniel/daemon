@@ -74,11 +74,9 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     let st = &view.session.status;
     let mut spans = Vec::new();
     let mut detail = None;
-    for (name, health) in [
-        ("mic", &st.mic),
-        ("system", &st.system),
-        ("model", &st.model),
-    ] {
+    // #59: the model dot is named after the provider answering, once one has been announced.
+    let model = st.provider.as_ref().map_or("model", |p| p.name.as_str());
+    for (name, health) in [("mic", &st.mic), ("system", &st.system), (model, &st.model)] {
         let (dot, style, suffix) = match health {
             Health::Ok => ("●", Style::new().fg(Color::Green), ""),
             Health::Unknown => ("○", Style::new().fg(Color::DarkGray), ""),
@@ -122,13 +120,21 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         };
         spans.push(Span::styled(text, style));
     }
-    if let Some(d) = detail {
+    // An error's reason first (red); otherwise, when transcript text leaves the machine, the
+    // SPEC § Providers notice in words (amber) for as long as it does.
+    let note = detail.map(|d| (d, Color::Red)).or_else(|| {
+        st.provider
+            .as_ref()
+            .filter(|p| p.remote)
+            .map(|_| ("transcript leaves this machine".to_owned(), Color::Yellow))
+    });
+    if let Some((d, color)) = note {
         let used = Line::from(spans.clone()).width();
         let room = usize::from(left.width).saturating_sub(used + 2);
         if room > 3 {
             spans.push(Span::styled(
                 format!(" {}", truncate(&d, room)),
-                Style::new().fg(Color::Red),
+                Style::new().fg(color),
             ));
         }
     }

@@ -646,6 +646,13 @@ impl Pipeline {
         let segments = bus.subscribe();
         let mic_muted = Arc::new(AtomicBool::new(false));
 
+        // #61: whisper may take GPU memory. Load the local LLM first, so that if it (re)loads —
+        // a `num_ctx` different from what is loaded, or a cold start — it sizes itself against a
+        // GPU whisper has not claimed yet, rather than pushing more of itself onto the CPU.
+        if !opts.no_llm && stt_cfg.device != DeviceChoice::Cpu {
+            warm_local_llm(&cfg.llm);
+        }
+
         // Load both whisper models and spawn every worker first, then start both sources back
         // to back: loading a model takes the better part of a second, and starting each file as
         // its lane was built put the candidate's audio that far behind the interviewer's.
@@ -764,6 +771,8 @@ impl Pipeline {
                     path: paths.db_file.clone(),
                     write: !opts.no_store,
                 },
+                // #59: `[llm]` changes in the config file swap the provider between requests.
+                Some(paths.config_file.clone()),
             )
         });
         let (commands_tx, commands) = mpsc::channel();
@@ -1329,6 +1338,28 @@ fn build_lane(
         sink,
         placement,
     ))
+}
+
+/// Block until the configured Ollama model is loaded (#61). A failure is only logged: the
+/// suggester's own warm-up reports it on the model dot. Remote providers use no local GPU.
+fn warm_local_llm(llm: &dmn_core::config::Llm) {
+    if llm.provider != dmn_core::config::Provider::Ollama {
+        return;
+    }
+    let warmed = wire::provider(llm)
+        .map_err(|e| e.to_string())
+        .and_then(|p| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(p.warm_up())
+                .map_err(|e| e.to_string())
+        });
+    match warmed {
+        Ok(()) => tracing::info!(model = %llm.model, "LLM loaded before GPU whisper"),
+        Err(e) => tracing::warn!(error = %e, "LLM warm-up before GPU whisper failed"),
+    }
 }
 
 /// `[stt].device` in `dmn-stt`'s terms (`dmn-stt` does not depend on `dmn-core`).

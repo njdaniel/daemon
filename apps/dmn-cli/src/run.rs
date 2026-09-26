@@ -146,6 +146,13 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     if args.headless && args.replay.is_none() && args.duration.is_none() {
         return Err("--headless needs --replay, or --duration for a live capture".into());
     }
+    // SPEC § Providers: say in words when transcript text leaves the machine. The TUI keeps it
+    // on the status line; with no terminal it goes to stderr before anything is sent.
+    if args.headless
+        && let Some(notice) = cfg.llm.privacy_notice()
+    {
+        eprintln!("run: {notice}");
+    }
     let (input, questions) = match args.replay.clone() {
         Some((interviewer, candidate)) => {
             let questions = interviewer.parent().map(|d| d.join("questions.json"));

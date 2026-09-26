@@ -49,19 +49,21 @@
 //! session's last 8 lines.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use dmn_core::config::Config;
 use dmn_core::{config, wire};
 use dmn_detect::Candidate;
 use dmn_llm::fast::FAST_PHASE_TIMEOUT;
 use dmn_llm::schema::Star;
 use dmn_llm::{
     CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason, Kind,
-    LlmError, OllamaProvider, OllamaSettings, PreviousAnswer, Provider, SlowFields, SlowOutcome,
-    SlowRequest, Suggestion, run_fast_phase, run_slow_phase,
+    LlmError, PreviousAnswer, Provider, SlowFields, SlowOutcome, SlowRequest, Suggestion,
+    run_fast_phase, run_slow_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
@@ -86,6 +88,15 @@ impl Output {
         match self {
             Output::Print { .. } => eprintln!("replay: {msg}"),
             Output::Quiet => tracing::warn!("{msg}"),
+        }
+    }
+
+    /// Something the user must know but that is not a failure: which provider answers, and
+    /// that transcript text leaves the machine (#59). `dmn run` shows it on the status line.
+    fn note(self, msg: &str) {
+        match self {
+            Output::Print { .. } => eprintln!("replay: {msg}"),
+            Output::Quiet => tracing::info!("{msg}"),
         }
     }
 }
@@ -307,7 +318,10 @@ pub struct Suggester {
 impl Suggester {
     /// `clock` stamps each outcome in session time (`--speed` × wall clock); `audio` stamps
     /// when each question and its first Approach line were produced, in audio time (#16).
-    /// `context` is where the sources and job requirements are read from (#54).
+    /// `context` is where the sources and job requirements are read from (#54). `config_file`,
+    /// when given, is watched between requests: a change to `[llm]`'s provider, endpoint, model
+    /// or key variable swaps the provider for the next request, without a restart (#59).
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         llm: &config::Llm,
         output: Output,
@@ -316,10 +330,13 @@ impl Suggester {
         clock: wire::SessionClock,
         audio: wire::AudioClock,
         context: ContextSource,
+        config_file: Option<PathBuf>,
     ) -> Self {
         let llm = llm.clone();
         Self::spawn(policy, hub, move |ch| {
-            worker(&llm, output, clock, audio, &ch, &context)
+            let reload =
+                config_file.map(|path| Reload::watch(path, &llm, Box::new(wire::provider)));
+            worker(&llm, output, clock, audio, &ch, &context, reload)
         })
     }
 
@@ -332,6 +349,44 @@ impl Suggester {
         hub: Arc<SessionHub>,
     ) -> Self {
         Self::start_with_context(provider, policy, hub, Context::empty(), None)
+    }
+
+    /// Serve jobs like [`Suggester::start_with`], starting on `build(llm)` and watching
+    /// `config_file` for `[llm]` changes: the reload path of `dmn run` with mock providers.
+    #[cfg(test)]
+    fn start_with_reload(
+        llm: &config::Llm,
+        config_file: PathBuf,
+        build: Builder,
+        policy: Policy,
+        hub: Arc<SessionHub>,
+    ) -> Self {
+        let llm = llm.clone();
+        Self::spawn(policy, hub, move |ch| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let provider = build(&llm).expect("first provider");
+            let mut answerer = Answerer {
+                rt: &rt,
+                provider,
+                hub: ch.hub,
+                clock: wire::SessionClock::start(1.0),
+                audio: wire::AudioClock::new(Instant::now(), 1.0),
+                output: Output::Quiet,
+                cancel: ch.cancel,
+                latest: ch.latest,
+                reload: Some(Reload::watch(config_file, &llm, build)),
+            };
+            ch.hub.dispatch(Action::Provider {
+                label: wire::provider_label(&llm),
+            });
+            let mut context = Context::empty();
+            let mut tally = Tally::default();
+            let _ = serve(&mut answerer, &ch, None, &mut context, &mut tally);
+            tally
+        })
     }
 
     /// [`Suggester::start_with`] with `context` already loaded, and the slow phase on when
@@ -349,21 +404,22 @@ impl Suggester {
                 .enable_all()
                 .build()
                 .expect("runtime");
-            let answerer = Answerer {
+            let mut answerer = Answerer {
                 rt: &rt,
-                provider: &provider,
+                provider: Arc::new(provider),
                 hub: ch.hub,
                 clock: wire::SessionClock::start(1.0),
                 audio: wire::AudioClock::new(Instant::now(), 1.0),
                 output: Output::Quiet,
                 cancel: ch.cancel,
                 latest: ch.latest,
+                reload: None,
             };
             let mut tally = Tally {
                 context: context.info(),
                 ..Tally::default()
             };
-            let _ = serve(&answerer, &ch, slow, &mut context, &mut tally);
+            let _ = serve(&mut answerer, &ch, slow, &mut context, &mut tally);
             tally
         })
     }
@@ -512,6 +568,7 @@ fn worker(
     audio: wire::AudioClock,
     ch: &Channels<'_>,
     context: &ContextSource,
+    reload: Option<Reload>,
 ) -> Tally {
     let (rx, hub, cancel) = (ch.rx, ch.hub, ch.cancel);
     let mut tally = Tally::default();
@@ -533,15 +590,6 @@ fn worker(
         }
     };
 
-    if llm.provider != config::Provider::Ollama {
-        output.warn(&format!(
-            "no suggestions: [llm].provider {:?} is not wired until M2; transcribing only",
-            llm.provider
-        ));
-        model_down(format!("{:?} is not wired until M2", llm.provider));
-        skip_all(&mut tally, "LLM unavailable");
-        return tally;
-    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -556,14 +604,8 @@ fn worker(
             return tally;
         }
     };
-    let settings = OllamaSettings {
-        base_url: llm.base_url.clone(),
-        model: llm.model.clone(),
-        // #61: a smaller window than the server's lets the whole model sit in VRAM.
-        num_ctx: (llm.num_ctx > 0).then_some(llm.num_ctx),
-        ..OllamaSettings::default()
-    };
-    let provider = match OllamaProvider::from_settings(&settings) {
+    // #59: whichever provider `[llm]` names; the API key is read from its env var here.
+    let provider = match wire::provider(llm) {
         Ok(p) => p,
         Err(e) => {
             output.warn(&format!("no suggestions: {e}; transcribing only"));
@@ -582,10 +624,13 @@ fn worker(
     match warm {
         Some(Ok(())) => {}
         Some(Err(e)) => {
-            output.warn(&format!(
-                "no suggestions: {e}; transcribing only (fix: start Ollama and `ollama pull {}`)",
-                settings.model
-            ));
+            let fix = match llm.provider {
+                config::Provider::Ollama => {
+                    format!(" (fix: start Ollama and `ollama pull {}`)", llm.model)
+                }
+                _ => String::new(),
+            };
+            output.warn(&format!("no suggestions: {e}; transcribing only{fix}"));
             model_down(e.to_string());
             skip_all(&mut tally, "LLM unavailable");
             return tally;
@@ -599,6 +644,7 @@ fn worker(
         dot: Dot::Model,
         health: Health::Ok,
     });
+    announce(llm, hub, output);
 
     // #54: the sources and job requirements, loaded once before the first question. A new job
     // description is summarised here, off every question's path; candidates queue meanwhile.
@@ -606,7 +652,7 @@ fn worker(
         output.warn(&format!("no context: {e}; prompts go without it"));
         Context::empty()
     });
-    if let Err(e) = context.ensure_requirements(&rt, &provider, cancel) {
+    if let Err(e) = context.ensure_requirements(&rt, &*provider, cancel) {
         output.warn(&format!(
             "job description not summarised: {e}; prompts go without its requirements"
         ));
@@ -614,19 +660,20 @@ fn worker(
     tally.context = context.info();
     print_context(&context, output);
 
-    let answerer = Answerer {
+    let mut answerer = Answerer {
         rt: &rt,
-        provider: &provider,
+        provider,
         hub,
         clock,
         audio,
         output,
         cancel,
         latest: ch.latest,
+        reload,
     };
     // `[llm].slow_timeout_ms = 0` turns the slow phase off.
     let slow = (llm.slow_timeout_ms > 0).then(|| Duration::from_millis(llm.slow_timeout_ms));
-    if let Err(e) = serve(&answerer, ch, slow, &mut context, &mut tally) {
+    if let Err(e) = serve(&mut answerer, ch, slow, &mut context, &mut tally) {
         output.warn(&format!(
             "no suggestions from here on: {e}; transcribing only"
         ));
@@ -639,8 +686,8 @@ fn worker(
 /// Serve jobs until the sender drops (or the run is stopped). A job waiting always goes first;
 /// the slow phase (when `slow` gives its deadline) runs only while none is. `Err` only for an
 /// unreachable provider, after which nothing more is sent.
-fn serve<P: Provider>(
-    answerer: &Answerer<'_, P>,
+fn serve(
+    answerer: &mut Answerer<'_>,
     ch: &Channels<'_>,
     slow: Option<Duration>,
     context: &mut Context,
@@ -665,6 +712,8 @@ fn serve<P: Provider>(
                 if let (Some(timeout), Some(mut next)) =
                     (slow, answerer.next_slow(&mut pending, &mut memory, tally))
                 {
+                    // #59: between requests, never mid-request.
+                    answerer.reload();
                     if answerer.run_slow(&mut next, timeout, ch.gate, context, &mut memory, tally)
                         == SlowRun::Interrupted
                     {
@@ -696,6 +745,8 @@ fn serve<P: Provider>(
             }
         };
         ch.gate.taken();
+        // #59: a provider change in the config file takes effect here, before this request.
+        answerer.reload();
         let carried = job.answered.clone();
         let Some(mut next) = answerer.answer(job, &mut current, context, tally)? else {
             // No slow phase from this job (ignored, a clarification, superseded, failed). While
@@ -736,10 +787,11 @@ enum SlowRun {
     Interrupted,
 }
 
-/// Runs one job at a time against a provider (Ollama in `dmn`, a `MockProvider` in tests).
-struct Answerer<'a, P: Provider> {
+/// Runs one job at a time against a provider (the one `[llm]` names in `dmn`, a `MockProvider`
+/// in tests). `provider` is swapped only between requests, by [`Answerer::reload`].
+struct Answerer<'a> {
     rt: &'a tokio::runtime::Runtime,
-    provider: &'a P,
+    provider: Arc<dyn Provider>,
     hub: &'a SessionHub,
     clock: wire::SessionClock,
     /// Stamps [`Action::Timing`] for the session log (#16).
@@ -748,6 +800,52 @@ struct Answerer<'a, P: Provider> {
     cancel: &'a CancellationToken,
     /// `Some` under [`Policy::Supersede`].
     latest: Option<&'a Latest>,
+    /// #59: the config file to watch for a provider change; `None` in `dmn replay` without a
+    /// config file and in most tests.
+    reload: Option<Reload>,
+}
+
+/// Builds the provider `[llm]` names: [`wire::provider`] in `dmn`, mocks in tests.
+type Builder = Box<dyn Fn(&config::Llm) -> Result<Arc<dyn Provider>, LlmError> + Send>;
+
+/// The config file `dmn run` watches (#59). Read between requests: unchanged text costs one read
+/// and a compare; changed text is parsed, and only a change to the provider, endpoint, model or
+/// key variable builds a new provider.
+struct Reload {
+    path: PathBuf,
+    /// The file's text when last read.
+    seen: String,
+    /// The `[llm]` the current provider was built from.
+    llm: config::Llm,
+    build: Builder,
+}
+
+impl Reload {
+    fn watch(path: PathBuf, llm: &config::Llm, build: Builder) -> Self {
+        let seen = std::fs::read_to_string(&path).unwrap_or_default();
+        Self {
+            path,
+            seen,
+            llm: llm.clone(),
+            build,
+        }
+    }
+}
+
+/// Say which provider answers: the model dot's name, and, when transcript text leaves the
+/// machine, the notice (SPEC § Providers) on the status line and in `dmn replay`'s output.
+fn announce(llm: &config::Llm, hub: &SessionHub, output: Output) {
+    hub.dispatch(Action::Provider {
+        label: wire::provider_label(llm),
+    });
+    match llm.privacy_notice() {
+        Some(notice) => output.note(&format!(
+            "model: {} ({}); {notice}",
+            llm.provider.as_str(),
+            llm.model
+        )),
+        None => tracing::info!(provider = llm.provider.as_str(), model = %llm.model, "model"),
+    }
 }
 
 /// The request for `job`: a new candidate (answered with the question on screen as context, so
@@ -762,7 +860,75 @@ fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
     }
 }
 
-impl<P: Provider> Answerer<'_, P> {
+impl Answerer<'_> {
+    /// #59: if the watched config file now names a different provider, build it, warm it up and
+    /// answer the next request with it. Called between requests only, so a request in flight
+    /// always finishes on the provider it started on. A bad file, a provider that cannot be
+    /// built, or a failed warm-up keeps the current provider and says why.
+    fn reload(&mut self) {
+        let Some(r) = self.reload.as_mut() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&r.path) else {
+            return;
+        };
+        if text == r.seen {
+            return;
+        }
+        r.seen.clone_from(&text);
+        let keep = r.llm.provider.as_str();
+        let cfg = match Config::from_toml(&text, &r.path.display().to_string()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                self.output
+                    .warn(&format!("config reload: {e}; keeping {keep}"));
+                return;
+            }
+        };
+        if wire::same_provider(&cfg.llm, &r.llm) {
+            return;
+        }
+        let next = match (r.build)(&cfg.llm) {
+            Ok(p) => p,
+            Err(e) => {
+                self.output
+                    .warn(&format!("config reload: {e}; keeping {keep}"));
+                return;
+            }
+        };
+        let cancel = self.cancel;
+        let warm = self.rt.block_on(async {
+            tokio::select! {
+                r = next.warm_up() => Some(r),
+                () = cancel.cancelled() => None,
+            }
+        });
+        match warm {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                self.output.warn(&format!(
+                    "config reload: {} did not warm up: {e}; keeping {keep}",
+                    cfg.llm.provider.as_str()
+                ));
+                return;
+            }
+            None => return,
+        }
+        tracing::info!(
+            from = keep,
+            to = cfg.llm.provider.as_str(),
+            model = %cfg.llm.model,
+            "provider switched by config reload"
+        );
+        self.provider = next;
+        r.llm = cfg.llm;
+        self.hub.dispatch(Action::Status {
+            dot: Dot::Model,
+            health: Health::Ok,
+        });
+        announce(&r.llm, self.hub, self.output);
+    }
+
     /// Answer one job and dispatch everything it produced. Returns the slow phase to run for a
     /// question it put on screen (#55). `Err` only for an unreachable provider, after which
     /// nothing more is sent.
@@ -859,7 +1025,7 @@ impl<P: Provider> Answerer<'_, P> {
         };
         let result = self
             .rt
-            .block_on(run_fast_phase(self.provider, &req, token.clone(), |e| {
+            .block_on(run_fast_phase(&*self.provider, &req, token.clone(), |e| {
                 let timing = match e {
                     FastEvent::Question { .. } | FastEvent::Clarification { .. } => {
                         let first = question_at.is_none();
@@ -1123,7 +1289,7 @@ impl<P: Provider> Answerer<'_, P> {
         let mut arrived: Vec<(&'static str, Duration)> = Vec::new();
         let result = self
             .rt
-            .block_on(run_slow_phase(self.provider, &req, token.clone(), |f| {
+            .block_on(run_slow_phase(&*self.provider, &req, token.clone(), |f| {
                 arrived.push((f.name(), started.elapsed()));
                 fields.apply(&f);
                 if let Some(action) = wire::slow_field(job.id, &f) {
@@ -1559,6 +1725,7 @@ mod tests {
             wire::SessionClock::start(1.0),
             wire::AudioClock::new(Instant::now(), 1.0),
             ContextSource::Off,
+            None,
         );
         for id in [1, 2] {
             hub.dispatch(wire::candidate(id, &candidate()));
@@ -1576,28 +1743,61 @@ mod tests {
         assert_eq!(session.counts.failed, 2);
     }
 
+    /// Answer one request on loopback with a 401, like a remote API given a bad key.
+    fn serve_one_401() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 16384];
+                let _ = stream.read(&mut buf);
+                let body = "{\"type\":\"error\",\"error\":{\"message\":\"invalid x-api-key\"}}";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        url
+    }
+
+    /// #59: `[llm].provider = "anthropic"` really answers through Anthropic (here a loopback
+    /// server that rejects the key), the model dot is named after it with the "leaves this
+    /// machine" flag, and the failed request turns the dot red. No network: `base_url` is local.
     #[test]
-    fn a_remote_provider_is_not_called_in_m1() {
+    fn a_remote_provider_named_in_the_config_is_the_one_asked() {
         let llm = config::Llm {
             provider: config::Provider::Anthropic,
+            base_url: serve_one_401(),
+            model: "claude-test".into(),
             ..config::Llm::default()
         };
+        let hub = Arc::new(SessionHub::default());
         let s = Suggester::start(
             &llm,
             Output::Quiet,
             Policy::AnswerAll,
-            Arc::new(SessionHub::default()),
+            Arc::clone(&hub),
             wire::SessionClock::start(1.0),
             wire::AudioClock::new(Instant::now(), 1.0),
             ContextSource::Off,
+            None,
         );
-        s.submit(1, &candidate(), String::new());
+        submit_with_candidate(&s, &hub, 1);
+        assert_eq!(s.finish().failed, 1);
+        let status = hub.snapshot().status;
+        let label = status.provider.expect("announced");
         assert_eq!(
-            s.finish(),
-            Tally {
-                skipped: 1,
-                ..Tally::default()
-            }
+            (label.name.as_str(), label.model.as_str(), label.remote),
+            ("anthropic", "claude-test", true)
+        );
+        assert!(
+            matches!(&status.model, Health::Error(why) if why.contains("401")),
+            "{:?}",
+            status.model
         );
     }
 
@@ -1618,6 +1818,7 @@ mod tests {
             wire::SessionClock::start(1.0),
             wire::AudioClock::new(Instant::now(), 1.0),
             ContextSource::Off,
+            None,
         );
         for id in [1, 2, 3] {
             hub.dispatch(wire::candidate(id, &candidate()));
@@ -1647,13 +1848,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let answerer = Answerer {
             rt: &rt,
-            provider: &provider,
+            provider: Arc::new(provider.clone()),
             hub: &hub,
             clock: wire::SessionClock::start(1.0),
             audio: wire::AudioClock::new(Instant::now(), 1.0),
             output: Output::Quiet,
             cancel: &cancel,
             latest: None,
+            reload: None,
         };
         // Candidate 1 is on screen, answered once already.
         hub.dispatch(wire::candidate(1, &candidate()));
@@ -1725,6 +1927,135 @@ mod tests {
         submit_with_candidate(&s, &hub, 2);
         assert_eq!(s.finish().shown, 1);
         assert_eq!(hub.snapshot().status.model, Health::Ok);
+    }
+
+    // --- Provider reload (#59) --------------------------------------------------------------
+
+    fn wait_for_live(hub: &SessionHub, text: &str) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while hub.snapshot().live.map(|q| q.text) != Some(text.to_owned()) {
+            assert!(Instant::now() < until, "never showed {text:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Changing `[llm].provider` in the config file while a request streams: that request
+    /// finishes on the provider it started on, the next question goes to the new one, and a
+    /// change elsewhere in the file builds nothing.
+    #[test]
+    fn a_config_reload_swaps_the_provider_between_requests_never_mid_request() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm]\nprovider = \"ollama\"\n").unwrap();
+        let llm = Config::load(&path).unwrap().llm;
+
+        // A streams for about 2 s, so the file changes while its request is in flight. Both
+        // replies restate the candidate, so #16's echo guard never retries them.
+        let a = slow_reply("How would you design a rate limiter, from ollama?");
+        let b = dmn_llm::MockProvider::json(&serde_json::json!({
+            "is_question": true,
+            "kind": "system_design",
+            "question": "How would you design a rate limiter, from openai?",
+            "focus": "tradeoffs",
+            "approach": ["Clarify scope.", "Pick the data model.", "Name the failure modes."]
+        }));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let build: Builder = {
+            let (a, b, builds) = (a.clone(), b.clone(), Arc::clone(&builds));
+            Box::new(move |llm: &config::Llm| {
+                builds.fetch_add(1, Ordering::SeqCst);
+                Ok(match llm.provider {
+                    config::Provider::Ollama => Arc::new(a.clone()) as Arc<dyn Provider>,
+                    _ => Arc::new(b.clone()) as Arc<dyn Provider>,
+                })
+            })
+        };
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_reload(
+            &llm,
+            path.clone(),
+            build,
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+        );
+
+        submit_with_candidate(&s, &hub, 1);
+        std::thread::sleep(Duration::from_millis(300));
+        let label = hub
+            .snapshot()
+            .status
+            .provider
+            .expect("announced before the first request");
+        assert_eq!((label.name.as_str(), label.remote), ("ollama", false));
+        std::fs::write(
+            &path,
+            "[llm]\nprovider = \"openai\"\nmodel = \"gpt-test\"\n",
+        )
+        .unwrap();
+        wait_for_live(&hub, "How would you design a rate limiter, from ollama?");
+        assert_eq!(
+            b.requests().len(),
+            0,
+            "the request in flight stayed on ollama"
+        );
+
+        submit_with_candidate(&s, &hub, 2);
+        wait_for_live(&hub, "How would you design a rate limiter, from openai?");
+        // Not a provider field: nothing is rebuilt.
+        std::fs::write(
+            &path,
+            "[llm]\nprovider = \"openai\"\nmodel = \"gpt-test\"\nslow_timeout_ms = 0\n",
+        )
+        .unwrap();
+        submit_with_candidate(&s, &hub, 3);
+        let tally = s.finish();
+
+        assert_eq!(tally.shown, 3);
+        assert_eq!(a.requests().len(), 1);
+        assert_eq!(b.requests().len(), 2);
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "the first provider and the switch"
+        );
+        let label = hub.snapshot().status.provider.expect("label");
+        assert_eq!(
+            (label.name.as_str(), label.model.as_str()),
+            ("openai", "gpt-test")
+        );
+        assert!(label.remote, "openai sends transcript text off the machine");
+    }
+
+    /// A config file that no longer parses keeps the provider that works.
+    #[test]
+    fn a_broken_config_reload_keeps_the_current_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[llm]\nprovider = \"ollama\"\n").unwrap();
+        let llm = Config::load(&path).unwrap().llm;
+        let a = slow_reply("Still ollama?");
+        let build: Builder = {
+            let a = a.clone();
+            Box::new(move |_: &config::Llm| Ok(Arc::new(a.clone()) as Arc<dyn Provider>))
+        };
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_reload(
+            &llm,
+            path.clone(),
+            build,
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+        );
+        std::fs::write(&path, "[llm]\nprovider = \"nonsense\"\n").unwrap();
+        submit_with_candidate(&s, &hub, 1);
+        assert_eq!(s.finish().shown, 1);
+        assert_eq!(a.requests().len(), 1);
+        assert_eq!(
+            hub.snapshot().status.provider.map(|p| p.name).as_deref(),
+            Some("ollama")
+        );
     }
 
     /// A reply that streams for about 2 s (50 ms per 7-character chunk).

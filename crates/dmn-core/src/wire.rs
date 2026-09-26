@@ -5,11 +5,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dmn_detect::Candidate;
-use dmn_llm::{FastEvent, FastOutcome, LlmError};
-use dmn_session::{
-    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, IgnoreReason, SlowEnd, SlowField,
-    Speaker, StarCards, TradeoffItem,
+use dmn_llm::{
+    AnthropicProvider, FastEvent, FastOutcome, LlmError, OllamaProvider, OllamaSettings,
+    OpenAiProvider, Provider,
 };
+use dmn_session::{
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, IgnoreReason, ProviderLabel, SlowEnd,
+    SlowField, Speaker, StarCards, TradeoffItem,
+};
+
+use crate::config::{self, Llm};
 use dmn_transcript::Segment;
 
 /// Unix epoch seconds now. Actions carry their times, so this is called by whoever dispatches,
@@ -318,6 +323,51 @@ pub fn slow_ended(
         payload: fields.to_json().to_string(),
         at,
     }
+}
+
+/// The provider `[llm]` names (#59), with the API key read now from the env var
+/// `api_key_env` names. The key goes into the provider and nowhere else: not logged, not in any
+/// `Debug` output, not in the label.
+pub fn provider(llm: &Llm) -> Result<Arc<dyn Provider>, LlmError> {
+    let key = || llm.api_key().map(|k| k.expose().to_owned());
+    Ok(match llm.provider {
+        config::Provider::Ollama => Arc::new(OllamaProvider::from_settings(&OllamaSettings {
+            base_url: llm.endpoint(),
+            model: llm.model.clone(),
+            // #61: a context window smaller than the server's frees VRAM for GPU whisper.
+            num_ctx: (llm.num_ctx > 0).then_some(llm.num_ctx),
+            ..OllamaSettings::default()
+        })?),
+        config::Provider::OpenAI => Arc::new(OpenAiProvider::new(
+            llm.endpoint(),
+            llm.model.clone(),
+            key(),
+        )?),
+        config::Provider::Anthropic => Arc::new(AnthropicProvider::new(
+            llm.endpoint(),
+            llm.model.clone(),
+            key(),
+        )?),
+    })
+}
+
+/// What the model dot shows for `llm` (#59).
+pub fn provider_label(llm: &Llm) -> ProviderLabel {
+    ProviderLabel {
+        name: llm.provider.as_str().to_owned(),
+        model: llm.model.clone(),
+        remote: llm.leaves_machine(),
+    }
+}
+
+/// The `[llm]` fields that decide which provider answers: a change to any of them swaps the
+/// provider on reload; a change elsewhere in the file swaps nothing.
+pub fn same_provider(a: &Llm, b: &Llm) -> bool {
+    a.provider == b.provider
+        && a.endpoint() == b.endpoint()
+        && a.model == b.model
+        && a.api_key_env == b.api_key_env
+        && a.num_ctx == b.num_ctx
 }
 
 #[cfg(test)]
