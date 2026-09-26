@@ -690,6 +690,9 @@ impl Pipeline {
             })
             .max()
             .unwrap_or_default();
+        // The interviewer lane is built first on purpose (#61): its finals are on the question
+        // → Approach path, so when the GPU has room for only one whisper context it gets it,
+        // and the candidate's lane falls back to the CPU.
         let mut built = Vec::new();
         for (source, audio) in sources {
             let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));

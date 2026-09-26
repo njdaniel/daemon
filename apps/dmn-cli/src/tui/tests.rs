@@ -818,6 +818,17 @@ fn tui_the_status_line_says_which_device_transcribes() {
     let (x, y) = row_containing(&buf, "stt cpu (no gpu)");
     assert_eq!(buf[(x, y)].fg, Color::Yellow, "a fallback is amber");
 
+    // Beside a local LLM the usual split: the interviewer's lane on the GPU, yours on the CPU.
+    let mixed = text(&with(
+        "GPU NVIDIA GeForce RTX 4090 (Vulkan0, 1.2 of 26.0 GB free); CPU (fallback: Vulkan0 has \
+         0.33 GB free, whisper needs 1.16 GB)",
+        true,
+    ));
+    assert!(
+        mixed.contains(" stt gpu+cpu ") && !mixed.contains("no gpu"),
+        "{mixed}"
+    );
+
     let none = text(&render(&load("listening"), (100, 30)));
     assert!(
         !none.contains(" stt "),

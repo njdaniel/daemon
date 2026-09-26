@@ -100,6 +100,36 @@ The release binary is written to:
 target/release/dmn
 ```
 
+#### Optional: whisper on the GPU
+
+The default build transcribes on the CPU. With an NVIDIA GPU, a Vulkan build can run the
+interviewer's whisper on the GPU, which cuts the transcription step on the question → Approach
+path from about 0.8 s to about 0.35 s (#61, measured on an RTX 4090 beside
+`qwen3.6:35b-a3b`). Install the Vulkan headers and shader compiler, then build with the feature:
+
+```bash
+sudo apt install libvulkan-dev glslc vulkan-tools
+cargo build --release -p dmn-cli --features vulkan
+```
+
+(`--features cuda` works too, with the CUDA toolkit on `PATH`; it measured no faster here.)
+
+Whisper only fits beside a large local model when the model's context is smaller than
+Ollama's default, so set both in `~/.config/dmn/config.toml`:
+
+```toml
+[stt]
+device = "auto"      # the GPU when it has room, else the CPU; "gpu" warns when it falls back
+
+[llm]
+num_ctx = 8192       # Ollama context dmn asks for; frees the VRAM whisper needs
+```
+
+`dmn doctor` lists the GPUs the build sees and where whisper would run; the status line shows
+`stt gpu+cpu` when the interviewer's lane is on the GPU and yours on the CPU (the usual split
+on a 24 GB card). Changing `num_ctx` makes Ollama reload the model (about 6 s), and any other
+tool that uses Ollama's default context reloads it again (about 11 s).
+
 ### Initialize and inspect your system
 
 ```bash
