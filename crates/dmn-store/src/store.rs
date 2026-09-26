@@ -97,7 +97,8 @@ impl FromSql for Phase {
 }
 
 /// A row of `sessions`. `started_at` / `ended_at` are unix epoch seconds; `overruns` is the
-/// ring-buffer frames dropped over the session (schema v2).
+/// ring-buffer frames dropped over the session (schema v2); `echo_dropped` is the mic finals the
+/// echo guard dropped as copies of the loopback (schema v7, #60).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRow {
     pub id: i64,
@@ -105,6 +106,7 @@ pub struct SessionRow {
     pub ended_at: Option<i64>,
     pub label: String,
     pub overruns: i64,
+    pub echo_dropped: i64,
 }
 
 /// A row of `segments`. `start_time` / `end_time` are seconds relative to the session start.
@@ -334,6 +336,15 @@ impl Store {
         Ok(())
     }
 
+    /// Record how many mic finals the echo guard has dropped so far (#60).
+    pub fn set_session_echo_dropped(&self, id: i64, echo_dropped: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE sessions SET echo_dropped = ?2 WHERE id = ?1",
+            params![id, echo_dropped],
+        )?;
+        Ok(())
+    }
+
     /// The newest session's id, if there is one.
     pub fn latest_session_id(&self) -> Result<Option<i64>, StoreError> {
         Ok(self
@@ -345,7 +356,8 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, started_at, ended_at, label, overruns FROM sessions WHERE id = ?1",
+                "SELECT id, started_at, ended_at, label, overruns, echo_dropped
+                 FROM sessions WHERE id = ?1",
                 [id],
                 session_from_row,
             )
@@ -597,6 +609,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
         ended_at: row.get("ended_at")?,
         label: row.get("label")?,
         overruns: row.get("overruns")?,
+        echo_dropped: row.get("echo_dropped")?,
     })
 }
 

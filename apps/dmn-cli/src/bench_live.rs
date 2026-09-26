@@ -51,6 +51,8 @@ pub struct Stored {
     pub id: i64,
     pub label: String,
     pub overruns: i64,
+    /// Mic finals the echo guard dropped as copies of the loopback (schema v7, #60).
+    pub echo_dropped: i64,
     pub segments: Vec<SegmentRow>,
     pub questions: Vec<QuestionRow>,
     pub cpu: Vec<CpuSampleRow>,
@@ -73,6 +75,7 @@ pub fn load(store: &Store, session: Option<i64>) -> Result<Stored, String> {
         id,
         label: row.label,
         overruns: row.overruns,
+        echo_dropped: row.echo_dropped,
         segments: store.segments(id).map_err(err)?,
         questions: store.questions(id).map_err(err)?,
         cpu: store.cpu_samples(id).map_err(err)?,
@@ -250,6 +253,10 @@ pub fn report(s: &Stored, script: Option<&Path>) -> Result<String, String> {
         } else {
             " (NOT met: the target is none)"
         }
+    ));
+    out.push_str(&format!(
+        "echo guard: {} mic line(s) dropped as copies of the loopback\n",
+        s.echo_dropped
     ));
     Ok(out)
 }

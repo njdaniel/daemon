@@ -724,7 +724,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
         Action::Overruns { total } => s.status.overruns = *total,
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         // Measurements for the session log; nothing on screen depends on them.
-        Action::Timing { .. } | Action::Cpu { .. } => {}
+        Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}
     }
 }
 

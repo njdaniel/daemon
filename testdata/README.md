@@ -54,6 +54,17 @@ Several popular Piper voices are not safe to redistribute from, so do not switch
 
 `dmn replay <interviewer.wav> <candidate.wav>` feeds both tracks through the real pipeline. That arrives with issue #9. The recall and precision harness in `eval/` (issue #10) compares detected questions against `questions.json`.
 
+## Echo fixture (`echo/`, #60)
+
+The mic of a laptop without echo cancellation hears the call too. `python3 tools/fixtures/echo.py`
+derives `echo/` from `sysdesign/` (after `just fixtures-fetch`): the interviewer track is copied,
+and the candidate track becomes the candidate plus the interviewer at -9 dB, 100 ms late
+(`--source`, `--gain-db` and `--delay-ms` change that). The text files are copied, so it scores
+like its source. The whole folder is derived and ignored by git, so it needs no release of its
+own. The echo guard should drop every copied question and keep every real answer:
+`dmn replay testdata/echo/interviewer.wav testdata/echo/candidate.wav --no-llm` prints
+`echo guard   N mic line(s) dropped`.
+
 ## Context sources (`context/`, #53)
 
 Small fictional documents for `dmn sources` and, later, retrieval (#54). Nothing in them is about
