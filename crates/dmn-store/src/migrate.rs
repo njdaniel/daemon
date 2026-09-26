@@ -11,7 +11,8 @@
 //! the session start, mirroring the STT `Segment` shape (SPEC § Transcription).
 //!
 //! v3 (#50) records the coding-solutions mode per question; v4 (#53) adds context `sources` and
-//! their `chunks`; v5 (#54) caches the job-description summary.
+//! their `chunks`; v5 (#54) caches the job-description summary; v6 (#57) keeps the session
+//! memory's summary lines and promises.
 //!
 //! v2 (#16) adds what `dmn bench --live` needs to report latency and CPU from a stored session:
 //! per question, the audio time (REAL seconds, the same clock as segment times) at which the
@@ -24,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 struct Migration {
     version: i64,
@@ -51,6 +52,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: V5,
+    },
+    Migration {
+        version: 6,
+        sql: V6,
     },
 ];
 
@@ -186,6 +191,23 @@ CREATE TABLE jd_summaries (
     bullets     TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+";
+
+/// v6 (#57, SPEC § Session memory): one summary line per answered question (`question_id` is
+/// unique: a question has one line), the promise the candidate made in that answer if any, and
+/// whether a later answer covered it. `session_id` is kept too so a session's lines read back
+/// without a join, and both cascade, so purging a session removes its memory.
+const V6: &str = "
+CREATE TABLE summaries (
+    id          INTEGER PRIMARY KEY,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    question_id INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE CASCADE,
+    line        TEXT NOT NULL,
+    promise     TEXT,
+    mentioned   INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_summaries_session ON summaries(session_id);
 ";
 
 /// Apply every migration newer than the database's `user_version`, each in a transaction.

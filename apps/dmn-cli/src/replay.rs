@@ -193,6 +193,13 @@ pub fn print_downstream(report: &Report, paths: &Paths) {
                 t.slow_dropped,
                 t.slow_slowest.as_secs_f64()
             );
+            // #57: one summary line per answered question.
+            println!(
+                "memory       {} summary line(s), {} from the model, {} fallback(s)",
+                t.summaries,
+                t.summaries - t.summary_fallbacks,
+                t.summary_fallbacks
+            );
         }
         None => println!("fast phase   off (--no-llm)"),
     }
@@ -313,6 +320,10 @@ fn print_summary_json(report: &Report, audio: Duration) {
                     "restarts": t.slow_restarts,
                     "not_run": t.slow_dropped,
                     "slowest_ms": t.slow_slowest.as_millis() as u64,
+                },
+                "summaries": {
+                    "lines": t.summaries,
+                    "fallbacks": t.summary_fallbacks,
                 },
             })),
             "session": report.session.map(|r| serde_json::json!({

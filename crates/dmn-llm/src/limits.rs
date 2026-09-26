@@ -37,6 +37,11 @@ pub const EXAMPLE_LINES: usize = 12;
 pub const SOLUTION_LINES: usize = 40;
 /// Longest code line kept whole; longer lines are cut with `…`.
 pub const CODE_LINE_CHARS: usize = 120;
+/// #57, SPEC § Session memory: one summary line per answered question, the whole line (clock,
+/// summary and promise) at most this long. Eight of them ride in every prompt, so they stay short.
+pub const SUMMARY_CHARS: usize = 160;
+/// #57: a "promised to return to" topic is a few words.
+pub const PROMISE_CHARS: usize = 80;
 
 /// One limit that model output broke. `field` names the place, like `approach[2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +300,39 @@ pub fn limit_requirements(raw: &[String], flags: &mut Vec<Flag>) -> Vec<String> 
         limit_text(&format!("requirements[{i}]"), r, REQUIREMENT_CHARS, flags);
     }
     out
+}
+
+/// `raw` as one line: whitespace (newlines included) collapsed, trimmed, a bullet or number
+/// removed, then cut to `max`.
+pub fn limit_line(field: &str, raw: &str, max: usize, flags: &mut Vec<Flag>) -> String {
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut line = strip_marker(&one_line).to_owned();
+    limit_text(field, &mut line, max, flags);
+    line
+}
+
+/// A session summary line (#57, SPEC § Session memory): `clock` (when the question was asked),
+/// the summary, and the promise the candidate made, if any, as the SPEC's example has it: "14:31
+/// rate limiter — covered token bucket, Redis, fail-open; promised to return to clock skew". The
+/// whole line is at most [`SUMMARY_CHARS`]; the promise is kept whole when it fits and the
+/// summary is cut to make room, because the promise is what later questions act on.
+pub fn summary_line(
+    clock: &str,
+    summary: &str,
+    promise: Option<&str>,
+    flags: &mut Vec<Flag>,
+) -> String {
+    let promise = promise
+        .map(|p| limit_line("promise", p, PROMISE_CHARS, flags))
+        .filter(|p| !p.is_empty());
+    let tail = promise
+        .as_deref()
+        .map(|p| format!("; promised to return to {p}"))
+        .unwrap_or_default();
+    let head = format!("{clock} ");
+    let room = SUMMARY_CHARS.saturating_sub(head.chars().count() + tail.chars().count());
+    let body = limit_line("summary", summary, room, flags);
+    format!("{head}{body}{tail}").trim().to_owned()
 }
 
 /// One approach line as the UI shows it: trimmed, the model's own numbering or bullet removed
@@ -696,5 +734,44 @@ mod tests {
         let mut none_given = vec![item("resume.md")];
         limit_citations(&mut none_given, &[], &mut flags);
         assert!(none_given.is_empty(), "no chunks, nothing can be cited");
+    }
+
+    #[test]
+    fn a_summary_line_reads_like_the_spec_example_and_stays_one_line() {
+        let mut flags = Vec::new();
+        let line = summary_line(
+            "14:31",
+            "rate limiter —\n covered token bucket, Redis, fail-open",
+            Some(" clock skew "),
+            &mut flags,
+        );
+        assert_eq!(
+            line,
+            "14:31 rate limiter — covered token bucket, Redis, fail-open; promised to return to clock skew"
+        );
+        assert!(flags.is_empty());
+        assert_eq!(
+            summary_line("0:05", "two sum — hash map", Some("  "), &mut flags),
+            "0:05 two sum — hash map",
+            "a blank promise is no promise"
+        );
+    }
+
+    #[test]
+    fn an_over_long_summary_is_cut_and_the_promise_kept() {
+        let mut flags = Vec::new();
+        let long = "covered ".repeat(40);
+        let line = summary_line("03:12", &long, Some("clock skew"), &mut flags);
+        assert!(
+            line.chars().count() <= SUMMARY_CHARS,
+            "{}",
+            line.chars().count()
+        );
+        assert!(line.starts_with("03:12 covered"), "{line}");
+        assert!(
+            line.ends_with("; promised to return to clock skew"),
+            "{line}"
+        );
+        assert!(flags.iter().any(|f| f.field == "summary"), "{flags:?}");
     }
 }

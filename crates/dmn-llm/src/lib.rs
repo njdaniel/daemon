@@ -50,5 +50,7 @@ pub use provider::{
 };
 pub use requirements::{Requirements, summarise_job_description};
 pub use schema::{Kind, Suggestion};
-pub use slow::{CodingMode, SlowField, SlowFields, SlowOutcome, SlowRequest, run_slow_phase};
+pub use slow::{
+    CodingMode, PreviousAnswer, SlowField, SlowFields, SlowOutcome, SlowRequest, run_slow_phase,
+};
 pub use tokio_util::sync::CancellationToken;

@@ -4,7 +4,7 @@
 //! exactly the rows a live call would. [`StoreWriter`] turns actions into rows: finals only (no
 //! partials), no audio, and nothing but what the actions carry, which holds no configuration
 //! and no API key. It keeps its own reduced [`Session`] so a bare `Pin` knows which question row
-//! to mark.
+//! to mark, and so it sees which promise a You segment covered (#57: the reducer decides that).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,8 +13,8 @@ use std::thread::JoinHandle;
 
 use dmn_session::{Action, Session, SessionHub, SlowEnd, Speaker, Stage, reduce};
 use dmn_store::{
-    Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, NewSuggestion, Phase, Store,
-    StoreError,
+    Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, NewSuggestion, NewSummary, Phase,
+    Store, StoreError,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -128,7 +128,44 @@ impl StoreWriter {
             self.report.errors += 1;
             tracing::warn!(error = %e, "session writer: action not stored");
         }
+        // #57: a You final may cover an open promise; the reducer decides which.
+        let open: Vec<u64> = match action {
+            Action::Segment {
+                speaker: Speaker::You,
+                is_final: true,
+                ..
+            } => self
+                .state
+                .promises
+                .iter()
+                .filter(|p| !p.mentioned)
+                .map(|p| p.candidate)
+                .collect(),
+            _ => Vec::new(),
+        };
         reduce(&mut self.state, action);
+        for candidate in open {
+            let kept = self
+                .state
+                .promises
+                .iter()
+                .any(|p| p.candidate == candidate && p.mentioned);
+            if !kept {
+                continue;
+            }
+            let stored = self
+                .question_row(candidate)
+                .map_err(|e| e.to_string())
+                .and_then(|row| {
+                    self.store
+                        .set_promise_mentioned(row)
+                        .map_err(|e| e.to_string())
+                });
+            if let Err(e) = stored {
+                self.report.errors += 1;
+                tracing::warn!(error = %e, "session writer: covered promise not stored");
+            }
+        }
     }
 
     /// The question row for the live question, before or after `action` is reduced.
@@ -329,6 +366,25 @@ impl StoreWriter {
                     })?;
                     self.report.suggestions += 1;
                 }
+            }
+            // #57: the question's summary line, and the promise made in its answer.
+            Action::Summary {
+                candidate,
+                line,
+                promise,
+                at,
+            } => {
+                let Some(session_id) = self.session_id else {
+                    return Ok(());
+                };
+                let row = self.question_row(*candidate)?;
+                self.store.put_summary(&NewSummary {
+                    session_id,
+                    question_id: row,
+                    line: line.clone(),
+                    promise: promise.clone().filter(|p| !p.trim().is_empty()),
+                    created_at: *at,
+                })?;
             }
             Action::Focus { .. }
             | Action::ApproachLine { .. }

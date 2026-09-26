@@ -216,3 +216,52 @@ async fn live_the_slow_phase_fills_every_section_within_20_s() {
         );
     }
 }
+
+/// #57: the slow phase on the real model summarises the previous answer in one line and names
+/// the promise made in it; with nothing promised, the promise is empty.
+#[tokio::test]
+#[ignore]
+async fn live_the_slow_phase_summarises_the_previous_answer() {
+    use dmn_llm::{PreviousAnswer, SlowRequest, run_slow_phase};
+    let p = OllamaProvider::new("http://localhost:11434", "qwen3.6:35b-a3b").unwrap();
+    p.warm_up().await.unwrap();
+    for (answer, promised) in [
+        (
+            "I'd put a token bucket per API key in front of the service, with the counters in \
+             Redis, sharded by key. If Redis is down we fail open with a local limit and alert. \
+             There's also clock skew between regions, but I'll come back to that later.",
+            true,
+        ),
+        (
+            "A token bucket per API key, counters in Redis sharded by key, and fail open with a \
+             local limit when Redis is unreachable.",
+            false,
+        ),
+    ] {
+        let question = "How would you shard the counters?";
+        let mut req = SlowRequest::new(question, Kind::SystemDesign);
+        req.context = FastRequest::new(question, 6);
+        req.previous = Some(PreviousAnswer {
+            question: "How would you design a rate limiter for a globally distributed API?".into(),
+            answer: answer.into(),
+        });
+        let started = Instant::now();
+        let outcome = run_slow_phase(&p, &req, CancellationToken::new(), |_| {})
+            .await
+            .unwrap();
+        let summary = outcome.fields.summary.clone().unwrap_or_default();
+        let promise = outcome.fields.promise.clone().unwrap_or_default();
+        eprintln!(
+            "in {:?}\n  summary: {summary}\n  promise: {promise:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < dmn_llm::slow::SLOW_PHASE_TIMEOUT);
+        assert!(!summary.is_empty(), "a summary line");
+        assert!(summary.chars().count() <= dmn_llm::limits::SUMMARY_CHARS);
+        if promised {
+            assert!(promise.to_lowercase().contains("skew"), "{promise:?}");
+        } else {
+            assert!(promise.is_empty(), "nothing was promised: {promise:?}");
+        }
+    }
+}

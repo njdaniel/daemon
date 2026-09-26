@@ -985,3 +985,225 @@ fn section_toggles_replay_identically_through_json_lines() {
         .collect();
     assert_eq!(Session::replay(&parsed), Session::replay(&log));
 }
+
+// --- Session memory (#57) ----------------------------------------------------------------------
+
+fn summary(candidate: u64, line: &str, promise: Option<&str>) -> Action {
+    Action::Summary {
+        candidate,
+        line: line.into(),
+        promise: promise.map(str::to_owned),
+        at: 1_700_000_000 + candidate as i64,
+    }
+}
+
+fn mention(candidate: u64, items: &[&str]) -> Action {
+    Action::Slow {
+        candidate,
+        field: SlowField::Mention {
+            items: items.iter().map(|i| (*i).to_owned()).collect(),
+        },
+    }
+}
+
+#[test]
+fn every_summary_line_is_kept_and_prompts_get_the_last_eight() {
+    let mut log = Vec::new();
+    for id in 1..=10u64 {
+        log.push(candidate(id, id as f64 * 60.0, "Q?"));
+        log.extend(shown(id, &format!("Q{id}"), &["a", "b", "c"]));
+    }
+    // Lines arrive out of order (a fallback for an earlier question at the end): stored in
+    // question order.
+    for id in (1..=10u64).rev() {
+        log.push(summary(id, &format!("{id:02}:00 Q{id} — covered it"), None));
+    }
+    let s = Session::replay(&log);
+    assert_eq!(s.summary.len(), 10);
+    assert_eq!(s.summary[0].candidate, 1);
+    let prompt = s.summary_for_prompt();
+    assert_eq!(prompt.len(), memory::PROMPT_LINES);
+    assert_eq!(prompt[0], "03:00 Q3 — covered it");
+    assert_eq!(prompt[7], "10:00 Q10 — covered it");
+
+    // The same question summarised again replaces its line.
+    let mut again = log.clone();
+    again.push(summary(4, "04:00 Q4 — covered more", None));
+    let s = Session::replay(&again);
+    assert_eq!(s.summary.len(), 10);
+    assert_eq!(s.summary[3].line, "04:00 Q4 — covered more");
+}
+
+#[test]
+fn a_promise_shows_on_later_questions_until_the_candidate_covers_it() {
+    let mut log = vec![candidate(1, 10.0, "Design a rate limiter.")];
+    log.extend(shown(1, "Design a rate limiter.", &["a", "b", "c"]));
+    log.push(seg(
+        Speaker::You,
+        15.0,
+        30.0,
+        "Token bucket per key. I'll come back to clock skew.",
+        true,
+    ));
+    log.push(candidate(2, 40.0, "How do you shard it?"));
+    log.extend(shown(2, "How do you shard it?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 2 });
+    log.push(mention(2, &["Name the SLO."]));
+    // Question 2's slow phase summarises question 1's answer, promise included.
+    log.push(summary(
+        1,
+        "00:10 rate limiter — covered token bucket; promised to return to clock skew",
+        Some("clock skew"),
+    ));
+    let s = Session::replay(&log);
+    let item = "Come back to clock skew: you said you would";
+    let live = s.live.as_ref().unwrap();
+    assert_eq!(live.sections.mention, [item, "Name the SLO."]);
+    assert_eq!(*live.sections.state(Section::Mention), SectionState::Done);
+    assert!(!s.promises[0].mentioned);
+
+    // Question 3 arrives while it is still open: it shows there too, before any slow phase.
+    let mut log3 = log.clone();
+    log3.push(candidate(3, 90.0, "What about hot keys?"));
+    log3.extend(shown(3, "What about hot keys?", &["a", "b", "c"]));
+    let s3 = Session::replay(&log3);
+    assert_eq!(s3.live.as_ref().unwrap().sections.mention, [item]);
+    // Its own Mention field later keeps the promise first.
+    log3.push(mention(3, &["Mention replication."]));
+    let s3 = Session::replay(&log3);
+    assert_eq!(
+        s3.live.as_ref().unwrap().sections.mention,
+        [item, "Mention replication."]
+    );
+
+    // Talking about something else keeps it, and so do the interviewer's words; the candidate
+    // covering it closes it.
+    log.push(seg(Speaker::You, 50.0, 55.0, "We hash the key.", true));
+    log.push(seg(
+        Speaker::Interviewer,
+        56.0,
+        58.0,
+        "What about clock skew?",
+        true,
+    ));
+    assert!(!Session::replay(&log).promises[0].mentioned);
+    log.push(seg(
+        Speaker::You,
+        60.0,
+        70.0,
+        "Back to clock skew: we bound it with NTP.",
+        true,
+    ));
+    let s = Session::replay(&log);
+    assert!(s.promises[0].mentioned);
+    assert_eq!(s.live.as_ref().unwrap().sections.mention, ["Name the SLO."]);
+
+    // A covered promise is not added to later questions.
+    log.push(candidate(4, 90.0, "Next?"));
+    log.extend(shown(4, "Next?", &["a", "b", "c"]));
+    assert!(
+        Session::replay(&log)
+            .live
+            .unwrap()
+            .sections
+            .mention
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_mention_row_holding_only_a_covered_promise_is_hidden_again() {
+    let mut log = vec![candidate(1, 1.0, "Q1?")];
+    log.extend(shown(1, "Q1?", &["a", "b", "c"]));
+    log.push(candidate(2, 20.0, "Q2?"));
+    log.extend(shown(2, "Q2?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 2 });
+    log.push(mention(2, &[]));
+    log.push(Action::SlowEnded {
+        candidate: 2,
+        end: SlowEnd::Done,
+        payload: "{}".into(),
+        at: 1,
+    });
+    let state = |log: &[Action]| {
+        Session::replay(log)
+            .live
+            .unwrap()
+            .sections
+            .state(Section::Mention)
+            .clone()
+    };
+    assert_eq!(state(&log), SectionState::Empty);
+    log.push(summary(1, "00:01 Q1 — covered", Some("consistent hashing")));
+    assert_eq!(
+        state(&log),
+        SectionState::Done,
+        "a promise gives the hidden row something to show"
+    );
+    log.push(seg(
+        Speaker::You,
+        30.0,
+        35.0,
+        "Consistent hashing, then.",
+        true,
+    ));
+    assert_eq!(state(&log), SectionState::Empty);
+}
+
+#[test]
+fn an_open_mention_row_closes_when_its_only_promise_is_covered() {
+    let mut log = vec![candidate(1, 1.0, "Q1?")];
+    log.extend(shown(1, "Q1?", &["a", "b", "c"]));
+    log.push(candidate(2, 20.0, "Q2?"));
+    log.extend(shown(2, "Q2?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 2 });
+    log.push(mention(2, &[]));
+    log.push(Action::SlowEnded {
+        candidate: 2,
+        end: SlowEnd::Done,
+        payload: "{}".into(),
+        at: 1,
+    });
+    log.push(summary(1, "00:01 Q1 — covered", Some("consistent hashing")));
+    log.push(toggle(Section::Mention));
+    assert_eq!(open_section(&log), Some(Section::Mention));
+    log.push(seg(
+        Speaker::You,
+        30.0,
+        35.0,
+        "Consistent hashing, then.",
+        true,
+    ));
+    assert_eq!(
+        open_section(&log),
+        None,
+        "the row left the screen, so it is no longer open"
+    );
+}
+
+#[test]
+fn summary_lines_and_promises_survive_the_action_log_and_json() {
+    let mut log = vec![candidate(1, 1.0, "Q1?")];
+    log.extend(shown(1, "Q1?", &["a", "b", "c"]));
+    log.push(summary(1, "00:01 Q1 — covered", Some("clock skew")));
+    let text: String = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap() + "\n")
+        .collect();
+    let back: Vec<Action> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let s = Session::replay(&back);
+    assert_eq!(s, Session::replay(&log));
+    assert_eq!(s.summary[0].line, "00:01 Q1 — covered");
+    let again: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(again, s);
+    // A session with no memory serialises as it did before #57.
+    let bare = Session::replay(&log[..log.len() - 1]);
+    let json = serde_json::to_string(&bare).unwrap();
+    assert!(
+        !json.contains("\"summary\"") && !json.contains("\"promises\""),
+        "{json}"
+    );
+}
