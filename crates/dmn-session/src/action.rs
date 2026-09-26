@@ -112,6 +112,133 @@ pub enum Stage {
     Approach,
 }
 
+/// One of the six expandable sections under the Approach (SPEC § AI Assistance), in the fixed
+/// order the UI shows them. The slow phase (#55) fills them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Section {
+    Deeper,
+    Followups,
+    Tradeoffs,
+    Example,
+    Mention,
+    ResumeContext,
+}
+
+impl Section {
+    /// All six, in on-screen order (keys `1`–`6`).
+    pub const ALL: [Section; 6] = [
+        Section::Deeper,
+        Section::Followups,
+        Section::Tradeoffs,
+        Section::Example,
+        Section::Mention,
+        Section::ResumeContext,
+    ];
+
+    /// The row title (SPEC § AI Assistance).
+    pub fn title(self) -> &'static str {
+        match self {
+            Section::Deeper => "Deeper Answer",
+            Section::Followups => "Follow-up Questions",
+            Section::Tradeoffs => "Tradeoffs",
+            Section::Example => "Example",
+            Section::Mention => "Things I Should Mention",
+            Section::ResumeContext => "Resume Context",
+        }
+    }
+}
+
+/// Where one section's slow-phase content is. A section keeps whatever content it had through
+/// every state: a regenerate, a restart or a timeout never blanks it (SPEC: "on timeout the UI
+/// keeps the previous section content and shows a small 'slow' tag").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", tag = "state", content = "error")]
+pub enum SectionState {
+    /// Not filled yet: the UI shows the "…" hint.
+    #[default]
+    Loading,
+    /// Filled.
+    Done,
+    /// The slow phase finished with nothing for this section: the UI hides the row.
+    Empty,
+    /// The 20 s deadline passed first: the UI keeps what it has and shows the "slow" tag.
+    Slow,
+    /// The request failed.
+    Failed(String),
+}
+
+/// A Deeper Answer entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeeperItem {
+    pub label: String,
+    pub text: String,
+}
+
+/// A Tradeoffs row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TradeoffItem {
+    pub option: String,
+    pub pro: String,
+    pub con: String,
+}
+
+/// An Example, or a worked solution in Deeper Answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeBlock {
+    pub language: String,
+    pub code: String,
+}
+
+/// A Resume Context entry: a source file the prompt carried, and what from it fits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Citation {
+    pub source: String,
+    pub text: String,
+}
+
+/// One slow-phase field, already within limits (`dmn-llm`'s `limits.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "snake_case")]
+pub enum SlowField {
+    Deeper {
+        items: Vec<DeeperItem>,
+    },
+    Followups {
+        items: Vec<String>,
+    },
+    Tradeoffs {
+        items: Vec<TradeoffItem>,
+    },
+    Example {
+        code: Option<CodeBlock>,
+    },
+    Mention {
+        items: Vec<String>,
+    },
+    ResumeContext {
+        items: Vec<Citation>,
+    },
+    /// A worked solution, part of Deeper Answer: coding questions in `full` mode only (#50).
+    Solution {
+        code: CodeBlock,
+    },
+}
+
+/// How a slow phase ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "end", content = "error")]
+pub enum SlowEnd {
+    /// The reply closed; any section still loading had nothing and is empty.
+    Done,
+    /// The 20 s deadline passed; sections still loading are marked slow.
+    TimedOut,
+    /// The request failed; sections still loading are marked failed.
+    Failed(String),
+    /// The run was stopped (`q`); sections are left as they were.
+    Stopped,
+}
+
 /// One change to the session. Serialised with a `type` tag, one JSON object per action, so an
 /// action log is JSON Lines.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +300,19 @@ pub enum Action {
     },
     /// The fast phase failed (timeout, unreachable, malformed). Anything already shown stays.
     Failed { candidate: u64, error: String },
+    /// The slow phase (#55) starts (or restarts) for a question: every section of it is loading
+    /// again, keeping the content it has until new content replaces it.
+    SlowStarted { candidate: u64 },
+    /// One slow-phase field arrived for a question; its section is done (or empty).
+    Slow { candidate: u64, field: SlowField },
+    /// The slow phase for a question ended. `payload` is the prompt-contract JSON of the fields
+    /// that arrived, for the store; `at` is unix epoch seconds.
+    SlowEnded {
+        candidate: u64,
+        end: SlowEnd,
+        payload: String,
+        at: i64,
+    },
     /// `r`: ask the fast phase again for a question already on screen (or queued), with the
     /// "different angle" note at temperature 0.7. The new fields arrive tagged with the same
     /// candidate id and replace that question in place, pinned or not; until the new question

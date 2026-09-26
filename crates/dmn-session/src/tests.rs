@@ -563,3 +563,246 @@ fn a_session_saved_before_coding_solutions_existed_still_loads() {
     let s: Session = serde_json::from_value(v).unwrap();
     assert_eq!(s.coding_solutions, CodingSolutions::Hints);
 }
+
+// --- Slow phase (#55) --------------------------------------------------------------------------
+
+fn slow(id: u64, field: SlowField) -> Action {
+    Action::Slow {
+        candidate: id,
+        field,
+    }
+}
+
+fn slow_ended(id: u64, end: SlowEnd) -> Action {
+    Action::SlowEnded {
+        candidate: id,
+        end,
+        payload: "{}".into(),
+        at: 1_700_000_200,
+    }
+}
+
+fn deeper(text: &str) -> SlowField {
+    SlowField::Deeper {
+        items: vec![DeeperItem {
+            label: "Core".into(),
+            text: text.into(),
+        }],
+    }
+}
+
+/// A question shown, its slow phase started, three sections filled, then `end`.
+fn sections_log(end: SlowEnd) -> Vec<Action> {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 1 });
+    log.push(slow(1, deeper("Evict with LRU.")));
+    log.push(slow(
+        1,
+        SlowField::Followups {
+            items: vec!["What about TTLs?".into()],
+        },
+    ));
+    log.push(slow(1, SlowField::Tradeoffs { items: vec![] }));
+    log.push(slow_ended(1, end));
+    log
+}
+
+#[test]
+fn a_new_question_starts_with_every_section_loading() {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["a", "b", "c"]));
+    let s = Session::replay(&log);
+    let sections = &s.live.unwrap().sections;
+    assert!(sections.is_untouched());
+    for section in Section::ALL {
+        assert_eq!(
+            *sections.state(section),
+            SectionState::Loading,
+            "{section:?}"
+        );
+    }
+}
+
+#[test]
+fn slow_fields_fill_their_sections_and_the_end_settles_the_rest() {
+    let s = Session::replay(&sections_log(SlowEnd::Done));
+    let q = s.live.unwrap();
+    assert_eq!(q.sections.deeper[0].text, "Evict with LRU.");
+    assert_eq!(q.sections.followups, ["What about TTLs?"]);
+    assert_eq!(*q.sections.state(Section::Deeper), SectionState::Done);
+    assert_eq!(
+        *q.sections.state(Section::Tradeoffs),
+        SectionState::Empty,
+        "an empty list hides the row"
+    );
+    assert_eq!(
+        *q.sections.state(Section::Example),
+        SectionState::Empty,
+        "a field that never came is empty once the phase is done"
+    );
+    assert_eq!(
+        q.progress,
+        Progress::Done,
+        "the fast phase's state is untouched"
+    );
+}
+
+#[test]
+fn a_slow_timeout_keeps_what_arrived_and_marks_the_rest_slow() {
+    let s = Session::replay(&sections_log(SlowEnd::TimedOut));
+    let q = s.live.unwrap();
+    assert_eq!(*q.sections.state(Section::Deeper), SectionState::Done);
+    assert_eq!(*q.sections.state(Section::Example), SectionState::Slow);
+    assert_eq!(
+        *q.sections.state(Section::ResumeContext),
+        SectionState::Slow
+    );
+
+    let failed = Session::replay(&sections_log(SlowEnd::Failed("boom".into())));
+    assert_eq!(
+        *failed.live.unwrap().sections.state(Section::Mention),
+        SectionState::Failed("boom".into())
+    );
+}
+
+#[test]
+fn a_restarted_or_regenerated_question_keeps_its_sections_until_new_ones_arrive() {
+    let mut log = sections_log(SlowEnd::Done);
+    // `r`: the new fast reply replaces the question in place; its sections stay.
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(
+        1,
+        "How would you design a cache, again?",
+        &["x", "y", "z"],
+    ));
+    let s = Session::replay(&log);
+    let q = s.live.as_ref().unwrap();
+    assert_eq!(q.text, "How would you design a cache, again?");
+    assert_eq!(q.sections.deeper[0].text, "Evict with LRU.", "kept");
+
+    // The new slow phase: loading again, old content still shown until replaced.
+    log.push(Action::SlowStarted { candidate: 1 });
+    let q = Session::replay(&log).live.unwrap();
+    assert_eq!(*q.sections.state(Section::Deeper), SectionState::Loading);
+    assert_eq!(q.sections.deeper[0].text, "Evict with LRU.");
+
+    // It times out before Deeper Answer: the old content stays, marked slow.
+    log.push(slow(
+        1,
+        SlowField::Followups {
+            items: vec!["New?".into()],
+        },
+    ));
+    log.push(slow_ended(1, SlowEnd::TimedOut));
+    let q = Session::replay(&log).live.unwrap();
+    assert_eq!(q.sections.deeper[0].text, "Evict with LRU.");
+    assert_eq!(*q.sections.state(Section::Deeper), SectionState::Slow);
+    assert_eq!(q.sections.followups, ["New?"]);
+    assert_eq!(*q.sections.state(Section::Followups), SectionState::Done);
+
+    // A stopped run leaves every section as it was.
+    let before = Session::replay(&log);
+    log.push(Action::SlowStarted { candidate: 1 });
+    log.push(slow_ended(1, SlowEnd::Stopped));
+    let after = Session::replay(&log).live.unwrap();
+    assert_eq!(
+        *after.sections.state(Section::Followups),
+        SectionState::Loading
+    );
+    assert_eq!(
+        after.sections.followups,
+        before.live.unwrap().sections.followups
+    );
+}
+
+#[test]
+fn a_solution_belongs_to_deeper_answer() {
+    let mut log = vec![candidate(1, 10.0, "Two sum?")];
+    log.extend(shown(1, "Two sum?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 1 });
+    log.push(slow(1, SlowField::Deeper { items: vec![] }));
+    let q = Session::replay(&log).live.unwrap();
+    assert_eq!(*q.sections.state(Section::Deeper), SectionState::Empty);
+    log.push(slow(
+        1,
+        SlowField::Solution {
+            code: CodeBlock {
+                language: "python".into(),
+                code: "def f(): pass".into(),
+            },
+        },
+    ));
+    let q = Session::replay(&log).live.unwrap();
+    assert!(q.sections.solution.is_some());
+    assert_eq!(*q.sections.state(Section::Deeper), SectionState::Done);
+}
+
+#[test]
+fn slow_actions_for_a_queued_question_fill_it_behind_the_pin() {
+    let mut log = vec![candidate(1, 10.0, "Q1")];
+    log.extend(shown(1, "Q1", &["a", "b", "c"]));
+    log.push(Action::Pin);
+    log.push(candidate(2, 30.0, "Q2"));
+    log.extend(shown(2, "Q2", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 2 });
+    log.push(slow(2, deeper("For Q2.")));
+    let s = Session::replay(&log);
+    assert!(s.live.as_ref().unwrap().sections.deeper.is_empty());
+    assert_eq!(s.queued[0].sections.deeper[0].text, "For Q2.");
+}
+
+#[test]
+fn slow_actions_replay_identically_through_json_lines() {
+    let mut log = sections_log(SlowEnd::TimedOut);
+    log.push(slow(
+        1,
+        SlowField::ResumeContext {
+            items: vec![Citation {
+                source: "resume.md".into(),
+                text: "Built a cache.".into(),
+            }],
+        },
+    ));
+    log.push(slow(
+        1,
+        SlowField::Example {
+            code: Some(CodeBlock {
+                language: "text".into(),
+                code: "1 GB, 90% hit rate".into(),
+            }),
+        },
+    ));
+    let jsonl: Vec<String> = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap())
+        .collect();
+    assert!(
+        jsonl
+            .iter()
+            .any(|l| l.contains(r#""type":"slow""#) && l.contains(r#""name":"resume_context""#))
+    );
+    assert!(jsonl.iter().any(|l| l.contains(r#""end":"timed_out""#)));
+    let parsed: Vec<Action> = jsonl
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(parsed, log);
+    assert_eq!(Session::replay(&parsed), Session::replay(&log));
+    let q = Session::replay(&parsed).live.unwrap();
+    assert_eq!(q.sections.resume_context[0].source, "resume.md");
+}
+
+#[test]
+fn a_session_saved_before_sections_existed_still_loads() {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["a", "b", "c"]));
+    let s = Session::replay(&log);
+    let v = serde_json::to_value(&s).unwrap();
+    assert!(
+        v["live"].get("sections").is_none(),
+        "untouched sections stay out of the JSON, so M1 fixtures are unchanged"
+    );
+    let back: Session = serde_json::from_value(v).unwrap();
+    assert_eq!(back, s);
+}

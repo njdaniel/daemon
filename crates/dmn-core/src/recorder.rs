@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use dmn_session::{Action, Session, SessionHub, Speaker, Stage, reduce};
+use dmn_session::{Action, Session, SessionHub, SlowEnd, Speaker, Stage, reduce};
 use dmn_store::{
     Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, NewSuggestion, Phase, Store,
     StoreError,
@@ -307,11 +307,37 @@ impl StoreWriter {
                         .set_session_overruns(id, i64::try_from(*total).unwrap_or(i64::MAX))?;
                 }
             }
+            // #55: one `slow` suggestion row per slow phase that got anywhere: the fields that
+            // arrived, whether it finished, timed out or failed. A stopped run stores nothing
+            // new, and neither does a phase that produced no field.
+            Action::SlowEnded {
+                candidate,
+                end,
+                payload,
+                at,
+            } => {
+                let empty = serde_json::from_str::<serde_json::Value>(payload)
+                    .map(|v| v.as_object().is_none_or(|o| o.is_empty()))
+                    .unwrap_or(true);
+                if *end != SlowEnd::Stopped && !empty {
+                    let row = self.question_row(*candidate)?;
+                    self.store.insert_suggestion(&NewSuggestion {
+                        question_id: row,
+                        phase: Phase::Slow,
+                        payload: payload.clone(),
+                        created_at: *at,
+                    })?;
+                    self.report.suggestions += 1;
+                }
+            }
             Action::Focus { .. }
             | Action::ApproachLine { .. }
             | Action::Star { .. }
             | Action::Ignored { .. }
             | Action::Failed { .. }
+            // Each field lands in the `SlowEnded` payload; the row is written once, there.
+            | Action::SlowStarted { .. }
+            | Action::Slow { .. }
             // A regenerate writes through the actions it causes: `Question` updates the same
             // question row and `Answered` adds a second suggestion to it.
             | Action::Regenerate { .. }
