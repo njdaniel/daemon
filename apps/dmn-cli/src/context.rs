@@ -98,8 +98,11 @@ pub struct Retrieval {
 /// Which story a request carries (#58).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoryPick<'a> {
-    /// A new candidate: match the stories to it when it asks for one ("tell me about a time…").
-    Match,
+    /// A new candidate: match the stories to this text when it asks for one ("tell me about a
+    /// time…"). The whole utterance, not only the sentence the detector picked: "Give me an
+    /// example of a time you had to cut scope. How did you decide what to cut?" is a candidate
+    /// whose question sentence alone has no behavioral cue and names no theme.
+    Match(&'a str),
     /// `r` or Swap on a question already built from this story (`stories/<file>`).
     Chosen(&'a str),
     /// No story: a regenerate of a question that had none.
@@ -309,13 +312,13 @@ impl Context {
         let mut out = Retrieval::default();
         let stories = self.library.stories();
         let story = match pick {
-            StoryPick::Match if asks_for_a_story(query) => {
-                let ranked = stories.rank(query);
+            StoryPick::Match(said) if asks_for_a_story(said) => {
+                let ranked = stories.rank(said);
                 out.stories = ranked.iter().map(|m| m.story.label.clone()).collect();
                 ranked.first().map(|m| m.story)
             }
             StoryPick::Chosen(label) => stories.get(label),
-            StoryPick::Match | StoryPick::Off => None,
+            StoryPick::Match(_) | StoryPick::Off => None,
         };
         let skip = story.map(|s| s.path.clone());
         out.story = story.map(|s| StoryText {
@@ -542,5 +545,41 @@ mod tests {
         );
         assert!(!r.chunks.is_empty(), "the loaded library still answers");
         writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// #58: stories are matched on the whole utterance. Replaying testdata/behavioral, the
+    /// detector picked "How did you decide what to cut?" out of "Give me an example of a time
+    /// you had to cut scope…", and that sentence alone asks for no story.
+    #[test]
+    fn stories_are_matched_on_the_whole_utterance_not_only_the_question_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture_db(dir.path());
+        let stories =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/context/stories");
+        ingest(
+            &Store::open(&db).unwrap(),
+            &stories,
+            SourceKind::Stories,
+            1_700_000_050,
+        )
+        .unwrap();
+        let mut ctx = Context::open(&ContextSource::Db {
+            path: db,
+            write: false,
+        })
+        .unwrap();
+        let sentence = "How did you decide what to cut?";
+        let line = "Give me an example of a time you had to cut scope to ship something. \
+                    How did you decide what to cut?";
+        let alone = ctx.retrieve_for(sentence, StoryPick::Match(sentence));
+        assert_eq!(alone.story, None);
+        let whole = ctx.retrieve_for(sentence, StoryPick::Match(line));
+        assert_eq!(
+            whole.story.map(|s| s.label).as_deref(),
+            Some("stories/audit-log-scope-cut.md")
+        );
+        assert!(whole.stories.len() > 1, "{:?}", whole.stories);
+        let off = ctx.retrieve_for(sentence, StoryPick::Off);
+        assert!(off.story.is_none() && off.stories.is_empty());
     }
 }

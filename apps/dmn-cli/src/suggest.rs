@@ -705,10 +705,16 @@ impl<P: Provider> Answerer<'_, P> {
                     .and_then(|q| q.story_label().map(str::to_owned))
             })
             .flatten();
+        // A new candidate is matched on the whole utterance it came from (see `StoryPick`).
+        let said = if job.candidate.line.trim().is_empty() {
+            job.candidate.text.as_str()
+        } else {
+            job.candidate.line.as_str()
+        };
         let pick = match (&chosen, regenerating) {
             (Some(label), _) => StoryPick::Chosen(label),
             (None, true) => StoryPick::Off,
-            (None, false) => StoryPick::Match,
+            (None, false) => StoryPick::Match(said),
         };
         let retrieval = context.retrieve_for(query, pick);
         tally.retrieved(retrieval.took);
@@ -1878,10 +1884,11 @@ mod tests {
             context,
             None,
         );
+        let text = "Tell me about a time you disagreed with a technical decision and how you \
+                    handled it.";
         let asked = Candidate {
-            text: "Tell me about a time you disagreed with a technical decision and how you \
-                   handled it."
-                .into(),
+            text: text.into(),
+            line: format!("Okay, first one. {text}"),
             ..candidate()
         };
         hub.dispatch(wire::candidate(1, &asked));
