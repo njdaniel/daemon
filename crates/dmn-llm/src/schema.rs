@@ -143,6 +143,22 @@ impl FastReply {
 
 /// JSON schema for the fast phase. See the module doc for why the property order matters.
 pub fn fast_schema() -> serde_json::Value {
+    fast_schema_with(false)
+}
+
+/// [`fast_schema`], with `star` required when `star` is true (#58): a request carrying a
+/// matched story is a behavioral question that must come back with STAR cards. Left optional,
+/// the model skipped them (live, 2026-09-26: an Approach built from the story, `star` absent).
+/// Other questions keep it optional, so they never pay for four more fields.
+pub fn fast_schema_with(star: bool) -> serde_json::Value {
+    let mut schema = fast_schema_base();
+    if star && let Some(required) = schema["required"].as_array_mut() {
+        required.push(serde_json::json!("star"));
+    }
+    schema
+}
+
+fn fast_schema_base() -> serde_json::Value {
     let kinds: Vec<&str> = Kind::ALL.iter().map(|k| k.as_str()).collect();
     serde_json::json!({
         "type": "object",
@@ -307,6 +323,19 @@ mod tests {
         let q = text.find("\"question\"").unwrap();
         let a = text.find("\"approach\"").unwrap();
         assert!(q < a, "{text}");
+    }
+
+    #[test]
+    fn star_is_required_only_when_asked_and_the_order_is_unchanged() {
+        let required = |s: &serde_json::Value| s["required"].as_array().unwrap().clone();
+        assert!(!required(&fast_schema()).contains(&serde_json::json!("star")));
+        let with = fast_schema_with(true);
+        assert!(required(&with).contains(&serde_json::json!("star")));
+        assert_eq!(
+            with["properties"],
+            fast_schema()["properties"],
+            "same fields, same order"
+        );
     }
 
     #[test]

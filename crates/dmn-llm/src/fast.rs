@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::limits::{self, Flag, FlagKind};
 use crate::prompt::{FastRequest, fast_messages};
 use crate::provider::{ChatRequest, LlmError, Provider};
-use crate::schema::{Kind, Star, Suggestion, fast_schema};
+use crate::schema::{Kind, Star, Suggestion, fast_schema_with};
 use crate::stream_json::{IncrementalObject, JsonEvent};
 
 /// SPEC § Providers: fast phase 4 s.
@@ -37,7 +37,7 @@ pub fn fast_chat_request(req: &FastRequest) -> ChatRequest {
         0.0
     };
     ChatRequest::new(fast_messages(req))
-        .with_schema(fast_schema())
+        .with_schema(fast_schema_with(req.story.is_some()))
         .with_temperature(temperature)
         .with_timeout(FAST_PHASE_TIMEOUT)
 }
@@ -490,7 +490,10 @@ mod tests {
         assert_eq!(suggestion.kind, Some(Kind::SystemDesign));
         assert_eq!(suggestion.approach.len(), 5);
         assert_eq!(mock.requests()[0].timeout, FAST_PHASE_TIMEOUT);
-        assert_eq!(mock.requests()[0].schema, Some(fast_schema()));
+        assert_eq!(
+            mock.requests()[0].schema,
+            Some(crate::schema::fast_schema())
+        );
     }
 
     #[tokio::test]
@@ -789,10 +792,16 @@ mod tests {
             label: "stories/broker.md".into(),
             text: "We chose a broker.".into(),
         });
-        let (events, outcome, _) = run(&MockProvider::json(&reply), &req).await;
+        let mock = MockProvider::json(&reply);
+        let (events, outcome, _) = run(&mock, &req).await;
         assert_eq!(
             star_of(&events).unwrap().story.as_deref(),
             Some("stories/broker.md")
+        );
+        assert_eq!(
+            mock.requests()[0].schema,
+            Some(crate::schema::fast_schema_with(true)),
+            "a matched story makes the STAR cards required"
         );
         let Ok(FastOutcome::Shown { suggestion, .. }) = outcome else {
             panic!("{outcome:?}");
