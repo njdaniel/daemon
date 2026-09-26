@@ -227,6 +227,77 @@ fn a_clarification_with_nothing_on_screen_becomes_the_question() {
     assert_eq!(live.approach, ["Warm it from the replica."]);
 }
 
+/// #63: the first half of a split question, shown, then its continuation.
+fn split_question(pin: bool) -> Vec<Action> {
+    let mut log = vec![candidate(1, 20.0, "How would you design a rate limiter?")];
+    log.extend(shown(
+        1,
+        "How would you design a rate limiter?",
+        &["Token bucket."],
+    ));
+    if pin {
+        log.push(Action::Pin);
+    }
+    log.push(candidate(
+        2,
+        20.0,
+        "How would you design a rate limiter? And if Redis dies?",
+    ));
+    log.push(Action::Continues {
+        candidate: 2,
+        continued: 1,
+    });
+    log.extend(shown(
+        2,
+        "How would you design a rate limiter, and what if Redis dies?",
+        &["Token bucket.", "Fail open."],
+    ));
+    log
+}
+
+#[test]
+fn a_continuation_replaces_its_first_half_in_place() {
+    let s = Session::replay(&split_question(false));
+    let live = s.live.as_ref().unwrap();
+    assert_eq!(live.candidate, 2);
+    assert_eq!(live.approach, ["Token bucket.", "Fail open."]);
+    assert!(s.queued.is_empty(), "one question on screen, not two");
+    assert_eq!(s.continuing, None, "the link is used once");
+}
+
+#[test]
+fn a_continuation_of_the_pinned_question_replaces_it_instead_of_queueing() {
+    let s = Session::replay(&split_question(true));
+    assert!(s.pinned);
+    assert_eq!(
+        s.live.as_ref().unwrap().candidate,
+        2,
+        "the pinned question, refined"
+    );
+    assert!(
+        s.queued.is_empty(),
+        "no \"1 new\" badge for the rest of the same question"
+    );
+}
+
+#[test]
+fn a_continuation_whose_first_half_is_gone_is_a_new_question() {
+    let log = vec![
+        candidate(7, 20.0, "And if Redis dies?"),
+        Action::Continues {
+            candidate: 7,
+            continued: 6,
+        },
+        Action::Question {
+            candidate: 7,
+            text: "What if Redis dies?".into(),
+            kind: "system_design".into(),
+        },
+    ];
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().candidate, 7);
+}
+
 #[test]
 fn pinned_questions_queue_and_unpin_shows_the_newest() {
     let log = interview();

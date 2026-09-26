@@ -277,6 +277,11 @@ pub enum Action {
         text: String,
         score: i32,
     },
+    /// #63: candidate `candidate` continues `continued`, the same question split at a pause
+    /// ("And if the state lived in Redis … and Redis went down, what then?"). Its reply replaces
+    /// `continued`'s question where it is (live, pinned or queued) instead of arriving as a
+    /// second question. Dispatched right after that candidate's [`Action::Candidate`].
+    Continues { candidate: u64, continued: u64 },
     /// Fast phase: the extracted question, first field of a shown reply.
     Question {
         candidate: u64,

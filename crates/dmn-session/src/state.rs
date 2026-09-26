@@ -392,6 +392,10 @@ pub struct Session {
     /// #57: what the candidate promised to come back to, open or since covered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promises: Vec<Promise>,
+    /// #63: the latest continuation, `(candidate, continued)`: that candidate's question
+    /// replaces the continued one's where it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuing: Option<(u64, u64)>,
 }
 
 impl Session {
@@ -528,12 +532,28 @@ pub fn reduce(s: &mut Session, action: &Action) {
             s.counts.candidates += 1;
             s.pending = Some(*id);
         }
+        Action::Continues {
+            candidate,
+            continued,
+        } => {
+            s.continuing = Some((*candidate, *continued));
+        }
         Action::Question {
             candidate,
             text,
             kind,
         } => {
             let mut q = Question::new(*candidate, text.clone(), kind.clone());
+            // #63: the rest of a question split at a pause takes the first part's place, pinned
+            // or queued, as a fresh question: the first part's reply was for half a question.
+            if let Some((c, continued)) = s.continuing
+                && c == *candidate
+                && let Some(existing) = s.question_mut(continued)
+            {
+                *existing = q;
+                s.continuing = None;
+                return;
+            }
             // A regenerated reply replaces its own question where it is, pinned or queued. Its
             // sections stay until the new slow phase replaces them (#55).
             if let Some(existing) = s.question_mut(*candidate) {

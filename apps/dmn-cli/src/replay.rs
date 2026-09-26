@@ -258,6 +258,7 @@ fn print_candidate(found: &Found, json: bool) {
                 "cues": c.cues.iter().map(|q| q.label()).collect::<Vec<_>>(),
                 "detect_us": found.latency.as_micros() as u64,
                 "late": found.late,
+                "continues": found.continues,
             })
         );
     } else {
@@ -266,7 +267,12 @@ fn print_candidate(found: &Found, json: bool) {
         } else {
             ""
         };
-        println!("  -> candidate {}{when}", c.render());
+        let cont = if found.continues {
+            " (continues the one before)"
+        } else {
+            ""
+        };
+        println!("  -> candidate {}{when}{cont}", c.render());
     }
 }
 

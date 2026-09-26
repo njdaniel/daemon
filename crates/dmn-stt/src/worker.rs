@@ -205,7 +205,8 @@ struct Job {
     cfg: SttWorkerConfig,
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
-    /// Text of the last final, passed to whisper as the prompt for continuity.
+    /// Text of the last punctuated final, passed to whisper as the prompt for continuity. See
+    /// [`carries_punctuation`] for why an unpunctuated final is not.
     last_final: String,
 }
 
@@ -282,7 +283,9 @@ impl Job {
             return;
         }
         self.counters.finals.fetch_add(1, Ordering::Relaxed);
-        self.last_final = text.clone();
+        if carries_punctuation(&text) {
+            self.last_final = text.clone();
+        }
         (self.publish)(Segment {
             source: u.source,
             start: u.start,
@@ -407,6 +410,16 @@ fn coalesce(batch: Vec<VadEvent>, counters: &Counters) -> Vec<Work> {
         }
     }
     work
+}
+
+/// Whether a final is fit to be the next prompt. whisper copies its prompt's style: a final that
+/// came out with no sentence punctuation (whisper does that on a hurried or clipped utterance)
+/// used as the prompt makes the next final unpunctuated too, and then the next, for the rest of
+/// the lane. The detector needs the `?` and the sentence breaks, so one such final cost Silero
+/// three behavioral questions on the fixtures (#62, #63). Such a final is still published; it
+/// just does not replace the previous prompt.
+fn carries_punctuation(text: &str) -> bool {
+    text.chars().any(|c| matches!(c, '.' | '?' | '!'))
 }
 
 #[cfg(test)]
@@ -688,6 +701,30 @@ mod tests {
         assert_eq!(stats.dropped_low_confidence, 1);
         assert_eq!(stats.dropped_empty, 1);
         assert_eq!(stats.finals, 1);
+    }
+
+    #[test]
+    fn an_unpunctuated_final_does_not_replace_the_prompt() {
+        let h = harness(
+            &[
+                ("Tell me about a time you disagreed.", -0.2, 7),
+                ("and what did you do about it", -0.2, 6),
+                ("How did it end?", -0.2, 4),
+            ],
+            false,
+        );
+        h.tx.send(utterance(0, 2_000)).unwrap();
+        h.tx.send(utterance(3_000, 5_000)).unwrap();
+        h.tx.send(utterance(6_000, 8_000)).unwrap();
+        drop(h.tx);
+        let stats = h.worker.finish();
+        assert_eq!(stats.finals, 3, "the unpunctuated final is still published");
+        let calls = h.calls.lock().unwrap();
+        assert_eq!(
+            calls[2].1.as_deref(),
+            Some("Tell me about a time you disagreed."),
+            "the last punctuated final stays the prompt, so the lane keeps its punctuation"
+        );
     }
 
     #[test]

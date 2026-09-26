@@ -953,16 +953,18 @@ mod tests {
             &FakeHttp(Ok(TAGS.into())),
             &FakeResolver::local(),
         );
-        // whisper model is the only required failure; tools are a warning; gpu is info.
-        assert_eq!(report.failed_required(), 1);
+        // The two models are the only required failures (Silero is the default VAD since #63,
+        // so its model is required too); tools are a warning; gpu is info.
+        assert_eq!(report.failed_required(), 2);
         let text = report.render();
         assert!(text.contains("provider: ollama, model qwen3.6:35b-a3b"));
         assert!(text.contains("nothing leaves this machine"));
         assert!(text.contains("FAIL whisper model"));
+        assert!(text.contains("FAIL silero model"));
         assert!(text.contains("warn pipewire tools"));
         assert!(text.contains("info gpu backend"));
         assert!(
-            text.trim_end().ends_with("1 of 5 required checks failed"),
+            text.trim_end().ends_with("2 of 6 required checks failed"),
             "{text}"
         );
     }

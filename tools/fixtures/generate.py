@@ -20,7 +20,7 @@ run to run. We seed ONNX Runtime from the fixture name before loading each voice
 turns in script order, which makes the output byte-identical across runs on the same machine and
 package versions. Editing one turn changes the audio of every later turn of that speaker.
 
-Usage (from the repo root):  just fixtures            # all three
+Usage (from the repo root):  just fixtures            # all four
                              cd tools && uv run python fixtures/generate.py mixed
 """
 
@@ -55,6 +55,8 @@ TAIL_S = 1.5
 DEFAULT_PAUSE_S = 0.8
 FRAME = 320  # 20 ms at 16 kHz, same frame the VAD uses
 VOICED_DBFS = -40.0  # sound vs the -60 dBFS floor, for turns.json's voiced_t / voiced_end
+SPLIT_MARK = "||"  # a mid-turn pause in a script's text; see synth_turn
+DEFAULT_SPLIT_GAP_S = 0.9  # above the VAD's utterance close (500 ms since #16, 700 ms before)
 
 
 @dataclass
@@ -124,16 +126,32 @@ def load_voice(voice: str, seed: int) -> PiperVoice:
     return loaded
 
 
-def synth_turn(voice: PiperVoice, text: str) -> np.ndarray:
-    """Synthesise one turn at 16 kHz, sentences joined by a short gap, levelled to TARGET_DBFS."""
+def spoken(text: str) -> str:
+    """The turn's text as said: the `||` pause markers removed (see `synth_turn`)."""
+    return " ".join(p.strip() for p in text.split(SPLIT_MARK))
+
+
+def synth_turn(voice: PiperVoice, text: str, split_gap_s: float = DEFAULT_SPLIT_GAP_S) -> np.ndarray:
+    """Synthesise one turn at 16 kHz, sentences joined by a short gap, levelled to TARGET_DBFS.
+
+    A `||` in the text is a pause inside the turn: the speaker stops mid-sentence ("And if the
+    limiter's state lived in Redis || and Redis went down, what then?") for `split_gap_s`, long
+    enough that the VAD closes the utterance there. The turn is still one turn with one span, so
+    a question split this way is one question in questions.json. Without a marker the audio is
+    exactly what it was before markers existed.
+    """
     parts: list[np.ndarray] = []
     src_rate = voice.config.sample_rate
     gap = np.zeros(int(SENTENCE_GAP_S * RATE), dtype=np.float32)
-    for chunk in voice.synthesize(text):
-        audio = resample(chunk.audio_float_array, chunk.sample_rate or src_rate, RATE)
-        if parts:
-            parts.append(gap)
-        parts.append(audio)
+    split_gap = np.zeros(int(split_gap_s * RATE), dtype=np.float32)
+    for n, piece in enumerate(text.split(SPLIT_MARK)):
+        first = True
+        for chunk in voice.synthesize(piece.strip()):
+            audio = resample(chunk.audio_float_array, chunk.sample_rate or src_rate, RATE)
+            if parts:
+                parts.append(split_gap if n > 0 and first else gap)
+            parts.append(audio)
+            first = False
     if not parts:
         raise ValueError(f"Piper produced no audio for: {text[:60]!r}")
     x = np.concatenate(parts)
@@ -211,7 +229,9 @@ def generate(script_path: Path, out_root: Path) -> dict:
         speaker = turn["speaker"]
         if speaker not in voices:
             raise ValueError(f"{name} turn {i}: unknown speaker {speaker!r}")
-        x = synth_turn(voices[speaker], turn["text"])
+        x = synth_turn(
+            voices[speaker], turn["text"], float(turn.get("split_gap_s", DEFAULT_SPLIT_GAP_S))
+        )
         start = cursor
         end = start + len(x) / RATE
         placed.append(
@@ -220,7 +240,7 @@ def generate(script_path: Path, out_root: Path) -> dict:
                 speaker=speaker,
                 start=round(start, 3),
                 end=round(end, 3),
-                text=turn["text"],
+                text=spoken(turn["text"]),
                 is_question=bool(turn.get("is_question", False)),
                 kind=turn.get("kind"),
             )
