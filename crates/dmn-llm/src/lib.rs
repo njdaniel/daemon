@@ -11,8 +11,10 @@
 //! (question first, then approach lines one by one) to a caller-supplied callback; the session
 //! crate owns what happens to them. #54 adds [`requirements`]: the one-off job-description
 //! summary into ≤ 8 bullets that the fast phase's prompt then carries, with the retrieved chunks,
-//! in [`FastRequest`]. The slow phase and the OpenAI-compatible and Anthropic providers arrive
-//! with M2.
+//! in [`FastRequest`]. #55 adds the [`slow`] phase: after the fast phase has answered, a second
+//! request fills the six expandable sections, each published ([`SlowField`]) as its field
+//! completes, cut in Rust, within a 20 s deadline; its caller cancels it whenever a new question
+//! needs the model. The OpenAI-compatible and Anthropic providers arrive with M2.
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:
@@ -34,6 +36,7 @@ pub mod prompt;
 mod provider;
 pub mod requirements;
 pub mod schema;
+pub mod slow;
 pub mod stream_json;
 
 pub use fast::{FastEvent, FastOutcome, IgnoreReason, run_fast_phase};
@@ -47,4 +50,5 @@ pub use provider::{
 };
 pub use requirements::{Requirements, summarise_job_description};
 pub use schema::{Kind, Suggestion};
+pub use slow::{CodingMode, SlowField, SlowFields, SlowOutcome, SlowRequest, run_slow_phase};
 pub use tokio_util::sync::CancellationToken;

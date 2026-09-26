@@ -110,6 +110,10 @@ pub struct Suggestion {
     pub mention: Vec<String>,
     pub resume_context: Vec<ResumeContext>,
     pub star: Option<Star>,
+    /// A worked solution for a coding question, only in the `full` coding-solutions mode (#50,
+    /// #55); part of Deeper Answer and collapsed until opened. Never set in `hints` mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solution: Option<Example>,
 }
 
 /// The fast phase's reply as the model sends it: [`Suggestion`]'s fast fields plus `is_question`.
@@ -168,9 +172,120 @@ pub fn fast_schema() -> serde_json::Value {
     })
 }
 
+/// JSON schema for the slow phase (#55): the six expandable sections in the order the UI shows
+/// them (SPEC § AI Assistance), so the first rows fill first; `solution` last, and only for a
+/// coding question in `full` mode, because it is the longest field. Every field is required (an
+/// empty list or empty code is a valid answer), so the reply always closes with every section
+/// decided.
+pub fn slow_schema(with_solution: bool) -> serde_json::Value {
+    use crate::limits::{DEEPER_MAX, LIST_MAX};
+    let string_list = |max: usize| serde_json::json!({ "type": "array", "items": { "type": "string" }, "maxItems": max });
+    let code = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "language": { "type": "string" },
+            "code": { "type": "string" }
+        },
+        "required": ["language", "code"]
+    });
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "deeper": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["label", "text"]
+                },
+                "maxItems": DEEPER_MAX
+            },
+            "followups": string_list(LIST_MAX),
+            "tradeoffs": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "option": { "type": "string" },
+                        "pro": { "type": "string" },
+                        "con": { "type": "string" }
+                    },
+                    "required": ["option", "pro", "con"]
+                },
+                "maxItems": LIST_MAX
+            },
+            "example": code.clone(),
+            "mention": string_list(LIST_MAX),
+            "resume_context": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["source", "text"]
+                },
+                "maxItems": LIST_MAX
+            }
+        },
+        "required": ["deeper", "followups", "tradeoffs", "example", "mention", "resume_context"]
+    });
+    if with_solution {
+        if let Some(props) = schema["properties"].as_object_mut() {
+            props.insert("solution".into(), code);
+        }
+        if let Some(required) = schema["required"].as_array_mut() {
+            required.push("solution".into());
+        }
+    }
+    schema
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_schema_orders_the_sections_as_the_ui_shows_them() {
+        let keys = |s: &serde_json::Value| -> Vec<String> {
+            s["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            keys(&slow_schema(false)),
+            [
+                "deeper",
+                "followups",
+                "tradeoffs",
+                "example",
+                "mention",
+                "resume_context"
+            ]
+        );
+        let full = slow_schema(true);
+        assert_eq!(keys(&full).last().map(String::as_str), Some("solution"));
+        assert!(
+            full["required"]
+                .as_array()
+                .unwrap()
+                .contains(&"solution".into())
+        );
+        assert!(!slow_schema(false).to_string().contains("solution"));
+    }
+
+    #[test]
+    fn a_suggestion_without_a_solution_serialises_as_before() {
+        let text = serde_json::to_string(&Suggestion::default()).unwrap();
+        assert!(!text.contains("solution"), "{text}");
+    }
 
     #[test]
     fn fast_schema_orders_gate_fields_then_question_then_approach() {
