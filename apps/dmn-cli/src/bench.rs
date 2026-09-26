@@ -143,9 +143,16 @@ pub fn run(a: &BenchArgs) -> Result<String, Box<dyn std::error::Error>> {
     } else {
         "full 30 s encoder window"
     };
+    // #61: the device whisper actually ran on, not merely the backend compiled in: a Vulkan
+    // build that fell back to the CPU must not report a GPU real-time factor.
+    let backend = if stt.placement().is_gpu() {
+        Backend::compiled().name()
+    } else {
+        Backend::Cpu.name()
+    };
     Ok(format!(
         "{}({window}; whisper on {device})\n",
-        render(&a.model, &a.fixture, a.threads, load, &rows)
+        render(&a.model, &a.fixture, backend, a.threads, load, &rows)
     ))
 }
 
@@ -162,10 +169,16 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-pub fn render(model: &str, fixture: &str, threads: usize, load: Duration, rows: &[Row]) -> String {
+pub fn render(
+    model: &str,
+    fixture: &str,
+    backend: &str,
+    threads: usize,
+    load: Duration,
+    rows: &[Row],
+) -> String {
     let mut s = format!(
-        "whisper {model} on {fixture} interviewer turns, {} × {threads} threads, model load {:.2} s\n",
-        Backend::compiled().name(),
+        "whisper {model} on {fixture} interviewer turns, {backend} × {threads} threads, model load {:.2} s\n",
         load.as_secs_f64()
     );
     s.push_str("  #    dur    wall    RTF    WER  text\n");
@@ -193,12 +206,11 @@ pub fn render(model: &str, fixture: &str, threads: usize, load: Duration, rows: 
         wers.iter().sum::<f64>() / wers.len() as f64
     };
     s.push_str(&format!(
-        "summary: median RTF {:.3}, median wall {:.2} s, max wall {:.2} s, mean WER {:.1} %, backend {} × {threads} threads\n",
+        "summary: median RTF {:.3}, median wall {:.2} s, max wall {:.2} s, mean WER {:.1} %, backend {backend} × {threads} threads\n",
         median(rows.iter().map(|r| r.rtf).collect()),
         median(rows.iter().map(|r| r.wall.as_secs_f64()).collect()),
         rows.iter().map(|r| r.wall.as_secs_f64()).fold(0.0, f64::max),
         mean_wer * 100.0,
-        Backend::compiled().name(),
     ));
     let wrong: Vec<(usize, &Row)> = rows
         .iter()
@@ -295,6 +307,7 @@ mod tests {
         let out = render(
             "small.en",
             "sysdesign",
+            "CPU",
             4,
             Duration::from_millis(300),
             &rows,
