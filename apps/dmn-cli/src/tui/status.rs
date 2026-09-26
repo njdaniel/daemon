@@ -104,6 +104,24 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         spans.push(Span::styled("●", Style::new().fg(Color::Red)));
         spans.push(Span::raw(format!(" {} dropped ", st.overruns)));
     }
+    // #61: which device transcribes. Quiet while it is the one asked for; amber when a GPU was
+    // asked for and the CPU runs instead (the reason is in the log and the replay header).
+    if !st.stt.is_empty() {
+        let device = if st.stt.starts_with("GPU") {
+            "gpu"
+        } else {
+            "cpu"
+        };
+        let (text, style) = if st.stt_fallback {
+            (
+                format!(" stt {device} (no gpu) "),
+                Style::new().fg(Color::Yellow),
+            )
+        } else {
+            (format!(" stt {device} "), Style::new().fg(Color::DarkGray))
+        };
+        spans.push(Span::styled(text, style));
+    }
     if let Some(d) = detail {
         let used = Line::from(spans.clone()).width();
         let room = usize::from(left.width).saturating_sub(used + 2);

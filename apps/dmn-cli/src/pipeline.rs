@@ -40,7 +40,10 @@ use dmn_core::{Config, Paths, wire};
 use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
 use dmn_llm::{CurrentQuestion, Kind};
 use dmn_session::{Action, CodingSolutions, Dot, Health, Section, SessionHub, Stage};
-use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
+use dmn_stt::{
+    DeviceChoice, Model, Placement, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber,
+    model_path,
+};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
 use dmn_vad::{
     EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
@@ -188,6 +191,8 @@ pub struct Options {
     pub vad_close_ms: Option<u16>,
     /// Which VAD decides speech, over `[stt].vad` (#62).
     pub vad: Option<VadChoice>,
+    /// Where whisper runs (#61), over `[stt].device`.
+    pub device: Option<dmn_core::config::SttDevice>,
     pub partials: Partials,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
@@ -210,6 +215,8 @@ pub struct Options {
 pub struct Info {
     pub model: String,
     pub threads: usize,
+    /// Where whisper runs, as [`placement_summary`] words it (#61).
+    pub stt_device: String,
     /// "energy" or "silero".
     pub vad: &'static str,
     pub speed: Speed,
@@ -612,6 +619,7 @@ impl Pipeline {
         };
         let stt_cfg = SttConfig {
             threads: opts.threads.unwrap_or(usize::from(cfg.stt.threads)),
+            device: device_choice(opts.device.unwrap_or(cfg.stt.device)),
             ..SttConfig::default()
         };
         // #34: `--speed N` paces delivery at N× wall-clock. A live call is 1× by definition.
@@ -685,9 +693,11 @@ impl Pipeline {
                 gate,
             )?);
         }
+        let placements: Vec<Placement> = built.iter().map(|(_, _, p)| p.clone()).collect();
+        let stt_device = placement_summary(&placements);
         let audio_zero = Instant::now();
         let mut lanes = Vec::new();
-        for (mut lane, sink) in built {
+        for (mut lane, sink, _) in built {
             lane.audio.start(sink)?;
             lanes.push(lane);
         }
@@ -707,6 +717,11 @@ impl Pipeline {
         // In the log from the start, so every stored question records the mode it ran under.
         hub.dispatch(Action::CodingSolutions {
             mode: opts.coding_solutions.unwrap_or(cfg.ui.coding_solutions),
+        });
+        // #61: where whisper ended up, for the status line; a GPU that fell back says so.
+        hub.dispatch(Action::Transcriber {
+            device: stt_device.clone(),
+            fallback: placements.iter().any(Placement::is_fallback),
         });
         for lane in &lanes {
             // A file is fine once open; a live capture's dot follows its state (the monitor).
@@ -756,6 +771,7 @@ impl Pipeline {
             info: Info {
                 model: name,
                 threads: stt_cfg.threads,
+                stt_device,
                 vad: match vad_choice {
                     VadChoice::Energy => "energy",
                     VadChoice::Silero => "silero",
@@ -1272,7 +1288,7 @@ fn build_lane(
     partials: bool,
     bus: &Arc<Bus>,
     mute: Option<Arc<AtomicBool>>,
-) -> Result<(Lane, FrameSink), Box<dyn Error>> {
+) -> Result<(Lane, FrameSink, Placement), Box<dyn Error>> {
     let (sink, frames) = dmn_audio::frame_channel(source, ring);
     let (tx, rx) = event_channel(EVENT_CAPACITY);
     let mut vad_cfg = VadConfig::default();
@@ -1281,6 +1297,7 @@ fn build_lane(
         vad_cfg.segmenter.partial_every = None;
     }
     let transcriber = Transcriber::load(model, stt_cfg.clone())?;
+    let placement = transcriber.placement().clone();
     let publisher = Arc::clone(bus);
     let stt = SttWorker::spawn(
         Box::new(transcriber),
@@ -1310,12 +1327,50 @@ fn build_lane(
             stt,
         },
         sink,
+        placement,
     ))
+}
+
+/// `[stt].device` in `dmn-stt`'s terms (`dmn-stt` does not depend on `dmn-core`).
+pub fn device_choice(d: dmn_core::config::SttDevice) -> DeviceChoice {
+    match d {
+        dmn_core::config::SttDevice::Cpu => DeviceChoice::Cpu,
+        dmn_core::config::SttDevice::Gpu => DeviceChoice::Gpu,
+        dmn_core::config::SttDevice::Auto => DeviceChoice::Auto,
+    }
+}
+
+/// One line for where the lanes' whisper runs: the shared placement when both lanes agree (the
+/// usual case), else each lane's.
+fn placement_summary(placements: &[Placement]) -> String {
+    match placements {
+        [] => String::new(),
+        [first, rest @ ..] if rest.iter().all(|p| p == first) => first.label(),
+        all => all
+            .iter()
+            .map(Placement::label)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_lanes_on_the_same_device_read_as_one() {
+        let cpu = Placement::Cpu { reason: None };
+        assert_eq!(placement_summary(&[cpu.clone(), cpu.clone()]), "CPU");
+        let fell_back = Placement::Cpu {
+            reason: Some("Vulkan0 failed: out of memory".into()),
+        };
+        assert_eq!(
+            placement_summary(&[cpu, fell_back]),
+            "CPU; CPU (fallback: Vulkan0 failed: out of memory)"
+        );
+        assert_eq!(placement_summary(&[]), "");
+    }
 
     #[test]
     fn the_configured_sensitivity_reaches_the_detector() {
@@ -1517,6 +1572,7 @@ mod tests {
                 threads: None,
                 vad_close_ms: None,
                 vad: None,
+                device: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
                 no_llm: true,

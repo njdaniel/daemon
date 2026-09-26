@@ -17,6 +17,8 @@ pub struct BenchArgs {
     pub turns: usize,
     /// false = whisper's fixed 30 s encoder window (`--full-window`), for comparison.
     pub trim_audio_ctx: bool,
+    /// `[stt].device` or `--device` (#61).
+    pub device: dmn_core::config::SttDevice,
     pub testdata: PathBuf,
     pub models_dir: PathBuf,
 }
@@ -107,11 +109,12 @@ pub fn run(a: &BenchArgs) -> Result<String, Box<dyn std::error::Error>> {
     let cfg = SttConfig {
         threads: a.threads,
         trim_audio_ctx: a.trim_audio_ctx,
-        ..SttConfig::default()
+        device: crate::pipeline::device_choice(a.device),
     };
     let t_load = Instant::now();
     let mut stt = Transcriber::load(&file, cfg)?;
     let load = t_load.elapsed();
+    let device = stt.placement().label();
 
     let sr = SAMPLE_RATE as f64;
     let mut rows = Vec::new();
@@ -141,7 +144,7 @@ pub fn run(a: &BenchArgs) -> Result<String, Box<dyn std::error::Error>> {
         "full 30 s encoder window"
     };
     Ok(format!(
-        "{}({window})\n",
+        "{}({window}; whisper on {device})\n",
         render(&a.model, &a.fixture, a.threads, load, &rows)
     ))
 }

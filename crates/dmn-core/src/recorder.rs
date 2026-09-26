@@ -406,6 +406,7 @@ impl StoreWriter {
             // `Answered` payload; a swap writes through its `Question` and `Answered` like `r`.
             | Action::Stories { .. }
             | Action::SwapStory { .. }
+            | Action::Transcriber { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

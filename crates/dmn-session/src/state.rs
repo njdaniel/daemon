@@ -339,6 +339,12 @@ pub struct Status {
     /// Ring-buffer frames dropped so far (#16); shown beside the dots while non-zero.
     #[serde(default)]
     pub overruns: u64,
+    /// Where whisper transcribes (#61); empty until the models are loaded (and in older logs).
+    #[serde(default)]
+    pub stt: String,
+    /// A GPU was asked for and the CPU runs instead.
+    #[serde(default)]
+    pub stt_fallback: bool,
 }
 
 /// Running totals, for the status line and the end-of-run summary.
@@ -722,6 +728,10 @@ pub fn reduce(s: &mut Session, action: &Action) {
             *slot = health.clone();
         }
         Action::Overruns { total } => s.status.overruns = *total,
+        Action::Transcriber { device, fallback } => {
+            s.status.stt.clone_from(device);
+            s.status.stt_fallback = *fallback;
+        }
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } => {}

@@ -294,6 +294,7 @@ model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
 vad = "energy"                       # energy | silero (M2)
 vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
+device = "cpu"                       # cpu | gpu | auto: where whisper runs (gpu needs --features vulkan|cuda)
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -306,6 +307,7 @@ api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
 fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
+num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
 [ui]
 always_on_top = true

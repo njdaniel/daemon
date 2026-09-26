@@ -559,6 +559,8 @@ fn worker(
     let settings = OllamaSettings {
         base_url: llm.base_url.clone(),
         model: llm.model.clone(),
+        // #61: a smaller window than the server's lets the whole model sit in VRAM.
+        num_ctx: (llm.num_ctx > 0).then_some(llm.num_ctx),
         ..OllamaSettings::default()
     };
     let provider = match OllamaProvider::from_settings(&settings) {
