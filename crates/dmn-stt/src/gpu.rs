@@ -136,6 +136,31 @@ pub fn resolve(choice: DeviceChoice, backend: Backend, devices: &[GpuDevice]) ->
     }
 }
 
+/// VRAM one whisper context takes beyond its model file: KV caches and the compute buffers.
+/// small.en measured 2026-09-26: kv self 18.9 + kv cross 56.6 + kv pad 4.7 + compute (conv 22.4,
+/// encode 128.0, cross 6.2, decode 97.3) = 334 MB; rounded up for larger models and driver slack.
+pub const STATE_BYTES: u64 = 448 * 1024 * 1024;
+/// VRAM left free after whisper loads, so the desktop and the LLM keep working.
+pub const VRAM_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether one whisper context with a `model_bytes` model fits on `device` now. ggml aborts the
+/// whole process when a GPU allocation fails (`GGML_ASSERT(buffer)` in ggml-backend.cpp), so an
+/// out-of-memory GPU is never tried: this check is the fallback's first line, and it runs per
+/// lane, against the free memory the registry reports at that moment.
+pub fn fits(device: &GpuDevice, model_bytes: u64) -> Result<(), String> {
+    let need = model_bytes + STATE_BYTES + VRAM_RESERVE_BYTES;
+    if device.free_bytes >= need {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} has {:.2} GB free, whisper needs {:.2} GB",
+            device.name,
+            gb(device.free_bytes),
+            gb(need)
+        ))
+    }
+}
+
 fn cpu_because(quiet: bool, reason: &str) -> Placement {
     Placement::Cpu {
         reason: (!quiet).then(|| reason.to_owned()),
@@ -266,6 +291,18 @@ mod tests {
             Placement::Cpu { reason: None },
             "auto without a GPU is plain CPU, not a warning"
         );
+    }
+
+    #[test]
+    fn a_model_is_only_put_on_a_gpu_with_room_for_it() {
+        let small_en = 487_614_201;
+        let mut rtx = dev(0, "Vulkan0", false, 24);
+        // Beside Ollama's 65k-context model the 4090 had 0.8 GB free: small.en does not fit.
+        rtx.free_bytes = 800_000_000;
+        let err = fits(&rtx, small_en).unwrap_err();
+        assert!(err.contains("Vulkan0 has 0.80 GB free"), "{err}");
+        rtx.free_bytes = 2_000_000_000;
+        assert!(fits(&rtx, small_en).is_ok());
     }
 
     #[test]

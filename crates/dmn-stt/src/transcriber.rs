@@ -104,9 +104,10 @@ pub struct Transcriber {
 
 impl Transcriber {
     /// Load a ggml model on the device `cfg.device` resolves to (see [`crate::gpu`]). A GPU that
-    /// is missing, or fails to load the model or allocate its state (out of VRAM, a driver
-    /// error), falls back to the CPU with a warning rather than failing the run. whisper.cpp's
-    /// own logging is routed into `tracing` so it never writes to the terminal the TUI owns.
+    /// is missing, too full for the model ([`crate::gpu::fits`], checked first because ggml
+    /// aborts the process on a failed GPU allocation), or failing to load it falls back to the
+    /// CPU with a warning rather than failing the run. whisper.cpp's own logging is routed into
+    /// `tracing` so it never writes to the terminal the TUI owns.
     pub fn load(model_file: &Path, cfg: SttConfig) -> Result<Self, SttError> {
         let shown = model_file.display().to_string();
         if !model_file.is_file() {
@@ -117,7 +118,19 @@ impl Transcriber {
             DeviceChoice::Cpu => Vec::new(),
             DeviceChoice::Gpu | DeviceChoice::Auto => gpu_devices(),
         };
-        let wanted = resolve(cfg.device, Backend::compiled(), &devices);
+        let model_bytes = std::fs::metadata(model_file).map_or(0, |m| m.len());
+        let wanted = match resolve(cfg.device, Backend::compiled(), &devices) {
+            Placement::Gpu(device) => match crate::gpu::fits(&device, model_bytes) {
+                Ok(()) => Placement::Gpu(device),
+                // `auto` means "the GPU if it has room"; `gpu` asked for it, so say why not.
+                Err(why) if cfg.device == DeviceChoice::Auto => {
+                    tracing::info!(model = %shown, reason = %why, "whisper on the CPU (auto)");
+                    Placement::Cpu { reason: None }
+                }
+                Err(why) => Placement::Cpu { reason: Some(why) },
+            },
+            cpu => cpu,
+        };
         let ((ctx, state), placement) =
             with_fallback(wanted, |gpu| load_on(model_file, &shown, gpu))?;
         match &placement {
