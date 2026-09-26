@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Provider, Usage, error_body_within, guard_until,
-    send_within,
+    redact, send_within,
 };
 use crate::sse::SseParser;
 
@@ -85,7 +85,11 @@ impl OpenAiProvider {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "suggestion",
-                    "strict": true,
+                    // Not strict: OpenAI's strict mode rejects any schema with an optional
+                    // property or without `additionalProperties: false` on every object, and
+                    // the fast schema's `star` is optional. vLLM and LM Studio constrain decoding
+                    // to the schema either way; the Rust-side parser and limits hold the rest.
+                    "strict": false,
                     "schema": schema,
                 }
             });
@@ -193,15 +197,21 @@ impl Provider for OpenAiProvider {
             if let Some(key) = &self.api_key {
                 http = http.bearer_auth(key);
             }
-            let resp = send_within(NAME, &url, http.send(), &cancel, deadline, req.timeout).await?;
+            let key = self.api_key.clone();
+            let resp = send_within(NAME, &url, http.send(), &cancel, deadline, req.timeout)
+                .await
+                .map_err(|e| redact(e, key.as_deref()))?;
             let status = resp.status();
             if !status.is_success() {
                 let body = error_body_within(resp, &cancel, deadline).await;
-                return Err(LlmError::HttpStatus {
-                    provider: NAME,
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(redact(
+                    LlmError::HttpStatus {
+                        provider: NAME,
+                        status: status.as_u16(),
+                        body,
+                    },
+                    key.as_deref(),
+                ));
             }
             tracing::debug!(model = %self.model, "openai stream open");
 
@@ -260,6 +270,8 @@ impl Provider for OpenAiProvider {
                     }
                 }
             });
+            // Mid-stream error frames can quote the request back too.
+            let deltas = deltas.map(move |item| item.map_err(|e| redact(e, key.as_deref())));
             Ok(guard_until(deltas, cancel, deadline, req.timeout))
         })
     }
@@ -289,7 +301,7 @@ mod tests {
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
-        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["strict"], false);
         let t = body["temperature"].as_f64().unwrap();
         assert!((t - 0.7).abs() < 1e-6, "{t}");
         assert_eq!(body["messages"][0]["role"], "system");
@@ -576,7 +588,7 @@ mod tests {
             body["response_format"],
             serde_json::json!({
                 "type": "json_schema",
-                "json_schema": {"name": "suggestion", "strict": true, "schema": fast_schema()}
+                "json_schema": {"name": "suggestion", "strict": false, "schema": fast_schema()}
             })
         );
     }
@@ -643,5 +655,98 @@ mod tests {
                     && f.kind == limits::FlagKind::Dropped { from: 7, to: 5 }),
             "{fields:?}"
         );
+    }
+
+    /// The six slow-phase sections (#55), one JSON object: what both providers must stream.
+    fn slow_reply() -> serde_json::Value {
+        serde_json::json!({
+            "deeper": [{"label": "Algorithm", "text": "A token bucket per key refills at the limit."}],
+            "followups": ["What happens when Redis is down?"],
+            "tradeoffs": [{"option": "Central Redis", "pro": "exact counts", "con": "one hop"}],
+            "example": {"language": "text", "code": "100 req/s per key, bucket 200"},
+            "mention": ["Fail open, and alert."],
+            "resume_context": []
+        })
+    }
+
+    /// `json` in `pieces` roughly equal parts, split on char boundaries.
+    fn pieces_of(json: &str, pieces: usize) -> Vec<String> {
+        let chars: Vec<char> = json.chars().collect();
+        chars
+            .chunks(chars.len().div_ceil(pieces.max(1)).max(1))
+            .map(|c| c.iter().collect())
+            .collect()
+    }
+
+    fn openai_sse(json: &str, pieces: usize) -> String {
+        let mut out = String::new();
+        for p in pieces_of(json, pieces) {
+            let frame = serde_json::json!({"choices": [{"delta": {"content": p}}]});
+            out.push_str(&format!("data: {frame}\n\n"));
+        }
+        out + "data: [DONE]\n\n"
+    }
+
+    /// #55's slow phase and #54's job-description summary go through the same `chat` as the
+    /// fast phase; this proves the slow phase's six fields survive OpenAI's framing.
+    #[tokio::test]
+    async fn slow_phase_streams_its_six_sections_through_openai() {
+        use crate::schema::{Kind, slow_schema};
+        use crate::slow::{SlowRequest, run_slow_phase};
+
+        let body = openai_sse(&slow_reply().to_string(), 9);
+        let server = testserver::serve_once("200 OK", "text/event-stream", body, 12);
+        let p = provider(&server.url);
+        let req = SlowRequest::new("How would you design a rate limiter?", Kind::SystemDesign);
+        let mut fields = 0;
+        let outcome = run_slow_phase(&p, &req, CancellationToken::new(), |_| fields += 1)
+            .await
+            .unwrap();
+        assert!(outcome.missing.is_empty(), "{:?}", outcome.missing);
+        assert_eq!(fields, 6);
+        let requests = server.requests();
+        let (_, sent) = testserver::MockServer::head_and_body(&requests[0]);
+        let sent: serde_json::Value = serde_json::from_str(sent).unwrap();
+        assert_eq!(
+            sent["response_format"]["json_schema"]["schema"],
+            slow_schema(false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_body_quoting_the_key_is_redacted() {
+        let server = testserver::serve_once(
+            "401 Unauthorized",
+            "application/json",
+            format!("{{\"error\":{{\"message\":\"Incorrect API key provided: {KEY}\"}}}}"),
+            1,
+        );
+        let err = provider(&server.url)
+            .chat(ChatRequest::new(vec![]), CancellationToken::new())
+            .await
+            .map(|_| ())
+            .expect_err("401");
+        let text = err.to_string();
+        assert!(!text.contains(KEY), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_error_quoting_the_key_is_redacted() {
+        let server = testserver::serve_once(
+            "200 OK",
+            "text/event-stream",
+            format!("data: {{\"error\":{{\"message\":\"key {KEY} was revoked\"}}}}\n\n"),
+            1,
+        );
+        let p = provider(&server.url);
+        let mut s = p
+            .chat(ChatRequest::new(vec![]), CancellationToken::new())
+            .await
+            .unwrap();
+        let err = s.next().await.unwrap().expect_err("error frame");
+        let text = err.to_string();
+        assert!(!text.contains(KEY), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
     }
 }

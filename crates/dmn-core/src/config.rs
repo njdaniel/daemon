@@ -166,6 +166,15 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// The config-file spelling, for logs, notices and the TUI's model dot.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Ollama => "ollama",
+            Provider::OpenAI => "openai",
+            Provider::Anthropic => "anthropic",
+        }
+    }
+
     /// True when transcript text is sent off the machine. Settings and `dmn doctor` say so in words.
     pub fn is_remote(self) -> bool {
         !matches!(self, Provider::Ollama)
@@ -360,15 +369,27 @@ impl Config {
 
     /// Read the API key from the env var named in `[llm].api_key_env`. `None` when unset or empty.
     pub fn api_key(&self) -> Option<ApiKey> {
-        self.api_key_from(|name| std::env::var(name).ok())
+        self.llm.api_key()
     }
 
     /// Same as [`Config::api_key`] with the environment lookup injected (tests use a closure).
     pub fn api_key_from(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<ApiKey> {
-        if self.llm.api_key_env.is_empty() {
+        self.llm.api_key_from(lookup)
+    }
+}
+
+impl Llm {
+    /// The API key from the env var `api_key_env` names. `None` when unset or empty.
+    pub fn api_key(&self) -> Option<ApiKey> {
+        self.api_key_from(|name| std::env::var(name).ok())
+    }
+
+    /// Same as [`Llm::api_key`] with the environment lookup injected (tests use a closure).
+    pub fn api_key_from(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<ApiKey> {
+        if self.api_key_env.is_empty() {
             return None;
         }
-        lookup(&self.llm.api_key_env)
+        lookup(&self.api_key_env)
             .filter(|v| !v.is_empty())
             .map(ApiKey::new)
     }

@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Provider, Role, Usage, error_body_within,
-    guard_until, send_within,
+    guard_until, redact, send_within,
 };
 use crate::sse::SseParser;
 
@@ -28,8 +28,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const API_VERSION: &str = "2023-06-01";
 /// The forced tool carrying the phase's schema.
 const TOOL_NAME: &str = "suggestion";
-/// `max_tokens` is mandatory on this API. A fast-phase reply is a few hundred tokens.
-const MAX_TOKENS: u32 = 1024;
+/// `max_tokens` is mandatory on this API, and a reply that reaches it stops mid-JSON. A fast-phase
+/// reply is a few hundred tokens; the slow phase's six sections with a worked solution (#55, up
+/// to 40 lines of code) and the summary line (#57) can pass 2,000, so the cap sits well above
+/// both. It bounds the bill, not the latency: the phase deadline does that.
+const MAX_TOKENS: u32 = 4096;
 
 /// The Anthropic provider. `base_url` like `https://api.anthropic.com`; a trailing slash is
 /// tolerated.
@@ -234,15 +237,21 @@ impl Provider for AnthropicProvider {
             if let Some(key) = &self.api_key {
                 http = http.header("x-api-key", key);
             }
-            let resp = send_within(NAME, &url, http.send(), &cancel, deadline, req.timeout).await?;
+            let key = self.api_key.clone();
+            let resp = send_within(NAME, &url, http.send(), &cancel, deadline, req.timeout)
+                .await
+                .map_err(|e| redact(e, key.as_deref()))?;
             let status = resp.status();
             if !status.is_success() {
                 let body = error_body_within(resp, &cancel, deadline).await;
-                return Err(LlmError::HttpStatus {
-                    provider: NAME,
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(redact(
+                    LlmError::HttpStatus {
+                        provider: NAME,
+                        status: status.as_u16(),
+                        body,
+                    },
+                    key.as_deref(),
+                ));
             }
             tracing::debug!(model = %self.model, "anthropic stream open");
 
@@ -296,6 +305,8 @@ impl Provider for AnthropicProvider {
                     }
                 }
             });
+            // Mid-stream error frames can quote the request back too.
+            let deltas = deltas.map(move |item| item.map_err(|e| redact(e, key.as_deref())));
             Ok(guard_until(deltas, cancel, deadline, req.timeout))
         })
     }
@@ -681,5 +692,104 @@ mod tests {
                     && f.kind == limits::FlagKind::Dropped { from: 7, to: 5 }),
             "{fields:?}"
         );
+    }
+
+    /// The six slow-phase sections (#55), one JSON object: what both providers must stream.
+    fn slow_reply() -> serde_json::Value {
+        serde_json::json!({
+            "deeper": [{"label": "Algorithm", "text": "A token bucket per key refills at the limit."}],
+            "followups": ["What happens when Redis is down?"],
+            "tradeoffs": [{"option": "Central Redis", "pro": "exact counts", "con": "one hop"}],
+            "example": {"language": "text", "code": "100 req/s per key, bucket 200"},
+            "mention": ["Fail open, and alert."],
+            "resume_context": []
+        })
+    }
+
+    /// `json` in `pieces` roughly equal parts, split on char boundaries.
+    fn pieces_of(json: &str, pieces: usize) -> Vec<String> {
+        let chars: Vec<char> = json.chars().collect();
+        chars
+            .chunks(chars.len().div_ceil(pieces.max(1)).max(1))
+            .map(|c| c.iter().collect())
+            .collect()
+    }
+
+    fn anthropic_sse(json: &str, pieces: usize) -> String {
+        let mut out = String::from(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        );
+        for p in pieces_of(json, pieces) {
+            let frame = serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": p}
+            });
+            out.push_str(&format!("event: content_block_delta\ndata: {frame}\n\n"));
+        }
+        out + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+    }
+
+    /// #55's slow phase and #54's job-description summary go through the same `chat` as the
+    /// fast phase; this proves the slow phase's six fields survive the forced tool call.
+    #[tokio::test]
+    async fn slow_phase_streams_its_six_sections_through_the_tool_call() {
+        use crate::schema::{Kind, slow_schema};
+        use crate::slow::{SlowRequest, run_slow_phase};
+
+        let body = anthropic_sse(&slow_reply().to_string(), 9);
+        let server = testserver::serve_once("200 OK", "text/event-stream", body, 12);
+        let p = provider(&server.url);
+        let req = SlowRequest::new("How would you design a rate limiter?", Kind::SystemDesign);
+        let mut fields = 0;
+        let outcome = run_slow_phase(&p, &req, CancellationToken::new(), |_| fields += 1)
+            .await
+            .unwrap();
+        assert!(outcome.missing.is_empty(), "{:?}", outcome.missing);
+        assert_eq!(fields, 6);
+        let requests = server.requests();
+        let (_, sent) = testserver::MockServer::head_and_body(&requests[0]);
+        let sent: serde_json::Value = serde_json::from_str(sent).unwrap();
+        assert_eq!(sent["tools"][0]["input_schema"], slow_schema(false, false));
+        assert_eq!(sent["max_tokens"], serde_json::json!(MAX_TOKENS));
+    }
+
+    #[tokio::test]
+    async fn an_error_body_quoting_the_key_is_redacted() {
+        let server = testserver::serve_once(
+            "401 Unauthorized",
+            "application/json",
+            format!("{{\"type\":\"error\",\"error\":{{\"message\":\"bad key {KEY}\"}}}}"),
+            1,
+        );
+        let err = provider(&server.url)
+            .chat(ChatRequest::new(vec![]), CancellationToken::new())
+            .await
+            .map(|_| ())
+            .expect_err("401");
+        let text = err.to_string();
+        assert!(!text.contains(KEY), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_error_quoting_the_key_is_redacted() {
+        let server = testserver::serve_once(
+            "200 OK",
+            "text/event-stream",
+            format!(
+                "data: {{\"type\":\"error\",\"error\":{{\"message\":\"key {KEY} revoked\"}}}}\n\n"
+            ),
+            1,
+        );
+        let p = provider(&server.url);
+        let mut s = p
+            .chat(ChatRequest::new(vec![]), CancellationToken::new())
+            .await
+            .unwrap();
+        let err = s.next().await.unwrap().expect_err("error event");
+        let text = err.to_string();
+        assert!(!text.contains(KEY), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
     }
 }

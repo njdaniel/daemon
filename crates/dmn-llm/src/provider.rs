@@ -204,6 +204,45 @@ where
     })
 }
 
+/// `err` with every occurrence of `secret` replaced by `<redacted>`, in each text an error
+/// carries. A remote API may quote the key back in a 401 body or a mid-stream error frame, and
+/// errors reach logs and the status line; the key must reach neither (#59).
+pub(crate) fn redact(err: LlmError, secret: Option<&str>) -> LlmError {
+    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+        return err;
+    };
+    let scrub = |s: String| s.replace(secret, "<redacted>");
+    match err {
+        LlmError::Unreachable {
+            provider,
+            url,
+            detail,
+        } => LlmError::Unreachable {
+            provider,
+            url: scrub(url),
+            detail: scrub(detail),
+        },
+        LlmError::HttpStatus {
+            provider,
+            status,
+            body,
+        } => LlmError::HttpStatus {
+            provider,
+            status,
+            body: scrub(body),
+        },
+        LlmError::MalformedStream { provider, detail } => LlmError::MalformedStream {
+            provider,
+            detail: scrub(detail),
+        },
+        LlmError::Remote { provider, message } => LlmError::Remote {
+            provider,
+            message: scrub(message),
+        },
+        e @ (LlmError::Timeout(_) | LlmError::Cancelled) => e,
+    }
+}
+
 /// How much of a non-2xx response body is read for the error message.
 pub(crate) const ERROR_BODY_CAP: usize = 4096;
 
