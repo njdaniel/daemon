@@ -460,6 +460,87 @@ fn a_regenerate_that_fails_after_its_new_reply_started_is_marked_failed() {
     assert_eq!(live.progress, Progress::Failed("timeout".into()));
 }
 
+/// A behavioral question with STAR cards built from `story`.
+fn behavioral(id: u64, story: &str) -> Vec<Action> {
+    vec![
+        Action::Question {
+            candidate: id,
+            text: "Tell me about a time you disagreed".into(),
+            kind: "behavioral".into(),
+        },
+        Action::Star {
+            candidate: id,
+            cards: StarCards {
+                situation: format!("from {story}"),
+                task: "t".into(),
+                action: "a".into(),
+                result: "r".into(),
+                story: Some(story.into()),
+            },
+        },
+        Action::Answered {
+            candidate: id,
+            clarification: false,
+            payload: "{}".into(),
+            at: 1_700_000_100,
+        },
+    ]
+}
+
+#[test]
+fn swap_cycles_through_the_ranked_stories_and_back_to_the_first() {
+    let ranked = ["stories/a.md", "stories/b.md", "stories/c.md"];
+    let mut log = vec![candidate(1, 20.0, "Tell me about a time you disagreed")];
+    log.extend(behavioral(1, ranked[0]));
+    log.push(Action::Stories {
+        candidate: 1,
+        ranked: ranked.iter().map(|s| (*s).into()).collect(),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().story_label(), Some("stories/a.md"));
+
+    for want in ["stories/b.md", "stories/c.md", "stories/a.md"] {
+        log.push(Action::SwapStory { candidate: 1 });
+        let waiting = Session::replay(&log);
+        let q = waiting.live.as_ref().unwrap();
+        assert_eq!(q.story_label(), Some(want));
+        assert!(q.regenerating, "the old cards dim until the new ones come");
+        assert_eq!(waiting.pending, Some(1));
+        // The reply for the swapped-to story replaces the question in place.
+        log.extend(behavioral(1, want));
+        let after = Session::replay(&log);
+        let q = after.live.as_ref().unwrap();
+        assert_eq!(q.story_label(), Some(want), "the reply keeps the choice");
+        assert_eq!(q.stories.len(), 3, "and the ranking");
+        assert_eq!(q.star.as_ref().unwrap().story.as_deref(), Some(want));
+        assert!(!q.regenerating);
+    }
+    // Deterministic: the same log, the same session.
+    assert_eq!(Session::replay(&log), Session::replay(&log.clone()));
+}
+
+#[test]
+fn swap_with_one_story_or_none_says_so_and_asks_nothing() {
+    let mut log = vec![candidate(1, 20.0, "Tell me about a time you disagreed")];
+    log.extend(behavioral(1, "stories/only.md"));
+    log.push(Action::Stories {
+        candidate: 1,
+        ranked: vec!["stories/only.md".into()],
+    });
+    log.push(Action::SwapStory { candidate: 1 });
+    let s = Session::replay(&log);
+    let q = s.live.as_ref().unwrap();
+    assert!(q.no_other_story);
+    assert!(!q.regenerating, "nothing is being asked");
+    assert_eq!(q.story_label(), Some("stories/only.md"));
+    assert_eq!(s.pending, None);
+
+    let mut none = vec![candidate(2, 20.0, "Tell me about a time you failed")];
+    none.extend(behavioral(2, "x"));
+    none.push(Action::SwapStory { candidate: 2 });
+    assert!(Session::replay(&none).live.unwrap().no_other_story);
+}
+
 #[test]
 fn regenerate_of_an_unknown_candidate_changes_nothing() {
     let mut log = vec![candidate(1, 20.0, "q")];

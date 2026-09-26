@@ -331,6 +331,9 @@ impl Observer for Quiet {}
 pub enum Command {
     /// `r`: answer the live question again.
     Regenerate,
+    /// `w` (#58): build candidate `candidate`'s STAR block from the story the session moved on
+    /// to.
+    Swap { candidate: u64 },
 }
 
 /// The TUI's handle on a running pipeline. Cheap to clone; safe from any thread.
@@ -377,6 +380,21 @@ impl Controls {
     pub fn toggle_coding_solutions(&self) {
         let mode = self.hub.snapshot().coding_solutions.toggled();
         self.hub.dispatch(Action::CodingSolutions { mode });
+    }
+
+    /// `w` (#58): Swap the live behavioral question's STAR block to the next-ranked story,
+    /// wrapping round to the first. The session moves on at once (the header names the new
+    /// story, the old cards dim); the pipeline then asks the model for cards from that story.
+    /// With one story or none, the session notes there is no other and nothing is asked.
+    pub fn swap_story(&self) {
+        let Some(live) = self.hub.snapshot().live else {
+            return;
+        };
+        let candidate = live.candidate;
+        self.hub.dispatch(Action::SwapStory { candidate });
+        if live.stories.len() > 1 {
+            let _ = self.commands.send(Command::Swap { candidate });
+        }
     }
 
     /// `1`–`6`: open `section` under the live question's Approach (closing the open one), or
@@ -872,6 +890,32 @@ impl Pipeline {
                     self.log.render_window(DEFAULT_WINDOW),
                     CurrentQuestion {
                         question: live.text,
+                        kind,
+                    },
+                );
+            }
+            Command::Swap { candidate: id } => {
+                let Some(s) = &self.suggester else {
+                    return;
+                };
+                let snap = self.hub.snapshot();
+                let Some(q) = snap
+                    .live
+                    .into_iter()
+                    .chain(snap.queued)
+                    .find(|q| q.candidate == id)
+                else {
+                    return;
+                };
+                let (Some(candidate), Some(kind)) = (self.known.get(&id), kind(&q.kind)) else {
+                    return;
+                };
+                s.swap(
+                    id,
+                    candidate,
+                    self.log.render_window(DEFAULT_WINDOW),
+                    CurrentQuestion {
+                        question: q.text,
                         kind,
                     },
                 );

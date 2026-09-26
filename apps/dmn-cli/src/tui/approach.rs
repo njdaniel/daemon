@@ -19,10 +19,29 @@ const FRAME_CELLS: u16 = 4;
 /// The top and bottom border.
 const FRAME_ROWS: u16 = 2;
 
-/// The STAR cards when the live question has them in place of an Approach.
+/// The STAR cards when the live question has them in place of an Approach: SPEC § AI Assistance,
+/// "Behavioral questions replace the Approach block with the STAR block" (the fast phase also
+/// returns an Approach for them, which the cards stand in for).
 fn star<'a>(view: &View<'a>) -> Option<&'a StarCards> {
-    view.live()
-        .and_then(|q| q.star.as_ref().filter(|_| q.approach.is_empty()))
+    view.live().and_then(|q| {
+        q.star
+            .as_ref()
+            .filter(|_| q.kind == BEHAVIORAL || q.approach.is_empty())
+    })
+}
+
+/// The fast phase's `kind` for a behavioral question.
+const BEHAVIORAL: &str = "behavioral";
+
+/// What the STAR header names (#58): the story the session has chosen (which Swap moves on at
+/// once, before the new cards arrive), with its place in the ranking when there is more than
+/// one; otherwise the story the cards say they came from.
+fn story_title(q: Option<&Question>, cards: &StarCards) -> Option<String> {
+    match q.and_then(|q| q.story_label().map(|l| (l, q.story, q.stories.len()))) {
+        Some((label, _, 1)) => Some(label.to_owned()),
+        Some((label, at, n)) => Some(format!("{label} {}/{n}", at + 1)),
+        None => cards.story.clone().filter(|s| !s.is_empty()),
+    }
 }
 
 /// Rows the block would like at `area_width`: its content plus the border. An open section
@@ -59,12 +78,14 @@ pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         Some("thinking…")
     } else if view.streaming {
         Some("…")
+    } else if cards.is_some() && view.live().is_some_and(|q| q.no_other_story) {
+        // Swap pressed with no other matched story (#58).
+        Some("no other story")
     } else {
         None
     };
-    // SPEC § AI Assistance: the STAR block names the matched story in its header (#58 fills
-    // it; the fast phase's `story` shows here until then).
-    let title = match cards.and_then(|c| c.story.as_deref().filter(|s| !s.is_empty())) {
+    // SPEC § AI Assistance: the STAR block names the matched story in its header (#58).
+    let title = match cards.and_then(|c| story_title(view.live(), c)) {
         Some(story) => {
             let room = usize::from(area.width)
                 .saturating_sub(usize::from(FRAME_CELLS) + hint.map_or(0, |h| width(h) + 2));

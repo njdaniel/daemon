@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 18] = [
+const STATES: [&str; 20] = [
     "listening",
     "live",
     "pinned",
@@ -42,6 +42,9 @@ const STATES: [&str; 18] = [
     "sections-slow",
     "behavioral-sections",
     "coding-full-open",
+    // #58: STAR built from a matched story, and Swap with no other story.
+    "star-story",
+    "star-no-other",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 
@@ -325,6 +328,47 @@ fn behavioral_star() -> Vec<Action> {
     ]
 }
 
+/// A behavioral question as the fast phase answers it with a story matched (#58): an Approach
+/// (which the STAR block stands in for), the cards naming the story, and the ranking.
+fn story_star(ranked: &[&str]) -> Vec<Action> {
+    let q = "Tell me about a time you disagreed with a technical decision and how you handled it.";
+    let mut a = answered(
+        1,
+        q,
+        "behavioral",
+        "conflict handling, evidence, relationships",
+        &[
+            "Situation: choosing the pipeline broker.",
+            "Task: make the case without a public fight.",
+            "Action: two-day spike, one-on-one with the lead.",
+            "Result: shipped on time; replay saved an incident.",
+        ],
+    );
+    // The cards arrive before `Answered`, as in the fast phase.
+    let at = a.len() - 1;
+    a.insert(
+        at,
+        Action::Star {
+            candidate: 1,
+            cards: StarCards {
+                situation: "Choosing a broker for the shipment event pipeline at Contoso.".into(),
+                task: "Argue for replay and fan-out without turning a meeting into a fight.".into(),
+                action: "Built a two-day spike on real events and took it to the lead one-on-one \
+                         first."
+                    .into(),
+                result: "Shipped on time; a year later replay recovered six hours of events."
+                    .into(),
+                story: Some(ranked[0].into()),
+            },
+        },
+    );
+    a.push(Action::Stories {
+        candidate: 1,
+        ranked: ranked.iter().map(|s| (*s).into()).collect(),
+    });
+    a
+}
+
 /// #50's coding question, answered.
 fn median_question() -> Vec<Action> {
     let mut a = answered(
@@ -449,6 +493,23 @@ fn actions(state: &str) -> Vec<Action> {
                 dot: Dot::Mic,
                 health: Health::Muted,
             });
+        }
+        // #58: the fast phase's Approach and STAR cards from a matched story; three matched, so
+        // the header counts them and the footer offers Swap.
+        "star-story" | "star-no-other" => {
+            let ranked: &[&str] = if state == "star-story" {
+                &[
+                    "stories/disagreed-on-broker.md",
+                    "stories/kafka-replay-incident.md",
+                    "stories/security-review-influence.md",
+                ]
+            } else {
+                &["stories/disagreed-on-broker.md"]
+            };
+            a.extend(story_star(ranked));
+            if state == "star-no-other" {
+                a.push(Action::SwapStory { candidate: 1 });
+            }
         }
         // #50: a coding question under each coding-solutions mode; the footer names the mode.
         "coding" | "coding-full" => {

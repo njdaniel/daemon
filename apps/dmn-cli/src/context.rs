@@ -15,9 +15,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dmn_context::{Library, Retrieved};
+use dmn_context::{Library, Retrieved, asks_for_a_story};
 use dmn_core::wire;
-use dmn_llm::{CancellationToken, LlmError, Provider, summarise_job_description};
+use dmn_llm::{CancellationToken, LlmError, Provider, StoryText, summarise_job_description};
 use dmn_store::Store;
 
 /// How long caching a new summary may wait for the session writer (at load, not per question).
@@ -63,6 +63,8 @@ impl RequirementsFrom {
 pub struct ContextInfo {
     pub sources: usize,
     pub passages: usize,
+    /// Stories files loaded for STAR matching (#58).
+    pub stories: usize,
     pub requirements: usize,
     pub from: RequirementsFrom,
 }
@@ -83,8 +85,25 @@ pub struct Retrieval {
     /// The chunks as the prompt carries them: `kind (file): text`.
     pub chunks: Vec<String>,
     pub refs: Vec<ChunkRef>,
-    /// The staleness check, any reload and the search.
+    /// The story the prompt carries whole (#58), when one was matched or chosen.
+    pub story: Option<StoryText>,
+    /// For a new behavioral question with a matched story: every matched story, best first
+    /// (the first is `story`), for Swap. Empty for a regenerate or a swap, which keep the
+    /// ranking the question already has.
+    pub stories: Vec<String>,
+    /// The staleness check, any reload, the story match and the search.
     pub took: Duration,
+}
+
+/// Which story a request carries (#58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryPick<'a> {
+    /// A new candidate: match the stories to it when it asks for one ("tell me about a time…").
+    Match,
+    /// `r` or Swap on a question already built from this story (`stories/<file>`).
+    Chosen(&'a str),
+    /// No story: a regenerate of a question that had none.
+    Off,
 }
 
 impl Retrieval {
@@ -277,11 +296,33 @@ impl Context {
     }
 
     /// The chunks for `query`, after reloading the library if the sources changed.
+    #[cfg(test)]
     pub fn retrieve(&mut self, query: &str) -> Retrieval {
+        self.retrieve_for(query, StoryPick::Off)
+    }
+
+    /// [`Context::retrieve`], and the story `pick` names (#58). A matched story goes whole into
+    /// the prompt, so its own chunks are left out of the chunk budget.
+    pub fn retrieve_for(&mut self, query: &str, pick: StoryPick<'_>) -> Retrieval {
         let started = Instant::now();
         self.refresh();
-        let hits = self.library.retrieve(query);
         let mut out = Retrieval::default();
+        let stories = self.library.stories();
+        let story = match pick {
+            StoryPick::Match if asks_for_a_story(query) => {
+                let ranked = stories.rank(query);
+                out.stories = ranked.iter().map(|m| m.story.label.clone()).collect();
+                ranked.first().map(|m| m.story)
+            }
+            StoryPick::Chosen(label) => stories.get(label),
+            StoryPick::Match | StoryPick::Off => None,
+        };
+        let skip = story.map(|s| s.path.clone());
+        out.story = story.map(|s| StoryText {
+            label: s.label.clone(),
+            text: s.text.clone(),
+        });
+        let hits = self.library.retrieve_excluding(query, skip.as_deref());
         for Retrieved { passage, score } in hits {
             out.chunks.push(format!(
                 "{} ({}): {}",
@@ -305,6 +346,7 @@ impl Context {
         ContextInfo {
             sources: self.library.sources(),
             passages: self.library.passages(),
+            stories: self.library.stories().len(),
             requirements: self.requirements.len(),
             from: self.from,
         }

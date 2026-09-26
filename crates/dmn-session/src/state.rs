@@ -241,9 +241,28 @@ pub struct Question {
     /// nothing expands on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<Section>,
+    /// The stories matched to this behavioral question, best first (#58).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stories: Vec<String>,
+    /// Which of `stories` the STAR block is built from; Swap moves it on.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub story: usize,
+    /// Swap was pressed with no other story to swap to: the STAR header says so until the
+    /// question changes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_other_story: bool,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Question {
+    /// The story the STAR block is built from, if any was matched.
+    pub fn story_label(&self) -> Option<&str> {
+        self.stories.get(self.story).map(String::as_str)
+    }
+
     fn new(candidate: u64, text: String, kind: String) -> Self {
         Self {
             candidate,
@@ -257,6 +276,9 @@ impl Question {
             regenerating: false,
             sections: Sections::default(),
             open: None,
+            stories: Vec::new(),
+            story: 0,
+            no_other_story: false,
         }
     }
 
@@ -432,6 +454,9 @@ pub fn reduce(s: &mut Session, action: &Action) {
             if let Some(existing) = s.question_mut(*candidate) {
                 q.sections = std::mem::take(&mut existing.sections);
                 q.open = existing.open;
+                // A swap's (or `r`'s) reply keeps the ranking and which story it was built from.
+                q.stories = std::mem::take(&mut existing.stories);
+                q.story = existing.story;
                 *existing = q;
                 return;
             }
@@ -537,6 +562,27 @@ pub fn reduce(s: &mut Session, action: &Action) {
                 q.regenerating = true;
                 q.progress = Progress::Streaming;
                 s.pending = Some(*candidate);
+            }
+        }
+        Action::Stories { candidate, ranked } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                q.stories = ranked.clone();
+                q.story = 0;
+                q.no_other_story = false;
+            }
+        }
+        Action::SwapStory { candidate } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                if q.stories.len() < 2 {
+                    q.no_other_story = true;
+                } else {
+                    // Round the ranking and back to the first.
+                    q.story = (q.story + 1) % q.stories.len();
+                    q.no_other_story = false;
+                    q.regenerating = true;
+                    q.progress = Progress::Streaming;
+                    s.pending = Some(*candidate);
+                }
             }
         }
         Action::Pin => {

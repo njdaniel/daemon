@@ -318,6 +318,14 @@ pub enum Action {
     /// candidate id and replace that question in place, pinned or not; until the new question
     /// arrives the old Approach stays, dimmed.
     Regenerate { candidate: u64 },
+    /// The stories matched to a behavioral question (#58), best first, as `stories/<file>`
+    /// labels. The first is the one its STAR cards were built from; Swap walks down the list.
+    Stories { candidate: u64, ranked: Vec<String> },
+    /// Swap (#58): build the question's STAR block from the next-ranked story, wrapping round to
+    /// the first. The new cards arrive tagged with the same candidate id, as after `r`; until
+    /// then the old ones stay, dimmed. With fewer than two stories nothing is asked of the
+    /// model, and the STAR header says there is no other story.
+    SwapStory { candidate: u64 },
     /// Keys `1`–`6` (#56): open `section` under the live question's Approach, closing the one
     /// that was open, or close it if it is the open one. A row that is not on screen (no slow
     /// phase yet, or nothing for this question) does not open.

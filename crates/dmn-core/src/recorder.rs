@@ -346,6 +346,10 @@ impl StoreWriter {
             | Action::CodingSolutions { .. }
             // Which section is open is screen state; no row records it.
             | Action::ToggleSection { .. }
+            // The matched story is stored where it matters, on the `star.story` of each
+            // `Answered` payload; a swap writes through its `Question` and `Answered` like `r`.
+            | Action::Stories { .. }
+            | Action::SwapStory { .. }
             | Action::Status { .. } => {}
         }
         Ok(())
