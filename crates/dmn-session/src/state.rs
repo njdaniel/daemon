@@ -728,7 +728,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
         Action::Provider { label } => s.status.provider = Some(label.clone()),
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         // Measurements for the session log; nothing on screen depends on them.
-        Action::Timing { .. } | Action::Cpu { .. } => {}
+        Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}
     }
 }
 

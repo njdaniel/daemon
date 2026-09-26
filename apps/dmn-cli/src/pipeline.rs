@@ -1,7 +1,13 @@
 //! The pipeline `dmn replay`, `dmn run --replay` and the live `dmn run` share: two audio lanes
 //! (two WAVs, or live PipeWire capture of the mic and the call's output) → VAD → whisper →
-//! transcript bus → detector → fast phase, all dispatched into one session ([`Recorder`]) that
-//! is written to SQLite.
+//! transcript bus → echo guard → detector → fast phase, all dispatched into one session
+//! ([`Recorder`]) that is written to SQLite.
+//!
+//! The echo guard ([`EchoGuard`], #60) sits where both lanes' finals meet, just past the bus: a
+//! mic final that copies the loopback within 300 ms is dropped and counted (`[audio].echo_guard`
+//! turns it off); any other mic final waits up to 1.5 s (4 s while an overlapping interviewer
+//! utterance is still open) for its possible original, on the wall clock, since the skew between
+//! the two whisper lanes is wall time whatever the replay speed. Only the You lane waits.
 //!
 //! [`Pipeline::start`] builds and starts every stage; [`Pipeline::run`] is the loop that moves
 //! segments from the bus into the session and the detector, and candidates into the fast phase;
@@ -41,7 +47,7 @@ use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, cand
 use dmn_llm::{CurrentQuestion, Kind};
 use dmn_session::{Action, CodingSolutions, Dot, Health, Section, SessionHub, Stage};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
-use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
+use dmn_transcript::{Bus, DEFAULT_WINDOW, EchoGuard, Segment, TranscriptLog, Verdict};
 use dmn_vad::{
     EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
 };
@@ -541,6 +547,8 @@ pub struct Report {
     pub log: TranscriptLog,
     pub bus_dropped: u64,
     pub dropped_candidates: u64,
+    /// Mic finals the echo guard dropped as copies of the loopback (#60).
+    pub echo_dropped: u64,
     /// `q` ended the run before the audio did.
     pub stopped: bool,
 }
@@ -566,6 +574,8 @@ pub struct Pipeline {
     audio: AudioClock,
     suggester: Option<Suggester>,
     detecting: Detecting,
+    /// Between the bus and everything downstream (#60); `[audio].echo_guard`.
+    echo: EchoGuard,
     flushed: bool,
     log: TranscriptLog,
     candidates_tx: crossbeam_channel::Sender<Candidate>,
@@ -785,6 +795,7 @@ impl Pipeline {
                 opts.spec_literal_detector,
                 sensitivity(cfg.detect.sensitivity),
             ),
+            echo: EchoGuard::new(cfg.audio.echo_guard),
             flushed: false,
             log: TranscriptLog::new(),
             candidates_tx,
@@ -840,15 +851,50 @@ impl Pipeline {
                 }
                 Err(_) => {}
             }
+            // Release held mic finals whose wait is over, even when both lanes have gone quiet.
+            if self.echo.held() > 0 {
+                let verdicts = self.echo.expire(self.audio_zero.elapsed());
+                self.verdicts(verdicts, observer);
+            }
         }
     }
 
+    /// One segment from the bus, through the echo guard first (#60).
     fn segment(&mut self, seg: Segment, observer: &mut dyn Observer) {
+        let verdicts = self.echo.observe(seg, self.audio_zero.elapsed());
+        self.verdicts(verdicts, observer);
+    }
+
+    fn verdicts(&mut self, verdicts: Vec<Verdict>, observer: &mut dyn Observer) {
+        for verdict in verdicts {
+            match verdict {
+                Verdict::Publish(seg) => self.publish(seg, observer),
+                Verdict::Drop(seg) => self.retract(seg, observer),
+            }
+        }
+    }
+
+    /// A segment the guard let through: session, observer, detector, log.
+    fn publish(&mut self, seg: Segment, observer: &mut dyn Observer) {
         self.hub.dispatch(wire::segment(&seg));
         observer.segment(&seg);
         let new = self.detecting.feed(&seg);
         self.emit(new, observer);
         self.log.apply(seg);
+    }
+
+    /// A mic final the guard dropped as a copy of the loopback: counted into the session, and
+    /// its already-shown partial closed with an empty final of the same key (dmn-stt's own "no
+    /// text" marker). Its text never reaches the screen, the transcript, the store or the
+    /// detector.
+    fn retract(&mut self, seg: Segment, observer: &mut dyn Observer) {
+        let close = retraction(seg);
+        self.hub.dispatch(Action::EchoDropped {
+            total: self.echo.dropped(),
+        });
+        self.hub.dispatch(wire::segment(&close));
+        observer.segment(&close);
+        self.log.apply(close);
     }
 
     /// Score the line the detector still holds once the audio has ended.
@@ -857,6 +903,10 @@ impl Pipeline {
             return;
         }
         self.flushed = true;
+        // Whatever the guard still holds goes first: those finals are part of the transcript
+        // the detector's last line is scored against.
+        let verdicts = self.echo.finish();
+        self.verdicts(verdicts, observer);
         let new = self.detecting.flush();
         self.emit(new, observer);
     }
@@ -982,7 +1032,23 @@ impl Pipeline {
             .join()
             .map_err(|_| "pipeline thread panicked")?;
         // Segments the stages flushed while stopping still belong in the session and the log.
+        // Detection is already flushed, so these are recorded, not scored; they still pass the
+        // echo guard, and whatever it holds is released.
+        let mut pending = Vec::new();
         while let Ok(seg) = self.segments.try_recv() {
+            pending.extend(self.echo.observe(seg, self.audio_zero.elapsed()));
+        }
+        pending.extend(self.echo.finish());
+        for verdict in pending {
+            let seg = match verdict {
+                Verdict::Publish(seg) => seg,
+                Verdict::Drop(seg) => {
+                    self.hub.dispatch(Action::EchoDropped {
+                        total: self.echo.dropped(),
+                    });
+                    retraction(seg)
+                }
+            };
             self.hub.dispatch(wire::segment(&seg));
             observer.segment(&seg);
             self.log.apply(seg);
@@ -1005,8 +1071,17 @@ impl Pipeline {
             log: self.log,
             bus_dropped: self.bus.dropped(),
             dropped_candidates: self.dropped_candidates,
+            echo_dropped: self.echo.dropped(),
             stopped,
         })
+    }
+}
+
+/// The empty final that closes a dropped echo copy's partial: same key, no text.
+fn retraction(seg: Segment) -> Segment {
+    Segment {
+        text: String::new(),
+        ..seg
     }
 }
 
@@ -1318,6 +1393,35 @@ fn build_lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn echo_retraction_closes_the_copys_partial_and_keeps_nothing() {
+        let partial = Segment {
+            source: Source::You,
+            start: Duration::from_secs(10),
+            end: Duration::from_secs(11),
+            text: "How would you".into(),
+            is_final: false,
+            avg_logprob: -0.2,
+        };
+        let copy = Segment {
+            end: Duration::from_secs(12),
+            text: "How would you design a rate limiter?".into(),
+            is_final: true,
+            ..partial.clone()
+        };
+        let close = retraction(copy.clone());
+        assert_eq!(close.key(), copy.key(), "same utterance");
+        assert!(close.is_final && close.text.is_empty());
+        let mut log = TranscriptLog::new();
+        log.apply(partial);
+        log.apply(close);
+        assert!(log.finals().is_empty(), "the copy's text never lands");
+        assert!(
+            log.render_window(DEFAULT_WINDOW).is_empty(),
+            "and its partial is gone from the window the LLM sees"
+        );
+    }
 
     #[test]
     fn the_configured_sensitivity_reaches_the_detector() {

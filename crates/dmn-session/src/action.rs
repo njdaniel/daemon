@@ -367,6 +367,9 @@ pub enum Action {
     /// Ring-buffer frames dropped so far, over every capture lane (SPEC § Threading rules: a
     /// full ring drops the incoming frame and counts it). Shown beside the dots while non-zero.
     Overruns { total: u64 },
+    /// Mic finals the echo guard has dropped so far as copies of the loopback (#60, SPEC §
+    /// Audio capture). For the session log and `dmn bench --live`; the screen does not change.
+    EchoDropped { total: u64 },
     /// When candidate `candidate` reached `stage`, in audio seconds from the session start (the
     /// clock segment times use). For the session log and `dmn bench --live`; the screen does not
     /// change.
