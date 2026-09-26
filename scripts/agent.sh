@@ -2,6 +2,7 @@
 # just agent <n|next> [--budget USD] [--dry-run]
 # Runs one issue headlessly per docs/PROCESS.md § 4: branch issue/<n>-<slug>, claude -p, PR. Never merges.
 source "$(dirname "$0")/lib.sh"
+need claude
 
 n=""; budget=""; dry=0
 while [ $# -gt 0 ]; do

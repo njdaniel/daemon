@@ -48,7 +48,8 @@ COPILOT_SKIPPED = (
     "Copilot's findings, if any, are left out of this review on purpose; there is nothing to triage."
 )
 
-CHUNK_START = re.compile(r"^(?:diff --git a/(\S+) b/|\[(\S+): \d+ changed lines omitted)")
+# Keyed by the new (b/) path: the one Copilot's inline findings name, also for a renamed file.
+CHUNK_START = re.compile(r"^(?:diff --git a/\S+ b/(\S+)|\[(\S+): \d+ changed lines omitted)")
 FINDING = re.compile(r"^### C\d+(?: \[[A-Za-z]+\])? (.+):(\S+) \(")
 
 
@@ -88,6 +89,15 @@ def split_copilot(md: str) -> tuple[str, dict[str, list[str]]]:
     return "".join(overview), by_path
 
 
+def fill(text: str, marker: str, value: str, last: bool) -> str:
+    """Replace the template's own marker (first or last occurrence), never a copy quoted in text."""
+    head, found, tail = text.rpartition(marker) if last else text.partition(marker)
+    if not found:
+        print(f"error: the prompt template has no {marker.strip()} marker", file=sys.stderr)
+        sys.exit(2)
+    return head + value + tail
+
+
 def main() -> None:
     template_path, diff_path, copilot_path, state, limit_s, outdir = sys.argv[1:7]
     limit = int(limit_s)
@@ -112,11 +122,14 @@ def main() -> None:
         else:
             instruction = COPILOT_SKIPPED
         note = "" if total == 1 else PASS_NOTE.format(K=total, k=k, files=", ".join(paths)) + "\n"
-        out = template.replace("@@PASS@@\n", note, 1)
-        out = out.replace("@@COPILOT_INSTRUCTION@@\n", instruction + "\n", 1)
         section = "\n---\n# GitHub Copilot review of this PR\n\n" + copilot if copilot else ""
-        out = out.replace("@@COPILOT@@", section, 1)
-        return out.replace("@@DIFF@@", "".join(chunks[i][1] for i in idxs), 1)
+        # The header markers come before any issue / PR text, so their first occurrence is the
+        # template's own; the tail markers come after everything, so their last occurrence is.
+        # Filling in this order keeps every marker's position pristine when it is looked up.
+        out = fill(template, "@@COPILOT_INSTRUCTION@@\n", instruction + "\n", last=False)
+        out = fill(out, "@@PASS@@\n", note, last=False)
+        out = fill(out, "@@DIFF@@", "".join(chunks[i][1] for i in idxs), last=True)
+        return fill(out, "@@COPILOT@@", section, last=True)
 
     def size(k: int, total: int, idxs: list[int]) -> int:
         return len(render(k, total, idxs, last=True).encode("utf-8"))

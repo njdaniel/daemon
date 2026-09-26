@@ -40,7 +40,7 @@ n=$(jq -r .body <<<"$prj" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-
 [ -n "$size" ] || die "no size label on PR #$pr or issue #$n"
 read -r _ _ _ reviewer <<<"$(size_row "$size")"
 case "$via" in
-  claude) model=$(model_id "$(tr '[:upper:]' '[:lower:]' <<<"$reviewer" | grep -oE 'sonnet|opus|fable' | head -1)") ;;
+  claude) need claude; model=$(model_id "$(tr '[:upper:]' '[:lower:]' <<<"$reviewer" | grep -oE 'sonnet|opus|fable' | head -1)") ;;
   agy)    need agy; model="gemini-3.1-pro-high" ;;
   *) die "unknown reviewer backend '$via' (agy|claude)" ;;
 esac
@@ -56,7 +56,7 @@ out, cur, keep, n = [], None, True, 0
 def flush():
     if cur and not keep: out.append(f"[{cur}: {n} changed lines omitted from review: lockfile or generated fixture data]\n")
 for line in sys.stdin:
-    m = re.match(r"diff --git a/(\S+) b/", line)
+    m = re.match(r"diff --git a/\S+ b/(\S+)", line)
     if m:
         flush(); cur, n = m.group(1), 0; keep = not skip.search(cur)
     if keep: out.append(line)
@@ -72,7 +72,8 @@ if [ "$copilot" = 1 ]; then
   has_review && found=1
   while [ "$found" = 0 ] && [ "$waited" -lt "$copilot_wait" ]; do
     [ "$waited" = 0 ] && echo "waiting up to ${copilot_wait}s for a Copilot review on PR #$pr ..."
-    sleep 20; waited=$((waited + 20))
+    step=$((copilot_wait - waited)); [ "$step" -gt 20 ] && step=20
+    sleep "$step"; waited=$((waited + step))
     has_review && found=1
   done
   if [ "$found" = 1 ]; then
