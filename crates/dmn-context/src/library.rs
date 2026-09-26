@@ -13,6 +13,7 @@ use crate::bm25::Bm25;
 use crate::chunk::join;
 use crate::error::ContextError;
 use crate::kind::SourceKind;
+use crate::story::{Stories, Story};
 
 /// SPEC § Context and LLM: the top 6 chunks per question…
 pub const RETRIEVE_TOP: usize = 6;
@@ -64,6 +65,9 @@ pub struct Library {
     passages: Vec<Passage>,
     index: Bm25,
     job_description: Option<JobDescription>,
+    /// Each stories file as one story (#58), for STAR matching. Their chunks are also searched
+    /// like any other passage.
+    stories: Stories,
     sources: usize,
     signature: SourcesSignature,
 }
@@ -85,6 +89,8 @@ impl Library {
     pub fn from_chunks(chunks: Vec<SourceChunk>, signature: SourcesSignature) -> Self {
         let mut passages = Vec::new();
         let mut jd: Option<(String, Vec<String>)> = None;
+        // (source id, path, chunk texts) per stories file, in load order.
+        let mut story_chunks: Vec<(i64, String, Vec<String>)> = Vec::new();
         let mut source_ids = Vec::new();
         for c in chunks {
             let Some(kind) = SourceKind::parse(&c.kind) else {
@@ -92,6 +98,12 @@ impl Library {
             };
             if source_ids.last() != Some(&c.source_id) {
                 source_ids.push(c.source_id);
+            }
+            if kind == SourceKind::Stories {
+                match story_chunks.last_mut() {
+                    Some((id, _, texts)) if *id == c.source_id => texts.push(c.text.clone()),
+                    _ => story_chunks.push((c.source_id, c.path.clone(), vec![c.text.clone()])),
+                }
             }
             if kind == SourceKind::JobDescription {
                 jd.get_or_insert_with(|| (c.path.clone(), Vec::new()))
@@ -116,10 +128,17 @@ impl Library {
                 text,
             }
         });
+        let stories = Stories::new(
+            story_chunks
+                .iter()
+                .map(|(_, path, texts)| Story::parse(path, &join(texts.iter().map(String::as_str))))
+                .collect(),
+        );
         Self {
             passages,
             index,
             job_description,
+            stories,
             sources: source_ids.len(),
             signature,
         }
@@ -135,6 +154,12 @@ impl Library {
     /// [`RETRIEVE_TOKENS`] (a passage that would overflow the budget is skipped and a smaller
     /// later one may still fit). Passages sharing no term with the query are never returned.
     pub fn retrieve(&self, query: &str) -> Vec<Retrieved<'_>> {
+        self.retrieve_excluding(query, None)
+    }
+
+    /// [`Library::retrieve`] without the passages of the source read from `skip`: the story
+    /// the prompt already carries whole (#58) is not spent on the chunk budget a second time.
+    pub fn retrieve_excluding(&self, query: &str, skip: Option<&str>) -> Vec<Retrieved<'_>> {
         let mut out = Vec::new();
         let mut tokens = 0;
         for (i, score) in self.index.search(query) {
@@ -142,6 +167,9 @@ impl Library {
                 break;
             }
             let passage = &self.passages[i];
+            if skip.is_some_and(|p| p == passage.path) {
+                continue;
+            }
             if tokens + passage.tokens > RETRIEVE_TOKENS {
                 continue;
             }
@@ -153,6 +181,11 @@ impl Library {
 
     pub fn job_description(&self) -> Option<&JobDescription> {
         self.job_description.as_ref()
+    }
+
+    /// The stories, one per stories file (#58).
+    pub fn stories(&self) -> &Stories {
+        &self.stories
     }
 
     /// Searchable passages (every chunk but the job description's).
@@ -238,6 +271,77 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn each_behavioral_fixture_question_ranks_its_story_first() {
+        let store = fixtures();
+        ingest(
+            &store,
+            &fixture("stories"),
+            SourceKind::Stories,
+            1_700_000_002,
+        )
+        .unwrap();
+        let lib = Library::load(&store).unwrap();
+        assert_eq!(lib.stories().len(), 8, "one story per file");
+        // testdata/behavioral/questions.json, the behavioral ones.
+        let cases = [
+            (
+                "Tell me about a time you disagreed with a technical decision and how you handled it.",
+                "stories/disagreed-on-broker.md",
+            ),
+            (
+                "Let's talk about failure. Describe a project that didn't go well, and what you took from it.",
+                "stories/billing-cutover-failure.md",
+            ),
+            (
+                "Give me an example of a time you had to cut scope to ship something. How did you decide what to cut?",
+                "stories/audit-log-scope-cut.md",
+            ),
+            (
+                "Tell me about a time you mentored someone, and what changed for them.",
+                "stories/mentoring-draft-prs.md",
+            ),
+            (
+                "I want to dig into ownership. Describe a situation where something was broken that wasn't your responsibility, and what you did.",
+                "stories/feature-flag-ownership.md",
+            ),
+            (
+                "Walk me through a time you had to deliver bad news to a stakeholder.",
+                "stories/realtime-sync-bad-news.md",
+            ),
+            (
+                "Let's do one more. Tell me about a time you had to get something done with a team that didn't report to you, where you had no authority.",
+                "stories/security-review-influence.md",
+            ),
+        ];
+        for (question, want) in cases {
+            let ranked = lib.stories().rank(question);
+            assert_eq!(
+                ranked.first().map(|m| m.story.label.as_str()),
+                Some(want),
+                "{question}: {:?}",
+                ranked
+                    .iter()
+                    .map(|m| (&m.story.label, &m.tags, m.score))
+                    .collect::<Vec<_>>()
+            );
+            assert!(!ranked[0].tags.is_empty(), "{question}: matched by tag");
+        }
+        // A story's own chunks can be left out of the chunk budget once it is in the prompt.
+        let broker = lib.stories().get("stories/disagreed-on-broker.md").unwrap();
+        let q = "Tell me about the broker spike and replay";
+        assert!(
+            lib.retrieve(q)
+                .iter()
+                .any(|h| h.passage.path == broker.path)
+        );
+        assert!(
+            lib.retrieve_excluding(q, Some(&broker.path))
+                .iter()
+                .all(|h| h.passage.path != broker.path)
+        );
     }
 
     #[test]

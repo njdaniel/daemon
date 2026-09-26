@@ -65,6 +65,7 @@ a real person or company, and they are checked into git.
 | `context/resume.pdf` | resume | The same resume as a one-page text PDF, generated from `resume.md` by `python3 tools/fixtures/context_pdf.py` (stdlib only, deterministic) |
 | `context/job-description.txt` | job_description | Plain text |
 | `context/notes/` | notes | A folder of two notes, one `.md` and one `.txt` |
+| `context/stories/` | stories | Eight short STAR stories (#58), one per file, covering the behavioral fixture's questions; tags in YAML front matter (`[a, b]` or `a, b`) or on a first `tags:` line, and one untagged story that only BM25 can match |
 
 Refusals (empty, unsupported, non-UTF-8, broken or image-only PDFs) are built in tempdirs by the
 tests rather than committed.
