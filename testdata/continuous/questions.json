@@ -1,0 +1,98 @@
+[
+  {
+    "t": 16.151,
+    "end": 24.702,
+    "text": "So, uh, to start us off, how would you, um, design a rate limiter for an internal API that a few hundred services call?",
+    "kind": "system_design"
+  },
+  {
+    "t": 59.801,
+    "end": 65.948,
+    "text": "And if the limiter's state lived in Redis and Redis went down for a minute, what would you want to happen?",
+    "kind": "clarification"
+  },
+  {
+    "t": 85.568,
+    "end": 95.425,
+    "text": "Okay, let's switch gears to something more hands-on. Given a stream of log lines, how would you find the ten most frequent error messages in the last hour?",
+    "kind": "coding"
+  },
+  {
+    "t": 114.733,
+    "end": 119.14,
+    "text": "What's the time complexity of that, and how much memory does it need?",
+    "kind": "clarification"
+  },
+  {
+    "t": 141.244,
+    "end": 144.344,
+    "text": "Tell me about a time you had to push back on a deadline.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 164.157,
+    "end": 167.663,
+    "text": "What did you, uh, what did you actually say to your manager?",
+    "kind": "clarification"
+  },
+  {
+    "t": 183.119,
+    "end": 188.559,
+    "text": "Can you explain the difference between optimistic and pessimistic locking?",
+    "kind": "knowledge"
+  },
+  {
+    "t": 208.59,
+    "end": 219.666,
+    "text": "Imagine you're building the notification service for a food delivery app. Orders change state every few seconds. How would you get those updates to the customer's phone quickly?",
+    "kind": "system_design"
+  },
+  {
+    "t": 241.314,
+    "end": 246.986,
+    "text": "Would you use push for everything, or keep the web socket open, or something else?",
+    "kind": "clarification"
+  },
+  {
+    "t": 259.133,
+    "end": 262.395,
+    "text": "Walk me through a time a production incident was your fault.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 281.204,
+    "end": 284.432,
+    "text": "How did you, uh, how did you make sure it didn't happen again?",
+    "kind": "clarification"
+  },
+  {
+    "t": 300.503,
+    "end": 306.372,
+    "text": "So, um, what happens when you type a URL into the browser and press enter? At a high level.",
+    "kind": "knowledge"
+  },
+  {
+    "t": 329.862,
+    "end": 339.789,
+    "text": "Suppose the log volume from earlier grows ten times overnight, because a new team starts logging every request. What breaks first in your design?",
+    "kind": "system_design"
+  },
+  {
+    "t": 363.448,
+    "end": 368.841,
+    "text": "Describe a time you disagreed with a teammate about a design, and how it got resolved.",
+    "kind": "behavioral"
+  },
+  {
+    "t": 396.959,
+    "end": 402.782,
+    "text": "Why would you put a message queue between two services instead of having one call the other directly?",
+    "kind": "knowledge"
+  },
+  {
+    "t": 426.057,
+    "end": 431.909,
+    "text": "Okay, great. We're almost out of time. Do you have any questions for me?",
+    "kind": "knowledge"
+  }
+]

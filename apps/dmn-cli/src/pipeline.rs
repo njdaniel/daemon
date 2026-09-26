@@ -239,6 +239,24 @@ pub struct Detecting {
     /// An interviewer final that did not clear the bar on its own, with when it arrived.
     pending: Option<(Segment, Instant)>,
     found: Vec<Found>,
+    /// The question still being asked (#63), if the last interviewer lines were one.
+    chain: Option<Chain>,
+    /// Recent You finals' audio spans, for "did the candidate speak in between".
+    you: VecDeque<(Duration, Duration)>,
+}
+
+/// A question the interviewer may still be asking: the candidate it started from and the
+/// interviewer lines since, until the candidate speaks or a pause hands the floor back.
+#[derive(Debug, Clone)]
+struct Chain {
+    /// Index in `found` of the candidate the chain started from.
+    cand: usize,
+    /// Where the chain's last interviewer final ended.
+    end: Duration,
+    /// Interviewer lines after that candidate that were not candidates themselves: "Imagine a
+    /// delivery app." (candidate) "Orders change state every few seconds." (this) "How would you
+    /// get those updates to the phone?" (the continuation).
+    between: Vec<String>,
 }
 
 /// One emitted candidate and how long after its final it came out.
@@ -247,7 +265,25 @@ pub struct Found {
     pub latency: Duration,
     /// Emitted only once the next final showed the line was followed.
     pub late: bool,
+    /// #63: this candidate continues the one before it: the same question, split at a pause.
+    /// Its text is the combined question, and it replaces the earlier one on screen.
+    pub continues: bool,
 }
+
+/// #63: an interviewer final that starts within this long after the previous interviewer final,
+/// with no You speech in between, continues it. Since #16 closes an utterance on 500 ms of
+/// silence, a question with a mid-sentence pause ("And if the state lived in Redis … and Redis
+/// went down, what then?") or a 12 s forced split arrives as two finals; each part scored alone
+/// became two candidates for one question. This is the SPEC's hand-back silence
+/// ([`dmn_detect::FOLLOW_SILENCE`]): a pause shorter than that has not handed the floor back.
+pub const CONTINUE_GAP: Duration = dmn_detect::FOLLOW_SILENCE;
+
+/// A chain spans at most this much audio from its first candidate's start: past it, a long
+/// monologue's next question is a new question, not a refinement of one asked half a minute ago.
+pub const CONTINUE_SPAN: Duration = Duration::from_secs(30);
+
+/// How many recent You spans [`Detecting`] keeps; only the last few can fall inside a gap.
+const YOU_SPANS: usize = 16;
 
 impl Detecting {
     pub fn new(spec_literal: bool, sensitivity: Sensitivity) -> Self {
@@ -260,29 +296,108 @@ impl Detecting {
             detector: Detector::new(cfg.with_sensitivity(sensitivity)),
             pending: None,
             found: Vec::new(),
+            chain: None,
+            you: VecDeque::new(),
         }
     }
 
     /// Feed one segment; returns how many candidates became decidable because of it (they are
     /// the last ones in [`found`](Self::found)).
     fn feed(&mut self, seg: &Segment) -> usize {
-        if !seg.is_final {
+        // An empty final is dmn-stt closing an utterance it heard nothing in (a breath, a
+        // filtered hallucination): no speech, so it neither scores nor breaks a question in two.
+        if !seg.is_final || seg.text.trim().is_empty() {
             return 0;
         }
         let before = self.found.len();
+        if seg.source == Source::You {
+            if self.you.len() == YOU_SPANS {
+                self.you.pop_front();
+            }
+            self.you.push_back((seg.start, seg.end));
+        }
         if let Some((prev, arrived)) = self.pending.take() {
             let following = Following {
                 silence: Some(seg.start.saturating_sub(prev.end)),
                 next_speaker: Some(seg.source),
             };
-            self.score(&prev, following, arrived, true);
+            // A line that only clears the bar once followed starts a question of its own.
+            if self.score(&prev, following, arrived, true)
+                && self.chain.as_ref().is_none_or(|c| c.end == prev.end)
+            {
+                self.chain = Some(Chain {
+                    cand: self.found.len() - 1,
+                    end: prev.end,
+                    between: Vec::new(),
+                });
+            }
         }
-        if seg.source == Source::Interviewer
-            && !self.score(seg, Following::UNKNOWN, Instant::now(), false)
-        {
-            self.pending = Some((seg.clone(), Instant::now()));
+        if seg.source == Source::Interviewer {
+            let open = self.chain.take().filter(|c| self.continues_chain(c, seg));
+            if self.score(seg, Following::UNKNOWN, Instant::now(), false) {
+                if let Some(chain) = &open {
+                    self.continue_from(chain);
+                }
+                self.chain = Some(Chain {
+                    cand: self.found.len() - 1,
+                    end: seg.end,
+                    between: Vec::new(),
+                });
+            } else {
+                self.pending = Some((seg.clone(), Instant::now()));
+                self.chain = open.map(|mut c| {
+                    c.end = seg.end;
+                    c.between.push(seg.text.trim().to_owned());
+                    c
+                });
+            }
         }
         self.found.len() - before
+    }
+
+    /// Whether `seg` is more of the question `chain` holds: it starts within [`CONTINUE_GAP`] of
+    /// the chain's last line, no You final lies in the gap, and the chain stays inside
+    /// [`CONTINUE_SPAN`]. Judged on audio time, not arrival order: at replay speed, or with
+    /// whisper busy, the candidate's answer can be transcribed before the interviewer's second
+    /// half arrives.
+    fn continues_chain(&self, chain: &Chain, seg: &Segment) -> bool {
+        let gap = seg.start.checked_sub(chain.end).unwrap_or(Duration::ZERO);
+        let Some(first) = self.found.get(chain.cand) else {
+            return false;
+        };
+        let span = seg
+            .end
+            .checked_sub(first.candidate.start)
+            .unwrap_or(Duration::ZERO);
+        let spoke = self
+            .you
+            .iter()
+            .any(|&(start, stop)| start < seg.start && stop > chain.end);
+        gap <= CONTINUE_GAP && span <= CONTINUE_SPAN && !spoke
+    }
+
+    /// Turn the candidate just pushed into the continuation of `chain`: the combined question,
+    /// from where the chain started. The screen then shows one question, refined, not two.
+    fn continue_from(&mut self, chain: &Chain) {
+        let Some(earlier) = self.found.get(chain.cand).map(|f| f.candidate.clone()) else {
+            return;
+        };
+        let Some(last) = self.found.last_mut() else {
+            return;
+        };
+        let join = |first: &str, rest: &str| {
+            std::iter::once(first.trim())
+                .chain(chain.between.iter().map(String::as_str))
+                .chain(std::iter::once(rest.trim()))
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let c = &mut last.candidate;
+        c.start = earlier.start;
+        c.text = join(&earlier.text, &c.text);
+        c.line = join(&earlier.line, &c.line);
+        last.continues = true;
     }
 
     /// Score whatever is still held after the audio ends.
@@ -302,6 +417,7 @@ impl Detecting {
                     candidate,
                     latency: arrived.elapsed(),
                     late,
+                    continues: false,
                 });
                 true
             }
@@ -581,8 +697,11 @@ pub struct Pipeline {
     candidates_tx: crossbeam_channel::Sender<Candidate>,
     candidates_rx: Receiver<Candidate>,
     next_candidate: u64,
-    /// Session ids of the candidates in the detector's channel, oldest first.
-    sent_ids: VecDeque<u64>,
+    /// Session ids of the candidates in the detector's channel, oldest first, and whether each
+    /// continues the one before it (#63).
+    sent_ids: VecDeque<(u64, bool)>,
+    /// The last candidate handed to the session: the one a continuation replaces.
+    last_sent: Option<u64>,
     dropped_candidates: u64,
     /// Every candidate by session id, for `r`.
     known: HashMap<u64, Candidate>,
@@ -802,6 +921,7 @@ impl Pipeline {
             candidates_rx,
             next_candidate: 0,
             sent_ids: VecDeque::new(),
+            last_sent: None,
             dropped_candidates: 0,
             known: HashMap::new(),
         })
@@ -918,29 +1038,47 @@ impl Pipeline {
         for f in &found[found.len() - new..] {
             self.next_candidate += 1;
             if self.candidates_tx.try_send(f.candidate.clone()).is_ok() {
-                self.sent_ids.push_back(self.next_candidate);
+                self.sent_ids.push_back((self.next_candidate, f.continues));
             } else {
                 self.dropped_candidates += 1;
             }
             observer.candidate(self.next_candidate, f);
         }
         for candidate in self.candidates_rx.try_iter() {
-            let Some(id) = self.sent_ids.pop_front() else {
+            let Some((id, continues)) = self.sent_ids.pop_front() else {
                 break;
             };
             self.hub.dispatch(wire::candidate(id, &candidate));
+            // #63: the same question, split at a pause. Its reply replaces the earlier one's
+            // question where it is, instead of arriving as a second question.
+            let continued = if continues {
+                self.last_sent.inspect(|&prev| {
+                    self.hub.dispatch(Action::Continues {
+                        candidate: id,
+                        continued: prev,
+                    });
+                })
+            } else {
+                None
+            };
+            self.last_sent = Some(id);
             self.hub.dispatch(Action::Timing {
                 candidate: id,
                 stage: Stage::Emitted,
                 at: self.audio.now(),
             });
             if let Some(s) = &self.suggester {
-                let answered = self.answered(&candidate);
+                // A continuation is the question still being asked: nothing has been answered.
+                let answered = match continued {
+                    Some(_) => None,
+                    None => self.answered(&candidate),
+                };
                 s.submit_after(
                     id,
                     &candidate,
                     self.log.render_window(DEFAULT_WINDOW),
                     answered,
+                    continued.is_some(),
                 );
             }
             self.known.insert(id, candidate);
@@ -1420,6 +1558,196 @@ mod tests {
         assert!(
             log.render_window(DEFAULT_WINDOW).is_empty(),
             "and its partial is gone from the window the LLM sees"
+        );
+    }
+
+    fn final_at(source: Source, start_ms: u64, end_ms: u64, text: &str) -> Segment {
+        Segment {
+            source,
+            start: Duration::from_millis(start_ms),
+            end: Duration::from_millis(end_ms),
+            text: text.into(),
+            is_final: true,
+            avg_logprob: -0.2,
+        }
+    }
+
+    fn detecting() -> Detecting {
+        Detecting::new(false, sensitivity(dmn_core::config::Sensitivity::Balanced))
+    }
+
+    /// sysdesign's first question as whisper split it at #16's 500 ms close: two finals 0.6 s
+    /// apart, each a candidate on its own (#63).
+    const FIRST: &str = "How would you design a rate limiter for a globally distributed API?";
+    const SECOND: &str = "And how would you handle the case where the limiter itself goes down?";
+
+    #[test]
+    fn a_question_split_at_a_pause_continues_as_one_candidate() {
+        let mut d = detecting();
+        assert_eq!(
+            d.feed(&final_at(Source::Interviewer, 19_980, 26_000, FIRST)),
+            1
+        );
+        assert!(!d.found()[0].continues);
+        assert_eq!(
+            d.feed(&final_at(Source::Interviewer, 26_560, 29_740, SECOND)),
+            1
+        );
+        let second = &d.found()[1];
+        assert!(
+            second.continues,
+            "the rest of the question, not a second one"
+        );
+        assert_eq!(second.candidate.start, Duration::from_millis(19_980));
+        assert_eq!(second.candidate.text, format!("{FIRST} {SECOND}"));
+    }
+
+    #[test]
+    fn the_candidates_answer_in_the_gap_ends_the_question() {
+        let mut d = detecting();
+        d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST));
+        d.feed(&final_at(Source::You, 5_200, 5_900, "Sure."));
+        d.feed(&final_at(Source::Interviewer, 6_000, 9_000, SECOND));
+        assert!(
+            !d.found()[1].continues,
+            "the candidate spoke: a new question"
+        );
+    }
+
+    #[test]
+    fn an_answer_transcribed_early_but_spoken_later_does_not_end_it() {
+        // At replay speed the answer (spoken after the second half) can arrive first.
+        let mut d = detecting();
+        d.feed(&final_at(Source::Interviewer, 19_980, 26_000, FIRST));
+        d.feed(&final_at(
+            Source::You,
+            31_040,
+            43_040,
+            "Okay, first I'd clarify the scope.",
+        ));
+        d.feed(&final_at(Source::Interviewer, 26_560, 29_740, SECOND));
+        assert!(d.found()[1].continues);
+    }
+
+    #[test]
+    fn a_pause_that_hands_the_floor_back_starts_a_new_question() {
+        let mut d = detecting();
+        d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST));
+        let gap = u64::try_from(CONTINUE_GAP.as_millis()).unwrap_or(1_500) + 100;
+        d.feed(&final_at(
+            Source::Interviewer,
+            5_000 + gap,
+            9_000 + gap,
+            SECOND,
+        ));
+        assert!(!d.found()[1].continues);
+    }
+
+    #[test]
+    fn a_forced_split_at_12_s_continues() {
+        let mut d = detecting();
+        d.feed(&final_at(
+            Source::Interviewer,
+            148_400,
+            160_400,
+            "Sorry about that. Where were we? Right, the pipeline. Let's switch gears to something \
+             more hands-on. Suppose you have a service whose P99 latency doubled overnight.",
+        ));
+        d.feed(&final_at(
+            Source::Interviewer,
+            161_180,
+            162_940,
+            "How do you go about finding the cause?",
+        ));
+        let found = d.found();
+        assert_eq!(
+            found.len(),
+            2,
+            "{:?}",
+            found.iter().map(|f| &f.candidate.text).collect::<Vec<_>>()
+        );
+        assert!(found[1].continues);
+    }
+
+    #[test]
+    fn an_empty_final_between_the_halves_does_not_break_the_question() {
+        let mut d = detecting();
+        d.feed(&final_at(Source::Interviewer, 19_980, 26_000, FIRST));
+        assert_eq!(
+            d.feed(&final_at(Source::Interviewer, 26_100, 26_300, "")),
+            0
+        );
+        d.feed(&final_at(Source::Interviewer, 26_560, 29_740, SECOND));
+        assert!(d.found()[1].continues);
+    }
+
+    #[test]
+    fn a_question_in_three_parts_continues_through_the_middle_statement() {
+        let mut d = detecting();
+        d.feed(&final_at(
+            Source::Interviewer,
+            208_700,
+            212_700,
+            "Imagine you're building the notification service for a food delivery app.",
+        ));
+        d.feed(&final_at(
+            Source::Interviewer,
+            213_600,
+            216_000,
+            "Orders change state every few seconds.",
+        ));
+        d.feed(&final_at(
+            Source::Interviewer,
+            216_900,
+            219_600,
+            "How would you get those updates to the customer's phone quickly?",
+        ));
+        let last = d.found().last().unwrap();
+        assert!(last.continues);
+        assert_eq!(last.candidate.start, Duration::from_millis(208_700));
+        assert_eq!(
+            last.candidate.text,
+            "Imagine you're building the notification service for a food delivery app. Orders \
+             change state every few seconds. How would you get those updates to the customer's \
+             phone quickly?"
+        );
+    }
+
+    #[test]
+    fn a_chain_ends_after_30_s() {
+        let mut d = detecting();
+        d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST));
+        let mut at = 5_000;
+        for _ in 0..5 {
+            d.feed(&final_at(
+                Source::Interviewer,
+                at + 500,
+                at + 6_000,
+                "That's the setup.",
+            ));
+            at += 6_000;
+        }
+        d.feed(&final_at(Source::Interviewer, at + 500, at + 4_000, SECOND));
+        assert!(
+            !d.found().last().unwrap().continues,
+            "34 s in: a new question"
+        );
+    }
+
+    #[test]
+    fn only_a_candidate_is_continued() {
+        let mut d = detecting();
+        d.feed(&final_at(
+            Source::Interviewer,
+            0,
+            3_000,
+            "Okay, that makes sense.",
+        ));
+        d.feed(&final_at(Source::Interviewer, 3_400, 7_000, FIRST));
+        assert_eq!(d.found().len(), 1);
+        assert!(
+            !d.found()[0].continues,
+            "a statement before a question is not a candidate"
         );
     }
 

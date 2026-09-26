@@ -14,7 +14,7 @@ use dmn_audio::Source;
 use dmn_detect::{Candidate, DetectConfig, Detector, Following};
 use dmn_transcript::Segment;
 
-const FIXTURES: [&str; 3] = ["sysdesign", "behavioral", "mixed"];
+const FIXTURES: [&str; 4] = ["sysdesign", "behavioral", "mixed", "continuous"];
 
 fn testdata() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -141,7 +141,7 @@ fn short(text: &str) -> String {
 }
 
 #[test]
-fn recall_and_precision_clear_the_m1_targets_on_scripted_text() {
+fn recall_and_precision_clear_the_m2_targets_on_scripted_text() {
     let mut overall = (0usize, 0usize, 0usize);
     for fixture in FIXTURES {
         let s = score(fixture, DetectConfig::default());
@@ -169,13 +169,11 @@ fn recall_and_precision_clear_the_m1_targets_on_scripted_text() {
         "overall     recall {recall:.3} ({}/{}) precision {precision:.3} ({} false positives)",
         overall.0, overall.1, overall.2
     );
+    // SPEC § Milestones, M2 (#63): recall and precision >= 0.9.
+    assert!(recall >= 0.9, "recall {recall:.3} is under the 0.9 target");
     assert!(
-        recall >= 0.85,
-        "recall {recall:.3} is under the 0.85 target"
-    );
-    assert!(
-        precision >= 0.8,
-        "precision {precision:.3} is under the 0.8 target"
+        precision >= 0.9,
+        "precision {precision:.3} is under the 0.9 target"
     );
 }
 

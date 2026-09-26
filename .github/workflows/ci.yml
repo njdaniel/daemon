@@ -43,7 +43,7 @@ jobs:
           path: |
             testdata/*/interviewer.wav
             testdata/*/candidate.wav
-          key: fixtures-${{ hashFiles('testdata/fixtures-v1.sha256') }}
+          key: fixtures-${{ hashFiles('testdata/fixtures-v*.sha256') }}
       - name: Fetch fixtures
         if: steps.fixtures.outputs.cache-hit != 'true'
         env:

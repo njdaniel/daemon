@@ -416,6 +416,9 @@ impl StoreWriter {
             | Action::SwapStory { .. }
             // Which provider answered is status-line state, like the dots (#59).
             | Action::Provider { .. }
+            // #63: both halves of a split question keep their question rows, as every candidate
+            // does; the link is screen state and stays in the action log.
+            | Action::Continues { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

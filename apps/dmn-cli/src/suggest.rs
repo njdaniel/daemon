@@ -118,6 +118,10 @@ struct Job {
     swap: bool,
     /// #57: the question on screen when this candidate arrived, and the candidate's answer to it.
     answered: Option<Answered>,
+    /// #63: this candidate is the rest of the question on screen, split at a pause. It is asked
+    /// as a question of its own, without that half as the current question: the model would
+    /// otherwise take the whole question for a clarification of its first half.
+    continues: bool,
 }
 
 /// A shown question and what the candidate said while it was on screen (#57): what the next
@@ -461,18 +465,20 @@ impl Suggester {
     /// [`Suggester::submit_after`] with nothing answered before: the tests' way in.
     #[cfg(test)]
     pub fn submit(&self, id: u64, candidate: &Candidate, transcript: String) {
-        self.submit_after(id, candidate, transcript, None);
+        self.submit_after(id, candidate, transcript, None, false);
     }
 
     /// Queue candidate `id` for the fast phase, with the question on screen and the candidate's
     /// answer to it for session memory (#57). Never blocks the pipeline loop. Under
     /// [`Policy::Supersede`], unless the session is pinned, this cancels the request in flight.
+    /// `continues`: the candidate is the rest of the question on screen (#63).
     pub fn submit_after(
         &self,
         id: u64,
         candidate: &Candidate,
         transcript: String,
         answered: Option<Answered>,
+        continues: bool,
     ) {
         if let Some(latest) = &self.latest {
             latest.newest.fetch_max(id, Ordering::AcqRel);
@@ -489,6 +495,7 @@ impl Suggester {
             regenerate: None,
             swap: false,
             answered,
+            continues,
         });
     }
 
@@ -507,6 +514,7 @@ impl Suggester {
             regenerate: Some(current),
             swap: false,
             answered: None,
+            continues: false,
         });
     }
 
@@ -527,6 +535,7 @@ impl Suggester {
             regenerate: Some(current),
             swap: true,
             answered: None,
+            continues: false,
         });
     }
 
@@ -851,6 +860,8 @@ fn announce(llm: &config::Llm, hub: &SessionHub, output: Output) {
 /// The request for `job`: a new candidate (answered with the question on screen as context, so
 /// a clarification can attach to it), or a regeneration of the question on screen.
 fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
+    // #63: the question on screen is this candidate's own first half, not context for it.
+    let current = current.filter(|_| !job.continues);
     FastRequest {
         transcript: job.transcript.clone(),
         current: job.regenerate.clone().or_else(|| current.cloned()),
@@ -1882,6 +1893,7 @@ mod tests {
             }),
             swap: false,
             answered: None,
+            continues: false,
         };
         let mut tally = Tally::default();
         answerer
@@ -2555,11 +2567,39 @@ mod tests {
             regenerate: None,
             swap: false,
             answered: None,
+            continues: false,
         };
         let req = request(&job, None);
         assert!(!req.regenerate);
         let chat = dmn_llm::fast::fast_chat_request(&req);
         assert_eq!(chat.temperature, 0.0);
+    }
+
+    #[test]
+    fn a_continuation_is_asked_without_its_first_half_as_the_current_question() {
+        let on_screen = CurrentQuestion {
+            question: "How would you design a rate limiter?".into(),
+            kind: Kind::SystemDesign,
+        };
+        let job = |continues| Job {
+            id: 2,
+            candidate: candidate(),
+            transcript: String::new(),
+            regenerate: None,
+            swap: false,
+            answered: None,
+            continues,
+        };
+        assert_eq!(
+            request(&job(false), Some(&on_screen)).current,
+            Some(on_screen.clone()),
+            "a new question sees the one on screen, so a clarification can attach"
+        );
+        assert_eq!(
+            request(&job(true), Some(&on_screen)).current,
+            None,
+            "the rest of the same question is not a clarification of its first half"
+        );
     }
 
     #[test]
@@ -2622,7 +2662,7 @@ mod tests {
             Some(Duration::from_secs(20)),
         );
         hub.dispatch(wire::candidate(1, &candidate()));
-        s.submit_after(1, &candidate(), String::new(), None);
+        s.submit_after(1, &candidate(), String::new(), None, false);
         assert!(wait_for(&hub, Duration::from_secs(5), |_| provider
             .requests()
             .len()
@@ -2637,7 +2677,13 @@ mod tests {
         hub.dispatch(you_said(5.0, answer));
 
         hub.dispatch(wire::candidate(2, &candidate()));
-        s.submit_after(2, &candidate(), String::new(), Some(answered_1(answer)));
+        s.submit_after(
+            2,
+            &candidate(),
+            String::new(),
+            Some(answered_1(answer)),
+            false,
+        );
         let item = "Come back to clock skew: you said you would";
         assert!(
             wait_for(&hub, Duration::from_secs(5), |s| s
@@ -2741,6 +2787,7 @@ mod tests {
             &candidate(),
             String::new(),
             Some(answered_1("Hash map.")),
+            false,
         );
         let tally = s.finish();
         assert_eq!(
@@ -2782,6 +2829,7 @@ mod tests {
             &candidate(),
             String::new(),
             Some(answered_1("Hash map.")),
+            false,
         );
         assert!(
             wait_for(&hub, Duration::from_secs(5), |s| s

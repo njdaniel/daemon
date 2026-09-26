@@ -3,7 +3,8 @@
 
 Runs `dmn replay --json` over each fixture in testdata/, matches the candidates the detector
 emitted against that fixture's questions.json, and prints the numbers docs/SPEC.md sets targets
-for (recall >= 0.85, precision >= 0.8 at M1; detection <= 100 ms).
+for (recall >= 0.85, precision >= 0.8 at M1; both >= 0.9 at M2; detection <= 100 ms). The exit
+status follows the M2 targets.
 
 This measures the whole pipeline: a question whisper mistranscribed badly enough that no cue
 survives counts as a miss here, while `cargo test -p dmn-detect --test fixtures` scores the same
@@ -34,7 +35,10 @@ from pathlib import Path
 # The checkout to measure. Normally the harness sits inside it; DMN_REPO lets CI, or a copy of
 # this file kept outside the tree, point at one explicitly.
 REPO = Path(os.environ.get("DMN_REPO") or Path(__file__).resolve().parent.parent)
-FIXTURES = ("sysdesign", "behavioral", "mixed")
+FIXTURES = ("sysdesign", "behavioral", "mixed", "continuous")
+# docs/SPEC.md § Milestones: M1 recall >= 0.85 / precision >= 0.8; M2 recall and precision >= 0.9.
+M1_RECALL, M1_PRECISION = 0.85, 0.8
+M2_RECALL, M2_PRECISION = 0.9, 0.9
 
 # A candidate matches a scripted question when their audio spans overlap, or when the candidate
 # starts within this much of the question's span. Whisper's utterance bounds differ from the
@@ -56,6 +60,31 @@ class Candidate:
     score: int
     cues: list[str]
     detect_us: int
+    # #63: this candidate continues the one before it (the same question, split at a pause), so
+    # it replaces that one on screen rather than adding a second question.
+    continues: bool = False
+
+
+def collapse(candidates: list[Candidate]) -> list[Candidate]:
+    """Fold each continuation into the candidate it continues: one question, the widest span,
+    the combined text. The screen shows one question for the chain, so the eval counts one."""
+    out: list[Candidate] = []
+    for c in candidates:
+        if c.continues and out:
+            prev = out[-1]
+            out[-1] = Candidate(
+                start=min(prev.start, c.start),
+                end=max(prev.end, c.end),
+                text=c.text,
+                line=c.line,
+                score=max(prev.score, c.score),
+                cues=c.cues,
+                detect_us=max(prev.detect_us, c.detect_us),
+                continues=False,
+            )
+        else:
+            out.append(c)
+    return out
 
 
 @dataclass
@@ -175,13 +204,22 @@ def evaluate(fixture: str, events: list[dict], wall_s: float) -> Result:
         Question(q["t"], q["end"], q["text"], q.get("kind", "?"))
         for q in json.loads((REPO / "testdata" / fixture / "questions.json").read_text())
     ]
-    candidates = [
-        Candidate(
-            e["start"], e["end"], e["text"], e.get("line", ""), e["score"], e["cues"], e["detect_us"]
-        )
-        for e in events
-        if e.get("type") == "candidate"
-    ]
+    candidates = collapse(
+        [
+            Candidate(
+                e["start"],
+                e["end"],
+                e["text"],
+                e.get("line", ""),
+                e["score"],
+                e["cues"],
+                e["detect_us"],
+                bool(e.get("continues", False)),
+            )
+            for e in events
+            if e.get("type") == "candidate"
+        ]
+    )
     summary = next((e for e in events if e.get("type") == "summary"), {})
 
     # Greedy best-first pairing: the closest, most similar candidate wins each question, and no
@@ -249,7 +287,7 @@ def detail(results: list[Result]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fixture", action="append", choices=FIXTURES, help="default: all three")
+    p.add_argument("--fixture", action="append", choices=FIXTURES, help="default: all four")
     p.add_argument("--speed", default=8, type=float, help="replay pacing factor: N plays the audio at N x real time (default 8)")
     p.add_argument("--model", help="whisper model; default is [stt].model")
     p.add_argument("--threads", type=int, help="decoder threads")
@@ -298,13 +336,19 @@ def main() -> int:
         print("\npipeline: no replay summary, so latency is unmeasured")
 
     fast = bool(pipeline) and slowest <= LATENCY_BUDGET_MS
-    ok = recall >= 0.85 and precision >= 0.8 and fast
+    m1 = recall >= M1_RECALL and precision >= M1_PRECISION and fast
+    m2 = recall >= M2_RECALL and precision >= M2_PRECISION and fast
     print(
-        f"\nM1 targets (recall >= 0.85, precision >= 0.8, detection <= {LATENCY_BUDGET_MS} ms): "
-        f"{'met' if ok else 'NOT met'} — recall {recall:.2f}, precision {precision:.2f}, "
-        f"slowest {slowest:.2f} ms"
+        f"\nM1 targets (recall >= {M1_RECALL}, precision >= {M1_PRECISION}, "
+        f"detection <= {LATENCY_BUDGET_MS} ms): {'met' if m1 else 'NOT met'} — "
+        f"recall {recall:.2f}, precision {precision:.2f}, slowest {slowest:.2f} ms"
     )
-    return 0 if ok or wanted_literal else 1
+    print(
+        f"M2 targets (recall >= {M2_RECALL}, precision >= {M2_PRECISION}, "
+        f"detection <= {LATENCY_BUDGET_MS} ms): {'met' if m2 else 'NOT met'}"
+    )
+    # The milestone in progress sets the exit status.
+    return 0 if m2 or wanted_literal else 1
 
 
 if __name__ == "__main__":
