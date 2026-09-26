@@ -120,19 +120,36 @@ impl Transcriber {
         };
         let model_bytes = std::fs::metadata(model_file).map_or(0, |m| m.len());
         let wanted = match resolve(cfg.device, Backend::compiled(), &devices) {
+            // Reported free memory first, then a real allocation of what the load needs: a
+            // failed allocation returns here, where the load itself would abort the process.
             Placement::Gpu(device) => match crate::gpu::fits(&device, model_bytes) {
-                Ok(()) => Placement::Gpu(device),
-                // `auto` means "the GPU if it has room"; `gpu` asked for it, so say why not.
-                Err(why) if cfg.device == DeviceChoice::Auto => {
-                    tracing::info!(model = %shown, reason = %why, "whisper on the CPU (auto)");
-                    Placement::Cpu { reason: None }
-                }
                 Err(why) => Placement::Cpu { reason: Some(why) },
+                Ok(())
+                    if !crate::gpu::probe(
+                        device.ordinal,
+                        model_bytes + crate::gpu::state_bytes(model_bytes),
+                    ) =>
+                {
+                    Placement::Cpu {
+                        reason: Some(format!(
+                            "{} could not allocate whisper's memory",
+                            device.name
+                        )),
+                    }
+                }
+                Ok(()) => Placement::Gpu(device),
             },
             cpu => cpu,
         };
         let ((ctx, state), placement) =
             with_fallback(wanted, |gpu| load_on(model_file, &shown, gpu))?;
+        // `auto` means "the GPU if it has room": whatever kept it off, it falls back quietly.
+        if cfg.device == DeviceChoice::Auto
+            && let Placement::Cpu { reason: Some(why) } = &placement
+        {
+            tracing::info!(model = %shown, reason = %why, "whisper on the CPU (auto)");
+        }
+        let placement = placement.for_choice(cfg.device);
         match &placement {
             Placement::Cpu {
                 reason: Some(why), ..

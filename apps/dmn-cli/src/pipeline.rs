@@ -811,9 +811,10 @@ impl Pipeline {
             .unwrap_or_default();
         // The interviewer lane is built first on purpose (#61): its finals are on the question
         // → Approach path, so when the GPU has room for only one whisper context it gets it,
-        // and the candidate's lane falls back to the CPU.
+        // and the candidate's lane falls back to the CPU. `live_sources` lists the mic first, so
+        // the order is enforced here for every input.
         let mut built = Vec::new();
-        for (source, audio) in sources {
+        for (source, audio) in interviewer_first(sources) {
             let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));
             let ring = match &audio {
                 Audio::Wav(w) => ring_frames(w.duration(), speed),
@@ -1587,12 +1588,18 @@ pub fn device_choice(d: dmn_core::config::SttDevice) -> DeviceChoice {
     }
 }
 
+/// The interviewer's lane before the candidate's, whatever order `sources` came in.
+fn interviewer_first<T>(mut sources: Vec<(Source, T)>) -> Vec<(Source, T)> {
+    sources.sort_by_key(|(source, _)| *source != Source::Interviewer);
+    sources
+}
+
 /// One line for where the lanes' whisper runs: the shared placement when both lanes agree (the
 /// usual case), else each lane's.
 fn placement_summary(placements: &[Placement]) -> String {
     match placements {
         [] => String::new(),
-        [first, rest @ ..] if rest.iter().all(|p| p == first) => first.label(),
+        [first, rest @ ..] if rest.iter().all(|p| p.same_device(first)) => first.label(),
         all => all
             .iter()
             .map(Placement::label)
@@ -1617,6 +1624,32 @@ mod tests {
             "CPU; CPU (fallback: Vulkan0 failed: out of memory)"
         );
         assert_eq!(placement_summary(&[]), "");
+
+        // Two lanes on one GPU: free memory differs after the first load, the device does not.
+        let gpu = |free: u64| {
+            Placement::Gpu(dmn_stt::GpuDevice {
+                ordinal: 0,
+                name: "Vulkan0".into(),
+                description: "RTX 4090".into(),
+                integrated: false,
+                free_bytes: free,
+                total_bytes: 25_800_000_000,
+            })
+        };
+        let both = placement_summary(&[gpu(2_600_000_000), gpu(1_300_000_000)]);
+        assert!(!both.contains("; "), "one device, one label: {both}");
+    }
+
+    #[test]
+    fn the_interviewer_lane_is_built_first_whatever_the_input_order() {
+        // `live_sources` lists the mic first; the GPU must still go to the interviewer's lane.
+        let live = vec![(Source::You, "mic"), (Source::Interviewer, "app")];
+        assert_eq!(
+            interviewer_first(live),
+            [(Source::Interviewer, "app"), (Source::You, "mic")]
+        );
+        let files = vec![(Source::Interviewer, "i.wav"), (Source::You, "c.wav")];
+        assert_eq!(interviewer_first(files.clone()), files);
     }
 
     #[test]

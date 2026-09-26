@@ -83,6 +83,25 @@ impl Placement {
     pub fn is_fallback(&self) -> bool {
         matches!(self, Placement::Cpu { reason: Some(_) })
     }
+
+    /// The same device as `other`: the same GPU by identity (free memory differs lane to lane,
+    /// since each lane's load takes some), or the CPU for the same reason.
+    pub fn same_device(&self, other: &Placement) -> bool {
+        match (self, other) {
+            (Placement::Gpu(a), Placement::Gpu(b)) => a.ordinal == b.ordinal && a.name == b.name,
+            (a, b) => a == b,
+        }
+    }
+
+    /// `auto` falls back quietly whatever the cause; `gpu` keeps the reason and warns.
+    pub fn for_choice(self, choice: DeviceChoice) -> Placement {
+        match self {
+            Placement::Cpu { reason: Some(_) } if choice == DeviceChoice::Auto => {
+                Placement::Cpu { reason: None }
+            }
+            p => p,
+        }
+    }
 }
 
 /// Every GPU and integrated GPU ggml registered, in whisper.cpp's `gpu_device` order. Empty in a
@@ -145,12 +164,22 @@ pub const STATE_BYTES: u64 = 384 * 1024 * 1024;
 /// VRAM left free after whisper loads, so the desktop and the LLM keep working.
 pub const VRAM_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Whether one whisper context with a `model_bytes` model fits on `device` now. ggml aborts the
-/// whole process when a GPU allocation fails (`GGML_ASSERT(buffer)` in ggml-backend.cpp), so an
-/// out-of-memory GPU is never tried: this check is the fallback's first line, and it runs per
-/// lane, against the free memory the registry reports at that moment.
+/// VRAM one context of a `model_bytes` model takes beyond the model. Measured for small.en only
+/// ([`STATE_BYTES`]); the KV caches and compute buffers grow with the model's width and layer
+/// count, so bigger models (medium.en, large-v3-turbo) are bounded at three quarters of the model
+/// file, above what their KV cross cache and encoder buffers come to. Too high only costs a CPU
+/// fallback; too low would reach ggml's abort.
+pub fn state_bytes(model_bytes: u64) -> u64 {
+    STATE_BYTES.max(model_bytes / 4 * 3)
+}
+
+/// Whether one whisper context with a `model_bytes` model fits on `device` now. whisper.cpp does
+/// not handle a failed GPU allocation: it skips the missing model buffer and ggml aborts the
+/// whole process on the next use (`GGML_ASSERT(buffer)` in ggml-backend.cpp). So an out-of-memory
+/// GPU is never tried: this check runs per lane against the free memory the registry reports at
+/// that moment, and [`probe`] then proves the allocation right before the load.
 pub fn fits(device: &GpuDevice, model_bytes: u64) -> Result<(), String> {
-    let need = model_bytes + STATE_BYTES + VRAM_RESERVE_BYTES;
+    let need = model_bytes + state_bytes(model_bytes) + VRAM_RESERVE_BYTES;
     if device.free_bytes >= need {
         Ok(())
     } else {
@@ -226,6 +255,59 @@ fn registry() -> Vec<RegDev> {
         });
     }
     out
+}
+
+/// Allocate `bytes` on the GPU with whisper.cpp ordinal `ordinal` and free it at once: whether
+/// that much really is allocatable now, not only reported free (a driver's free figure is an
+/// estimate). ggml's buffer-type allocators return null on failure instead of aborting (the
+/// Vulkan one catches `vk::SystemError`, the CUDA one checks `cudaMalloc`), so this is the safe
+/// way to ask; `Transcriber::load` calls it right before the real load. What it cannot close is
+/// another process taking the memory in the microseconds between the probe and the load;
+/// [`VRAM_RESERVE_BYTES`] is the slack for that, and the load happens once, at session start.
+#[allow(unsafe_code)] // CLAUDE.md allows unsafe in dmn-stt.
+pub fn probe(ordinal: i32, bytes: u64) -> bool {
+    use whisper_rs::whisper_rs_sys as sys;
+    let Ok(size) = usize::try_from(bytes) else {
+        return false;
+    };
+    let mut seen = 0;
+    // SAFETY: as in `registry`: the count and handles come from ggml's static registry.
+    let n = unsafe { sys::ggml_backend_dev_count() };
+    for i in 0..n {
+        // SAFETY: `i < ggml_backend_dev_count()`; the handle is registry-owned and lives for the
+        // process.
+        let dev = unsafe { sys::ggml_backend_dev_get(i) };
+        if dev.is_null() {
+            continue;
+        }
+        // SAFETY: `dev` is a valid device handle; the call only reads it.
+        let kind = unsafe { sys::ggml_backend_dev_type(dev) };
+        if kind != sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+            && kind != sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+        {
+            continue;
+        }
+        if seen != ordinal {
+            seen += 1;
+            continue;
+        }
+        // SAFETY: `dev` is a valid GPU device; its default buffer type is registry-owned.
+        let buft = unsafe { sys::ggml_backend_dev_buffer_type(dev) };
+        if buft.is_null() {
+            return false;
+        }
+        // SAFETY: `buft` is valid (above). The allocator returns null when the device is out of
+        // memory rather than aborting; a non-null buffer is ours to free, exactly once, below.
+        let buf = unsafe { sys::ggml_backend_buft_alloc_buffer(buft, size) };
+        if buf.is_null() {
+            return false;
+        }
+        // SAFETY: `buf` came from `ggml_backend_buft_alloc_buffer` above, is non-null, and is
+        // freed once and never used again.
+        unsafe { sys::ggml_backend_buffer_free(buf) };
+        return true;
+    }
+    false
 }
 
 /// Copy a C string the registry owns; empty when null.
@@ -311,6 +393,47 @@ mod tests {
         assert!(fits(&rtx, small_en).is_ok(), "one lane fits");
         rtx.free_bytes -= small_en + STATE_BYTES;
         assert!(fits(&rtx, small_en).is_err(), "the second does not");
+    }
+
+    #[test]
+    fn bigger_models_are_budgeted_bigger_state() {
+        let small_en = 487_614_201;
+        let turbo = 1_624_555_275; // ggml-large-v3-turbo.bin
+        assert_eq!(state_bytes(small_en), STATE_BYTES, "measured");
+        assert!(
+            state_bytes(turbo) >= turbo / 4 * 3,
+            "{}",
+            state_bytes(turbo)
+        );
+        let mut rtx = dev(0, "Vulkan0", false, 24);
+        rtx.free_bytes = 1_220_000_000;
+        assert!(
+            fits(&rtx, turbo).is_err(),
+            "turbo does not fit where small.en does"
+        );
+    }
+
+    #[test]
+    fn the_same_gpu_on_two_lanes_is_one_device_and_auto_is_quiet() {
+        let mut a = dev(0, "Vulkan0", false, 24);
+        let mut b = a.clone();
+        a.free_bytes = 1_300_000_000;
+        b.free_bytes = 400_000_000;
+        assert!(Placement::Gpu(a.clone()).same_device(&Placement::Gpu(b)));
+        assert!(!Placement::Gpu(a).same_device(&Placement::Cpu { reason: None }));
+
+        let failed = Placement::Cpu {
+            reason: Some("Vulkan0 failed: out of device memory".into()),
+        };
+        assert_eq!(
+            failed.clone().for_choice(DeviceChoice::Auto),
+            Placement::Cpu { reason: None },
+            "auto never warns"
+        );
+        assert!(
+            failed.for_choice(DeviceChoice::Gpu).is_fallback(),
+            "gpu does"
+        );
     }
 
     #[test]
