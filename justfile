@@ -42,6 +42,7 @@ fixtures-fetch:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
+    tmps=(); trap 'rm -rf "${tmps[@]}"' EXIT  # also on a failed download or checksum
     fetch() { # <release> <fixture…>: download and unpack the release when one of its fixtures is missing
       local rel=$1; shift
       local missing=0
@@ -49,14 +50,13 @@ fixtures-fetch:
         for r in interviewer candidate; do [ -f "testdata/$f/$r.wav" ] || missing=1; done
       done
       if [ "$missing" = 0 ]; then echo "$rel: fixtures present"; return; fi
-      local tmp; tmp=$(mktemp -d)
+      local tmp; tmp=$(mktemp -d); tmps+=("$tmp")
       # The repo is private, so prefer an authenticated gh download; fall back to a plain URL.
       if command -v gh >/dev/null && gh release download "$rel" -R njdaniel/daemon -p "$rel.tar.gz" -D "$tmp" 2>/dev/null; then :
       else curl -fsSL -o "$tmp/$rel.tar.gz" "https://github.com/njdaniel/daemon/releases/download/$rel/$rel.tar.gz"
       fi
       (cd "$tmp" && sed "s#  .*#  $rel.tar.gz#" "{{justfile_directory()}}/testdata/$rel.sha256" | sha256sum -c --quiet)
       tar -xzf "$tmp/$rel.tar.gz"
-      rm -rf "$tmp"
       echo "$rel: unpacked into testdata/"
     }
     fetch fixtures-v1 sysdesign behavioral mixed
