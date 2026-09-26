@@ -37,6 +37,14 @@ impl MockServer {
 impl Drop for MockServer {
     fn drop(&mut self) {
         if let Some(h) = self.handle.take() {
+            // A test that failed before connecting leaves the thread waiting in `accept`, and
+            // joining it would hang the suite on the unwind. Connect once so `accept` returns;
+            // the thread reads an empty request, fails to write to the closed socket, and ends.
+            if !h.is_finished()
+                && let Some(addr) = self.url.strip_prefix("http://")
+            {
+                let _ = std::net::TcpStream::connect(addr);
+            }
             let _ = h.join();
         }
     }
@@ -116,4 +124,20 @@ fn content_length(head: &[u8]) -> usize {
         .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, value)| value.trim().parse().ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A test that fails before connecting drops its server with the thread still in `accept`;
+    /// the drop must return, not hang the suite.
+    #[test]
+    fn dropping_a_server_nobody_connected_to_returns_promptly() {
+        let server = serve_once("200 OK", "text/plain", "never sent".to_owned(), 1);
+        let started = Instant::now();
+        drop(server);
+        assert!(started.elapsed() < READ_TIMEOUT, "{:?}", started.elapsed());
+    }
 }
