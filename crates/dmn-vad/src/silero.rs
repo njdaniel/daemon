@@ -202,6 +202,10 @@ impl SileroVad {
             path: shown.clone(),
             reason: e.to_string(),
         };
+        let unusable = |reason: String| SileroError::Runtime {
+            path: shown.clone(),
+            reason,
+        };
         // One thread each, like the upstream wrapper: a window is tiny, and whisper already
         // uses every core it can get.
         let session = Session::builder()
@@ -223,7 +227,7 @@ impl SileroVad {
             speaking: false,
             stats: InferenceStats::default(),
         };
-        vad.infer().map_err(runtime)?;
+        vad.infer().map_err(unusable)?;
         vad.reset();
         Ok(vad)
     }
@@ -237,21 +241,39 @@ impl SileroVad {
         self.stats
     }
 
-    /// Run the model on `input`, update `state`, return the speech probability.
-    fn infer(&mut self) -> Result<f32, ort::Error> {
-        let input = TensorRef::from_array_view(([1usize, CONTEXT + WINDOW], &self.input[..]))?;
-        let state = TensorRef::from_array_view(([2usize, 1, 128], &self.state[..]))?;
-        let outputs = self.session.run(ort::inputs![
-            "input" => input,
-            "state" => state,
-            "sr" => &self.sr,
-        ])?;
-        let (_, prob) = outputs["output"].try_extract_tensor::<f32>()?;
-        let p = prob.first().copied().unwrap_or(0.0);
-        let (_, next) = outputs["stateN"].try_extract_tensor::<f32>()?;
-        if next.len() == STATE_LEN {
-            self.state.copy_from_slice(next);
+    /// Run the model on `input`, update `state`, return the speech probability. Every failure is
+    /// an `Err`: a missing output is looked up with `get`, never indexed, so a model with other
+    /// output names fails `load` with a message instead of panicking the VAD thread.
+    fn infer(&mut self) -> Result<f32, String> {
+        let e = |e: ort::Error| e.to_string();
+        let input =
+            TensorRef::from_array_view(([1usize, CONTEXT + WINDOW], &self.input[..])).map_err(e)?;
+        let state = TensorRef::from_array_view(([2usize, 1, 128], &self.state[..])).map_err(e)?;
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                "input" => input,
+                "state" => state,
+                "sr" => &self.sr,
+            ])
+            .map_err(e)?;
+        let tensor = |name: &str| {
+            outputs
+                .get(name)
+                .ok_or_else(|| format!("the model has no `{name}` output"))?
+                .try_extract_tensor::<f32>()
+                .map(|(_, data)| data)
+                .map_err(e)
+        };
+        let p = tensor("output")?.first().copied().unwrap_or(0.0);
+        let next = tensor("stateN")?;
+        if next.len() != STATE_LEN {
+            return Err(format!(
+                "`stateN` has {} values, expected {STATE_LEN}",
+                next.len()
+            ));
         }
+        self.state.copy_from_slice(next);
         Ok(p)
     }
 
@@ -289,6 +311,12 @@ impl SileroVad {
 }
 
 impl Vad for SileroVad {
+    /// Every frame gets the latest window's decision, so speech that runs to the end of the
+    /// stream stays speech to its last frame. What is never scored at end of stream is the < 512
+    /// samples (32 ms) waiting for a window: speech that exists only there is below the
+    /// segmenter's 100 ms `min_speech` and would be dropped as a click whatever the VAD said, and
+    /// the segmenter cannot re-classify frames it already holds, so padding and scoring that tail
+    /// at flush would change no utterance.
     fn is_speech(&mut self, frame: &[f32; FRAME_LEN]) -> bool {
         self.pending.extend_from_slice(frame);
         while self.pending.len() >= WINDOW {
