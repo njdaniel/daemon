@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 struct Migration {
     version: i64,
@@ -56,6 +56,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 6,
         sql: V6,
+    },
+    Migration {
+        version: 7,
+        sql: V7,
     },
 ];
 
@@ -208,6 +212,13 @@ CREATE TABLE summaries (
     created_at  INTEGER NOT NULL
 );
 CREATE INDEX idx_summaries_session ON summaries(session_id);
+";
+
+/// v7 (#60, SPEC § Audio capture): `sessions.echo_dropped`, the mic finals the echo guard
+/// dropped as copies of the loopback, so `dmn bench --live` can report them. NOT NULL DEFAULT 0:
+/// sessions from older builds, and sessions whose guard never fired, read back as none.
+const V7: &str = "
+ALTER TABLE sessions ADD COLUMN echo_dropped INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Apply every migration newer than the database's `user_version`, each in a transaction.

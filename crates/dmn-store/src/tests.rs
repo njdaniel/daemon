@@ -831,7 +831,7 @@ fn a_v5_database_upgrades_to_v6_and_keeps_its_rows() {
         .unwrap();
     }
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     assert_eq!(store.questions(1).unwrap().len(), 1, "earlier rows kept");
     assert!(store.summaries(1).unwrap().is_empty());
     assert!(
@@ -839,6 +839,38 @@ fn a_v5_database_upgrades_to_v6_and_keeps_its_rows() {
             .schema_object_names()
             .unwrap()
             .contains(&"idx_summaries_session".to_string())
+    );
+}
+
+#[test]
+fn a_v6_database_upgrades_to_v7_and_sessions_record_echo_guard_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 6).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label, overruns) VALUES (1, 1700000000, 'v6', 2);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let session = store.session(1).unwrap().unwrap();
+    assert_eq!(
+        (session.overruns, session.echo_dropped),
+        (2, 0),
+        "a v6 row keeps its overruns and reads back as nothing echo-dropped"
+    );
+    store.set_session_echo_dropped(1, 3).unwrap();
+    assert_eq!(store.session(1).unwrap().unwrap().echo_dropped, 3);
+    let mut out = Vec::new();
+    store.export_session_jsonl(1, &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("\"echo_dropped\":3"),
+        "the export carries it: {text}"
     );
 }
 

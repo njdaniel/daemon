@@ -2,6 +2,8 @@
 **/*.rs.bk
 .env
 /testdata/**/*.wav
+# Derived by tools/fixtures/echo.py from a fetched fixture (#60)
+/testdata/echo/
 !/testdata/README.md
 /eval/.venv
 /tools/.venv

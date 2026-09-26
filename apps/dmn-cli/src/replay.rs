@@ -302,6 +302,7 @@ fn print_summary_json(report: &Report, audio: Duration) {
             "audio_s": audio.as_secs_f64(),
             "wall_s": report.wall.as_secs_f64(),
             "bus_dropped": report.bus_dropped,
+            "echo_dropped": report.echo_dropped,
             "suggestions": report.tally.map(|t| serde_json::json!({
                 "shown": t.shown,
                 "clarifications": t.clarifications,
@@ -389,6 +390,12 @@ pub fn print_summary(report: &Report, audio: Duration) {
         println!(
             "bus          {} segments dropped by a slow subscriber",
             report.bus_dropped
+        );
+    }
+    if report.echo_dropped > 0 {
+        println!(
+            "echo guard   {} mic line(s) dropped as copies of the loopback",
+            report.echo_dropped
         );
     }
     println!(

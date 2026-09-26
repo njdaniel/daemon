@@ -344,6 +344,14 @@ impl StoreWriter {
                         .set_session_overruns(id, i64::try_from(*total).unwrap_or(i64::MAX))?;
                 }
             }
+            Action::EchoDropped { total } => {
+                if let Some(id) = self.session_id {
+                    self.store.set_session_echo_dropped(
+                        id,
+                        i64::try_from(*total).unwrap_or(i64::MAX),
+                    )?;
+                }
+            }
             // #55: one `slow` suggestion row per slow phase that got anywhere: the fields that
             // arrived, whether it finished, timed out or failed. A stopped run stores nothing
             // new, and neither does a phase that produced no field.
