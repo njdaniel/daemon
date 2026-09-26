@@ -1,0 +1,106 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    },
+    {
+      "speaker": "you",
+      "start": 31.0,
+      "end": 36.0,
+      "text": "So I'd split the numbers into two halves around the median."
+    }
+  ],
+  "partials": [],
+  "last_interviewer": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "live": {
+    "candidate": 1,
+    "text": "Given a stream of integers, return the median after each one arrives.",
+    "kind": "coding",
+    "focus": "two heaps, balancing, O(log n) insert",
+    "approach": [
+      "Keep a max-heap of the lower half and a min-heap of the upper half.",
+      "Insert into one heap, then move its top across so the sizes differ by ≤ 1.",
+      "The median is the larger heap's top, or the mean of both tops.",
+      "Each insert is O(log n); reading the median is O(1)."
+    ],
+    "star": null,
+    "clarifications": [],
+    "progress": {
+      "state": "done"
+    },
+    "sections": {
+      "deeper": [
+        {
+          "label": "Insight",
+          "text": "Balance two heaps so the median is always at a top: O(log n) per insert, O(1) to read."
+        }
+      ],
+      "solution": {
+        "language": "python",
+        "code": "import heapq\n\nlo, hi = [], []  # max-heap (negated), min-heap\n\ndef add(x):\n    heapq.heappush(lo, -x)\n    heapq.heappush(hi, -heapq.heappop(lo))\n    if len(hi) > len(lo):\n        heapq.heappush(lo, -heapq.heappop(hi))\n\ndef median():\n    return -lo[0] if len(lo) > len(hi) else (hi[0] - lo[0]) / 2"
+      },
+      "followups": [],
+      "tradeoffs": [],
+      "example": null,
+      "mention": [],
+      "resume_context": [],
+      "states": {
+        "deeper": {
+          "state": "done"
+        },
+        "followups": {
+          "state": "empty"
+        },
+        "tradeoffs": {
+          "state": "empty"
+        },
+        "example": {
+          "state": "empty"
+        },
+        "mention": {
+          "state": "empty"
+        },
+        "resume_context": {
+          "state": "empty"
+        }
+      },
+      "started": true
+    },
+    "open": "deeper"
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 1,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "full"
+}

@@ -4,12 +4,12 @@
 │                                                                                                  │
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ STAR ────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Story: payments-migration                                                                        │
+┌ STAR · payments-migration ───────────────────────────────────────────────────────────────────────┐
 │ S  Payments team, 2024: a rushed schema migration before a launch.                               │
 │ T  I owned the rollout plan and had to get sign-off from the lead.                               │
 │ A  Wrote a one-page risk comparison and proposed a dual-write step.                              │
 │ R  Shipped a week later with zero incidents; dual-write became standard.                         │
+│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

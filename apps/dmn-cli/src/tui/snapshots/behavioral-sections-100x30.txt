@@ -1,0 +1,30 @@
+┌ LIVE QUESTION ─────────────────────────────────────────────────────────────────────── behavioral ┐
+│ Tell me about a time you disagreed with a teammate.                                              │
+│ ↳ And how did the teammate take it afterwards?                                                   │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ STAR · payments-migration ───────────────────────────────────────────────────────────────────────┐
+│ S  Payments team, 2024: a rushed schema migration before a launch.                               │
+│ T  I owned the rollout plan and had to get sign-off from the lead.                               │
+│ A  Wrote a one-page risk comparison and proposed a dual-write step.                              │
+│ R  Shipped a week later with zero incidents; dual-write became standard.                         │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+  2 ▾ Follow-up Questions                         5 ▸ Things I Should Mention
+      • What would you do differently next time?
+      • How did the teammate respond afterwards?
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+Interviewer Hi, thanks for making the time today. This session is about an hour of system design.
+You         Sounds great.
+ ● mic  ● system  ● model                                                           2 close · p pin

@@ -344,6 +344,8 @@ impl StoreWriter {
             // The mode lands in the writer's own reduced state; each question row takes it from
             // there when it is inserted.
             | Action::CodingSolutions { .. }
+            // Which section is open is screen state; no row records it.
+            | Action::ToggleSection { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

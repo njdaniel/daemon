@@ -12,17 +12,20 @@
 //!    the last thing the interviewer said), the focus line and the latest clarification (`↳`).
 //!    Its title is the state label (`LISTENING`, `LIVE QUESTION`, `PINNED QUESTION`), with the
 //!    "N new" badge while pinned questions queue.
-//! 2. Approach: the numbered lines (or the STAR cards for a behavioral question). While the next
-//!    question's reply is on its way the previous Approach stays, dimmed, rather than clearing.
+//! 2. Approach: the numbered lines (or the STAR cards for a behavioral question, the matched
+//!    story in their header). While the next question's reply is on its way the previous
+//!    Approach stays, dimmed, rather than clearing. Under it, once the slow phase has started,
+//!    the six expandable sections (#56): a compact grid of rows, keys `1`–`6`, and the body of
+//!    the one that is open, which takes rows from the Approach down to a floor.
 //! 3. Transcript and status: the last two transcript lines, then one line with the mic, system
 //!    and model dots and the two most useful shortcuts for the current state.
 //!
-//! Density rules: every field is cut to its area with `…` instead of growing it, nothing
-//! expands on its own, and there are no expandable sections yet (the slow phase that fills them
-//! is later work), so "one section open at a time" holds trivially.
+//! Density rules: every field is cut to its area with `…` instead of growing it, and nothing
+//! expands on its own: a section opens only on its key, one at a time (`Question::open`).
 
 mod approach;
 mod question;
+mod sections;
 mod status;
 #[cfg(test)]
 mod tests;
@@ -39,6 +42,11 @@ const QUESTION_ROWS: u16 = 6;
 const TRANSCRIPT_ROWS: u16 = 3;
 /// The status line.
 const STATUS_ROWS: u16 = 1;
+/// The Approach block never gets less than a border and one line.
+const APPROACH_MIN_ROWS: u16 = 3;
+/// An open section's body always gets at least this many rows, even when the Approach then has
+/// to be cut for it: the user pressed its key to read it.
+const BODY_MIN_ROWS: u16 = 3;
 
 /// What the screen is showing, derived from the session alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +116,41 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
     ])
     .areas(area);
     question::render(&view, q, buf);
-    approach::render(&view, a, buf);
+    match sections::plan(&view, a.width) {
+        None => approach::render(&view, a, buf),
+        Some(plan) => {
+            let [approach_area, grid, body] = split_middle(&view, &plan, a);
+            approach::render(&view, approach_area, buf);
+            sections::render(&plan, grid, body, buf);
+        }
+    }
     status::render_transcript(&view, t, buf);
     status::render_status(&view, s, buf);
+}
+
+/// Area 2 with sections on screen: the Approach on top, the grid of rows pinned under it, and
+/// the open section's body (if any) between the grid and the transcript. Closed, the Approach
+/// keeps all the room the grid leaves. Open, the body takes the room the Approach does not
+/// need; the Approach, the thing read first, is cut only to give the body [`BODY_MIN_ROWS`].
+fn split_middle(view: &View<'_>, plan: &sections::Plan, a: Rect) -> [Rect; 3] {
+    let grid = plan
+        .grid_rows()
+        .min(a.height.saturating_sub(APPROACH_MIN_ROWS));
+    let rest = a.height - grid;
+    let body_wanted = plan.body_rows();
+    let approach = if body_wanted == 0 {
+        rest
+    } else {
+        let keep = approach::rows_needed(view, a.width)
+            .min(rest.saturating_sub(BODY_MIN_ROWS.min(body_wanted)))
+            .max(APPROACH_MIN_ROWS);
+        rest.saturating_sub(body_wanted).max(keep).min(rest)
+    };
+    let body = rest - approach;
+    Layout::vertical([
+        Constraint::Length(approach),
+        Constraint::Length(grid),
+        Constraint::Length(body),
+    ])
+    .areas(a)
 }

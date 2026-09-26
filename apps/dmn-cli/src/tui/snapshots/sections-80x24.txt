@@ -1,0 +1,24 @@
+┌ LIVE QUESTION ──────────────────────────────────────────────── system design ┐
+│ How would you design a rate limiter for a globally distributed API, and how  │
+│ would you handle the case where the limiter itself goes down?                │
+│ Focus: architecture, consistency tradeoffs, distributed state, failure hand… │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────┐
+│ 1  Clarify scope: per user, per API key or per IP, and the limits per tier.  │
+│ 2  Use a token bucket per key; sliding-window counters if bursts matter.     │
+│ 3  Keep counters in regional Redis with a local in-process cache in front.   │
+│ 4  Accept small over-admission across regions; reconcile quotas              │
+│    asynchronously.                                                           │
+│ 5  If Redis is down, fail open to a conservative local limit and alert.      │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+  1 ▸ Deeper Answer                     4 ▸ Example
+  2 ▸ Follow-up Questions               5 ▸ Things I Should Mention
+  3 ▸ Tradeoffs                         6 ▸ Resume Context
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+You         Sounds great.
+You         Okay, so first I'd want to know what we're limiting on.
+ ● mic  ● system  ● model                                      1–6 more · p pin
