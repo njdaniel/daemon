@@ -72,7 +72,7 @@ eval:
 agent +args:
     scripts/agent.sh {{args}}
 
-# Review a PR with the model from the size table; add --post to comment on the PR
+# Review a PR at once: Gemini via agy, Copilot findings triaged when present but never waited for; --via claude, --post
 review +args:
     scripts/review.sh {{args}}
 

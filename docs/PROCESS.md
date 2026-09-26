@@ -69,7 +69,7 @@ If the spec and the issue disagree, the issue wins; say so in the PR.
 
 ## 5. Review — `just review <pr>`
 
-- A fresh session of the reviewing model (from the size table) gets the PR diff, the issue, `docs/SPEC.md` and this prompt:
+- One review is enough, and it starts at once. `just review <pr>` runs a fresh session of Gemini 3.1 Pro through the `agy` CLI: a different model family from every author model, and no Claude usage. `--via claude` uses the reviewer from the size table instead (Opus reviews Sonnet and Opus PRs; Fable reviews every L PR regardless of author); `--model` overrides either. The reviewer gets the PR diff, the issue, `docs/SPEC.md` and this prompt:
 
   ```
   List every acceptance criterion from the issue and state whether the diff meets it, with evidence from the diff.
@@ -78,17 +78,16 @@ If the spec and the issue disagree, the issue wins; say so in the PR.
   End with exactly one line: BLOCKING: <n> findings.
   ```
 
-- GitHub Copilot also reviews every PR. `just review` waits up to 10 minutes for its review, puts every Copilot finding (overview and inline, marked still-anchored or outdated) into the reviewer prompt, and the reviewer must mark each one VALID, FIXED or FALSE with evidence. A VALID finding about correctness, safety or a CLAUDE.md / SPEC rule counts as blocking. The script refuses to pass a PR with no Copilot review (exit 3) unless run with `--no-copilot`, which the PR must then explain. Added 2026-09-22 after Copilot findings on PRs #17–#25 were merged untriaged (cleanup in #30).
+- GitHub Copilot reviews every PR on its own schedule, and nothing waits for it. If its review exists when `just review` runs, every Copilot finding (overview and inline, marked still-anchored or outdated) goes into the prompt and the reviewer marks each one VALID, FIXED or FALSE with evidence, summed on a `COPILOT:` line; a VALID finding about correctness, safety or a CLAUDE.md / SPEC rule counts as blocking. If Copilot has not reviewed yet, the review proceeds without it and the prompt says so. `--copilot-wait <s>` waits that long first; `--no-copilot` leaves Copilot's findings out even when present. History: a hard gate from 2026-09-22 (10-minute wait, exit 3 without a Copilot review) after Copilot findings on PRs #17–#25 were merged untriaged (cleanup in #30); relaxed 2026-09-26 in #46 after reviews stalled on the wait and PRs #40 and #41 were each reviewed twice.
+- Prompt size: `agy` drops input past about 192 KB and Gemini reviews what arrived without saying so (measured 2026-09-26 with numbered lines; PR #48's 217 KB prompt lost its last 9 files and the Copilot findings and still printed `BLOCKING: 0 findings`; PRs #67 and #71 were over the limit too). `just review` caps the prompt at 160 KB (`--max-prompt-bytes`, 0 for none) and, over the cap, `scripts/review_passes.py` splits the diff by file into passes that each carry the issue, the PR, the SPEC and the Copilot findings anchored in their files. The review file ends with the total over all passes, and a pass that ends without a `BLOCKING:` line fails the review instead of passing it.
 - Blocking findings go back as one fix run of the original issue with the review appended to the prompt. A second failure escalates to a human.
-- Reviewer assignment: Opus reviews Sonnet and Opus PRs; Fable reviews every L PR regardless of author.
-- Alternative reviewer: `just review <pr> --via agy` sends the same prompt through the `agy` CLI (Gemini 3.1 Pro by default, `--model` to change), a different model family that spends no Claude usage. Either backend's `BLOCKING: 0 findings` satisfies § 6.2; when a PR was implemented interactively on Fable, prefer `--via agy` so the reviewer is not the author's model.
 
 ## 6. Merge
 
 A PR merges when all of these hold:
 
 1. CI green.
-2. Review ends with `BLOCKING: 0 findings`, and its `COPILOT:` line shows every Copilot finding triaged (§ 5).
+2. One review passes (§ 5): `just review` ends with `BLOCKING: 0 findings`, its `COPILOT:` line covering every Copilot finding that existed when it ran; or, without a `just review` run, Copilot's review with every finding triaged on the PR (fixed, or answered as false with a reason). Either one is enough, and neither waits for the other.
 3. Human approval at the checkpoint issues (#5, #10, #14, #16) — see §8.
 4. Squash-merge; commit title `#<n>: <issue title>`.
 
