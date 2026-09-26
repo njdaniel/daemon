@@ -695,12 +695,13 @@ mod tests {
 
     #[test]
     fn english_mode_reports_no_language_and_pins_nothing() {
-        let h = harness(
-            &[("How would", -0.2, 2), ("How would you?", -0.2, 3)],
-            false,
-        );
-        h.tx.send(partial(0, 1_000)).unwrap();
-        h.tx.send(utterance(0, 2_000)).unwrap();
+        // Gated and one event at a time: sent together, the partial is coalesced away once
+        // its final is in the same batch, and this test is about the calls that do happen.
+        let h = harness(&[("How would", -0.2, 2), ("How would you?", -0.2, 3)], true);
+        for ev in [partial(0, 1_000), utterance(0, 2_000)] {
+            h.tx.send(ev).unwrap();
+            h.step();
+        }
         drop(h.tx);
         h.worker.finish();
         let calls = h.calls.lock().unwrap();
