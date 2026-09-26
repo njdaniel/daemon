@@ -273,6 +273,123 @@ async fn the_api_key_never_reaches_the_database_or_an_export() {
     }
 }
 
+/// A one-shot loopback server that answers every request with a 401 whose body quotes `key`
+/// back, as some APIs do. Returns its base URL.
+fn serve_401_quoting(key: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let Ok(mut stream) = stream else { return };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 16384];
+            let _ = stream.read(&mut buf);
+            let body =
+                format!("{{\"error\":{{\"message\":\"Incorrect API key provided: {key}\"}}}}");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+/// #59: with the remote providers, a key a server quotes back in an error must not reach the
+/// log file (where `dmn run` logs failures), the database or an export.
+#[tokio::test]
+async fn remote_providers_keep_the_api_key_out_of_the_log_the_database_and_exports() {
+    use std::sync::Arc;
+
+    use dmn_core::config::Provider as Which;
+    use dmn_llm::{AnthropicProvider, OpenAiProvider, Provider};
+    use dmn_session::{Dot, Health};
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let writer = dmn_core::logging::LogWriter::open(&paths.log_file).unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let hub = rec.hub();
+    hub.dispatch(Action::Started {
+        label: "remote providers".into(),
+        at: 1_700_000_000,
+    });
+    let question = seg(
+        Source::Interviewer,
+        1.0,
+        4.0,
+        "How would you design a rate limiter?",
+        true,
+    );
+    hub.dispatch(wire::segment(&question));
+    let c = Detector::default()
+        .observe(&question, Following::UNKNOWN)
+        .expect("a question");
+    for (id, which) in [(1u64, Which::OpenAI), (2, Which::Anthropic)] {
+        let url = serve_401_quoting(SECRET);
+        let provider: Arc<dyn Provider> = match which {
+            Which::OpenAI => {
+                Arc::new(OpenAiProvider::new(url, "m", Some(SECRET.to_owned())).unwrap())
+            }
+            _ => Arc::new(AnthropicProvider::new(url, "m", Some(SECRET.to_owned())).unwrap()),
+        };
+        let llm = dmn_core::config::Llm {
+            provider: which,
+            api_key_env: "DMN_TEST_API_KEY".into(),
+            ..Default::default()
+        };
+        hub.dispatch(Action::Provider {
+            label: wire::provider_label(&llm),
+        });
+        hub.dispatch(wire::candidate(id, &c));
+        let req = FastRequest::new(c.text.clone(), c.score);
+        let result = dmn_llm::run_fast_phase(&*provider, &req, CancellationToken::new(), |e| {
+            hub.dispatch(wire::fast_event(id, &e));
+        })
+        .await;
+        let err = result.as_ref().expect_err("the server said 401");
+        // What `dmn run` does with a failed request: the model dot's reason, and the log.
+        hub.dispatch(Action::Status {
+            dot: Dot::Model,
+            health: Health::Error(err.to_string()),
+        });
+        tracing::warn!(error = %err, "fast phase failed");
+        hub.dispatch(wire::outcome(id, &result, 1_700_000_100 + id as i64));
+        assert!(err.to_string().contains("<redacted>"), "{err}");
+    }
+    let id = rec
+        .finish(1_700_000_600)
+        .unwrap()
+        .unwrap()
+        .session_id
+        .unwrap();
+    let (export, _) = recorder::export(&paths, id).unwrap();
+
+    let log = std::fs::read_to_string(&paths.log_file).unwrap();
+    assert!(
+        log.contains("fast phase failed"),
+        "the failures were logged: {log}"
+    );
+    for file in [&paths.log_file, &paths.db_file, &export] {
+        let bytes = std::fs::read(file).unwrap();
+        assert!(
+            !bytes.windows(SECRET.len()).any(|w| w == SECRET.as_bytes()),
+            "{} holds the API key",
+            file.display()
+        );
+    }
+}
+
 #[tokio::test]
 async fn purge_removes_rows_and_files() {
     let dir = tempfile::tempdir().unwrap();
