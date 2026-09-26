@@ -750,7 +750,10 @@ fn a_solution_belongs_to_deeper_answer() {
     log.push(slow(1, deeper("Use a hash map.")));
     log.push(slow_ended(1, SlowEnd::Done));
     let q = Session::replay(&log).live.unwrap();
-    assert_eq!(q.sections.solution, None, "the new Deeper Answer replaced it");
+    assert_eq!(
+        q.sections.solution, None,
+        "the new Deeper Answer replaced it"
+    );
     assert_eq!(q.sections.deeper[0].text, "Use a hash map.");
 }
 
