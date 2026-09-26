@@ -97,6 +97,8 @@ pub struct FastAssembler {
     /// What the detector proposed and what is on screen, for [`FastAssembler::echoed`].
     guard: Option<(String, String)>,
     echoed: bool,
+    /// The matched story's label (#58), put on `star.story` in place of whatever the model said.
+    story: Option<String>,
 }
 
 impl FastAssembler {
@@ -117,7 +119,16 @@ impl FastAssembler {
             flags: Vec::new(),
             guard: None,
             echoed: false,
+            story: None,
         }
+    }
+
+    /// Name `story` on the STAR cards (#58). The label is the prompt's matched story, set here
+    /// rather than asked of the model, so the header can only ever name the story the cards were
+    /// built from; with no story matched, the cards name none.
+    pub fn with_story(mut self, story: Option<String>) -> Self {
+        self.story = story;
+        self
     }
 
     /// Hold back a reply whose `question` restates the question already on screen instead of
@@ -167,6 +178,7 @@ impl FastAssembler {
                 "star" => {
                     if let Ok(mut star) = serde_json::from_value::<Star>(value) {
                         limits::limit_star(&mut star, &mut self.flags);
+                        star.story = self.story.clone();
                         self.star = Some(star.clone());
                         released.push(FastEvent::Star(star));
                     }
@@ -360,7 +372,8 @@ where
 {
     let mut stream = provider.chat(fast_chat_request(req), cancel).await?;
     let mut parser = IncrementalObject::new();
-    let mut asm = FastAssembler::new(req.current.is_some());
+    let mut asm = FastAssembler::new(req.current.is_some())
+        .with_story(req.story.as_ref().map(|s| s.label.clone()));
     if guard && let Some(cur) = &req.current {
         asm = asm.with_echo_guard(&req.candidate, &cur.question);
     }
@@ -752,6 +765,53 @@ mod tests {
         let mock = MockProvider::json(&reply);
         let (events, _, _) = run(&mock, &FastRequest::new("Tell me about a conflict.", 4)).await;
         assert!(matches!(events.last().unwrap().1, FastEvent::Star(_)));
+    }
+
+    #[tokio::test]
+    async fn the_star_names_the_matched_story_and_never_one_the_model_made_up() {
+        let reply = json!({
+            "is_question": true,
+            "kind": "behavioral",
+            "question": "Tell me about a conflict.",
+            "focus": "ownership",
+            "approach": ["Situation.", "Task.", "Action.", "Result."],
+            "star": {"situation": "s", "task": "t", "action": "a", "result": "r",
+                     "story": "stories/invented.md"}
+        });
+        let star_of = |events: &[(Instant, FastEvent)]| {
+            events.iter().find_map(|(_, e)| match e {
+                FastEvent::Star(s) => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let mut req = FastRequest::new("Tell me about a conflict.", 4);
+        req.story = Some(crate::prompt::StoryText {
+            label: "stories/broker.md".into(),
+            text: "We chose a broker.".into(),
+        });
+        let (events, outcome, _) = run(&MockProvider::json(&reply), &req).await;
+        assert_eq!(
+            star_of(&events).unwrap().story.as_deref(),
+            Some("stories/broker.md")
+        );
+        let Ok(FastOutcome::Shown { suggestion, .. }) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            suggestion.star.unwrap().story.as_deref(),
+            Some("stories/broker.md")
+        );
+
+        let (events, _, _) = run(
+            &MockProvider::json(&reply),
+            &FastRequest::new("Tell me about a conflict.", 4),
+        )
+        .await;
+        assert_eq!(
+            star_of(&events).unwrap().story,
+            None,
+            "no story matched, none named"
+        );
     }
 
     #[tokio::test]
