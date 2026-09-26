@@ -120,3 +120,27 @@ async fn live_small_talk_is_still_ignored() {
         "{outcome:?}"
     );
 }
+
+/// #54: the job-description fixture becomes ≤ 8 requirement bullets on the real model.
+#[tokio::test]
+#[ignore]
+async fn live_the_job_description_becomes_at_most_8_requirements() {
+    let jd = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/context/job-description.txt"
+    ))
+    .unwrap();
+    let p = OllamaProvider::new("http://localhost:11434", "qwen3.6:35b-a3b").unwrap();
+    p.warm_up().await.unwrap();
+    let started = Instant::now();
+    let r = dmn_llm::summarise_job_description(&p, &jd, CancellationToken::new())
+        .await
+        .unwrap();
+    eprintln!("{:?}", started.elapsed());
+    for b in &r.bullets {
+        eprintln!("- {b}");
+    }
+    assert!((3..=dmn_llm::limits::REQUIREMENTS_MAX).contains(&r.bullets.len()));
+    let all = r.bullets.join(" ").to_lowercase();
+    assert!(all.contains("rust") || all.contains("go"), "{all}");
+}

@@ -46,6 +46,7 @@ use dmn_vad::{
     EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
 };
 
+use crate::context::ContextSource;
 use crate::suggest::{Output, Policy, Suggester, Tally};
 
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
@@ -685,7 +686,8 @@ impl Pipeline {
             &stop,
         );
         let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
-        // #12: each candidate goes through the LLM fast phase on its own thread.
+        // #12: each candidate goes through the LLM fast phase on its own thread; #54: with the
+        // stored sources and job requirements, read-only under `--no-store`.
         let suggester = (!opts.no_llm).then(|| {
             Suggester::start(
                 &cfg.llm,
@@ -694,6 +696,10 @@ impl Pipeline {
                 Arc::clone(&hub),
                 clock,
                 audio_clock.clone(),
+                ContextSource::Db {
+                    path: paths.db_file.clone(),
+                    write: !opts.no_store,
+                },
             )
         });
         let (commands_tx, commands) = mpsc::channel();

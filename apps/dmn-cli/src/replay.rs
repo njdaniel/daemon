@@ -161,10 +161,29 @@ pub fn print_downstream(report: &Report, paths: &Paths) {
         }
     );
     match report.tally {
-        Some(t) => println!(
-            "fast phase   {} shown ({} regenerated), {} clarification(s), {} not shown, {} failed, {} skipped, {} superseded",
-            t.shown, t.regenerated, t.clarifications, t.ignored, t.failed, t.skipped, t.superseded
-        ),
+        Some(t) => {
+            println!(
+                "fast phase   {} shown ({} regenerated), {} clarification(s), {} not shown, {} failed, {} skipped, {} superseded",
+                t.shown,
+                t.regenerated,
+                t.clarifications,
+                t.ignored,
+                t.failed,
+                t.skipped,
+                t.superseded
+            );
+            // #54: what went into the prompts, and what retrieval cost against its 50 ms.
+            println!(
+                "context      {} source(s), {} passage(s); job requirements {} ({}); retrieval {}×, slowest {:.2} ms, mean {:.2} ms (budget 50 ms)",
+                t.context.sources,
+                t.context.passages,
+                t.context.requirements,
+                t.context.from.label(),
+                t.retrievals,
+                t.retrieval_slowest.as_secs_f64() * 1000.0,
+                t.retrieval_mean().as_secs_f64() * 1000.0
+            );
+        }
         None => println!("fast phase   off (--no-llm)"),
     }
     match report.session {
@@ -268,6 +287,15 @@ fn print_summary_json(report: &Report, audio: Duration) {
                 "ignored": t.ignored,
                 "failed": t.failed,
                 "skipped": t.skipped,
+                "context": {
+                    "sources": t.context.sources,
+                    "passages": t.context.passages,
+                    "requirements": t.context.requirements,
+                    "requirements_from": t.context.from.label(),
+                },
+                "retrievals": t.retrievals,
+                "retrieval_slowest_us": t.retrieval_slowest.as_micros() as u64,
+                "retrieval_mean_us": t.retrieval_mean().as_micros() as u64,
             })),
             "session": report.session.map(|r| serde_json::json!({
                 "id": r.session_id,

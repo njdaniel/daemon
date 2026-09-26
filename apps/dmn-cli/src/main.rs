@@ -10,6 +10,7 @@
 
 mod bench;
 mod bench_live;
+mod context;
 mod devices;
 mod doctor;
 mod latency;

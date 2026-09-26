@@ -11,7 +11,7 @@
 //! the session start, mirroring the STT `Segment` shape (SPEC § Transcription).
 //!
 //! v3 (#50) records the coding-solutions mode per question; v4 (#53) adds context `sources` and
-//! their `chunks`.
+//! their `chunks`; v5 (#54) caches the job-description summary.
 //!
 //! v2 (#16) adds what `dmn bench --live` needs to report latency and CPU from a stored session:
 //! per question, the audio time (REAL seconds, the same clock as segment times) at which the
@@ -24,7 +24,7 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 struct Migration {
     version: i64,
@@ -47,6 +47,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: V4,
+    },
+    Migration {
+        version: 5,
+        sql: V5,
     },
 ];
 
@@ -169,6 +173,19 @@ CREATE TABLE chunks (
     UNIQUE (source_id, idx)
 );
 CREATE INDEX idx_chunks_source ON chunks(source_id);
+";
+
+/// v5 (#54): the job-description summary, cached by the job description's content hash so it is
+/// computed once per job description, not once per session (SPEC § Context and LLM: "summarised
+/// once at load"). `bullets` holds the ≤ 8 requirement lines joined by newlines; each is one line
+/// after `dmn-llm`'s limits. One job description is loaded at a time, so storing a summary drops
+/// any other.
+const V5: &str = "
+CREATE TABLE jd_summaries (
+    hash        TEXT PRIMARY KEY,
+    bullets     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
 ";
 
 /// Apply every migration newer than the database's `user_version`, each in a transaction.

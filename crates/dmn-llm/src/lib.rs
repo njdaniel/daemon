@@ -9,8 +9,10 @@
 //! fast phase: per-kind prompts ([`prompt`]), the [`schema`], [`limits`], and [`run_fast_phase`],
 //! which parses the streamed reply incrementally ([`stream_json`]) and hands each [`FastEvent`]
 //! (question first, then approach lines one by one) to a caller-supplied callback; the session
-//! crate owns what happens to them. The slow phase and the OpenAI-compatible and Anthropic
-//! providers arrive with M2.
+//! crate owns what happens to them. #54 adds [`requirements`]: the one-off job-description
+//! summary into ≤ 8 bullets that the fast phase's prompt then carries, with the retrieved chunks,
+//! in [`FastRequest`]. The slow phase and the OpenAI-compatible and Anthropic providers arrive
+//! with M2.
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:
@@ -30,6 +32,7 @@ pub mod ndjson;
 pub mod ollama;
 pub mod prompt;
 mod provider;
+pub mod requirements;
 pub mod schema;
 pub mod stream_json;
 
@@ -42,5 +45,6 @@ pub use prompt::{CurrentQuestion, FastRequest};
 pub use provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard, guard_until,
 };
+pub use requirements::{Requirements, summarise_job_description};
 pub use schema::{Kind, Suggestion};
 pub use tokio_util::sync::CancellationToken;

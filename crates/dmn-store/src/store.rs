@@ -6,9 +6,10 @@
 //! `suggestions.payload` stays raw JSON text for the same reason (see `migrate.rs`).
 
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
@@ -244,6 +245,9 @@ pub struct NewSuggestion {
     pub created_at: i64,
 }
 
+/// How long a connection waits for another connection's write to finish.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The database handle. Opening (or creating) a database runs pending migrations, so every
 /// `Store` sees the current schema. Foreign keys are always enforced.
 pub struct Store {
@@ -262,10 +266,39 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// Open an existing database without writing to it, for `--no-store` runs that still read
+    /// the context sources (#54). `None` when there is no database yet, or when it is not at the
+    /// current schema: only a writing open migrates.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Option<Self>, StoreError> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let store = Self { conn };
+        Ok((store.schema_version()? == migrate::SCHEMA_VERSION).then_some(store))
+    }
+
     fn init(mut conn: Connection) -> Result<Self, StoreError> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // The session writer and the fast phase's context reader (#54) hold connections to the
+        // same file; one waits briefly for the other's write instead of failing with SQLITE_BUSY.
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         migrate::migrate(&mut conn)?;
         Ok(Self { conn })
+    }
+
+    /// How long this connection waits for another connection's write before failing with
+    /// `SQLITE_BUSY` (2 s from `open`). The fast phase's context reader sets zero on a
+    /// question's path, where a busy database means "check again next question", not a wait.
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<(), StoreError> {
+        Ok(self.conn.busy_timeout(timeout)?)
     }
 
     /// The schema version the database is at (`user_version`).

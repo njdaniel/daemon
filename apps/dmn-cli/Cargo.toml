@@ -37,6 +37,8 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# #54: a second connection holds a write lock to prove retrieval never waits on it.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true

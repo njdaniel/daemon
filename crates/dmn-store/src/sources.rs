@@ -1,11 +1,12 @@
-//! Context sources and their chunks (schema v4, #53).
+//! Context sources and their chunks (schema v4, #53), and the cached job-description summary
+//! (schema v5, #54).
 //!
 //! `dmn-context` extracts and chunks the text; this module only stores it. The source kind is
 //! plain text here (`resume`, `job_description`, `notes`, `stories`, checked by the schema) so
 //! the store never depends on `dmn-context`'s types, the same way `suggestions.payload` keeps it
 //! off `dmn-llm`'s.
 
-use rusqlite::{Row, params};
+use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
 
 use crate::error::StoreError;
@@ -55,6 +56,28 @@ pub struct ChunkRow {
     pub idx: i64,
     pub text: String,
     pub tokens: i64,
+}
+
+/// A stored chunk with the kind and path of its source, for building a retrieval index (#54).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceChunk {
+    pub source_id: i64,
+    pub kind: String,
+    pub path: String,
+    /// Position in its source, from 0.
+    pub idx: i64,
+    pub text: String,
+    pub tokens: i64,
+}
+
+/// What changes whenever a source is added, replaced or removed: the source count, the highest
+/// id (ids are `AUTOINCREMENT`, so a replacement always raises it) and the chunk count. Cheap to
+/// read per candidate, so a session notices `dmn sources add` run in another terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SourcesSignature {
+    pub sources: i64,
+    pub max_id: i64,
+    pub chunks: i64,
 }
 
 /// What [`Store::replace_source`] did.
@@ -149,6 +172,91 @@ impl Store {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
+    }
+
+    /// Every chunk of every source, with its source's kind and path, ordered by source then
+    /// position.
+    pub fn all_chunks(&self) -> Result<Vec<SourceChunk>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.source_id, s.kind, s.path, c.idx, c.text, c.tokens
+             FROM chunks c JOIN sources s ON s.id = c.source_id
+             ORDER BY c.source_id, c.idx",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SourceChunk {
+                    source_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    path: row.get(2)?,
+                    idx: row.get(3)?,
+                    text: row.get(4)?,
+                    tokens: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// See [`SourcesSignature`].
+    pub fn sources_signature(&self) -> Result<SourcesSignature, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT count(*) FROM sources), (SELECT coalesce(max(id), 0) FROM sources),
+                    (SELECT count(*) FROM chunks)",
+            [],
+            |row| {
+                Ok(SourcesSignature {
+                    sources: row.get(0)?,
+                    max_id: row.get(1)?,
+                    chunks: row.get(2)?,
+                })
+            },
+        )?)
+    }
+
+    /// The cached job-description summary for the job description with content hash `hash`
+    /// (v5, #54), one requirement per element.
+    pub fn jd_summary(&self, hash: &str) -> Result<Option<Vec<String>>, StoreError> {
+        let bullets: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT bullets FROM jd_summaries WHERE hash = ?1",
+                [hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bullets.map(|b| {
+            b.lines()
+                .map(str::to_owned)
+                .filter(|l| !l.is_empty())
+                .collect()
+        }))
+    }
+
+    /// Cache the summary of the job description with content hash `hash`, replacing any other:
+    /// one job description is loaded at a time. Newlines inside a bullet become spaces, so the
+    /// stored lines read back as the same bullets.
+    pub fn put_jd_summary(
+        &self,
+        hash: &str,
+        bullets: &[String],
+        created_at: i64,
+    ) -> Result<(), StoreError> {
+        let joined = bullets
+            .iter()
+            .map(|b| b.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|b| !b.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM jd_summaries WHERE hash <> ?1", [hash])?;
+        tx.execute(
+            "INSERT INTO jd_summaries (hash, bullets, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (hash) DO UPDATE SET bullets = excluded.bullets,
+                                              created_at = excluded.created_at",
+            params![hash, joined, created_at],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 }
 

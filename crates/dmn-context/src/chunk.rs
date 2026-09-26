@@ -71,6 +71,34 @@ pub fn chunk(text: &str) -> Vec<Chunk> {
     out
 }
 
+/// The text [`chunk`] was cut from, rebuilt from its chunks in order: the first whole, then each
+/// later one without the [`OVERLAP_TOKENS`] words it repeats. Line breaks inside a chunk survive;
+/// the join between two chunks is a space. Used for the job description (#54), which is
+/// summarised as one document.
+pub fn join<'a>(chunks: impl IntoIterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    for (i, text) in chunks.into_iter().enumerate() {
+        let rest = if i == 0 {
+            text
+        } else {
+            match word_spans(text).get(OVERLAP_WORDS) {
+                Some(&(start, _)) => &text[start..],
+                // A chunk is never shorter than the overlap plus one word, except the one it
+                // overlaps with: nothing new in it.
+                None => "",
+            }
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +160,23 @@ mod tests {
         let chunks = chunk(&words(CHUNK_WORDS + 1));
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[1].text.split_whitespace().count(), OVERLAP_WORDS + 1);
+    }
+
+    #[test]
+    fn join_undoes_chunk() {
+        for n in [0, 1, 5, CHUNK_WORDS, CHUNK_WORDS + 1, 1000] {
+            let text = words(n);
+            let chunks = chunk(&text);
+            let joined = join(chunks.iter().map(|c| c.text.as_str()));
+            assert_eq!(joined, text, "{n} words");
+        }
+        let lines = "line one\nline two\n".repeat(200);
+        let joined = join(chunk(&lines).iter().map(|c| c.text.as_str()));
+        assert_eq!(
+            joined.split_whitespace().collect::<Vec<_>>(),
+            lines.split_whitespace().collect::<Vec<_>>(),
+            "every word once, in order"
+        );
     }
 
     #[test]
