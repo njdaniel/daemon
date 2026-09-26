@@ -668,22 +668,33 @@ fn serve<P: Provider>(
             }
         };
         ch.gate.taken();
-        if let Some(mut next) = answerer.answer(job, &mut current, context, tally)? {
-            memory.shown(&next);
-            if slow.is_some() {
-                // A regeneration replaces its question's earlier slow job, and takes over the
-                // summary that job still owed.
-                if let Some(at) = pending.iter().position(|p| p.id == next.id)
-                    && let Some(old) = pending.remove(at)
-                    && next.answered.is_none()
-                {
-                    next.answered = old.answered;
-                }
-                pending.push_back(next);
-            } else if let Some(prev) = next.answered.take() {
-                // No slow phase to write it: the previous question's fallback line, now.
+        let carried = job.answered.clone();
+        let Some(mut next) = answerer.answer(job, &mut current, context, tally)? else {
+            // No slow phase from this job (ignored, a clarification, superseded, failed). While
+            // its previous question is still on screen the next job carries it again. If the
+            // screen moved on (a question that showed, then failed), nothing will: write that
+            // question's fallback line now rather than at the end of the session.
+            if let Some(prev) = carried
+                && answerer.hub.snapshot().live.map(|q| q.candidate) != Some(prev.id)
+            {
                 answerer.summarise(&Asked::from(&prev), None, &mut memory, tally);
             }
+            continue;
+        };
+        memory.shown(&next);
+        if slow.is_some() {
+            // A regeneration replaces its question's earlier slow job, and takes over the
+            // summary that job still owed.
+            if let Some(at) = pending.iter().position(|p| p.id == next.id)
+                && let Some(old) = pending.remove(at)
+                && next.answered.is_none()
+            {
+                next.answered = old.answered;
+            }
+            pending.push_back(next);
+        } else if let Some(prev) = next.answered.take() {
+            // No slow phase to write it: the previous question's fallback line, now.
+            answerer.summarise(&Asked::from(&prev), None, &mut memory, tally);
         }
     }
 }
@@ -2230,5 +2241,42 @@ mod tests {
                 "00:01 Q2 — asked about tradeoffs"
             ]
         );
+    }
+
+    #[test]
+    fn a_question_that_shows_then_fails_writes_the_previous_line_at_once() {
+        // Q1 is on screen. Q2's question shows, then its reply breaks off: no slow phase will
+        // summarise Q1, so its fallback line is written now, not at the end of the session.
+        let mut broken = dmn_llm::mock::json_script(&fast_json_reply("Q2", "system_design"));
+        let cut = broken.len() / 2;
+        broken.truncate(cut);
+        broken.push(dmn_llm::mock::Step::Error("model crashed".into()));
+        let provider =
+            dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design")).then(broken);
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with(provider, Policy::AnswerAll, Arc::clone(&hub));
+        hub.dispatch(wire::candidate(1, &candidate()));
+        s.submit(1, &candidate(), String::new());
+        assert!(wait_for(&hub, Duration::from_secs(5), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.candidate == 1)));
+        hub.dispatch(wire::candidate(2, &candidate()));
+        s.submit_after(
+            2,
+            &candidate(),
+            String::new(),
+            Some(answered_1("Hash map.")),
+        );
+        assert!(
+            wait_for(&hub, Duration::from_secs(5), |s| s
+                .summary
+                .iter()
+                .any(|l| l.candidate == 1)),
+            "Q1's line is written once Q2 fails, before the session ends"
+        );
+        assert_eq!(hub.snapshot().live.unwrap().candidate, 2, "Q2 showed");
+        let tally = s.finish();
+        assert_eq!(tally.failed, 1, "{tally:?}");
     }
 }
