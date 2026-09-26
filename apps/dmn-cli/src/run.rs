@@ -75,6 +75,9 @@ pub enum Key {
     Solutions,
     /// `1`–`6`: open that section under the Approach, or close it (#56).
     Section(Section),
+    /// `w`: Swap the STAR block to the next matched story (#58). `s` was taken by coding
+    /// solutions; `w` is the other letter of "swap" that is free and sits beside `q`/`r`.
+    Swap,
     Quit,
 }
 
@@ -92,6 +95,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('r' | 'R') => Some(Key::Regenerate),
         KeyCode::Char('m' | 'M') => Some(Key::Mute),
         KeyCode::Char('s' | 'S') => Some(Key::Solutions),
+        KeyCode::Char('w' | 'W') => Some(Key::Swap),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -110,6 +114,7 @@ pub fn press(k: Key, controls: &Controls) -> bool {
         Key::Mute => controls.toggle_mute(),
         Key::Solutions => controls.toggle_coding_solutions(),
         Key::Section(s) => controls.toggle_section(s),
+        Key::Swap => controls.swap_story(),
         Key::Quit => {
             controls.quit();
             return true;
@@ -570,6 +575,86 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("--duration"), "{err}");
+    }
+
+    #[test]
+    fn swap_cycles_the_star_story_and_back_and_with_one_story_says_there_is_no_other() {
+        use crate::pipeline::Command;
+        use dmn_session::StarCards;
+        assert_eq!(key(press_key('w')), Some(Key::Swap));
+
+        let behavioral = |hub: &dmn_session::SessionHub, ranked: &[&str]| {
+            hub.dispatch(Action::Question {
+                candidate: 1,
+                text: "Tell me about a time you disagreed with a technical decision.".into(),
+                kind: "behavioral".into(),
+            });
+            hub.dispatch(Action::ApproachLine {
+                candidate: 1,
+                index: 0,
+                text: "Set the scene.".into(),
+            });
+            hub.dispatch(Action::Star {
+                candidate: 1,
+                cards: StarCards {
+                    situation: "We were choosing a broker.".into(),
+                    task: "Make the case without an argument.".into(),
+                    action: "Built a two-day spike and took it to the lead first.".into(),
+                    result: "Shipped on time; replay saved an incident.".into(),
+                    story: Some(ranked[0].into()),
+                },
+            });
+            hub.dispatch(Action::Answered {
+                candidate: 1,
+                clarification: false,
+                payload: "{}".into(),
+                at: 0,
+            });
+            hub.dispatch(Action::Stories {
+                candidate: 1,
+                ranked: ranked.iter().map(|s| (*s).into()).collect(),
+            });
+        };
+
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        let ranked = [
+            "stories/disagreed-on-broker.md",
+            "stories/kafka-replay-incident.md",
+            "stories/security-review-influence.md",
+        ];
+        behavioral(hub, &ranked);
+        let first = screen(&hub.snapshot());
+        assert!(
+            first.contains("STAR · stories/disagreed-on-broker.md 1/3"),
+            "the STAR block replaces the Approach and names its story:\n{first}"
+        );
+        assert!(!first.contains("Set the scene."), "{first}");
+        assert!(first.contains("w swap"), "the footer offers Swap:\n{first}");
+
+        for (n, want) in [(2, ranked[1]), (3, ranked[2]), (1, ranked[0])] {
+            assert!(!press(Key::Swap, &controls));
+            assert_eq!(commands.try_recv(), Ok(Command::Swap { candidate: 1 }));
+            let s = screen(&hub.snapshot());
+            assert!(s.contains(&format!("STAR · {want} {n}/3")), "{s}");
+        }
+
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        behavioral(hub, &["stories/disagreed-on-broker.md"]);
+        let one = screen(&hub.snapshot());
+        assert!(
+            one.contains("STAR · stories/disagreed-on-broker.md "),
+            "{one}"
+        );
+        assert!(!one.contains("w swap"), "nothing to swap to:\n{one}");
+        assert!(!press(Key::Swap, &controls));
+        assert!(
+            commands.try_recv().is_err(),
+            "nothing is asked of the model"
+        );
+        let after = screen(&hub.snapshot());
+        assert!(after.contains("no other story"), "{after}");
     }
 
     #[test]

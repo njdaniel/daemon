@@ -65,7 +65,7 @@ use dmn_llm::{
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
-use crate::context::{Context, ContextInfo, ContextSource, Retrieval};
+use crate::context::{Context, ContextInfo, ContextSource, Retrieval, StoryPick};
 
 /// Where the fast phase's results go besides the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +101,10 @@ struct Job {
     transcript: String,
     /// `r`: the question on screen to answer again from a different angle.
     regenerate: Option<CurrentQuestion>,
+    /// Swap (#58): with `regenerate` set, answer the question on screen from the next story
+    /// (the one the session now names), at temperature 0 and without the "different angle"
+    /// note.
+    swap: bool,
     /// #57: the question on screen when this candidate arrived, and the candidate's answer to it.
     answered: Option<Answered>,
 }
@@ -427,6 +431,7 @@ impl Suggester {
             candidate: candidate.clone(),
             transcript,
             regenerate: None,
+            swap: false,
             answered,
         });
     }
@@ -444,6 +449,27 @@ impl Suggester {
             candidate: candidate.clone(),
             transcript,
             regenerate: Some(current),
+            swap: false,
+            answered: None,
+        });
+    }
+
+    /// Queue a swap (#58): candidate `id`'s STAR block again, from the story the session moved
+    /// on to. Like [`Suggester::regenerate`], the reply replaces the question in place, and a
+    /// newer question pre-empts it.
+    pub fn swap(
+        &self,
+        id: u64,
+        candidate: &Candidate,
+        transcript: String,
+        current: CurrentQuestion,
+    ) {
+        self.send(Job {
+            id,
+            candidate: candidate.clone(),
+            transcript,
+            regenerate: Some(current),
+            swap: true,
             answered: None,
         });
     }
@@ -728,7 +754,8 @@ fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
     FastRequest {
         transcript: job.transcript.clone(),
         current: job.regenerate.clone().or_else(|| current.cloned()),
-        regenerate: job.regenerate.is_some(),
+        regenerate: job.regenerate.is_some() && !job.swap,
+        swap: job.swap,
         ..FastRequest::new(job.candidate.text.clone(), job.candidate.score)
     }
 }
@@ -784,11 +811,35 @@ impl<P: Provider> Answerer<'_, P> {
             .regenerate
             .as_ref()
             .map_or(job.candidate.text.as_str(), |c| c.question.as_str());
-        let retrieval = context.retrieve(query);
+        // #58: a new candidate is matched to the stories; `r` and Swap reuse the story the
+        // session names for this question (Swap has already moved it on to the next one).
+        let chosen = regenerating
+            .then(|| {
+                let s = hub.snapshot();
+                s.live
+                    .iter()
+                    .chain(s.queued.iter())
+                    .find(|q| q.candidate == job.id)
+                    .and_then(|q| q.story_label().map(str::to_owned))
+            })
+            .flatten();
+        // A new candidate is matched on the whole utterance it came from (see `StoryPick`).
+        let said = if job.candidate.line.trim().is_empty() {
+            job.candidate.text.as_str()
+        } else {
+            job.candidate.line.as_str()
+        };
+        let pick = match (&chosen, regenerating) {
+            (Some(label), _) => StoryPick::Chosen(label),
+            (None, true) => StoryPick::Off,
+            (None, false) => StoryPick::Match(said),
+        };
+        let retrieval = context.retrieve_for(query, pick);
         tally.retrieved(retrieval.took);
         let mut req = request(&job, current.as_ref());
         req.job_requirements = context.requirements().to_vec();
         req.chunks = retrieval.chunks.clone();
+        req.story = retrieval.story.clone();
         // #57: the session's last 8 summary lines.
         req.summary = hub.snapshot().summary_for_prompt();
         let started = Instant::now();
@@ -887,6 +938,17 @@ impl<P: Provider> Answerer<'_, P> {
                     tally.shown += 1;
                     if regenerating {
                         tally.regenerated += 1;
+                    }
+                    // #58: a new behavioral question built from a matched story records the
+                    // ranking, so Swap can walk it. A regenerate or swap keeps what it has.
+                    if suggestion.kind == Some(Kind::Behavioral)
+                        && retrieval.story.is_some()
+                        && !retrieval.stories.is_empty()
+                    {
+                        hub.dispatch(Action::Stories {
+                            candidate: job.id,
+                            ranked: retrieval.stories.clone(),
+                        });
                     }
                     if let Some(kind) = suggestion.kind {
                         *current = Some(CurrentQuestion {
@@ -1017,13 +1079,21 @@ impl<P: Provider> Answerer<'_, P> {
         }
         // Retrieve again with the question and its focus: a better query than the candidate
         // text the fast phase had (#54).
-        let retrieval = context.retrieve(&format!("{} {}", job.question, job.focus));
+        // #58: a STAR block built from a story keeps that story for the sections too, so Deeper
+        // Answer never reaches for a different one.
+        let story = job
+            .star
+            .as_ref()
+            .and_then(|s| s.story.as_deref())
+            .map_or(StoryPick::Off, StoryPick::Chosen);
+        let retrieval = context.retrieve_for(&format!("{} {}", job.question, job.focus), story);
         tally.retrieved(retrieval.took);
         let mut req = SlowRequest::new(job.question.clone(), job.kind);
         req.context = FastRequest {
             transcript: job.transcript.clone(),
             job_requirements: context.requirements().to_vec(),
             chunks: retrieval.chunks.clone(),
+            story: retrieval.story.clone(),
             ..FastRequest::new(job.said.clone(), 0)
         };
         req.focus = job.focus.clone();
@@ -1312,15 +1382,18 @@ fn print_context(context: &Context, output: Output) {
                 "type": "context",
                 "sources": info.sources,
                 "passages": info.passages,
+                "stories": info.stories,
                 "requirements": context.requirements(),
                 "requirements_from": info.from.label(),
             })
         ),
         Output::Print { json: false } => {
             println!(
-                "context: {} source(s), {} passage(s) searchable; job requirements: {} ({})",
+                "context: {} source(s), {} passage(s) searchable, {} stor{}; job requirements: {} ({})",
                 info.sources,
                 info.passages,
+                info.stories,
+                if info.stories == 1 { "y" } else { "ies" },
                 info.requirements,
                 info.from.label()
             );
@@ -1331,6 +1404,7 @@ fn print_context(context: &Context, output: Output) {
         Output::Quiet => tracing::info!(
             sources = info.sources,
             passages = info.passages,
+            stories = info.stories,
             requirements = info.requirements,
             from = info.from.label(),
             "context loaded"
@@ -1602,6 +1676,7 @@ mod tests {
                 question: "How would you design a rate limiter?".into(),
                 kind: dmn_llm::Kind::SystemDesign,
             }),
+            swap: false,
             answered: None,
         };
         let mut tally = Tally::default();
@@ -2002,6 +2077,112 @@ mod tests {
             !weather.contains("## Candidate's material"),
             "nothing matches small talk: {weather}"
         );
+        assert!(
+            !kafka.contains("## Matched story"),
+            "no stories loaded, no story: the M1 behavioral prompt"
+        );
+    }
+
+    /// #58: a behavioral question with the stories fixtures loaded carries its matched story
+    /// (whose chunks are then not repeated), the STAR cards name it, the ranking reaches the
+    /// session, and Swap asks again with the next story at temperature 0.
+    #[test]
+    fn a_behavioral_question_gets_its_matched_story_and_swap_asks_with_the_next() {
+        use dmn_context::{SourceKind, ingest};
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::context::fixture_db(dir.path());
+        {
+            let store = dmn_store::Store::open(&db).unwrap();
+            let stories = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/context/stories");
+            ingest(&store, &stories, SourceKind::Stories, 1_700_000_050).unwrap();
+        }
+        let context = Context::open(&ContextSource::Db {
+            path: db,
+            write: false,
+        })
+        .unwrap();
+        assert_eq!(context.info().stories, 8);
+        let provider = dmn_llm::MockProvider::json(&serde_json::json!({
+            "is_question": true,
+            "kind": "behavioral",
+            "question": "Tell me about a time you disagreed with a technical decision.",
+            "focus": "conflict, evidence",
+            "approach": ["Situation.", "Task.", "Action.", "Result."],
+            "star": {"situation": "s", "task": "t", "action": "a", "result": "r"}
+        }));
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            context,
+            None,
+        );
+        let text = "Tell me about a time you disagreed with a technical decision and how you \
+                    handled it.";
+        let asked = Candidate {
+            text: text.into(),
+            line: format!("Okay, first one. {text}"),
+            ..candidate()
+        };
+        hub.dispatch(wire::candidate(1, &asked));
+        s.submit(1, &asked, String::new());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let live = loop {
+            if let Some(q) = hub.snapshot().live.filter(|q| !q.stories.is_empty()) {
+                break q;
+            }
+            assert!(Instant::now() < deadline, "no stories reached the session");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(live.stories[0], "stories/disagreed-on-broker.md");
+        assert!(live.stories.len() > 1, "{:?}", live.stories);
+        assert_eq!(
+            live.star.as_ref().and_then(|c| c.story.as_deref()),
+            Some("stories/disagreed-on-broker.md"),
+            "the header names the story the cards came from"
+        );
+
+        // `w`: the session moves on, then the pipeline asks again for this question.
+        hub.dispatch(Action::SwapStory { candidate: 1 });
+        s.swap(
+            1,
+            &asked,
+            String::new(),
+            CurrentQuestion {
+                question: live.text.clone(),
+                kind: dmn_llm::Kind::Behavioral,
+            },
+        );
+        let tally = s.finish();
+        assert_eq!((tally.shown, tally.regenerated), (2, 1), "{tally:?}");
+        let next = live.stories[1].clone();
+        let after = hub.snapshot().live.unwrap();
+        assert_eq!(after.story_label(), Some(next.as_str()));
+        assert_eq!(
+            after.star.as_ref().and_then(|c| c.story.as_deref()),
+            Some(next.as_str())
+        );
+
+        let sent = provider.requests();
+        assert_eq!(sent.len(), 2);
+        let first = &sent[0].messages.last().unwrap().content;
+        assert!(
+            first.contains("## Matched story (stories/disagreed-on-broker.md)\n"),
+            "{first}"
+        );
+        assert!(
+            !first.contains("stories (disagreed-on-broker.md)"),
+            "its chunks are not repeated as material: {first}"
+        );
+        let swapped = &sent[1].messages.last().unwrap().content;
+        assert!(
+            swapped.contains(&format!("## Matched story ({next})\n")),
+            "{swapped}"
+        );
+        assert!(swapped.contains("another of their stories"), "{swapped}");
+        assert_eq!(sent[1].temperature, 0.0);
     }
 
     /// #54: with no sources loaded the prompt is exactly the M1 prompt.
@@ -2039,6 +2220,7 @@ mod tests {
             candidate: candidate(),
             transcript: String::new(),
             regenerate: None,
+            swap: false,
             answered: None,
         };
         let req = request(&job, None);

@@ -147,11 +147,18 @@ fn shortcuts(view: &View<'_>) -> String {
     } else {
         "p pin"
     };
+    // #58: a STAR block built from one of several matched stories offers Swap in place of the
+    // pin or redo key.
+    let swap = view
+        .live()
+        .is_some_and(|q| q.star.is_some() && q.stories.len() > 1);
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
         (_, _, true, Some(sec)) => format!("{sec} · s: {solutions}"),
         (_, _, true, None) => format!("{pin} · s: {solutions}"),
+        (_, _, false, Some(sec)) if swap => format!("{sec} · w swap"),
         (_, _, false, Some(sec)) => format!("{sec} · {pin}"),
+        (_, _, false, None) if swap => format!("{pin} · w swap"),
         (_, _, false, None) => format!("{pin} · r redo"),
     };
     format!("{pair} ")

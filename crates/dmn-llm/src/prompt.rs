@@ -43,6 +43,15 @@ pub struct CurrentQuestion {
     pub kind: Kind,
 }
 
+/// A story from the candidate's own material (#58), matched to a behavioral question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryText {
+    /// `stories/<file>`: what the STAR header names. Set on `star.story` in Rust, never asked of
+    /// the model, so the named story is always the one the prompt carried.
+    pub label: String,
+    pub text: String,
+}
+
 /// Everything the fast phase is asked about. Built by the wiring crate from the detector's
 /// candidate, the transcript and (from M2) the context assembler; this crate only defines it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,6 +71,10 @@ pub struct FastRequest {
     pub current: Option<CurrentQuestion>,
     /// The user pressed regenerate: higher temperature and a note asking for another angle.
     pub regenerate: bool,
+    /// The story matched to a behavioral question (#58): STAR is built from it.
+    pub story: Option<StoryText>,
+    /// Swap (#58): answer the question on screen again from `story`, the next-ranked one.
+    pub swap: bool,
 }
 
 impl FastRequest {
@@ -94,6 +107,13 @@ pub fn user_message(req: &FastRequest) -> String {
         }
         out.push('\n');
     }
+    if let Some(story) = &req.story {
+        out.push_str(&format!(
+            "## Matched story ({})\n{}\n\n",
+            story.label,
+            story.text.trim()
+        ));
+    }
     if !req.summary.is_empty() {
         out.push_str("## Session so far\n");
         for s in &req.summary {
@@ -117,7 +137,12 @@ pub fn user_message(req: &FastRequest) -> String {
     out.push_str("## Interviewer just said\n");
     out.push_str(req.candidate.trim());
     out.push('\n');
-    if req.regenerate {
+    if req.swap {
+        out.push_str(
+            "\nThe user asked for another of their stories: build the STAR cards and the \
+             Approach from the matched story above.\n",
+        );
+    } else if req.regenerate {
         out.push_str("\nThe user asked for a different angle.\n");
     }
     out
@@ -125,7 +150,7 @@ pub fn user_message(req: &FastRequest) -> String {
 
 /// System + user messages for the fast phase.
 pub fn fast_messages(req: &FastRequest) -> Vec<Message> {
-    let kind = if req.regenerate {
+    let kind = if req.regenerate || req.swap {
         req.current.as_ref().map(|c| c.kind)
     } else {
         None
@@ -196,5 +221,57 @@ mod tests {
         assert!(msgs[0].content.contains("- knowledge:"));
         assert!(!msgs[0].content.contains("- coding:"));
         assert!(msgs[1].content.contains("different angle"));
+    }
+
+    fn story() -> StoryText {
+        StoryText {
+            label: "stories/broker.md".into(),
+            text: "Situation: we chose a broker.".into(),
+        }
+    }
+
+    #[test]
+    fn a_matched_story_goes_in_before_the_transcript_and_without_one_nothing_changes() {
+        let plain = FastRequest {
+            transcript: "Interviewer: hi".into(),
+            ..FastRequest::new("Tell me about a time you disagreed.", 5)
+        };
+        let with = FastRequest {
+            story: Some(story()),
+            ..plain.clone()
+        };
+        let m = user_message(&with);
+        let s = m.find("## Matched story (stories/broker.md)\n").expect(&m);
+        assert!(m.contains("Situation: we chose a broker."));
+        assert!(s < m.find("## Recent transcript").unwrap(), "{m}");
+        assert_eq!(
+            user_message(&FastRequest {
+                story: None,
+                ..with
+            }),
+            user_message(&plain),
+            "no story, the M1 prompt"
+        );
+        assert!(!user_message(&plain).contains("Matched story"));
+    }
+
+    #[test]
+    fn swap_uses_the_current_kind_and_asks_for_the_story_at_temperature_0() {
+        let req = FastRequest {
+            candidate: "Tell me about a time you disagreed.".into(),
+            current: Some(CurrentQuestion {
+                question: "Tell me about a time you disagreed.".into(),
+                kind: Kind::Behavioral,
+            }),
+            story: Some(story()),
+            swap: true,
+            ..FastRequest::default()
+        };
+        let msgs = fast_messages(&req);
+        assert!(msgs[0].content.contains("- behavioral:"));
+        assert!(!msgs[0].content.contains("- coding:"));
+        assert!(msgs[1].content.contains("another of their stories"));
+        assert!(!msgs[1].content.contains("different angle"));
+        assert_eq!(crate::fast::fast_chat_request(&req).temperature, 0.0);
     }
 }

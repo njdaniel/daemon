@@ -1,0 +1,24 @@
+┌ LIVE QUESTION ─────────────────────────────────────────────────── behavioral ┐
+│ Tell me about a time you disagreed with a technical decision and how you     │
+│ handled it.                                                                  │
+│ Focus: conflict handling, evidence, relationships                            │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ STAR · stories/disagreed-on-broker.md 1/3 ───────────────────────────────────┐
+│ S  Choosing a broker for the shipment event pipeline at Contoso.             │
+│ T  Argue for replay and fan-out without turning a meeting into a fight.      │
+│ A  Built a two-day spike on real events and took it to the lead one-on-one   │
+│    first.                                                                    │
+│ R  Shipped on time; a year later replay recovered six hours of events.       │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+Interviewer …ing the time today. This session is about an hour of system design.
+You         Sounds great.
+ ● mic  ● system  ● model                                        p pin · w swap

@@ -214,7 +214,7 @@ Timeouts: fast phase 4 s, slow phase 20 s; on timeout the UI keeps the previous 
 
 The window is 440 px wide, 760 px tall by default, frameless with a 36 px custom title bar, always-on-top where the compositor allows, and it never grows on its own. The [canvas](https://claude.ai/artifact/Kya3g5rdSzQ7k9tGPqZV2B) is the visual source of truth; this section states the behavior.
 
-**Terminal MVP (M1–M2)** renders the same three areas in a ratatui TUI, sized for a 100 × 30 pane beside the call: question + focus in a top block (2–4 lines), the numbered Approach in the middle, the last two transcript lines and the mic / system / model status in a one-line footer. Keys: `p` pin, `r` regenerate, `1`–`6` toggle one section, `m` mute mic, `s` coding solutions hints ↔ full, `q` quit. The same density rules apply: no paragraph over 3 sentences, one section open at a time, nothing auto-expands. Everything below describes the M3 window.
+**Terminal MVP (M1–M2)** renders the same three areas in a ratatui TUI, sized for a 100 × 30 pane beside the call: question + focus in a top block (2–4 lines), the numbered Approach in the middle, the last two transcript lines and the mic / system / model status in a one-line footer. Keys: `p` pin, `r` regenerate, `1`–`6` toggle one section, `m` mute mic, `s` coding solutions hints ↔ full, `w` swap the STAR story (#58), `q` quit. The same density rules apply: no paragraph over 3 sentences, one section open at a time, nothing auto-expands. Everything below describes the M3 window.
 
 **Window**
 

@@ -15,9 +15,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dmn_context::{Library, Retrieved};
+use dmn_context::{Library, Retrieved, asks_for_a_story};
 use dmn_core::wire;
-use dmn_llm::{CancellationToken, LlmError, Provider, summarise_job_description};
+use dmn_llm::{CancellationToken, LlmError, Provider, StoryText, summarise_job_description};
 use dmn_store::Store;
 
 /// How long caching a new summary may wait for the session writer (at load, not per question).
@@ -63,6 +63,8 @@ impl RequirementsFrom {
 pub struct ContextInfo {
     pub sources: usize,
     pub passages: usize,
+    /// Stories files loaded for STAR matching (#58).
+    pub stories: usize,
     pub requirements: usize,
     pub from: RequirementsFrom,
 }
@@ -83,8 +85,28 @@ pub struct Retrieval {
     /// The chunks as the prompt carries them: `kind (file): text`.
     pub chunks: Vec<String>,
     pub refs: Vec<ChunkRef>,
-    /// The staleness check, any reload and the search.
+    /// The story the prompt carries whole (#58), when one was matched or chosen.
+    pub story: Option<StoryText>,
+    /// For a new behavioral question with a matched story: every matched story, best first
+    /// (the first is `story`), for Swap. Empty for a regenerate or a swap, which keep the
+    /// ranking the question already has.
+    pub stories: Vec<String>,
+    /// The staleness check, any reload, the story match and the search.
     pub took: Duration,
+}
+
+/// Which story a request carries (#58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryPick<'a> {
+    /// A new candidate: match the stories to this text when it asks for one ("tell me about a
+    /// time…"). The whole utterance, not only the sentence the detector picked: "Give me an
+    /// example of a time you had to cut scope. How did you decide what to cut?" is a candidate
+    /// whose question sentence alone has no behavioral cue and names no theme.
+    Match(&'a str),
+    /// `r` or Swap on a question already built from this story (`stories/<file>`).
+    Chosen(&'a str),
+    /// No story: a regenerate of a question that had none.
+    Off,
 }
 
 impl Retrieval {
@@ -277,11 +299,33 @@ impl Context {
     }
 
     /// The chunks for `query`, after reloading the library if the sources changed.
+    #[cfg(test)]
     pub fn retrieve(&mut self, query: &str) -> Retrieval {
+        self.retrieve_for(query, StoryPick::Off)
+    }
+
+    /// [`Context::retrieve`], and the story `pick` names (#58). A matched story goes whole into
+    /// the prompt, so its own chunks are left out of the chunk budget.
+    pub fn retrieve_for(&mut self, query: &str, pick: StoryPick<'_>) -> Retrieval {
         let started = Instant::now();
         self.refresh();
-        let hits = self.library.retrieve(query);
         let mut out = Retrieval::default();
+        let stories = self.library.stories();
+        let story = match pick {
+            StoryPick::Match(said) if asks_for_a_story(said) => {
+                let ranked = stories.rank(said);
+                out.stories = ranked.iter().map(|m| m.story.label.clone()).collect();
+                ranked.first().map(|m| m.story)
+            }
+            StoryPick::Chosen(label) => stories.get(label),
+            StoryPick::Match(_) | StoryPick::Off => None,
+        };
+        let skip = story.map(|s| s.path.clone());
+        out.story = story.map(|s| StoryText {
+            label: s.label.clone(),
+            text: s.text.clone(),
+        });
+        let hits = self.library.retrieve_excluding(query, skip.as_deref());
         for Retrieved { passage, score } in hits {
             out.chunks.push(format!(
                 "{} ({}): {}",
@@ -305,6 +349,7 @@ impl Context {
         ContextInfo {
             sources: self.library.sources(),
             passages: self.library.passages(),
+            stories: self.library.stories().len(),
             requirements: self.requirements.len(),
             from: self.from,
         }
@@ -500,5 +545,41 @@ mod tests {
         );
         assert!(!r.chunks.is_empty(), "the loaded library still answers");
         writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// #58: stories are matched on the whole utterance. Replaying testdata/behavioral, the
+    /// detector picked "How did you decide what to cut?" out of "Give me an example of a time
+    /// you had to cut scope…", and that sentence alone asks for no story.
+    #[test]
+    fn stories_are_matched_on_the_whole_utterance_not_only_the_question_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fixture_db(dir.path());
+        let stories =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/context/stories");
+        ingest(
+            &Store::open(&db).unwrap(),
+            &stories,
+            SourceKind::Stories,
+            1_700_000_050,
+        )
+        .unwrap();
+        let mut ctx = Context::open(&ContextSource::Db {
+            path: db,
+            write: false,
+        })
+        .unwrap();
+        let sentence = "How did you decide what to cut?";
+        let line = "Give me an example of a time you had to cut scope to ship something. \
+                    How did you decide what to cut?";
+        let alone = ctx.retrieve_for(sentence, StoryPick::Match(sentence));
+        assert_eq!(alone.story, None);
+        let whole = ctx.retrieve_for(sentence, StoryPick::Match(line));
+        assert_eq!(
+            whole.story.map(|s| s.label).as_deref(),
+            Some("stories/audit-log-scope-cut.md")
+        );
+        assert!(whole.stories.len() > 1, "{:?}", whole.stories);
+        let off = ctx.retrieve_for(sentence, StoryPick::Off);
+        assert!(off.story.is_none() && off.stories.is_empty());
     }
 }

@@ -154,6 +154,7 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
     let shared = FastRequest {
         current: None,
         regenerate: false,
+        swap: false,
         ..req.context.clone()
     };
     let mut user = prompt::user_message(&shared);

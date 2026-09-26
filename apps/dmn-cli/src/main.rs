@@ -94,7 +94,8 @@ struct Cli {
 enum Command {
     /// Run the copilot in this terminal: live question, Approach, transcript and status.
     /// Captures the call live (your mic, the call app's output) until q.
-    /// Keys: p pin/unpin, r regenerate, m mute mic, s coding solutions hints/full, q quit
+    /// Keys: p pin/unpin, r regenerate, m mute mic, s coding solutions hints/full, w swap the
+    /// STAR story, 1–6 sections, q quit
     Run {
         /// Feed the pipeline from two WAV files at 1× instead of live capture
         #[arg(long, num_args = 2, value_names = ["INTERVIEWER", "CANDIDATE"])]

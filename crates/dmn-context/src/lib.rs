@@ -7,8 +7,10 @@
 //! `dmn-store` (#53); a [`Library`] (#54) loaded from those chunks that returns the best chunks
 //! for a query (BM25, top 6, ≤ 1,500 tokens) and holds the job description's text and content
 //! hash for its one-off summary (the summary itself is an LLM call, made by the caller through
-//! `dmn-llm` and cached in `dmn-store`); the clock and fallback text of a session summary line
-//! ([`memory`], #57: the line itself comes from the slow phase and lives in the session).
+//! `dmn-llm` and cached in `dmn-store`); the stories (#58), each file parsed for its tags and
+//! ranked for a behavioral question by tag overlap first and BM25 second; the clock and fallback
+//! text of a session summary line ([`memory`], #57: the line itself comes from the slow phase and
+//! lives in the session).
 //! Owns: the `sources` and `chunks` tables, written through `dmn-store`. No channel: ingestion
 //! is a synchronous CLI step, and retrieval and summary lines are synchronous calls on the
 //! suggestion thread.
@@ -27,6 +29,7 @@ mod ingest;
 mod kind;
 mod library;
 pub mod memory;
+mod story;
 
 pub use chunk::{CHUNK_TOKENS, Chunk, OVERLAP_TOKENS, approx_tokens, chunk, join};
 pub use error::ContextError;
@@ -36,3 +39,4 @@ pub use kind::SourceKind;
 pub use library::{
     JobDescription, Library, Passage, RETRIEVE_TOKENS, RETRIEVE_TOP, Retrieved, content_hash,
 };
+pub use story::{STORY_TOKENS, Stories, Story, StoryMatch, asks_for_a_story};

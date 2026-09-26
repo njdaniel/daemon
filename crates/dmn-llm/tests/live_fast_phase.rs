@@ -217,6 +217,56 @@ async fn live_the_slow_phase_fills_every_section_within_20_s() {
     }
 }
 
+/// #58: a behavioral question with a matched story gets STAR cards built from that story, and
+/// the cards name it. The story is the fixture's, front matter dropped as `dmn-context` does.
+#[tokio::test]
+#[ignore]
+async fn live_a_matched_story_fills_the_star_cards() {
+    let raw = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/context/stories/disagreed-on-broker.md"),
+    )
+    .unwrap();
+    let body = raw.splitn(3, "---").nth(2).unwrap().trim().to_owned();
+    let p = OllamaProvider::new("http://localhost:11434", "qwen3.6:35b-a3b").unwrap();
+    p.warm_up().await.unwrap();
+    let mut req = FastRequest::new(
+        "Tell me about a time you disagreed with a technical decision and how you handled it.",
+        6,
+    );
+    req.story = Some(dmn_llm::StoryText {
+        label: "stories/disagreed-on-broker.md".into(),
+        text: body,
+    });
+    let started = Instant::now();
+    let outcome = run_fast_phase(&p, &req, CancellationToken::new(), |_| {})
+        .await
+        .unwrap();
+    eprintln!("{:?}\n  => {outcome:?}", started.elapsed());
+    let FastOutcome::Shown { suggestion, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(suggestion.kind, Some(Kind::Behavioral));
+    let star = suggestion
+        .star
+        .expect("STAR cards for a behavioral question");
+    assert_eq!(
+        star.story.as_deref(),
+        Some("stories/disagreed-on-broker.md")
+    );
+    let cards = format!(
+        "{} {} {} {}",
+        star.situation, star.task, star.action, star.result
+    )
+    .to_lowercase();
+    assert!(
+        ["broker", "spike", "replay", "contoso"]
+            .iter()
+            .any(|w| cards.contains(w)),
+        "the cards come from the story: {cards}"
+    );
+}
+
 /// #57: the slow phase on the real model summarises the previous answer in one line and names
 /// the promise made in it; with nothing promised, the promise is empty.
 #[tokio::test]
