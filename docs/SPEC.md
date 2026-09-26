@@ -124,15 +124,15 @@ stream.capture.sink=true                                   # only for the sink-m
 
 **Verify at M0** (`dmn doctor` checks these and prints a fix for each): `libpipewire-0.3` headers and library present; PipeWire server running and its version; a capture stream with `target.object` set to a `Stream/Output/Audio` node actually receives that app's audio on the user's PipeWire version (`doctor --probe` plays a tone through `pw-play` and captures it back); `pw-record` on PATH for the emergency fallback; mic permission under Flatpak later.
 
-**Latency budget for this stage**: 10 ms PipeWire quantum, 20 ms VAD frames, VAD decision on 300 ms of trailing silence for a pause and 500 ms for utterance end (`[stt].vad_close_ms`; 700 ms until #16's tuning missed the 2.0 s p50 live), so an utterance reaches STT within about 0.55 s of the speaker stopping.
+**Latency budget for this stage**: 10 ms PipeWire quantum, 20 ms VAD frames, VAD decision on 300 ms of trailing silence for a pause and 400 ms for utterance end (`[stt].vad_close_ms`; 700 ms until #16's tuning missed the 2.0 s p50 live, 500 ms until #63 chose Silero and bought its later utterance ends back), so an utterance reaches STT within about 0.5 s of the speaker stopping.
 
 ## Transcription and question detection
 
-STT runs per utterance, not per fixed chunk: the VAD closes an utterance after 500 ms of silence (or at 12 s, whichever comes first) and whisper transcribes it whole, with the previous utterance's text passed as prompt for continuity. Partial results every 1 s keep the transcript strip moving while a long utterance is still open.
+STT runs per utterance, not per fixed chunk: the VAD (Silero by default since #63, energy as the no-model alternative) closes an utterance after 400 ms of silence (or at 12 s, whichever comes first) and whisper transcribes it whole, with the previous utterance's text passed as prompt for continuity. Partial results every 1 s keep the transcript strip moving while a long utterance is still open.
 
 **STT worker**
 
-- Input: 16 kHz mono f32; `whisper-rs` `FullParams` with `SamplingStrategy::Greedy`, `language=Some("en")`, `no_context=true`, `single_segment=true`, `temperature=0`, `suppress_blank=true`, `n_threads` from config. The previous final goes in explicitly as prompt tokens; `no_context=true` stops whisper.cpp also prepending its own last decode, which is usually a partial of the same utterance and made the final drop the words that partial covered (#39).
+- Input: 16 kHz mono f32; `whisper-rs` `FullParams` with `SamplingStrategy::Greedy`, `language=Some("en")`, `no_context=true`, `single_segment=true`, `temperature=0`, `suppress_blank=true`, `n_threads` from config. The previous final goes in explicitly as prompt tokens; `no_context=true` stops whisper.cpp also prepending its own last decode, which is usually a partial of the same utterance and made the final drop the words that partial covered (#39). Only a final with sentence punctuation (`.`, `?`, `!`) becomes the next prompt: whisper copies its prompt's style, so one unpunctuated final used as the prompt left every later final on that lane unpunctuated, and the detector lost its `?` cues (#63).
 - Sliding window for partials: the last 8 s of the open utterance, re-run every 1 s; the final pass replaces all partials for that utterance.
 - Output: `Segment { source, start, end, text, is_final, avg_logprob }`. Segments with `avg_logprob < -1.0`, or fewer than 3 words that match whisper's known hallucination phrases ("Thank you.", "Thanks for watching."), are dropped.
 - Model files live in `~/.cache/dmn/models/`; `dmn doctor --fetch small.en` downloads. Default `small.en`; `dmn bench` measures real-time factor on the target machine at M0 and records it in `doctor` output. GPU: build with `--features vulkan` (or `cuda`) and the same code path applies.
@@ -151,6 +151,8 @@ Score = sum of matched cues; a segment becomes a candidate at score ≥ 2:
 | Interviewer segment followed by ≥ 1.5 s of silence or a You segment | 1 |
 | Ends with "...right?" or "you know?" (rhetorical) | −2 |
 | Mostly small talk vocabulary (weather, weekend, coffee, can you hear me) | −2 |
+
+**Split questions (#63).** With a 500 ms utterance close, a question with a mid-sentence pause ("And if the limiter's state lived in Redis … and Redis went down, what then?"), a setup followed by the ask ("Imagine a delivery app. Orders change state every few seconds. How would you…?") or a 12 s forced split arrives as two or three finals, and each part that scores became a candidate of its own: two questions on screen for one. An interviewer final that starts within 1.5 s (the hand-back silence above) of the question still being asked, with no You speech in between (judged on audio time) and within 30 s of that question's start, continues it: the detector emits the combined text (earlier candidate, the lines between, this final) as one candidate marked `continues`, the session replaces the first part's question where it is (live, pinned or queued) instead of adding or queueing a second, and the fast phase asks it without the first part as the current question, so the model does not read the whole question as a clarification of its first half. Empty finals (an utterance whisper heard nothing in) neither score nor break a question. `just eval`, energy VAD at 500 ms: precision 0.83 → 0.98, recall 0.97 → 0.96 with `continuous/` added; Silero at 500 ms: 1.00 / 1.00. The shorter 400 ms close that `[stt]` now ships splits more, and this is what keeps its precision up: Silero at 400 ms scores recall 0.96 / precision 0.94.
 
 **Extraction (Tier-A, the LLM fast phase)** receives the last 60 s of transcript with speaker labels and the candidate, and returns `{is_question, question, kind, focus}` where `kind` is one of `system_design | coding | behavioral | knowledge | clarification | small_talk`. Rules:
 
@@ -292,8 +294,8 @@ echo_guard = true
 engine = "whisper.cpp"
 model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
-vad = "energy"                       # energy | silero (M2)
-vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
+vad = "silero"                       # silero | energy (#63: fixtures and keyboard noise)
+vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict

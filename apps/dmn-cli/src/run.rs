@@ -326,10 +326,21 @@ fn ui_loop(
 struct Emitted {
     clock: AudioClock,
     seen: BTreeMap<u64, Seen>,
+    /// The last candidate recorded: the one a continuation replaces.
+    last: Option<u64>,
 }
 
 impl Observer for Emitted {
     fn candidate(&mut self, id: u64, found: &Found) {
+        // #63: a continuation replaces the first part of its question on screen, so the question
+        // is on screen when the whole of it is. Pairing the scripted question with the first
+        // part would time a half question, often before the interviewer finished asking.
+        if found.continues
+            && let Some(prev) = self.last
+        {
+            self.seen.remove(&prev);
+        }
+        self.last = Some(id);
         let now = self.clock.now();
         self.seen.insert(
             id,
@@ -363,6 +374,7 @@ fn headless(
         Emitted {
             clock: clock.clone(),
             seen: BTreeMap::new(),
+            last: None,
         },
         false,
     );

@@ -74,11 +74,19 @@ pub struct Stt {
     /// whisper model name, resolved under `Paths::models_dir`.
     pub model: String,
     pub threads: u16,
+    /// Silero since #63. On the four fixtures (`just eval`, 500 ms close) Silero scored recall
+    /// 1.00 / precision 1.00 against energy's 0.96 / 0.98, and #62 found it holds utterance
+    /// bounds under keyboard clicks (80 of 92 turns) where energy loses almost all of them (1 of
+    /// 92). Its cost is ~0.1 s later utterance ends, which `vad_close_ms` buys back. Needs the
+    /// model: `dmn doctor --fetch silero`.
     pub vad: Vad,
     /// Trailing silence that ends an utterance, in ms. Every ms here is a ms of question-end →
     /// Approach latency; too short splits questions at a pause. #16 measured the fixtures at 1×
-    /// (8 threads): 700 → p50 1.96 s, 600 → 2.01 s, 500 → 1.78–1.85 s with recall 0.97 and
-    /// precision 0.83 (`just eval`); live session 5 at 700 missed the 2.0 s p50 by 0.11 s.
+    /// (8 threads, energy): 700 → p50 1.96 s, 600 → 2.01 s, 500 → 1.78–1.85 s with recall 0.97
+    /// and precision 0.83; live session 5 at 700 missed the 2.0 s p50 by 0.11 s. #63 (Silero,
+    /// split questions continued): 500 → p50 1.93 s sysdesign / 2.02 s continuous, recall 1.00
+    /// / precision 1.00; 400 → 1.83 s / 1.82 s, recall 0.96 / precision 0.94. 400 is the close
+    /// that keeps both fixtures inside the 2.0 s p50.
     pub vad_close_ms: u16,
 }
 
@@ -91,8 +99,8 @@ impl Default for Stt {
             // (Ryzen 7700X, small.en on CPU): question + Approach p50 2.29 s at 4 threads,
             // 1.95 s at 8. The final whisper pass is the stage threads move.
             threads: 8,
-            vad: Vad::Energy,
-            vad_close_ms: 500,
+            vad: Vad::Silero,
+            vad_close_ms: 400,
         }
     }
 }
@@ -274,8 +282,8 @@ echo_guard = true                    # drop mic text that duplicates the loopbac
 engine = "whisper.cpp"
 model = "small.en"                   # under ~/.cache/dmn/models/; `dmn doctor --fetch small.en`
 threads = 8                          # whisper threads per lane; the final pass is most of the 2 s budget
-vad = "energy"                       # energy | silero (M2)
-vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
+vad = "silero"                       # silero | energy; silero needs `dmn doctor --fetch silero`
+vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
@@ -459,8 +467,8 @@ echo_guard = true
 engine = "whisper.cpp"
 model = "small.en"
 threads = 8                          # per lane; 4 missed the 2 s p50 (#15)
-vad = "energy"                       # energy | silero (M2)
-vad_close_ms = 500                   # silence that ends an utterance; shorter = faster, more splits
+vad = "silero"                       # silero | energy (#63: fixtures and keyboard noise)
+vad_close_ms = 400                   # silence that ends an utterance; shorter = faster, more splits
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict

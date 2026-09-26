@@ -51,7 +51,7 @@ fixtures-fetch:
       if [ "$missing" = 0 ]; then echo "$rel: fixtures present"; return; fi
       local tmp; tmp=$(mktemp -d)
       # The repo is private, so prefer an authenticated gh download; fall back to a plain URL.
-      if command -v gh >/dev/null && gh release download "$rel" -p "$rel.tar.gz" -D "$tmp" 2>/dev/null; then :
+      if command -v gh >/dev/null && gh release download "$rel" -R njdaniel/daemon -p "$rel.tar.gz" -D "$tmp" 2>/dev/null; then :
       else curl -fsSL -o "$tmp/$rel.tar.gz" "https://github.com/njdaniel/daemon/releases/download/$rel/$rel.tar.gz"
       fi
       (cd "$tmp" && sed "s#  .*#  $rel.tar.gz#" "{{justfile_directory()}}/testdata/$rel.sha256" | sha256sum -c --quiet)
