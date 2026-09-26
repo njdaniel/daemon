@@ -43,6 +43,8 @@ enum CliError {
     Devices(String),
     #[error(transparent)]
     Stt(#[from] dmn_stt::SttError),
+    #[error(transparent)]
+    Silero(dmn_vad::SileroError),
     /// `dmn bench` could not read a fixture or its turns.
     #[error("bench: {0}")]
     Bench(String),
@@ -61,6 +63,22 @@ enum CliError {
     Usage(String),
     #[error("{failed} required check(s) failed")]
     ChecksFailed { failed: usize },
+}
+
+/// `--vad` (#62): which voice activity detector, over `[stt].vad`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum VadArg {
+    Energy,
+    Silero,
+}
+
+impl From<VadArg> for dmn_core::config::Vad {
+    fn from(v: VadArg) -> Self {
+        match v {
+            VadArg::Energy => dmn_core::config::Vad::Energy,
+            VadArg::Silero => dmn_core::config::Vad::Silero,
+        }
+    }
 }
 
 /// Daemon: a Linux-native interview copilot.
@@ -94,9 +112,12 @@ enum Command {
         /// Decoder threads; default is [stt].threads from the config
         #[arg(long)]
         threads: Option<usize>,
-        /// Silence (ms) that ends an utterance; default is [stt].vad_close_ms (700)
+        /// Silence (ms) that ends an utterance; default is [stt].vad_close_ms (500)
         #[arg(long)]
         vad_close_ms: Option<u16>,
+        /// Voice activity detector; default is [stt].vad (energy)
+        #[arg(long, value_enum)]
+        vad: Option<VadArg>,
         /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
         #[arg(long)]
         no_store: bool,
@@ -126,8 +147,8 @@ enum Command {
         /// monitor and pw-record (about 3 s of sound through the default output)
         #[arg(long, conflicts_with = "init")]
         probe: bool,
-        /// Download a whisper model (tiny.en, base.en, small.en, medium.en, large-v3-turbo)
-        /// into ~/.cache/dmn/models/, then run the checks
+        /// Download a whisper model (tiny.en, base.en, small.en, medium.en, large-v3-turbo) or
+        /// the Silero VAD model (silero) into ~/.cache/dmn/models/, then run the checks
         #[arg(long, value_name = "MODEL", conflicts_with = "init")]
         fetch: Option<String>,
     },
@@ -195,9 +216,12 @@ enum Command {
         /// Decoder threads; default is [stt].threads from the config
         #[arg(long)]
         threads: Option<usize>,
-        /// Silence (ms) that ends an utterance; default is [stt].vad_close_ms (700)
+        /// Silence (ms) that ends an utterance; default is [stt].vad_close_ms (500)
         #[arg(long)]
         vad_close_ms: Option<u16>,
+        /// Voice activity detector; default is [stt].vad (energy)
+        #[arg(long, value_enum)]
+        vad: Option<VadArg>,
         /// Transcribe the 1 s partials of an open utterance: on, since --speed always paces
         #[arg(long, value_enum, default_value_t = pipeline::Partials::Auto)]
         partials: pipeline::Partials,
@@ -313,6 +337,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             model,
             threads,
             vad_close_ms,
+            vad,
             partials,
             transcript,
             json,
@@ -332,6 +357,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     model,
                     threads,
                     vad_close_ms,
+                    vad: vad.map(Into::into),
                     partials,
                     transcript,
                     json,
@@ -349,6 +375,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             model,
             threads,
             vad_close_ms,
+            vad,
             no_store,
             headless,
             duration,
@@ -378,6 +405,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     model,
                     threads,
                     vad_close_ms,
+                    vad: vad.map(Into::into),
                     no_store,
                     headless,
                     duration,
@@ -444,8 +472,42 @@ fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// `dmn doctor --fetch silero` (#62): the Silero VAD model, then its size and SHA-256.
+fn fetch_silero(paths: &Paths) -> Result<(), CliError> {
+    use dmn_vad::silero;
+    let dest = silero::model_path(&paths.models_dir);
+    eprintln!(
+        "fetching {} ({:.1} MB) from {}",
+        silero::MODEL_FILE,
+        silero::MODEL_SIZE as f64 / 1e6,
+        silero::MODEL_URL
+    );
+    let path = dmn_stt::download_file(
+        &dest,
+        silero::MODEL_URL,
+        silero::MODEL_SIZE,
+        dmn_stt::model::MIN_DEADLINE,
+        |_, _| {},
+    )?;
+    if let Err(e) = silero::verify_model(&path) {
+        // Right size, wrong bytes: never leave a file that ONNX Runtime would be asked to parse.
+        let _ = std::fs::remove_file(&path);
+        return Err(CliError::Silero(e));
+    }
+    tracing::info!(path = %path.display(), "silero model ready");
+    println!(
+        "model:    {} ({} bytes, sha256 ok)",
+        path.display(),
+        silero::MODEL_SIZE
+    );
+    Ok(())
+}
+
 /// `dmn doctor --fetch <model>`: download with a progress line on stderr.
 fn fetch_model(paths: &Paths, name: &str) -> Result<(), CliError> {
+    if name == dmn_vad::silero::FETCH_NAME {
+        return fetch_silero(paths);
+    }
     let model = dmn_stt::Model::from_name(name)?;
     let total_mb = model.size_bytes() as f64 / 1e6;
     eprintln!(

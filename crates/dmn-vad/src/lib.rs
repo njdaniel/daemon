@@ -14,20 +14,23 @@
 //! from docs/SPEC.md § Transcription and question detection; `dmn-core` converts `[stt]` into it
 //! when it wires the pipeline (#13).
 //!
-//! Shape: a [`Vad`] makes one speech / non-speech decision per frame ([`EnergyVad`] now, Silero
-//! in M2 behind the same trait); a [`Segmenter`] turns those decisions into utterances with
-//! frame-count timestamps (never wall clock, so replay and live agree); a [`VadWorker`] runs both
-//! on its own thread.
+//! Shape: a [`Vad`] makes one speech / non-speech decision per frame ([`EnergyVad`], or
+//! [`SileroVad`] through ONNX Runtime from #62, chosen by `[stt].vad`); a [`Segmenter`] turns
+//! those decisions into utterances with frame-count timestamps (never wall clock, so replay and
+//! live agree); a [`VadWorker`] runs both on its own thread. The Silero model file is fetched by
+//! `dmn doctor --fetch silero` and checked by [`silero::verify_model`].
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod energy;
 mod segmenter;
+pub mod silero;
 mod worker;
 
 pub use energy::{EnergyVad, EnergyVadConfig, Vad, frame_dbfs};
 pub use segmenter::{CloseReason, Segmenter, SegmenterConfig, Utterance, VadEvent};
+pub use silero::{SileroError, SileroVad, SileroVadConfig};
 pub use worker::{VadError, VadWorker, WorkerStats, event_channel};
 
 /// Everything a [`VadWorker`] needs. `Default` is the SPEC's numbers.

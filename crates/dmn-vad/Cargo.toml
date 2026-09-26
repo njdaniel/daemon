@@ -10,6 +10,14 @@ rust-version.workspace = true
 thiserror = { workspace = true }
 crossbeam-channel = { workspace = true }
 dmn-audio = { path = "../dmn-audio" }
+tracing = { workspace = true }
+# Silero VAD (#62). rc.10 is the newest release whose MSRV (1.81) fits the workspace's 1.85;
+# rc.13 needs 1.88. `download-binaries` links a prebuilt static ONNX Runtime fetched at build
+# time, so nothing extra is installed and nothing is downloaded at run time.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries"] }
+# Checks the downloaded Silero model against its published hash before ONNX Runtime parses it.
+# Already in the tree: ort-sys's build script uses it to check the runtime it downloads.
+sha2 = "0.10"
 
 [dev-dependencies]
 serde_json = { workspace = true }

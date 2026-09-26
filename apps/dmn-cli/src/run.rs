@@ -55,6 +55,8 @@ pub struct Args {
     pub model: Option<String>,
     pub threads: Option<usize>,
     pub vad_close_ms: Option<u16>,
+    /// `--vad`, over `[stt].vad` (#62).
+    pub vad: Option<dmn_core::config::Vad>,
     pub no_store: bool,
     pub headless: bool,
     /// Live: stop after this many seconds, as if `q` had been pressed.
@@ -152,6 +154,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             model: args.model.clone(),
             threads: args.threads,
             vad_close_ms: args.vad_close_ms,
+            vad: args.vad,
             partials: Partials::Auto,
             spec_literal_detector: false,
             no_llm: false,
@@ -537,6 +540,7 @@ mod tests {
             model: None,
             threads: None,
             vad_close_ms: None,
+            vad: None,
             no_store: true,
             headless: false,
             duration: None,
