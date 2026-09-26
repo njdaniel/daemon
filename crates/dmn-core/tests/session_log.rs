@@ -582,3 +582,93 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
         .collect();
     assert_eq!(modes, [Some("hints".into()), Some("full".into())]);
 }
+
+/// #55: the slow phase on a `MockProvider`, dispatched as the pipeline does, lands in the session
+/// as sections and in the store as one `slow` suggestion row; a stopped one stores nothing.
+#[tokio::test]
+async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
+    use dmn_llm::{SlowFields, SlowRequest, run_slow_phase};
+    use dmn_session::{Section, SectionState, Speaker};
+    use dmn_store::Phase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let hub = rec.hub();
+    hub.dispatch(Action::Started {
+        label: "slow".into(),
+        at: 1_700_000_000,
+    });
+    let asked = "How would you design a cache?";
+    for a in [
+        Action::Segment {
+            speaker: Speaker::Interviewer,
+            start: 20.0,
+            end: 24.0,
+            text: asked.into(),
+            is_final: true,
+            avg_logprob: -0.2,
+        },
+        Action::Candidate {
+            id: 1,
+            speaker: Speaker::Interviewer,
+            start: 20.0,
+            end: 24.0,
+            text: asked.into(),
+            score: 5,
+        },
+        Action::Question {
+            candidate: 1,
+            text: asked.into(),
+            kind: "system_design".into(),
+        },
+    ] {
+        hub.dispatch(a);
+    }
+    let provider = MockProvider::json(&json!({
+        "deeper": [{"label": "Eviction", "text": "LRU with a TTL."}],
+        "followups": ["What about a thundering herd?"],
+        "tradeoffs": [],
+        "example": {"language": "text", "code": ""},
+        "mention": ["Name the hit-rate target."],
+        "resume_context": []
+    }));
+    let req = SlowRequest::new(asked, dmn_llm::Kind::SystemDesign);
+    let mut fields = SlowFields::default();
+    hub.dispatch(Action::SlowStarted { candidate: 1 });
+    let result = run_slow_phase(&provider, &req, CancellationToken::new(), |f| {
+        fields.apply(&f);
+        hub.dispatch(wire::slow_field(1, &f));
+    })
+    .await;
+    hub.dispatch(wire::slow_ended(1, &result, &fields, false, 1_700_000_030));
+    let live = hub.snapshot().live.unwrap();
+    assert_eq!(live.sections.mention, ["Name the hit-rate target."]);
+    assert_eq!(
+        *live.sections.state(Section::Example),
+        SectionState::Empty,
+        "empty code is no example"
+    );
+    // A second, stopped attempt: nothing new is stored.
+    hub.dispatch(Action::SlowStarted { candidate: 1 });
+    hub.dispatch(wire::slow_ended(
+        1,
+        &Err(dmn_llm::LlmError::Cancelled),
+        &SlowFields::default(),
+        true,
+        1_700_000_031,
+    ));
+
+    let report = rec.finish(1_700_000_090).unwrap().unwrap();
+    assert_eq!(report.errors, 0);
+    let store = open_store(&paths).unwrap();
+    let rows = store
+        .suggestions_for_session(report.session_id.unwrap())
+        .unwrap();
+    let slow: Vec<_> = rows.iter().filter(|r| r.phase == Phase::Slow).collect();
+    assert_eq!(slow.len(), 1, "{rows:?}");
+    let payload: serde_json::Value = serde_json::from_str(&slow[0].payload).unwrap();
+    assert_eq!(payload["deeper"][0]["label"], "Eviction");
+    assert_eq!(payload["followups"][0], "What about a thundering herd?");
+    assert!(payload.get("solution").is_none());
+}

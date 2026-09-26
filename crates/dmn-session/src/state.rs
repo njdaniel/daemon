@@ -6,7 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{Action, CodingSolutions, Dot, Health, IgnoreReason, Speaker, StarCards};
+use crate::action::{
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason, Section,
+    SectionState, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
+};
 
 /// How much transcript the session keeps: the SPEC's prompt window is the last 60 s, and the UI
 /// shows the last two lines, so nothing older is ever read from here.
@@ -45,6 +48,153 @@ pub struct Clarification {
     pub progress: Progress,
 }
 
+/// The state of each of the six sections.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionStates {
+    pub deeper: SectionState,
+    pub followups: SectionState,
+    pub tradeoffs: SectionState,
+    pub example: SectionState,
+    pub mention: SectionState,
+    pub resume_context: SectionState,
+}
+
+impl SectionStates {
+    pub fn get(&self, section: Section) -> &SectionState {
+        match section {
+            Section::Deeper => &self.deeper,
+            Section::Followups => &self.followups,
+            Section::Tradeoffs => &self.tradeoffs,
+            Section::Example => &self.example,
+            Section::Mention => &self.mention,
+            Section::ResumeContext => &self.resume_context,
+        }
+    }
+
+    fn get_mut(&mut self, section: Section) -> &mut SectionState {
+        match section {
+            Section::Deeper => &mut self.deeper,
+            Section::Followups => &mut self.followups,
+            Section::Tradeoffs => &mut self.tradeoffs,
+            Section::Example => &mut self.example,
+            Section::Mention => &mut self.mention,
+            Section::ResumeContext => &mut self.resume_context,
+        }
+    }
+}
+
+/// What the slow phase (#55) filled for a question: the six expandable sections and each one's
+/// state. Deeper Answer also holds the worked solution of a coding question in `full` mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sections {
+    pub deeper: Vec<DeeperItem>,
+    pub solution: Option<CodeBlock>,
+    pub followups: Vec<String>,
+    pub tradeoffs: Vec<TradeoffItem>,
+    pub example: Option<CodeBlock>,
+    pub mention: Vec<String>,
+    pub resume_context: Vec<Citation>,
+    pub states: SectionStates,
+}
+
+impl Sections {
+    /// Nothing filled and every section still loading: how a question starts, and what an
+    /// M1-era session log or fixture holds (the field is left out of their JSON).
+    pub fn is_untouched(&self) -> bool {
+        *self == Sections::default()
+    }
+
+    pub fn state(&self, section: Section) -> &SectionState {
+        self.states.get(section)
+    }
+
+    /// Whether `section` has anything to show.
+    pub fn has_content(&self, section: Section) -> bool {
+        match section {
+            Section::Deeper => !self.deeper.is_empty() || self.solution.is_some(),
+            Section::Followups => !self.followups.is_empty(),
+            Section::Tradeoffs => !self.tradeoffs.is_empty(),
+            Section::Example => self.example.is_some(),
+            Section::Mention => !self.mention.is_empty(),
+            Section::ResumeContext => !self.resume_context.is_empty(),
+        }
+    }
+
+    /// Store one field and settle its section: done when it has content, empty when not.
+    fn set(&mut self, field: &SlowField) {
+        let section = match field {
+            SlowField::Deeper { items } => {
+                self.deeper = items.clone();
+                // A new Deeper Answer replaces the old one whole, solution included: `solution`
+                // is the last field of the schema, so a phase that has one sends it after this.
+                // A regenerate in hints mode (or a model that sent none) never shows the old code.
+                self.solution = None;
+                Section::Deeper
+            }
+            SlowField::Solution { code } => {
+                self.solution = Some(code.clone());
+                Section::Deeper
+            }
+            SlowField::Followups { items } => {
+                self.followups = items.clone();
+                Section::Followups
+            }
+            SlowField::Tradeoffs { items } => {
+                self.tradeoffs = items.clone();
+                Section::Tradeoffs
+            }
+            SlowField::Example { code } => {
+                self.example = code.clone();
+                Section::Example
+            }
+            SlowField::Mention { items } => {
+                self.mention = items.clone();
+                Section::Mention
+            }
+            SlowField::ResumeContext { items } => {
+                self.resume_context = items.clone();
+                Section::ResumeContext
+            }
+        };
+        *self.states.get_mut(section) = if self.has_content(section) {
+            SectionState::Done
+        } else {
+            SectionState::Empty
+        };
+    }
+
+    /// A new (or restarted) slow phase: every section is loading again, content kept.
+    fn start(&mut self) {
+        // Content stays until the new phase replaces it; a solution goes when the new Deeper
+        // Answer arrives (see `set`).
+        for section in Section::ALL {
+            *self.states.get_mut(section) = SectionState::Loading;
+        }
+    }
+
+    /// The slow phase ended: settle every section still loading.
+    fn end(&mut self, end: &SlowEnd) {
+        let settled = match end {
+            SlowEnd::Done => SectionState::Empty,
+            SlowEnd::TimedOut => SectionState::Slow,
+            SlowEnd::Failed(error) => SectionState::Failed(error.clone()),
+            SlowEnd::Stopped => return,
+        };
+        for section in Section::ALL {
+            if *self.states.get(section) != SectionState::Loading {
+                continue;
+            }
+            // Done with nothing new: a section that still shows earlier content is done.
+            let next = if settled == SectionState::Empty && self.has_content(section) {
+                SectionState::Done
+            } else {
+                settled.clone()
+            };
+            *self.states.get_mut(section) = next;
+        }
+    }
+}
+
 /// A question the fast phase confirmed, with everything the fast phase filled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Question {
@@ -60,6 +210,9 @@ pub struct Question {
     /// Approach, as it dims the previous one while a new question loads.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub regenerating: bool,
+    /// The six expandable sections the slow phase fills (#55).
+    #[serde(default, skip_serializing_if = "Sections::is_untouched")]
+    pub sections: Sections,
 }
 
 impl Question {
@@ -74,6 +227,7 @@ impl Question {
             clarifications: Vec::new(),
             progress: Progress::Streaming,
             regenerating: false,
+            sections: Sections::default(),
         }
     }
 }
@@ -235,9 +389,11 @@ pub fn reduce(s: &mut Session, action: &Action) {
             text,
             kind,
         } => {
-            let q = Question::new(*candidate, text.clone(), kind.clone());
-            // A regenerated reply replaces its own question where it is, pinned or queued.
+            let mut q = Question::new(*candidate, text.clone(), kind.clone());
+            // A regenerated reply replaces its own question where it is, pinned or queued. Its
+            // sections stay until the new slow phase replaces them (#55).
             if let Some(existing) = s.question_mut(*candidate) {
+                q.sections = std::mem::take(&mut existing.sections);
                 *existing = q;
                 return;
             }
@@ -310,6 +466,21 @@ pub fn reduce(s: &mut Session, action: &Action) {
         Action::Failed { candidate, error } => {
             s.counts.failed += 1;
             s.settle(*candidate, &Progress::Failed(error.clone()));
+        }
+        Action::SlowStarted { candidate } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                q.sections.start();
+            }
+        }
+        Action::Slow { candidate, field } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                q.sections.set(field);
+            }
+        }
+        Action::SlowEnded { candidate, end, .. } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                q.sections.end(end);
+            }
         }
         Action::Regenerate { candidate } => {
             if let Some(q) = s.question_mut(*candidate) {

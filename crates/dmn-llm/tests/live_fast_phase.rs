@@ -144,3 +144,75 @@ async fn live_the_job_description_becomes_at_most_8_requirements() {
     let all = r.bullets.join(" ").to_lowercase();
     assert!(all.contains("rust") || all.contains("go"), "{all}");
 }
+
+/// #55: the slow phase on the real model fills every section within 20 s, cites only what it
+/// was given, and in hints mode sends no solution.
+#[tokio::test]
+#[ignore]
+async fn live_the_slow_phase_fills_every_section_within_20_s() {
+    use dmn_llm::{CodingMode, SlowRequest, run_slow_phase};
+    let p = OllamaProvider::new("http://localhost:11434", "qwen3.6:35b-a3b").unwrap();
+    p.warm_up().await.unwrap();
+    for (question, kind, coding) in [
+        (
+            "How would you design a rate limiter for a globally distributed API?",
+            Kind::SystemDesign,
+            CodingMode::Hints,
+        ),
+        (
+            "Given an array of integers, find two that add up to a target.",
+            Kind::Coding,
+            CodingMode::Hints,
+        ),
+        (
+            "Given an array of integers, find two that add up to a target.",
+            Kind::Coding,
+            CodingMode::Full,
+        ),
+    ] {
+        let mut req = SlowRequest::new(question, kind);
+        req.coding = coding;
+        req.focus = "approach, complexity, failure handling".into();
+        req.approach = vec![
+            "Clarify the constraints.".into(),
+            "Pick the core data structure.".into(),
+            "Walk through the edge cases.".into(),
+        ];
+        req.context = FastRequest::new(question, 6);
+        req.context.chunks = vec![
+            "resume (resume.md): Built the payments API's rate limiter in Go; Redis token buckets, 40k req/s.".into(),
+        ];
+        req.chunk_files = vec!["resume.md".into()];
+        let started = Instant::now();
+        let mut arrived = Vec::new();
+        let outcome = run_slow_phase(&p, &req, CancellationToken::new(), |f| {
+            arrived.push((f.name(), started.elapsed()));
+        })
+        .await
+        .unwrap();
+        eprintln!(
+            "{question} ({kind:?}, {coding:?}) in {:?}",
+            started.elapsed()
+        );
+        for (name, at) in &arrived {
+            eprintln!("  {name:<15} {at:?}");
+        }
+        eprintln!("  {}", outcome.fields.to_json());
+        assert!(started.elapsed() < dmn_llm::slow::SLOW_PHASE_TIMEOUT);
+        assert!(outcome.missing.is_empty(), "{:?}", outcome.missing);
+        assert!(
+            outcome
+                .fields
+                .resume_context
+                .iter()
+                .flatten()
+                .all(|c| c.source == "resume.md")
+        );
+        let wants = kind == Kind::Coding && coding == CodingMode::Full;
+        assert_eq!(
+            outcome.fields.solution.is_some(),
+            wants,
+            "{kind:?} {coding:?}"
+        );
+    }
+}

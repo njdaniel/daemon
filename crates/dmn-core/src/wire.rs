@@ -6,7 +6,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dmn_detect::Candidate;
 use dmn_llm::{FastEvent, FastOutcome, LlmError};
-use dmn_session::{Action, IgnoreReason, Speaker, StarCards};
+use dmn_session::{
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, IgnoreReason, SlowEnd, SlowField,
+    Speaker, StarCards, TradeoffItem,
+};
 use dmn_transcript::Segment;
 
 /// Unix epoch seconds now. Actions carry their times, so this is called by whoever dispatches,
@@ -226,9 +229,145 @@ pub fn outcome(id: u64, result: &Result<FastOutcome, LlmError>, at: i64) -> Acti
     }
 }
 
+/// The session's coding-solutions mode as the slow phase takes it (#50, #55).
+pub fn coding_mode(mode: CodingSolutions) -> dmn_llm::CodingMode {
+    match mode {
+        CodingSolutions::Hints => dmn_llm::CodingMode::Hints,
+        CodingSolutions::Full => dmn_llm::CodingMode::Full,
+    }
+}
+
+fn code_block(e: &dmn_llm::schema::Example) -> CodeBlock {
+    CodeBlock {
+        language: e.language.clone(),
+        code: e.code.clone(),
+    }
+}
+
+/// One slow-phase field for candidate `id` (#55).
+pub fn slow_field(id: u64, field: &dmn_llm::SlowField) -> Action {
+    use dmn_llm::SlowField as L;
+    let field = match field {
+        L::Deeper(items) => SlowField::Deeper {
+            items: items
+                .iter()
+                .map(|d| DeeperItem {
+                    label: d.label.clone(),
+                    text: d.text.clone(),
+                })
+                .collect(),
+        },
+        L::Followups(items) => SlowField::Followups {
+            items: items.clone(),
+        },
+        L::Tradeoffs(items) => SlowField::Tradeoffs {
+            items: items
+                .iter()
+                .map(|t| TradeoffItem {
+                    option: t.option.clone(),
+                    pro: t.pro.clone(),
+                    con: t.con.clone(),
+                })
+                .collect(),
+        },
+        L::Example(code) => SlowField::Example {
+            code: code.as_ref().map(code_block),
+        },
+        L::Mention(items) => SlowField::Mention {
+            items: items.clone(),
+        },
+        L::ResumeContext(items) => SlowField::ResumeContext {
+            items: items
+                .iter()
+                .map(|r| Citation {
+                    source: r.source.clone(),
+                    text: r.text.clone(),
+                })
+                .collect(),
+        },
+        L::Solution(code) => SlowField::Solution {
+            code: code_block(code),
+        },
+    };
+    Action::Slow {
+        candidate: id,
+        field,
+    }
+}
+
+/// How candidate `id`'s slow phase ended, with the fields that arrived (for the store). `stopped`
+/// says the run itself was stopped (`q`), which is not a failure. `at` is unix epoch seconds.
+pub fn slow_ended(
+    id: u64,
+    result: &Result<dmn_llm::SlowOutcome, LlmError>,
+    fields: &dmn_llm::SlowFields,
+    stopped: bool,
+    at: i64,
+) -> Action {
+    let end = match result {
+        Ok(_) => SlowEnd::Done,
+        Err(LlmError::Timeout(_)) => SlowEnd::TimedOut,
+        Err(LlmError::Cancelled) if stopped => SlowEnd::Stopped,
+        Err(e) => SlowEnd::Failed(e.to_string()),
+    };
+    Action::SlowEnded {
+        candidate: id,
+        end,
+        payload: fields.to_json().to_string(),
+        at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_fields_map_onto_session_actions() {
+        let example = dmn_llm::schema::Example {
+            language: "python".into(),
+            code: "x = 1".into(),
+        };
+        let a = slow_field(3, &dmn_llm::SlowField::Solution(example.clone()));
+        assert_eq!(
+            a,
+            Action::Slow {
+                candidate: 3,
+                field: SlowField::Solution {
+                    code: CodeBlock {
+                        language: "python".into(),
+                        code: "x = 1".into(),
+                    }
+                }
+            }
+        );
+        let mut fields = dmn_llm::SlowFields::default();
+        fields.apply(&dmn_llm::SlowField::Example(Some(example)));
+        let timed_out = slow_ended(
+            3,
+            &Err(LlmError::Timeout(std::time::Duration::from_secs(20))),
+            &fields,
+            false,
+            100,
+        );
+        let Action::SlowEnded { end, payload, .. } = timed_out else {
+            panic!("{timed_out:?}");
+        };
+        assert_eq!(end, SlowEnd::TimedOut);
+        assert!(payload.contains("\"example\""), "{payload}");
+        let stopped = slow_ended(3, &Err(LlmError::Cancelled), &fields, true, 100);
+        assert!(matches!(
+            stopped,
+            Action::SlowEnded {
+                end: SlowEnd::Stopped,
+                ..
+            }
+        ));
+        assert_eq!(
+            coding_mode(CodingSolutions::Full),
+            dmn_llm::CodingMode::Full
+        );
+    }
 
     #[test]
     fn the_session_clock_runs_at_the_replay_speed() {

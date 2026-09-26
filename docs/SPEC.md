@@ -305,7 +305,7 @@ base_url = "http://localhost:11434"
 api_key_env = ""                     # name of an env var; never the key itself
 answer_length = "concise"            # concise (5) | minimal (3)
 fast_timeout_ms = 4000
-slow_timeout_ms = 20000
+slow_timeout_ms = 20000              # 0 turns the slow phase off
 
 [ui]
 always_on_top = true

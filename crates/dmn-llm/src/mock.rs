@@ -17,6 +17,9 @@ pub enum Step {
     Done,
     /// Yields `LlmError::Remote { provider: "mock", message }`.
     Error(String),
+    /// Waits this long, then yields an empty delta: a reply that stalls mid-stream, as a slow
+    /// phase's does while a new question needs the model (#55).
+    Pause(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,12 @@ impl MockProvider {
         self
     }
 
+    /// Reply to the next request with `script`, like [`MockProvider::then_json`].
+    pub fn then(mut self, script: Vec<Step>) -> Self {
+        self.then.push(script);
+        self
+    }
+
     /// Sleep this long before each step, to exercise cancellation and timeouts.
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
@@ -65,7 +74,7 @@ impl MockProvider {
 
 /// `value` as JSON in chunks of a few characters, then `Done`. Chunks are cut on `char`
 /// boundaries, so every delta is valid UTF-8 and the concatenation is byte-exact.
-fn json_script(value: &serde_json::Value) -> Vec<Step> {
+pub fn json_script(value: &serde_json::Value) -> Vec<Step> {
     const CHARS_PER_CHUNK: usize = 7;
     let chars: Vec<char> = value.to_string().chars().collect();
     let mut script: Vec<Step> = chars
@@ -113,6 +122,10 @@ impl Provider for MockProvider {
                         provider: "mock",
                         message,
                     }),
+                    Step::Pause(d) => {
+                        tokio::time::sleep(d).await;
+                        Ok(Delta::text(String::new()))
+                    }
                 }
             });
             Ok(guard(inner, cancel, timeout))

@@ -3,8 +3,13 @@
 //! every list ≤ 5 items, `deeper` ≤ 4 entries of ≤ 240 characters. Text over its limit is cut at
 //! a sentence boundary (or, failing that, a word boundary with `…`) and flagged in the debug log;
 //! it is never shown as a wall. Lengths are counted in `char`s.
+//!
+//! The slow phase (#55) adds per-item caps the SPEC leaves open: every list item gets `deeper`'s
+//! 240 characters, headings and tradeoff parts one short line, code a line count (an example is a
+//! sketch, a worked solution about 40 lines), and `resume_context` keeps only items that cite a
+//! file the request actually carried.
 
-use crate::schema::{Kind, Star, Suggestion};
+use crate::schema::{Deeper, Example, Kind, ResumeContext, Star, Suggestion, Tradeoff};
 
 pub const APPROACH_MIN: usize = 3;
 pub const APPROACH_MAX: usize = 5;
@@ -19,6 +24,19 @@ pub const STAR_FIELD_CHARS: usize = 240;
 pub const REQUIREMENTS_MAX: usize = 8;
 /// Not stated in the SPEC; a requirement bullet gets the `focus` cap, one line of the prompt.
 pub const REQUIREMENT_CHARS: usize = 120;
+/// Not stated in the SPEC (#55): every slow-phase list item (a follow-up, a thing to mention, a
+/// resume excerpt) gets `deeper`'s per-entry cap, so none is a wall.
+pub const SLOW_ITEM_CHARS: usize = 240;
+/// A Deeper Answer entry's label is a heading: one short line.
+pub const DEEPER_LABEL_CHARS: usize = 40;
+/// Each of a tradeoff's option, pro and con: one short line.
+pub const TRADEOFF_CHARS: usize = 120;
+/// An Example is a sketch or a snippet, never a solution.
+pub const EXAMPLE_LINES: usize = 12;
+/// SPEC § AI Assistance (#50): a worked solution is capped at about 40 lines.
+pub const SOLUTION_LINES: usize = 40;
+/// Longest code line kept whole; longer lines are cut with `…`.
+pub const CODE_LINE_CHARS: usize = 120;
 
 /// One limit that model output broke. `field` names the place, like `approach[2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +53,9 @@ pub enum FlagKind {
     Dropped { from: usize, to: usize },
     /// Fewer items than the minimum; nothing is invented, the flag is all.
     TooFew { items: usize, min: usize },
+    /// An item that failed a check (a `resume_context` citing a file the request did not carry,
+    /// or a `solution` outside a coding question in `full` mode) was dropped whole.
+    Rejected,
 }
 
 impl Flag {
@@ -97,6 +118,164 @@ pub fn limit_list<T>(field: &str, list: &mut Vec<T>, max: usize, flags: &mut Vec
         list.truncate(max);
         flags.push(Flag::new(field, FlagKind::Dropped { from, to: max }));
     }
+}
+
+/// Trim every item, drop its bullet or number and the empty ones, keep at most `max_items`, and
+/// cut each to `max_chars`.
+pub fn limit_items(
+    field: &str,
+    items: &mut Vec<String>,
+    max_items: usize,
+    max_chars: usize,
+    flags: &mut Vec<Flag>,
+) {
+    let cleaned: Vec<String> = items
+        .iter()
+        .map(|i| strip_marker(i.trim()).to_owned())
+        .filter(|i| !i.is_empty())
+        .collect();
+    *items = cleaned;
+    limit_list(field, items, max_items, flags);
+    for (i, item) in items.iter_mut().enumerate() {
+        limit_text(&format!("{field}[{i}]"), item, max_chars, flags);
+    }
+}
+
+/// Deeper Answer: entries with no text dropped, at most [`DEEPER_MAX`], labels cut to
+/// [`DEEPER_LABEL_CHARS`] and texts to [`DEEPER_CHARS`].
+pub fn limit_deeper(items: &mut Vec<Deeper>, flags: &mut Vec<Flag>) {
+    items.retain(|d| !d.text.trim().is_empty());
+    limit_list("deeper", items, DEEPER_MAX, flags);
+    for (i, d) in items.iter_mut().enumerate() {
+        d.label = d.label.trim().to_owned();
+        d.text = d.text.trim().to_owned();
+        limit_text(
+            &format!("deeper[{i}].label"),
+            &mut d.label,
+            DEEPER_LABEL_CHARS,
+            flags,
+        );
+        limit_text(&format!("deeper[{i}]"), &mut d.text, DEEPER_CHARS, flags);
+    }
+}
+
+/// Tradeoffs: rows with no option dropped, at most [`LIST_MAX`], each part cut to
+/// [`TRADEOFF_CHARS`].
+pub fn limit_tradeoffs(items: &mut Vec<Tradeoff>, flags: &mut Vec<Flag>) {
+    items.retain(|t| !t.option.trim().is_empty());
+    limit_list("tradeoffs", items, LIST_MAX, flags);
+    for (i, t) in items.iter_mut().enumerate() {
+        for (part, text) in [
+            ("option", &mut t.option),
+            ("pro", &mut t.pro),
+            ("con", &mut t.con),
+        ] {
+            *text = text.trim().to_owned();
+            limit_text(
+                &format!("tradeoffs[{i}].{part}"),
+                text,
+                TRADEOFF_CHARS,
+                flags,
+            );
+        }
+    }
+}
+
+/// A code field as the UI shows it: Markdown fences the model may add removed, blank lines at
+/// either end dropped, at most `max_lines` lines of at most [`CODE_LINE_CHARS`]. `None` when
+/// nothing is left.
+pub fn limit_code(
+    field: &str,
+    mut code: Example,
+    max_lines: usize,
+    flags: &mut Vec<Flag>,
+) -> Option<Example> {
+    let mut lines: Vec<String> = code.code.lines().map(str::to_owned).collect();
+    if lines
+        .first()
+        .is_some_and(|l| l.trim_start().starts_with("```"))
+    {
+        lines.remove(0);
+    }
+    while lines
+        .last()
+        .is_some_and(|l| l.trim().is_empty() || l.trim() == "```")
+    {
+        lines.pop();
+    }
+    while lines.first().is_some_and(|l| l.trim().is_empty()) {
+        lines.remove(0);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    limit_list(field, &mut lines, max_lines, flags);
+    for (i, line) in lines.iter_mut().enumerate() {
+        let line_field = format!("{field}[{i}]");
+        limit_text(&line_field, line, CODE_LINE_CHARS, flags);
+    }
+    code.code = lines.join("\n");
+    code.language = code.language.trim().to_owned();
+    Some(code)
+}
+
+/// Resume Context: keep only items whose `source` names one of `files`, the files of the chunks
+/// the request carried (the model never cites what it was not given), rewritten to that file
+/// name; then at most [`LIST_MAX`], each text cut to [`SLOW_ITEM_CHARS`]. A source matches as
+/// the file name itself, a label ending in it (`resume (resume.md)`), or the chunk's `[n]`.
+pub fn limit_citations(items: &mut Vec<ResumeContext>, files: &[String], flags: &mut Vec<Flag>) {
+    let given = std::mem::take(items);
+    for (i, mut item) in given.into_iter().enumerate() {
+        match cited_file(&item.source, files) {
+            Some(file) if !item.text.trim().is_empty() => {
+                item.source = file.to_owned();
+                item.text = item.text.trim().to_owned();
+                items.push(item);
+            }
+            _ => flags.push(Flag::new(
+                format!("resume_context[{i}]"),
+                FlagKind::Rejected,
+            )),
+        }
+    }
+    limit_list("resume_context", items, LIST_MAX, flags);
+    for (i, item) in items.iter_mut().enumerate() {
+        limit_text(
+            &format!("resume_context[{i}]"),
+            &mut item.text,
+            SLOW_ITEM_CHARS,
+            flags,
+        );
+    }
+}
+
+/// Which of `files` a model-written `source` refers to.
+fn cited_file<'a>(source: &str, files: &'a [String]) -> Option<&'a str> {
+    let s = source
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+    if s.is_empty() {
+        return None;
+    }
+    let number = s.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(n) = number.parse::<usize>() {
+        return n
+            .checked_sub(1)
+            .and_then(|i| files.get(i))
+            .map(String::as_str);
+    }
+    let lower = s.to_lowercase();
+    files
+        .iter()
+        .filter(|f| !f.is_empty())
+        .find(|f| {
+            let f = f.to_lowercase();
+            lower == f
+                || lower.ends_with(&format!("({f})"))
+                || lower.ends_with(&format!("/{f}"))
+                || lower.ends_with(&format!(" {f}"))
+        })
+        .map(String::as_str)
 }
 
 /// The job-description requirement bullets as every prompt carries them (#54): each one line,
@@ -185,15 +364,41 @@ pub fn enforce(s: &mut Suggestion) -> Vec<Flag> {
             &mut flags,
         );
     }
-    limit_list("followups", &mut s.followups, LIST_MAX, &mut flags);
-    limit_list("tradeoffs", &mut s.tradeoffs, LIST_MAX, &mut flags);
-    limit_list("mention", &mut s.mention, LIST_MAX, &mut flags);
+    limit_items(
+        "followups",
+        &mut s.followups,
+        LIST_MAX,
+        SLOW_ITEM_CHARS,
+        &mut flags,
+    );
+    limit_tradeoffs(&mut s.tradeoffs, &mut flags);
+    limit_items(
+        "mention",
+        &mut s.mention,
+        LIST_MAX,
+        SLOW_ITEM_CHARS,
+        &mut flags,
+    );
     limit_list(
         "resume_context",
         &mut s.resume_context,
         LIST_MAX,
         &mut flags,
     );
+    for (i, r) in s.resume_context.iter_mut().enumerate() {
+        limit_text(
+            &format!("resume_context[{i}]"),
+            &mut r.text,
+            SLOW_ITEM_CHARS,
+            &mut flags,
+        );
+    }
+    if let Some(example) = s.example.take() {
+        s.example = limit_code("example.code", example, EXAMPLE_LINES, &mut flags);
+    }
+    if let Some(solution) = s.solution.take() {
+        s.solution = limit_code("solution.code", solution, SOLUTION_LINES, &mut flags);
+    }
     if let Some(star) = s.star.as_mut() {
         limit_star(star, &mut flags);
     }
@@ -359,5 +564,137 @@ mod tests {
         let before = s.clone();
         assert!(enforce(&mut s).is_empty());
         assert_eq!(s, before);
+    }
+
+    // --- Slow phase (#55) ------------------------------------------------------------------
+
+    #[test]
+    fn slow_list_items_are_cut_at_a_sentence_and_flagged_never_a_wall() {
+        let wall = "Ask how the counters are sharded. Then ask about the failure mode when a \
+                    region is cut off. "
+            .repeat(5);
+        let mut items = vec![
+            " 1. What if Redis is down?".to_owned(),
+            "   ".to_owned(),
+            wall.clone(),
+        ];
+        let mut flags = Vec::new();
+        limit_items(
+            "followups",
+            &mut items,
+            LIST_MAX,
+            SLOW_ITEM_CHARS,
+            &mut flags,
+        );
+        assert_eq!(items[0], "What if Redis is down?", "marker stripped");
+        assert_eq!(items.len(), 2, "the blank one dropped");
+        assert!(items[1].chars().count() <= SLOW_ITEM_CHARS);
+        assert!(items[1].ends_with('.'), "cut at a sentence: {}", items[1]);
+        assert!(flags.iter().any(|f| f.field == "followups[1]"));
+
+        let mut many = vec!["a".to_owned(); 9];
+        limit_items("mention", &mut many, LIST_MAX, SLOW_ITEM_CHARS, &mut flags);
+        assert_eq!(many.len(), LIST_MAX);
+    }
+
+    #[test]
+    fn deeper_and_tradeoffs_are_capped_per_part() {
+        let long = "word ".repeat(80);
+        let mut deeper = vec![
+            Deeper {
+                label: long.clone(),
+                text: long.clone(),
+            },
+            Deeper {
+                label: "empty".into(),
+                text: "  ".into(),
+            },
+        ];
+        let mut flags = Vec::new();
+        limit_deeper(&mut deeper, &mut flags);
+        assert_eq!(deeper.len(), 1, "an entry with no text is dropped");
+        assert!(deeper[0].label.chars().count() <= DEEPER_LABEL_CHARS);
+        assert!(deeper[0].text.chars().count() <= DEEPER_CHARS);
+
+        let mut tradeoffs = vec![
+            Tradeoff {
+                option: "Redis".into(),
+                pro: long.clone(),
+                con: "one hop".into(),
+            },
+            Tradeoff::default(),
+        ];
+        limit_tradeoffs(&mut tradeoffs, &mut flags);
+        assert_eq!(tradeoffs.len(), 1, "a row with no option is dropped");
+        assert!(tradeoffs[0].pro.chars().count() <= TRADEOFF_CHARS);
+        assert!(flags.iter().any(|f| f.field == "tradeoffs[0].pro"));
+    }
+
+    #[test]
+    fn code_loses_its_fences_and_is_capped_in_lines() {
+        let body: Vec<String> = (0..60).map(|i| format!("line_{i} = {i}")).collect();
+        let code = Example {
+            language: " python ".into(),
+            code: format!("```python\n{}\n```\n", body.join("\n")),
+        };
+        let mut flags = Vec::new();
+        let out = limit_code("solution.code", code, SOLUTION_LINES, &mut flags).unwrap();
+        assert_eq!(out.language, "python");
+        assert_eq!(out.code.lines().count(), SOLUTION_LINES);
+        assert!(out.code.starts_with("line_0"), "{}", out.code);
+        assert!(!out.code.contains("```"));
+        assert!(flags.iter().any(|f| f.field == "solution.code"
+            && f.kind
+                == FlagKind::Dropped {
+                    from: 60,
+                    to: SOLUTION_LINES
+                }));
+
+        let blank = Example {
+            language: "text".into(),
+            code: "\n  \n".into(),
+        };
+        assert_eq!(
+            limit_code("example.code", blank, EXAMPLE_LINES, &mut flags),
+            None
+        );
+    }
+
+    #[test]
+    fn resume_context_keeps_only_citations_of_files_the_request_carried() {
+        let files = vec!["resume.md".to_owned(), "system-design.md".to_owned()];
+        let item = |source: &str| ResumeContext {
+            source: source.into(),
+            text: "Led the migration to Kafka.".into(),
+        };
+        let mut items = vec![
+            item("resume.md"),
+            item("resume (RESUME.md)"),
+            item("[2]"),
+            item("linkedin.pdf"),
+            item("[7]"),
+            item(""),
+        ];
+        let mut flags = Vec::new();
+        limit_citations(&mut items, &files, &mut flags);
+        let sources: Vec<&str> = items.iter().map(|i| i.source.as_str()).collect();
+        assert_eq!(sources, ["resume.md", "resume.md", "system-design.md"]);
+        let rejected: Vec<&str> = flags
+            .iter()
+            .filter(|f| f.kind == FlagKind::Rejected)
+            .map(|f| f.field.as_str())
+            .collect();
+        assert_eq!(
+            rejected,
+            [
+                "resume_context[3]",
+                "resume_context[4]",
+                "resume_context[5]"
+            ]
+        );
+
+        let mut none_given = vec![item("resume.md")];
+        limit_citations(&mut none_given, &[], &mut flags);
+        assert!(none_given.is_empty(), "no chunks, nothing can be cited");
     }
 }

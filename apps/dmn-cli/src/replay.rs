@@ -183,6 +183,16 @@ pub fn print_downstream(report: &Report, paths: &Paths) {
                 t.retrieval_slowest.as_secs_f64() * 1000.0,
                 t.retrieval_mean().as_secs_f64() * 1000.0
             );
+            // #55: the six sections, filled after each fast phase and never ahead of one.
+            println!(
+                "slow phase   {} filled, {} slow (deadline), {} failed, {} restart(s) for a newer question, {} not run; slowest {:.2} s (budget 20 s)",
+                t.slow_done,
+                t.slow_timed_out,
+                t.slow_failed,
+                t.slow_restarts,
+                t.slow_dropped,
+                t.slow_slowest.as_secs_f64()
+            );
         }
         None => println!("fast phase   off (--no-llm)"),
     }
@@ -296,6 +306,14 @@ fn print_summary_json(report: &Report, audio: Duration) {
                 "retrievals": t.retrievals,
                 "retrieval_slowest_us": t.retrieval_slowest.as_micros() as u64,
                 "retrieval_mean_us": t.retrieval_mean().as_micros() as u64,
+                "slow": {
+                    "done": t.slow_done,
+                    "timed_out": t.slow_timed_out,
+                    "failed": t.slow_failed,
+                    "restarts": t.slow_restarts,
+                    "not_run": t.slow_dropped,
+                    "slowest_ms": t.slow_slowest.as_millis() as u64,
+                },
             })),
             "session": report.session.map(|r| serde_json::json!({
                 "id": r.session_id,
