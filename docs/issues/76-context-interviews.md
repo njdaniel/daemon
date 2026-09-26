@@ -2,7 +2,7 @@
 
 Labels: `size:M, model:opus, m2, lane:infra, backlog`
 
-Proposed 2026-09-26 (not yet on GitHub). Prompted by the M2 live-run prep: the store keeps one job description, so preparing for several companies means overwriting it before each interview and losing the previous one, and every company's notes share one retrieval pool. Decisions taken with the user: folder convention for ingestion, stories global by default, the command stays under `dmn sources`. The M3 Context view's `[COMPANY]` subtitle and per-source "Use" checkboxes (docs/design/Context.dc.html) build on this model.
+Proposed 2026-09-26 as a backlog item. Prompted by the M2 live-run prep: the store keeps one job description, so preparing for several companies means overwriting it before each interview and losing the previous one, and every company's notes share one retrieval pool. Decisions taken with the user: folder convention for ingestion, stories global by default, the command stays under `dmn sources`. The M3 Context view's `[COMPANY]` subtitle and per-source "Use" checkboxes (docs/design/Context.dc.html) build on this model.
 
 ## Goal
 Keep one named set of sources per company/interview (its job description, notes and, optionally, its own stories), switch between them with one command, and let a running session follow the switch between questions (SPEC § Context and LLM, Sources; § Data, config and privacy).
