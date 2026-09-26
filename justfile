@@ -36,24 +36,31 @@ fixtures *names:
     cd tools && uv run python fixtures/generate.py {{names}}
     cd tools && uv run python fixtures/verify.py {{names}}
 
-# Download the fixture WAVs from the fixtures-v1 release when any are missing (CI uses this)
+# Download the fixture WAVs from their releases when any are missing (CI uses this):
+# fixtures-v1 holds sysdesign, behavioral and mixed; fixtures-v2 adds continuous (#63)
 fixtures-fetch:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "{{justfile_directory()}}"
-    missing=0
-    for f in sysdesign behavioral mixed; do
-      for r in interviewer candidate; do [ -f "testdata/$f/$r.wav" ] || missing=1; done
-    done
-    if [ "$missing" = 0 ]; then echo "fixtures present"; exit 0; fi
-    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-    # The repo is private, so prefer an authenticated gh download; fall back to a plain URL.
-    if command -v gh >/dev/null && gh release download fixtures-v1 -p fixtures-v1.tar.gz -D "$tmp" 2>/dev/null; then :
-    else curl -fsSL -o "$tmp/fixtures-v1.tar.gz" https://github.com/njdaniel/daemon/releases/download/fixtures-v1/fixtures-v1.tar.gz
-    fi
-    (cd "$tmp" && sed 's#  .*#  fixtures-v1.tar.gz#' "{{justfile_directory()}}/testdata/fixtures-v1.sha256" | sha256sum -c --quiet)
-    tar -xzf "$tmp/fixtures-v1.tar.gz"
-    echo "fixtures unpacked into testdata/"
+    tmps=(); trap 'rm -rf "${tmps[@]}"' EXIT  # also on a failed download or checksum
+    fetch() { # <release> <fixture…>: download and unpack the release when one of its fixtures is missing
+      local rel=$1; shift
+      local missing=0
+      for f in "$@"; do
+        for r in interviewer candidate; do [ -f "testdata/$f/$r.wav" ] || missing=1; done
+      done
+      if [ "$missing" = 0 ]; then echo "$rel: fixtures present"; return; fi
+      local tmp; tmp=$(mktemp -d); tmps+=("$tmp")
+      # The repo is private, so prefer an authenticated gh download; fall back to a plain URL.
+      if command -v gh >/dev/null && gh release download "$rel" -R njdaniel/daemon -p "$rel.tar.gz" -D "$tmp" 2>/dev/null; then :
+      else curl -fsSL -o "$tmp/$rel.tar.gz" "https://github.com/njdaniel/daemon/releases/download/$rel/$rel.tar.gz"
+      fi
+      (cd "$tmp" && sed "s#  .*#  $rel.tar.gz#" "{{justfile_directory()}}/testdata/$rel.sha256" | sha256sum -c --quiet)
+      tar -xzf "$tmp/$rel.tar.gz"
+      echo "$rel: unpacked into testdata/"
+    }
+    fetch fixtures-v1 sysdesign behavioral mixed
+    fetch fixtures-v2 continuous
 
 # Offline eval: recall / precision / latency on the fixtures
 eval:
