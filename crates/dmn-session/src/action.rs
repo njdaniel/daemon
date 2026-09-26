@@ -318,6 +318,10 @@ pub enum Action {
     /// candidate id and replace that question in place, pinned or not; until the new question
     /// arrives the old Approach stays, dimmed.
     Regenerate { candidate: u64 },
+    /// Keys `1`–`6` (#56): open `section` under the live question's Approach, closing the one
+    /// that was open, or close it if it is the open one. A row that is not on screen (no slow
+    /// phase yet, or nothing for this question) does not open.
+    ToggleSection { section: Section },
     /// `p`: pin the live question; new questions queue behind it.
     Pin,
     /// The coding-solutions mode from now on: dispatched once after `Started` (from the config

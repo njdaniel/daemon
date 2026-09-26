@@ -1,12 +1,13 @@
 //! Area 3: the last two transcript lines, then the status dots and shortcuts.
 
-use dmn_session::{Health, Line as TranscriptLine, Speaker};
+use dmn_session::{Health, Line as TranscriptLine, Section, Speaker};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
+use super::sections::key_of;
 use super::text::{truncate, truncate_front, width};
 use super::{Mode, View};
 
@@ -125,15 +126,33 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
 /// the two most useful shortcuts for the current state"). While a coding question is on screen
 /// the second one is `s` with the coding-solutions mode it would switch from (#50), so which
 /// mode Deeper Answer follows is always visible.
+///
+/// Once the live question has section rows (#56), the first key is about them: `1–6 more`
+/// while all are closed, or the open one's own key to close it (`2 close`).
 fn shortcuts(view: &View<'_>) -> String {
     let coding = view.live().is_some_and(|q| q.kind == CODING);
     let solutions = view.session.coding_solutions.label();
-    let pair = match (view.mode, view.loading, coding) {
-        (Mode::Pinned, _, true) => format!("p unpin · s: {solutions}"),
-        (Mode::Live, _, true) => format!("p pin · s: {solutions}"),
-        (Mode::Pinned, _, false) => "p unpin · r redo".to_owned(),
-        (Mode::Live, false, false) => "p pin · r redo".to_owned(),
-        (Mode::Live, true, false) | (Mode::Listening, _, _) => "m mute · q quit".to_owned(),
+    let sections = view.live().and_then(|q| {
+        let visible = |s: &Section| q.sections.visible(*s);
+        match q.open.filter(visible) {
+            Some(open) => Some(format!("{} close", key_of(open))),
+            None => Section::ALL
+                .iter()
+                .any(visible)
+                .then(|| "1–6 more".to_owned()),
+        }
+    });
+    let pin = if view.mode == Mode::Pinned {
+        "p unpin"
+    } else {
+        "p pin"
+    };
+    let pair = match (view.mode, view.loading, coding, sections) {
+        (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
+        (_, _, true, Some(sec)) => format!("{sec} · s: {solutions}"),
+        (_, _, true, None) => format!("{pin} · s: {solutions}"),
+        (_, _, false, Some(sec)) => format!("{sec} · {pin}"),
+        (_, _, false, None) => format!("{pin} · r redo"),
     };
     format!("{pair} ")
 }

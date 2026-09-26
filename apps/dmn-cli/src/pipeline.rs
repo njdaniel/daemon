@@ -39,7 +39,7 @@ use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
 use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
 use dmn_llm::{CurrentQuestion, Kind};
-use dmn_session::{Action, CodingSolutions, Dot, Health, SessionHub, Stage};
+use dmn_session::{Action, CodingSolutions, Dot, Health, Section, SessionHub, Stage};
 use dmn_stt::{Model, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber, model_path};
 use dmn_transcript::{Bus, DEFAULT_WINDOW, Segment, TranscriptLog};
 use dmn_vad::{
@@ -377,6 +377,13 @@ impl Controls {
     pub fn toggle_coding_solutions(&self) {
         let mode = self.hub.snapshot().coding_solutions.toggled();
         self.hub.dispatch(Action::CodingSolutions { mode });
+    }
+
+    /// `1`–`6`: open `section` under the live question's Approach (closing the open one), or
+    /// close it (#56). The reducer ignores a row that is not on screen; one action per press,
+    /// so the session log replays to the same screen.
+    pub fn toggle_section(&self, section: Section) {
+        self.hub.dispatch(Action::ToggleSection { section });
     }
 
     #[cfg(test)]

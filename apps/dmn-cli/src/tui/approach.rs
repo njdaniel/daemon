@@ -14,21 +14,47 @@ use super::{Mode, View};
 /// lines are ≤ 90 characters (`dmn-llm` limits), so two rows hold one even at 80 columns.
 const ROWS_PER_ITEM: usize = 2;
 
-pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
-    let star = view
-        .live()
-        .and_then(|q| q.star.as_ref().filter(|_| q.approach.is_empty()));
-    let title = if star.is_some() {
-        " STAR "
-    } else {
-        " APPROACH "
+/// The border and the one-cell padding on each side.
+const FRAME_CELLS: u16 = 4;
+/// The top and bottom border.
+const FRAME_ROWS: u16 = 2;
+
+/// The STAR cards when the live question has them in place of an Approach.
+fn star<'a>(view: &View<'a>) -> Option<&'a StarCards> {
+    view.live()
+        .and_then(|q| q.star.as_ref().filter(|_| q.approach.is_empty()))
+}
+
+/// Rows the block would like at `area_width`: its content plus the border. An open section
+/// (#56) takes the rest of the area, down to a floor the caller sets.
+pub(super) fn rows_needed(view: &View<'_>, area_width: u16) -> u16 {
+    let cells = usize::from(area_width.saturating_sub(FRAME_CELLS));
+    let lines = u16::try_from(content(view, cells).len()).unwrap_or(u16::MAX);
+    lines.saturating_add(FRAME_ROWS)
+}
+
+/// The numbered Approach, the STAR cards, or a note while there is nothing to show yet.
+fn content(view: &View<'_>, cells: usize) -> Vec<Line<'static>> {
+    let mut lines = match (view.live(), star(view)) {
+        (Some(_), Some(cards)) => star_lines(cards, cells),
+        (Some(q), None) => approach_lines(q, cells),
+        (None, _) => Vec::new(),
     };
-    let mut block = Block::bordered()
-        .padding(Padding::horizontal(1))
-        .title(Line::from(Span::styled(
-            title,
-            Style::new().add_modifier(Modifier::BOLD),
+    if lines.is_empty() && !view.loading {
+        let note = match view.mode {
+            Mode::Listening => "The Approach appears here when the interviewer asks a question.",
+            Mode::Live | Mode::Pinned => "…",
+        };
+        lines.push(Line::from(Span::styled(
+            truncate(note, cells),
+            Style::new().fg(Color::DarkGray),
         )));
+    }
+    lines
+}
+
+pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
+    let cards = star(view);
     let hint = if view.loading {
         Some("thinking…")
     } else if view.streaming {
@@ -36,6 +62,23 @@ pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     } else {
         None
     };
+    // SPEC § AI Assistance: the STAR block names the matched story in its header (#58 fills
+    // it; the fast phase's `story` shows here until then).
+    let title = match cards.and_then(|c| c.story.as_deref().filter(|s| !s.is_empty())) {
+        Some(story) => {
+            let room = usize::from(area.width)
+                .saturating_sub(usize::from(FRAME_CELLS) + hint.map_or(0, |h| width(h) + 2));
+            truncate(&format!(" STAR · {story} "), room)
+        }
+        None if cards.is_some() => " STAR ".to_owned(),
+        None => " APPROACH ".to_owned(),
+    };
+    let mut block = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .title(Line::from(Span::styled(
+            title,
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
     if let Some(h) = hint {
         block = block.title(
             Line::from(Span::styled(
@@ -48,19 +91,14 @@ pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let cells = usize::from(inner.width);
-    let mut lines = match (view.live(), star) {
-        (Some(_), Some(cards)) => star_lines(cards, cells),
-        (Some(q), None) => approach_lines(q, cells),
-        (None, _) => Vec::new(),
-    };
-    if lines.is_empty() && !view.loading {
-        let note = match view.mode {
-            Mode::Listening => "The Approach appears here when the interviewer asks a question.",
-            Mode::Live | Mode::Pinned => "…",
-        };
+    let mut lines = content(view, usize::from(inner.width));
+    let room = usize::from(inner.height);
+    if lines.len() > room && room > 0 {
+        // Cut to the block with a visible mark, never silently: an open section (#56) on a
+        // small terminal can leave fewer rows than the Approach has.
+        lines.truncate(room - 1);
         lines.push(Line::from(Span::styled(
-            truncate(note, cells),
+            "…",
             Style::new().fg(Color::DarkGray),
         )));
     }
@@ -120,12 +158,6 @@ fn approach_lines(q: &Question, cells: usize) -> Vec<Line<'static>> {
 fn star_lines(cards: &StarCards, cells: usize) -> Vec<Line<'static>> {
     let letter = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let mut out = Vec::new();
-    if let Some(story) = cards.story.as_deref().filter(|s| !s.is_empty()) {
-        out.push(Line::from(Span::styled(
-            truncate(&format!("Story: {story}"), cells),
-            Style::new().fg(Color::DarkGray),
-        )));
-    }
     for (mark, text, style) in [
         ("S  ", &cards.situation, Style::new()),
         ("T  ", &cards.task, Style::new()),

@@ -95,6 +95,11 @@ pub struct Sections {
     pub mention: Vec<String>,
     pub resume_context: Vec<Citation>,
     pub states: SectionStates,
+    /// A slow phase has started for this question. Until then the sections are not shown at all:
+    /// a question answered with the slow phase off (`slow_timeout_ms = 0`) or an M1-era log has
+    /// no rows, rather than six "…" hints that never resolve.
+    #[serde(default)]
+    pub started: bool,
 }
 
 impl Sections {
@@ -106,6 +111,22 @@ impl Sections {
 
     pub fn state(&self, section: Section) -> &SectionState {
         self.states.get(section)
+    }
+
+    /// Whether `section`'s row is on screen (#56, SPEC § AI Assistance): only once a slow phase
+    /// has started; a row still loading shows (with its "…" hint), a row that timed out shows
+    /// (with its "slow" tag), and a row with nothing for this question is hidden. A failed row
+    /// shows only what it already had: errors appear only as status dots.
+    pub fn visible(&self, section: Section) -> bool {
+        if !self.started {
+            return false;
+        }
+        match self.state(section) {
+            SectionState::Loading | SectionState::Slow => true,
+            SectionState::Done | SectionState::Empty | SectionState::Failed(_) => {
+                self.has_content(section)
+            }
+        }
     }
 
     /// Whether `section` has anything to show.
@@ -122,6 +143,7 @@ impl Sections {
 
     /// Store one field and settle its section: done when it has content, empty when not.
     fn set(&mut self, field: &SlowField) {
+        self.started = true;
         let section = match field {
             SlowField::Deeper { items } => {
                 self.deeper = items.clone();
@@ -165,6 +187,7 @@ impl Sections {
 
     /// A new (or restarted) slow phase: every section is loading again, content kept.
     fn start(&mut self) {
+        self.started = true;
         // Content stays until the new phase replaces it; a solution goes when the new Deeper
         // Answer arrives (see `set`).
         for section in Section::ALL {
@@ -213,6 +236,11 @@ pub struct Question {
     /// The six expandable sections the slow phase fills (#55).
     #[serde(default, skip_serializing_if = "Sections::is_untouched")]
     pub sections: Sections,
+    /// The one section expanded under this question's Approach (#56), set only by a key press
+    /// ([`Action::ToggleSection`]). Per question, so a new question always starts collapsed:
+    /// nothing expands on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<Section>,
 }
 
 impl Question {
@@ -228,6 +256,15 @@ impl Question {
             progress: Progress::Streaming,
             regenerating: false,
             sections: Sections::default(),
+            open: None,
+        }
+    }
+
+    /// Close the open section if its row is no longer on screen (it settled empty, or failed
+    /// with nothing), so `open` always names a row the UI shows. Closing is not expanding.
+    fn settle_open(&mut self) {
+        if self.open.is_some_and(|s| !self.sections.visible(s)) {
+            self.open = None;
         }
     }
 }
@@ -394,6 +431,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
             // sections stay until the new slow phase replaces them (#55).
             if let Some(existing) = s.question_mut(*candidate) {
                 q.sections = std::mem::take(&mut existing.sections);
+                q.open = existing.open;
                 *existing = q;
                 return;
             }
@@ -475,11 +513,23 @@ pub fn reduce(s: &mut Session, action: &Action) {
         Action::Slow { candidate, field } => {
             if let Some(q) = s.question_mut(*candidate) {
                 q.sections.set(field);
+                q.settle_open();
             }
         }
         Action::SlowEnded { candidate, end, .. } => {
             if let Some(q) = s.question_mut(*candidate) {
                 q.sections.end(end);
+                q.settle_open();
+            }
+        }
+        Action::ToggleSection { section } => {
+            if let Some(q) = s.live.as_mut() {
+                if q.open == Some(*section) {
+                    q.open = None;
+                } else if q.sections.visible(*section) {
+                    // Opening one closes the other: exactly one open at a time.
+                    q.open = Some(*section);
+                }
             }
         }
         Action::Regenerate { candidate } => {

@@ -24,7 +24,7 @@ use std::time::Duration;
 use dmn_audio::CaptureTarget;
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths};
-use dmn_session::{CodingSolutions, Session};
+use dmn_session::{CodingSolutions, Section, Session};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::watch;
 
@@ -73,6 +73,8 @@ pub enum Key {
     Mute,
     /// `s`: coding solutions hints ↔ full (#50).
     Solutions,
+    /// `1`–`6`: open that section under the Approach, or close it (#56).
+    Section(Section),
     Quit,
 }
 
@@ -90,6 +92,11 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('r' | 'R') => Some(Key::Regenerate),
         KeyCode::Char('m' | 'M') => Some(Key::Mute),
         KeyCode::Char('s' | 'S') => Some(Key::Solutions),
+        // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
+        KeyCode::Char(c @ '1'..='6') => c
+            .to_digit(10)
+            .and_then(|d| Section::ALL.get(usize::try_from(d).ok()? - 1))
+            .map(|s| Key::Section(*s)),
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Key::Quit),
         _ => None,
     }
@@ -102,6 +109,7 @@ pub fn press(k: Key, controls: &Controls) -> bool {
         Key::Regenerate => controls.regenerate(),
         Key::Mute => controls.toggle_mute(),
         Key::Solutions => controls.toggle_coding_solutions(),
+        Key::Section(s) => controls.toggle_section(s),
         Key::Quit => {
             controls.quit();
             return true;
@@ -562,6 +570,92 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("--duration"), "{err}");
+    }
+
+    #[test]
+    fn keys_1_to_6_open_one_section_at_a_time_on_screen() {
+        use dmn_session::{DeeperItem, SlowEnd, SlowField};
+        assert_eq!(key(press_key('1')), Some(Key::Section(Section::Deeper)));
+        assert_eq!(
+            key(press_key('6')),
+            Some(Key::Section(Section::ResumeContext))
+        );
+        assert_eq!(key(press_key('7')), None);
+        assert_eq!(key(press_key('0')), None);
+
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        hub.dispatch(Action::Question {
+            candidate: 1,
+            text: "How would you design a cache?".into(),
+            kind: "system_design".into(),
+        });
+        hub.dispatch(Action::ApproachLine {
+            candidate: 1,
+            index: 0,
+            text: "Pick an eviction policy.".into(),
+        });
+        hub.dispatch(Action::SlowStarted { candidate: 1 });
+        for field in [
+            SlowField::Deeper {
+                items: vec![DeeperItem {
+                    label: "Eviction".into(),
+                    text: "LRU with a sampled clock hand.".into(),
+                }],
+            },
+            SlowField::Followups {
+                items: vec!["What about TTLs?".into()],
+            },
+        ] {
+            hub.dispatch(Action::Slow {
+                candidate: 1,
+                field,
+            });
+        }
+        hub.dispatch(Action::SlowEnded {
+            candidate: 1,
+            end: SlowEnd::Done,
+            payload: "{}".into(),
+            at: 0,
+        });
+        let before = screen(&hub.snapshot());
+        assert!(before.contains("1 ▸ Deeper Answer"), "{before}");
+        assert!(
+            !before.contains("LRU with a sampled"),
+            "nothing is open until a key is pressed:\n{before}"
+        );
+
+        assert!(!press(key(press_key('1')).unwrap(), &controls));
+        let one = screen(&hub.snapshot());
+        assert!(one.contains("1 ▾ Deeper Answer"), "{one}");
+        assert!(
+            one.contains("Eviction: LRU with a sampled clock hand."),
+            "{one}"
+        );
+        assert!(
+            one.contains("1 close"),
+            "the footer offers to close it:\n{one}"
+        );
+
+        press(key(press_key('2')).unwrap(), &controls);
+        let two = screen(&hub.snapshot());
+        assert!(two.contains("• What about TTLs?"), "{two}");
+        assert!(
+            !two.contains("LRU with a sampled"),
+            "opening the second closed the first:\n{two}"
+        );
+
+        press(key(press_key('3')).unwrap(), &controls);
+        assert_eq!(
+            hub.snapshot().live.and_then(|q| q.open),
+            Some(Section::Followups),
+            "3 is Tradeoffs, which had nothing and is hidden: the key does nothing"
+        );
+
+        press(key(press_key('2')).unwrap(), &controls);
+        let closed = screen(&hub.snapshot());
+        assert!(!closed.contains("• What about TTLs?"), "{closed}");
+        assert!(closed.contains("1–6 more"), "{closed}");
     }
 
     #[test]

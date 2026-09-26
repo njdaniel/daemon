@@ -1,0 +1,24 @@
+┌ LIVE QUESTION ─────────────────────────────────────────────────────── coding ┐
+│ Given a stream of integers, return the median after each one arrives.        │
+│ Focus: two heaps, balancing, O(log n) insert                                 │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────┐
+│ 1  Keep a max-heap of the lower half and a min-heap of the upper half.       │
+│ 2  Insert into one heap, then move its top across so the sizes differ by ≤   │
+│    1.                                                                        │
+│ 3  The median is the larger heap's top, or the mean of both tops.            │
+│ 4  Each insert is O(log n); reading the median is O(1).                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+  1 ▾ Deeper Answer
+      Insight: Balance two heaps so the median is always at a top: O(log n)
+      per insert, O(1) to read.
+      Solution · python
+      import heapq
+
+      …
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+You         Sounds great.
+You         So I'd split the numbers into two halves around the median.
+ ● mic  ● system  ● model                                     1 close · s: full

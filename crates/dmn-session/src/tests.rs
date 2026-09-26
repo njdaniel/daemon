@@ -825,3 +825,163 @@ fn a_session_saved_before_sections_existed_still_loads() {
     let back: Session = serde_json::from_value(v).unwrap();
     assert_eq!(back, s);
 }
+
+// --- Sections on screen (#56) ------------------------------------------------------------------
+
+fn toggle(section: Section) -> Action {
+    Action::ToggleSection { section }
+}
+
+fn open_section(log: &[Action]) -> Option<Section> {
+    Session::replay(log).live.and_then(|q| q.open)
+}
+
+#[test]
+fn rows_show_only_once_a_slow_phase_has_started() {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["a", "b", "c"]));
+    let q = Session::replay(&log).live.unwrap();
+    assert!(
+        Section::ALL.iter().all(|s| !q.sections.visible(*s)),
+        "no slow phase (off, or an M1 log): no rows, not six \"…\" hints for ever"
+    );
+    log.push(toggle(Section::Deeper));
+    assert_eq!(
+        open_section(&log),
+        None,
+        "a row not on screen does not open"
+    );
+
+    log.push(Action::SlowStarted { candidate: 1 });
+    let q = Session::replay(&log).live.unwrap();
+    assert!(
+        Section::ALL.iter().all(|s| q.sections.visible(*s)),
+        "loading rows show"
+    );
+}
+
+#[test]
+fn settled_rows_hide_when_empty_and_keep_a_slow_or_filled_row() {
+    let q = Session::replay(&sections_log(SlowEnd::TimedOut))
+        .live
+        .unwrap();
+    assert!(q.sections.visible(Section::Deeper), "filled");
+    assert!(q.sections.visible(Section::Followups), "filled");
+    assert!(!q.sections.visible(Section::Tradeoffs), "empty: hidden");
+    assert!(q.sections.visible(Section::Example), "timed out: slow tag");
+
+    let q = Session::replay(&sections_log(SlowEnd::Failed("boom".into())))
+        .live
+        .unwrap();
+    assert!(
+        q.sections.visible(Section::Deeper),
+        "failed but has content"
+    );
+    assert!(
+        !q.sections.visible(Section::Example),
+        "failed with nothing: hidden, the error shows only as a dot"
+    );
+}
+
+#[test]
+fn opening_a_second_section_closes_the_first_and_its_own_key_closes_it() {
+    let mut log = sections_log(SlowEnd::Done);
+    log.push(toggle(Section::Deeper));
+    assert_eq!(open_section(&log), Some(Section::Deeper));
+    log.push(toggle(Section::Followups));
+    assert_eq!(
+        open_section(&log),
+        Some(Section::Followups),
+        "one open at a time"
+    );
+    log.push(toggle(Section::Followups));
+    assert_eq!(open_section(&log), None, "its own key closes it");
+    log.push(toggle(Section::Tradeoffs));
+    assert_eq!(
+        open_section(&log),
+        None,
+        "an empty, hidden row does not open"
+    );
+}
+
+#[test]
+fn slow_content_arriving_never_changes_which_section_is_open() {
+    // Nothing open: every field of a slow phase arrives and nothing expands.
+    let log = sections_log(SlowEnd::Done);
+    assert_eq!(open_section(&log), None);
+
+    // One open while loading: the other fields arriving leave it as it is.
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 1 });
+    log.push(toggle(Section::Followups));
+    log.push(slow(1, deeper("Evict with LRU.")));
+    log.push(slow(
+        1,
+        SlowField::Followups {
+            items: vec!["What about TTLs?".into()],
+        },
+    ));
+    log.push(slow_ended(1, SlowEnd::Done));
+    assert_eq!(open_section(&log), Some(Section::Followups));
+}
+
+#[test]
+fn an_open_row_that_settles_empty_closes() {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 1 });
+    log.push(toggle(Section::Tradeoffs));
+    assert_eq!(
+        open_section(&log),
+        Some(Section::Tradeoffs),
+        "a loading row opens"
+    );
+    log.push(slow(1, SlowField::Tradeoffs { items: vec![] }));
+    assert_eq!(
+        open_section(&log),
+        None,
+        "it had nothing, so its row went away"
+    );
+}
+
+#[test]
+fn a_new_question_starts_collapsed_and_a_regenerate_keeps_the_open_row() {
+    let mut log = sections_log(SlowEnd::Done);
+    log.push(toggle(Section::Deeper));
+    // `r`: the same question is answered again in place; the row the user opened stays open.
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(
+        1,
+        "How would you design a cache, again?",
+        &["x", "y", "z"],
+    ));
+    assert_eq!(open_section(&log), Some(Section::Deeper));
+
+    // A new question replaces it: collapsed, whatever was open before.
+    log.push(candidate(2, 40.0, "Design a queue?"));
+    log.extend(shown(2, "How would you design a queue?", &["a", "b", "c"]));
+    log.push(Action::SlowStarted { candidate: 2 });
+    log.push(slow(2, deeper("Use a log.")));
+    assert_eq!(open_section(&log), None);
+}
+
+#[test]
+fn section_toggles_replay_identically_through_json_lines() {
+    let mut log = sections_log(SlowEnd::Done);
+    log.extend([toggle(Section::Deeper), toggle(Section::Followups)]);
+    let jsonl: Vec<String> = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap())
+        .collect();
+    assert!(
+        jsonl
+            .iter()
+            .any(|l| l.contains(r#""type":"toggle_section""#) && l.contains(r#""followups""#))
+    );
+    let parsed: Vec<Action> = jsonl
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(Session::replay(&parsed), Session::replay(&log));
+}
