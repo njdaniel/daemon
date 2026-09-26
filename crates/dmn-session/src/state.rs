@@ -125,6 +125,10 @@ impl Sections {
         let section = match field {
             SlowField::Deeper { items } => {
                 self.deeper = items.clone();
+                // A new Deeper Answer replaces the old one whole, solution included: `solution`
+                // is the last field of the schema, so a phase that has one sends it after this.
+                // A regenerate in hints mode (or a model that sent none) never shows the old code.
+                self.solution = None;
                 Section::Deeper
             }
             SlowField::Solution { code } => {
@@ -161,8 +165,8 @@ impl Sections {
 
     /// A new (or restarted) slow phase: every section is loading again, content kept.
     fn start(&mut self) {
-        // A restarted phase answers the question afresh, so a solution from an earlier run does
-        // not linger once the new Deeper Answer arrives without one; until then it stays.
+        // Content stays until the new phase replaces it; a solution goes when the new Deeper
+        // Answer arrives (see `set`).
         for section in Section::ALL {
             *self.states.get_mut(section) = SectionState::Loading;
         }

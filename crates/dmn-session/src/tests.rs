@@ -736,6 +736,22 @@ fn a_solution_belongs_to_deeper_answer() {
     let q = Session::replay(&log).live.unwrap();
     assert!(q.sections.solution.is_some());
     assert_eq!(*q.sections.state(Section::Deeper), SectionState::Done);
+
+    // `s` to hints, then `r`: the new slow phase sends a Deeper Answer and no solution. The old
+    // code must not stay on screen beside the new hints.
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(1, "Two sum?", &["x", "y", "z"]));
+    log.push(Action::SlowStarted { candidate: 1 });
+    let q = Session::replay(&log).live.unwrap();
+    assert!(
+        q.sections.solution.is_some(),
+        "kept while the new phase loads"
+    );
+    log.push(slow(1, deeper("Use a hash map.")));
+    log.push(slow_ended(1, SlowEnd::Done));
+    let q = Session::replay(&log).live.unwrap();
+    assert_eq!(q.sections.solution, None, "the new Deeper Answer replaced it");
+    assert_eq!(q.sections.deeper[0].text, "Use a hash map.");
 }
 
 #[test]
