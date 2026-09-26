@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::action::{
-    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason, Section,
-    SectionState, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
+    ProviderLabel, Section, SectionState, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
 };
 use crate::memory::{self, Promise, SummaryLine};
 
@@ -339,6 +339,9 @@ pub struct Status {
     /// Ring-buffer frames dropped so far (#16); shown beside the dots while non-zero.
     #[serde(default)]
     pub overruns: u64,
+    /// The provider answering (#59); `None` until the suggester has one (and in M1 logs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderLabel>,
 }
 
 /// Running totals, for the status line and the end-of-run summary.
@@ -722,6 +725,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
             *slot = health.clone();
         }
         Action::Overruns { total } => s.status.overruns = *total,
+        Action::Provider { label } => s.status.provider = Some(label.clone()),
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } => {}
