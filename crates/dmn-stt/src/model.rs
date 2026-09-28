@@ -53,7 +53,7 @@ pub fn deadline_for(model: Model) -> Duration {
 }
 
 /// Comma-separated list for error messages.
-pub const KNOWN_NAMES: &str = "tiny.en, base.en, small.en, medium.en (English only); tiny, base, small, medium, large-v3-turbo (multilingual)";
+pub const KNOWN_NAMES: &str = "tiny.en, base.en, small.en, medium.en (English only); tiny, base, small, medium (multilingual, translate to English); large-v3-turbo (multilingual, no translation)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Model {
@@ -88,6 +88,18 @@ impl Model {
         matches!(
             self,
             Model::TinyEn | Model::BaseEn | Model::SmallEn | Model::MediumEn
+        )
+    }
+
+    /// Whether whisper's translate task works on this model. `large-v3-turbo` is multilingual
+    /// but was trained without translation data: given the translate task it transcribes in
+    /// the language it hears (measured 2026-09-28 on the Spanish fixture: Spanish text back,
+    /// WER 99 % against the English reference), so it cannot serve `[stt].language` other
+    /// than `en` either.
+    pub fn translates(self) -> bool {
+        matches!(
+            self,
+            Model::Tiny | Model::Base | Model::Small | Model::Medium
         )
     }
 
@@ -356,6 +368,9 @@ mod tests {
         assert_eq!(multi.file_name(), "ggml-small.bin");
         assert!(!multi.is_english_only() && m.is_english_only());
         assert!(!Model::LargeV3Turbo.is_english_only());
+        // Only the multilingual tiny..medium translate; turbo was trained without it.
+        assert!(multi.translates() && Model::Medium.translates());
+        assert!(!Model::LargeV3Turbo.translates() && !m.translates());
         assert_eq!(Model::ALL.len(), 9);
     }
 

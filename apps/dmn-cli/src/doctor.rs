@@ -277,7 +277,7 @@ pub fn whisper_model(
         return Check::fail(
             "whisper model",
             e.to_string(),
-            "set [stt].model to small, medium or large-v3-turbo (dmn doctor --fetch <model>), or [stt].language to \"en\"",
+            "set [stt].model to small or medium (dmn doctor --fetch <model>), or [stt].language to \"en\"",
         );
     }
     let file = dmn_stt::model_path(models_dir, m);
@@ -786,6 +786,11 @@ mod tests {
         assert!(
             !en_only.ok && en_only.detail.contains("English-only"),
             "{en_only:?}"
+        );
+        let turbo = whisper_model(dir.path(), "large-v3-turbo", &SttLanguage::Auto);
+        assert!(
+            !turbo.ok && turbo.detail.contains("not trained to translate"),
+            "{turbo:?}"
         );
         let unknown = whisper_model(dir.path(), "small.en", &SttLanguage::Code("xx".into()));
         assert!(

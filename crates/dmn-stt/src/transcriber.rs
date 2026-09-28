@@ -88,14 +88,18 @@ impl Language {
         !matches!(self, Language::English)
     }
 
-    /// An English-only model cannot detect or translate.
+    /// An English-only model cannot detect or translate, and `large-v3-turbo` cannot
+    /// translate ([`Model::translates`]).
     pub fn check(&self, model: Model) -> Result<(), SttError> {
-        if self.translates() && model.is_english_only() {
-            return Err(SttError::ModelIsEnglishOnly {
-                model: model.name().to_owned(),
-            });
+        if !self.translates() || model.translates() {
+            return Ok(());
         }
-        Ok(())
+        let model_name = model.name().to_owned();
+        Err(if model.is_english_only() {
+            SttError::ModelIsEnglishOnly { model: model_name }
+        } else {
+            SttError::ModelCannotTranslate { model: model_name }
+        })
     }
 }
 
@@ -174,13 +178,17 @@ impl Transcriber {
         }
         // The callers check `Language::check` against the registry entry with a better message;
         // this is the backstop for a file handed in by path: the `.en` files cannot translate.
-        if cfg.language.translates()
-            && model_file
+        if cfg.language.translates() {
+            let name = model_file
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".en.bin"))
-        {
-            return Err(SttError::ModelIsEnglishOnly { model: shown });
+                .unwrap_or("");
+            if name.ends_with(".en.bin") {
+                return Err(SttError::ModelIsEnglishOnly { model: shown });
+            }
+            if name.contains("turbo") {
+                return Err(SttError::ModelCannotTranslate { model: shown });
+            }
         }
         whisper_rs::install_logging_hooks();
         let devices = match cfg.device {
