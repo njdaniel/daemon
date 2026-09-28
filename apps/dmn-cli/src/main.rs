@@ -175,7 +175,7 @@ enum Command {
         #[arg(long, conflicts_with = "init")]
         probe: bool,
         /// Download a whisper model (tiny.en, base.en, small.en, medium.en; multilingual: tiny,
-        /// base, small, medium, large-v3-turbo) or the Silero VAD model (silero) into
+        /// base, small, medium, large-v3, large-v3-turbo) or the Silero VAD model (silero) into
         /// ~/.cache/dmn/models/, then run the checks
         #[arg(long, value_name = "MODEL", conflicts_with = "init")]
         fetch: Option<String>,

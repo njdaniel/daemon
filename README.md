@@ -141,7 +141,7 @@ dmn doctor --fetch small
 
 ```toml
 [stt]
-model = "small"       # or medium; the .en files and large-v3-turbo cannot translate
+model = "small"       # or medium / large-v3; the .en files and large-v3-turbo cannot translate
 language = "auto"     # detect each utterance's language and translate it to English; or a code such as "es"
 ```
 

@@ -277,7 +277,7 @@ pub fn whisper_model(
         return Check::fail(
             "whisper model",
             e.to_string(),
-            "set [stt].model to small or medium (dmn doctor --fetch <model>), or [stt].language to \"en\"",
+            "set [stt].model to small, medium or large-v3 (dmn doctor --fetch <model>), or [stt].language to \"en\"",
         );
     }
     let file = dmn_stt::model_path(models_dir, m);

@@ -94,8 +94,8 @@ pub struct Stt {
     /// The audio's language (#77): `en` (English only, the default and the M1 path), `auto` (a
     /// multilingual model detects each utterance's language and translates its text to
     /// English) or an ISO 639-1 code such as `es` (translate from that language, no
-    /// detection). Anything but `en` needs a multilingual model that translates, `small` or
-    /// `medium`: the `.en` files cannot, and `large-v3-turbo` was trained without translation
+    /// detection). Anything but `en` needs a multilingual model that translates, `small`,
+    /// `medium` or `large-v3`: the `.en` files cannot, and `large-v3-turbo` was trained without translation
     /// and returns the original language. `dmn doctor` checks the pair.
     pub language: SttLanguage,
 }

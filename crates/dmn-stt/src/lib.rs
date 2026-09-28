@@ -45,11 +45,11 @@ pub enum SttError {
     )]
     UnknownLanguage(String),
     #[error(
-        "whisper model {model} is English-only and cannot detect or translate; set [stt].model to small or medium (dmn doctor --fetch <model>), or [stt].language to \"en\""
+        "whisper model {model} is English-only and cannot detect or translate; set [stt].model to small, medium or large-v3 (dmn doctor --fetch <model>), or [stt].language to \"en\""
     )]
     ModelIsEnglishOnly { model: String },
     #[error(
-        "whisper model {model} was not trained to translate and would return the original language; set [stt].model to small or medium (dmn doctor --fetch <model>), or [stt].language to \"en\""
+        "whisper model {model} was not trained to translate and would return the original language; set [stt].model to small, medium or large-v3 (dmn doctor --fetch <model>), or [stt].language to \"en\""
     )]
     ModelCannotTranslate { model: String },
     #[error("cannot load whisper model {path}: {source}")]
