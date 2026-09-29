@@ -348,6 +348,11 @@ pub struct Status {
     /// A GPU was asked for and the CPU runs instead.
     #[serde(default)]
     pub stt_fallback: bool,
+    /// The language whisper last detected in a final (#77), ISO 639-1; empty on the
+    /// English-only path and until the first final. The status line shows it when it is not
+    /// `en`.
+    #[serde(default)]
+    pub language: String,
 }
 
 /// Running totals, for the status line and the end-of-run summary.
@@ -484,6 +489,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
             end,
             text,
             is_final,
+            language,
             ..
         } => {
             s.partials
@@ -499,6 +505,10 @@ pub fn reduce(s: &mut Session, action: &Action) {
                     s.partials.push(line);
                 }
                 return;
+            }
+            // #77: finals only, so a partial's early guess never shows.
+            if let Some(lang) = language {
+                s.status.language.clone_from(lang);
             }
             if text.is_empty() {
                 return;

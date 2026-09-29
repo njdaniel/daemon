@@ -240,6 +240,7 @@ mod tests {
             text: text.to_owned(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         }
     }
 

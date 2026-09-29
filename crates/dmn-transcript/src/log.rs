@@ -131,6 +131,7 @@ mod tests {
             text: text.to_owned(),
             is_final,
             avg_logprob: -0.2,
+            language: None,
         }
     }
 

@@ -109,11 +109,14 @@ impl Counters {
 }
 
 /// Anything that can turn samples into text: the real [`Transcriber`], or a fake in tests.
+/// `pinned` is the language already detected in this utterance (#77), see
+/// [`Transcriber::transcribe`].
 pub trait Speech: Send {
     fn transcribe(
         &mut self,
         samples: &[f32],
         prompt: Option<&str>,
+        pinned: Option<&str>,
     ) -> Result<crate::Transcript, SttError>;
 }
 
@@ -122,8 +125,9 @@ impl Speech for Transcriber {
         &mut self,
         samples: &[f32],
         prompt: Option<&str>,
+        pinned: Option<&str>,
     ) -> Result<crate::Transcript, SttError> {
-        Transcriber::transcribe(self, samples, prompt)
+        Transcriber::transcribe(self, samples, prompt, pinned)
     }
 }
 
@@ -152,6 +156,7 @@ impl SttWorker {
             counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
             last_final: String::new(),
+            pinned: None,
         };
         let handle = std::thread::Builder::new()
             .name(format!("dmn-stt-{name}"))
@@ -208,6 +213,10 @@ struct Job {
     /// Text of the last punctuated final, passed to whisper as the prompt for continuity. See
     /// [`carries_punctuation`] for why an unpunctuated final is not.
     last_final: String,
+    /// The language whisper detected in the open utterance (keyed by its `start`), handed back
+    /// on that utterance's later inferences so detection runs once per utterance (#77). `None`
+    /// on the English-only path, where whisper reports no language.
+    pinned: Option<(Duration, String)>,
 }
 
 impl Job {
@@ -249,6 +258,7 @@ impl Job {
     /// ever: only a final with the same `start` clears them. Both no-text paths — a filtered
     /// final and a failed inference — go through here so they cannot drift apart.
     fn close_without_text(&mut self, u: &Utterance, avg_logprob: f32) {
+        self.unpin(u.start);
         (self.publish)(Segment {
             source: u.source,
             start: u.start,
@@ -256,12 +266,36 @@ impl Job {
             text: String::new(),
             is_final: true,
             avg_logprob,
+            language: None,
         });
+    }
+
+    /// The language pinned for the utterance that starts at `start`, if any.
+    fn pinned_for(&self, start: Duration) -> Option<String> {
+        self.pinned
+            .as_ref()
+            .filter(|(s, _)| *s == start)
+            .map(|(_, l)| l.clone())
+    }
+
+    /// Remember what whisper detected in this utterance for its later inferences.
+    fn pin(&mut self, start: Duration, t: &crate::Transcript) {
+        if let Some(lang) = &t.language {
+            self.pinned = Some((start, lang.clone()));
+        }
+    }
+
+    /// The utterance closed: its pin is no longer needed.
+    fn unpin(&mut self, start: Duration) {
+        if self.pinned.as_ref().is_some_and(|(s, _)| *s == start) {
+            self.pinned = None;
+        }
     }
 
     fn handle_final(&mut self, u: Utterance) {
         let prompt = (!self.last_final.is_empty()).then(|| self.last_final.clone());
-        let Some(t) = self.run_inference(&u.samples, prompt.as_deref()) else {
+        let pinned = self.pinned_for(u.start);
+        let Some(t) = self.run_inference(&u.samples, prompt.as_deref(), pinned.as_deref()) else {
             // `run_inference` counted the error and logged the cause. The utterance still has to
             // close, and nothing about it was heard, so it carries the lowest possible score: no
             // consumer can mistake it for a confident empty result.
@@ -286,6 +320,7 @@ impl Job {
         if carries_punctuation(&text) {
             self.last_final = text.clone();
         }
+        self.unpin(u.start);
         (self.publish)(Segment {
             source: u.source,
             start: u.start,
@@ -293,6 +328,7 @@ impl Job {
             text,
             is_final: true,
             avg_logprob: t.avg_logprob,
+            language: t.language,
         });
     }
 
@@ -307,9 +343,11 @@ impl Job {
             return;
         }
         let prompt = (!self.last_final.is_empty()).then(|| self.last_final.clone());
-        let Some(t) = self.run_inference(samples, prompt.as_deref()) else {
+        let pinned = self.pinned_for(start);
+        let Some(t) = self.run_inference(samples, prompt.as_deref(), pinned.as_deref()) else {
             return;
         };
+        self.pin(start, &t);
         let text = normalise(&t.text);
         // Partials are provisional, so only the cheap checks apply: a partial that looks like a
         // hallucination simply is not shown, and the final decides.
@@ -325,6 +363,7 @@ impl Job {
             text,
             is_final: false,
             avg_logprob: t.avg_logprob,
+            language: t.language,
         });
     }
 
@@ -332,9 +371,10 @@ impl Job {
         &mut self,
         samples: &[f32],
         prompt: Option<&str>,
+        pinned: Option<&str>,
     ) -> Option<crate::Transcript> {
         let t0 = Instant::now();
-        let r = self.speech.transcribe(samples, prompt);
+        let r = self.speech.transcribe(samples, prompt, pinned);
         self.counters.timed(t0.elapsed().as_millis() as u64);
         match r {
             Ok(t) => Some(t),
@@ -433,7 +473,8 @@ mod tests {
     use crate::Transcript;
 
     /// Samples handed to each call, and the prompt it carried.
-    type Calls = Arc<Mutex<Vec<(usize, Option<String>)>>>;
+    /// (samples, prompt, pinned language) per call.
+    type Calls = Arc<Mutex<Vec<(usize, Option<String>, Option<String>)>>>;
 
     /// A stand-in for whisper: returns the next scripted text and records prompts. With a gate
     /// it announces each call and waits to be released, so a test can hold an inference open and
@@ -445,6 +486,8 @@ mod tests {
             crossbeam_channel::Sender<usize>,
             crossbeam_channel::Receiver<()>,
         )>,
+        /// What whisper "detects" (#77); `None` plays the English-only path.
+        language: Option<String>,
     }
 
     impl Speech for Fake {
@@ -452,6 +495,7 @@ mod tests {
             &mut self,
             samples: &[f32],
             prompt: Option<&str>,
+            pinned: Option<&str>,
         ) -> Result<Transcript, SttError> {
             if let Some((started, release)) = &self.gate {
                 let n = self.calls.lock().unwrap().len();
@@ -460,7 +504,11 @@ mod tests {
             }
             let mut calls = self.calls.lock().unwrap();
             let i = calls.len();
-            calls.push((samples.len(), prompt.map(str::to_owned)));
+            calls.push((
+                samples.len(),
+                prompt.map(str::to_owned),
+                pinned.map(str::to_owned),
+            ));
             let (text, avg_logprob, n_tokens) = self
                 .texts
                 .get(i)
@@ -471,6 +519,7 @@ mod tests {
                 avg_logprob,
                 low_confidence: avg_logprob < -1.0,
                 n_tokens,
+                language: self.language.clone(),
             })
         }
     }
@@ -541,6 +590,15 @@ mod tests {
     }
 
     fn harness(texts: &[(&str, f32, usize)], gated: bool) -> Harness {
+        harness_hearing(texts, gated, None)
+    }
+
+    /// A harness whose fake whisper "detects" `language` on every call (#77).
+    fn harness_hearing(
+        texts: &[(&str, f32, usize)],
+        gated: bool,
+        language: Option<&str>,
+    ) -> Harness {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (started_tx, started_rx) = crossbeam_channel::unbounded();
         let (release_tx, release_rx) = crossbeam_channel::unbounded();
@@ -551,6 +609,7 @@ mod tests {
                 .collect(),
             calls: Arc::clone(&calls),
             gate: gated.then_some((started_tx, release_rx)),
+            language: language.map(str::to_owned),
         };
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&out);
@@ -587,6 +646,69 @@ mod tests {
         assert_eq!(out[0].end, Duration::from_millis(4_000));
         assert_eq!((stats.finals, stats.partials, stats.dropped()), (1, 0, 0));
         assert!(stats.inference_ms < 5_000);
+    }
+
+    #[test]
+    fn auto_mode_detects_once_per_utterance_and_the_segments_carry_the_language() {
+        // Two partials and the final of one utterance, then a partial of the next: whisper
+        // detects on the first call only; the pin follows the utterance, not the lane. Gated,
+        // and one event at a time, so nothing is coalesced away before it is transcribed.
+        let h = harness_hearing(
+            &[
+                ("How would", -0.2, 2),
+                ("How would you", -0.2, 3),
+                ("How would you design it?", -0.2, 5),
+                ("And", -0.2, 1),
+            ],
+            true,
+            Some("es"),
+        );
+        for ev in [
+            partial(0, 1_000),
+            partial(0, 2_000),
+            utterance(0, 3_000),
+            partial(5_000, 6_000),
+        ] {
+            h.tx.send(ev).unwrap();
+            h.step();
+        }
+        drop(h.tx);
+        h.worker.finish();
+        let calls = h.calls.lock().unwrap();
+        let pinned: Vec<Option<&str>> = calls.iter().map(|c| c.2.as_deref()).collect();
+        assert_eq!(
+            pinned,
+            vec![None, Some("es"), Some("es"), None],
+            "detected on the first inference, pinned for the rest of that utterance, and a new \
+             utterance detects again"
+        );
+        let out = h.out.lock().unwrap();
+        assert!(
+            out.iter().all(|s| s.language.as_deref() == Some("es")),
+            "every segment names the language: {out:?}"
+        );
+        assert_eq!(
+            out[2].render(),
+            "[00:00.0] Interviewer (es→en): How would you design it?"
+        );
+    }
+
+    #[test]
+    fn english_mode_reports_no_language_and_pins_nothing() {
+        // Gated and one event at a time: sent together, the partial is coalesced away once
+        // its final is in the same batch, and this test is about the calls that do happen.
+        let h = harness(&[("How would", -0.2, 2), ("How would you?", -0.2, 3)], true);
+        for ev in [partial(0, 1_000), utterance(0, 2_000)] {
+            h.tx.send(ev).unwrap();
+            h.step();
+        }
+        drop(h.tx);
+        h.worker.finish();
+        let calls = h.calls.lock().unwrap();
+        assert!(calls.iter().all(|c| c.2.is_none()));
+        let out = h.out.lock().unwrap();
+        assert!(out.iter().all(|s| s.language.is_none()));
+        assert_eq!(out[1].render(), "[00:00.0] Interviewer: How would you?");
     }
 
     #[test]
@@ -746,7 +868,12 @@ mod tests {
         /// whisper can fail mid-session (a bad state, an OOM); the utterance must still close.
         struct Failing;
         impl Speech for Failing {
-            fn transcribe(&mut self, _: &[f32], _: Option<&str>) -> Result<Transcript, SttError> {
+            fn transcribe(
+                &mut self,
+                _: &[f32],
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<Transcript, SttError> {
                 Err(SttError::Io {
                     path: "whisper".to_owned(),
                     source: std::io::Error::other("inference exploded"),
@@ -792,6 +919,7 @@ mod tests {
             text: "how would you".to_owned(),
             is_final: false,
             avg_logprob: -0.2,
+            language: None,
         });
         assert_eq!(log.open_partials().len(), 1);
         log.apply(closing.clone());

@@ -153,6 +153,7 @@ pub fn segment(seg: &Segment) -> Action {
         text: seg.text.clone(),
         is_final: seg.is_final,
         avg_logprob: f64::from(seg.avg_logprob),
+        language: seg.language.clone(),
     }
 }
 

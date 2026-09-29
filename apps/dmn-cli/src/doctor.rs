@@ -256,7 +256,11 @@ pub fn pipewire_tools(r: &dyn Runner) -> Check {
     }
 }
 
-pub fn whisper_model(models_dir: &Path, model: &str) -> Check {
+pub fn whisper_model(
+    models_dir: &Path,
+    model: &str,
+    language: &dmn_core::config::SttLanguage,
+) -> Check {
     let m = match dmn_stt::Model::from_name(model) {
         Ok(m) => m,
         Err(e) => {
@@ -267,6 +271,15 @@ pub fn whisper_model(models_dir: &Path, model: &str) -> Check {
             );
         }
     };
+    // #77: `[stt].language` other than `en` needs a multilingual model, and the code must be
+    // one whisper knows; both are refused here with the fix rather than at `dmn run`.
+    if let Err(e) = dmn_stt::Language::parse(language.label()).and_then(|l| l.check(m)) {
+        return Check::fail(
+            "whisper model",
+            e.to_string(),
+            "set [stt].model to small, medium or large-v3 (dmn doctor --fetch <model>), or [stt].language to \"en\"",
+        );
+    }
     let file = dmn_stt::model_path(models_dir, m);
     match std::fs::metadata(&file) {
         Ok(meta) if meta.len() == m.size_bytes() => {
@@ -588,7 +601,7 @@ pub fn run_all(
         libpipewire_headers(r),
         pipewire_server(r),
         pipewire_tools(r),
-        whisper_model(&paths.models_dir, &cfg.stt.model),
+        whisper_model(&paths.models_dir, &cfg.stt.model, &cfg.stt.language),
     ];
     if cfg.stt.vad == dmn_core::config::Vad::Silero {
         checks.push(silero_model(&paths.models_dir));
@@ -731,7 +744,11 @@ mod tests {
     #[test]
     fn model_file_check_names_the_fetch_command() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = whisper_model(dir.path(), "small.en");
+        let missing = whisper_model(
+            dir.path(),
+            "small.en",
+            &dmn_core::config::SttLanguage::English,
+        );
         assert!(!missing.ok);
         assert!(
             missing
@@ -742,7 +759,11 @@ mod tests {
         );
         let file = dir.path().join("ggml-small.en.bin");
         std::fs::write(&file, b"x").unwrap();
-        let partial = whisper_model(dir.path(), "small.en");
+        let partial = whisper_model(
+            dir.path(),
+            "small.en",
+            &dmn_core::config::SttLanguage::English,
+        );
         assert!(
             !partial.ok && partial.detail.contains("partial download"),
             "{}",
@@ -754,8 +775,28 @@ mod tests {
             .unwrap()
             .set_len(dmn_stt::Model::SmallEn.size_bytes())
             .unwrap();
-        assert!(whisper_model(dir.path(), "small.en").ok);
-        assert!(!whisper_model(dir.path(), "small").ok, "unknown names fail");
+        use dmn_core::config::SttLanguage;
+        assert!(whisper_model(dir.path(), "small.en", &SttLanguage::English).ok);
+        assert!(
+            !whisper_model(dir.path(), "smallish", &SttLanguage::English).ok,
+            "unknown names fail"
+        );
+        // #77: the English-only file cannot detect or translate.
+        let en_only = whisper_model(dir.path(), "small.en", &SttLanguage::Auto);
+        assert!(
+            !en_only.ok && en_only.detail.contains("English-only"),
+            "{en_only:?}"
+        );
+        let turbo = whisper_model(dir.path(), "large-v3-turbo", &SttLanguage::Auto);
+        assert!(
+            !turbo.ok && turbo.detail.contains("not trained to translate"),
+            "{turbo:?}"
+        );
+        let unknown = whisper_model(dir.path(), "small.en", &SttLanguage::Code("xx".into()));
+        assert!(
+            !unknown.ok && unknown.detail.contains("unknown language"),
+            "{unknown:?}"
+        );
     }
 
     #[test]

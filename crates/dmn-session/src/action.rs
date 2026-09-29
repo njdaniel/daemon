@@ -266,6 +266,11 @@ pub enum Action {
         text: String,
         is_final: bool,
         avg_logprob: f64,
+        /// The language whisper detected in the audio (ISO 639-1) when `[stt].language` is not
+        /// `en` (#77); the text is English either way. Absent in older logs and on the
+        /// English-only path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
     },
     /// The detector proposed the final interviewer segment that starts at `start` as a question.
     /// `id` is assigned by the pipeline and tags every fast-phase action for this candidate.

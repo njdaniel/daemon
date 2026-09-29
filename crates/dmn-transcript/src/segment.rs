@@ -20,6 +20,10 @@ pub struct Segment {
     pub is_final: bool,
     /// Mean token log-probability from whisper; 0.0 when it produced no text tokens.
     pub avg_logprob: f32,
+    /// ISO 639-1 code of the language whisper detected in this utterance's audio, when the STT
+    /// worker runs in a language mode other than `en` (#77); `None` on the English-only path.
+    /// The text is English either way: a multilingual model translates as it transcribes.
+    pub language: Option<String>,
 }
 
 impl Segment {
@@ -27,12 +31,17 @@ impl Segment {
         (self.source, self.start)
     }
 
-    /// `[mm:ss.t] Interviewer: text`, the transcript line `dmn replay` and the TUI print.
+    /// `[mm:ss.t] Interviewer: text`, the transcript line `dmn replay` and the TUI print. A
+    /// detected language other than English is tagged after the speaker: `Interviewer (es→en)`.
     pub fn render(&self) -> String {
         format!(
-            "[{}] {}{}: {}",
+            "[{}] {}{}{}: {}",
             timestamp(self.start),
             self.source.label(),
+            match self.language.as_deref() {
+                Some(lang) if lang != "en" => format!(" ({lang}→en)"),
+                _ => String::new(),
+            },
             if self.is_final { "" } else { " ~" },
             self.text
         )
@@ -122,6 +131,7 @@ mod tests {
             text: text.to_owned(),
             is_final: true,
             avg_logprob: -0.2,
+            language: None,
         }
     }
 

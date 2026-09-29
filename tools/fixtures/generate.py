@@ -70,6 +70,9 @@ class Placed:
     kind: str | None
     voiced_start: float = 0.0
     voiced_end: float = 0.0
+    # #77: for a script in another language, `text` is the English reference the pipeline is
+    # scored against (whisper translates as it transcribes) and `spoken` the words Piper said.
+    spoken: str | None = None
 
 
 def dbfs(x: np.ndarray) -> float:
@@ -240,9 +243,10 @@ def generate(script_path: Path, out_root: Path) -> dict:
                 speaker=speaker,
                 start=round(start, 3),
                 end=round(end, 3),
-                text=spoken(turn["text"]),
+                text=turn.get("english") or spoken(turn["text"]),
                 is_question=bool(turn.get("is_question", False)),
                 kind=turn.get("kind"),
+                spoken=spoken(turn["text"]) if turn.get("english") else None,
             )
         )
         audio.append((speaker, int(round(start * RATE)), x))
@@ -270,23 +274,31 @@ def generate(script_path: Path, out_root: Path) -> dict:
         if not found:
             print(f"  warning: turn {p.index} ({p.speaker}) has no sample over {VOICED_DBFS} dBFS")
 
+    def with_spoken(row: dict, p: Placed) -> dict:
+        if p.spoken is not None:
+            row["spoken"] = p.spoken
+        return row
+
     questions = [
-        {"t": p.start, "end": p.end, "text": p.text, "kind": p.kind}
+        with_spoken({"t": p.start, "end": p.end, "text": p.text, "kind": p.kind}, p)
         for p in placed
         if p.is_question
     ]
     turns = [
-        {
-            "i": p.index,
-            "speaker": p.speaker,
-            "t": p.start,
-            "end": p.end,
-            "voiced_t": p.voiced_start,
-            "voiced_end": p.voiced_end,
-            "is_question": p.is_question,
-            "kind": p.kind,
-            "text": p.text,
-        }
+        with_spoken(
+            {
+                "i": p.index,
+                "speaker": p.speaker,
+                "t": p.start,
+                "end": p.end,
+                "voiced_t": p.voiced_start,
+                "voiced_end": p.voiced_end,
+                "is_question": p.is_question,
+                "kind": p.kind,
+                "text": p.text,
+            },
+            p,
+        )
         for p in placed
     ]
     (out / "questions.json").write_text(json.dumps(questions, indent=2, ensure_ascii=False) + "\n")
@@ -304,7 +316,8 @@ def generate(script_path: Path, out_root: Path) -> dict:
     for p in placed:
         who = "Interviewer" if p.speaker == "interviewer" else "Candidate"
         tag = f" **Q** ({p.kind})" if p.is_question else (f" _({p.kind})_" if p.kind else "")
-        lines.append(f"- `{fmt_ts(p.start)}–{fmt_ts(p.end)}` **{who}**{tag}: {p.text}")
+        said = f" _(spoken: {p.spoken})_" if p.spoken is not None else ""
+        lines.append(f"- `{fmt_ts(p.start)}–{fmt_ts(p.end)}` **{who}**{tag}: {p.text}{said}")
     (out / "script.md").write_text("\n".join(lines) + "\n")
 
     digests = {

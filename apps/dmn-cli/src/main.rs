@@ -141,6 +141,10 @@ enum Command {
         /// Where whisper runs; default is [stt].device. gpu needs a --features vulkan|cuda build
         #[arg(long, value_enum)]
         device: Option<DeviceArg>,
+        /// The audio's language: en, auto (detect and translate to English) or a code such as
+        /// es; default is [stt].language. Anything but en needs a multilingual model (small)
+        #[arg(long)]
+        language: Option<dmn_core::config::SttLanguage>,
         /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
         #[arg(long)]
         no_store: bool,
@@ -170,8 +174,9 @@ enum Command {
         /// monitor and pw-record (about 3 s of sound through the default output)
         #[arg(long, conflicts_with = "init")]
         probe: bool,
-        /// Download a whisper model (tiny.en, base.en, small.en, medium.en, large-v3-turbo) or
-        /// the Silero VAD model (silero) into ~/.cache/dmn/models/, then run the checks
+        /// Download a whisper model (tiny.en, base.en, small.en, medium.en; multilingual: tiny,
+        /// base, small, medium, large-v3, large-v3-turbo) or the Silero VAD model (silero) into
+        /// ~/.cache/dmn/models/, then run the checks
         #[arg(long, value_name = "MODEL", conflicts_with = "init")]
         fetch: Option<String>,
     },
@@ -206,6 +211,10 @@ enum Command {
         /// Where whisper runs; default is [stt].device. gpu needs a --features vulkan|cuda build
         #[arg(long, value_enum)]
         device: Option<DeviceArg>,
+        /// The audio's language: en, auto (detect and translate to English) or a code such as
+        /// es; default is [stt].language. Anything but en needs a multilingual model (small)
+        #[arg(long)]
+        language: Option<dmn_core::config::SttLanguage>,
         /// Directory holding the fixtures
         #[arg(long, default_value = "testdata")]
         testdata: std::path::PathBuf,
@@ -251,6 +260,10 @@ enum Command {
         /// Where whisper runs; default is [stt].device. gpu needs a --features vulkan|cuda build
         #[arg(long, value_enum)]
         device: Option<DeviceArg>,
+        /// The audio's language: en, auto (detect and translate to English) or a code such as
+        /// es; default is [stt].language. Anything but en needs a multilingual model (small)
+        #[arg(long)]
+        language: Option<dmn_core::config::SttLanguage>,
         /// Transcribe the 1 s partials of an open utterance: on, since --speed always paces
         #[arg(long, value_enum, default_value_t = pipeline::Partials::Auto)]
         partials: pipeline::Partials,
@@ -368,6 +381,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             vad_close_ms,
             vad,
             device,
+            language,
             partials,
             transcript,
             json,
@@ -389,6 +403,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     vad_close_ms,
                     vad: vad.map(Into::into),
                     device: device.map(Into::into),
+                    language,
                     partials,
                     transcript,
                     json,
@@ -408,6 +423,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             vad_close_ms,
             vad,
             device,
+            language,
             no_store,
             headless,
             duration,
@@ -439,6 +455,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     vad_close_ms,
                     vad: vad.map(Into::into),
                     device: device.map(Into::into),
+                    language,
                     no_store,
                     headless,
                     duration,
@@ -482,6 +499,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             full_window,
             testdata,
             device,
+            language,
             ..
         }) => {
             let cfg = Config::load(&paths.config_file)?;
@@ -492,6 +510,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 turns,
                 trim_audio_ctx: !full_window,
                 device: device.map(Into::into).unwrap_or(cfg.stt.device),
+                language: language.unwrap_or_else(|| cfg.stt.language.clone()),
                 testdata,
                 models_dir: paths.models_dir.clone(),
             };

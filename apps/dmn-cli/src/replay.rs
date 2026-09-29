@@ -30,6 +30,8 @@ pub struct Args {
     pub vad: Option<dmn_core::config::Vad>,
     /// `--device` (#61), over `[stt].device`.
     pub device: Option<dmn_core::config::SttDevice>,
+    /// `--language` (#77), over `[stt].language`.
+    pub language: Option<dmn_core::config::SttLanguage>,
     pub partials: Partials,
     /// Print the merged transcript at the end.
     pub transcript: bool,
@@ -84,6 +86,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             vad_close_ms: args.vad_close_ms,
             vad: args.vad,
             device: args.device,
+            language: args.language.clone(),
             partials: args.partials,
             spec_literal_detector: args.spec_literal_detector,
             no_llm: args.no_llm,
@@ -96,7 +99,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     if !args.json {
         let info = pipeline.info();
         println!(
-            "replay: {} + {} ({} of audio) through {} on {} threads ({}), {} VAD, {}, partials {}\n",
+            "replay: {} + {} ({} of audio) through {} on {} threads ({}), {} VAD, language {}, {}, partials {}\n",
             args.interviewer.display(),
             args.candidate.display(),
             pretty(info.audio),
@@ -104,6 +107,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             info.threads,
             info.stt_device,
             info.vad,
+            info.language,
             match info.speed {
                 Speed::RealTime => "1× (wall clock)".to_string(),
                 Speed::Factor(f) => format!("{f}× (wall clock)"),
@@ -238,6 +242,7 @@ fn print_segment_json(seg: &Segment) {
             "text": seg.text,
             "is_final": seg.is_final,
             "avg_logprob": seg.avg_logprob,
+            "language": seg.language,
         })
     );
 }

@@ -36,6 +36,11 @@ from pathlib import Path
 # this file kept outside the tree, point at one explicitly.
 REPO = Path(os.environ.get("DMN_REPO") or Path(__file__).resolve().parent.parent)
 FIXTURES = ("sysdesign", "behavioral", "mixed", "continuous")
+# #77: fixtures spoken in another language. Their questions.json holds the English reference,
+# so they are scored the same way, but only under `--language auto` (or their code) with a
+# multilingual model such as `--model small`; they are not in the default run and are held to
+# the M1 bar, since the text the detector sees is whisper's translation.
+TRANSLATED = {"es": "es"}
 # docs/SPEC.md § Milestones: M1 recall >= 0.85 / precision >= 0.8; M2 recall and precision >= 0.9.
 M1_RECALL, M1_PRECISION = 0.85, 0.8
 M2_RECALL, M2_PRECISION = 0.9, 0.9
@@ -144,7 +149,9 @@ def fingerprint(args) -> str:
     uncommitted diff) and the user's config file. A cached run is reused only when all match."""
     h = hashlib.sha256()
     h.update(
-        repr((args.speed, args.model, args.threads, args.spec_literal, args.vad_close_ms, args.vad)).encode()
+        repr(
+            (args.speed, args.model, args.threads, args.spec_literal, args.vad_close_ms, args.vad, args.language)
+        ).encode()
     )
     for cmd in (["git", "rev-parse", "HEAD"], ["git", "diff", "HEAD"]):
         out = subprocess.run(cmd, cwd=REPO, capture_output=True, check=False)
@@ -188,6 +195,8 @@ def replay(fixture: str, cache: Path, args) -> list[dict]:
         cmd += ["--vad-close-ms", str(args.vad_close_ms)]
     if args.vad:
         cmd += ["--vad", args.vad]
+    if args.language:
+        cmd += ["--language", args.language]
     if args.spec_literal:
         cmd += ["--spec-literal-detector"]
 
@@ -287,12 +296,18 @@ def detail(results: list[Result]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fixture", action="append", choices=FIXTURES, help="default: all four")
+    p.add_argument(
+        "--fixture",
+        action="append",
+        choices=FIXTURES + tuple(TRANSLATED),
+        help="default: the four English fixtures; es needs --language auto (or es) and a multilingual --model",
+    )
     p.add_argument("--speed", default=8, type=float, help="replay pacing factor: N plays the audio at N x real time (default 8)")
     p.add_argument("--model", help="whisper model; default is [stt].model")
     p.add_argument("--threads", type=int, help="decoder threads")
     p.add_argument("--vad-close-ms", type=int, help="silence (ms) that ends an utterance; default [stt].vad_close_ms")
     p.add_argument("--vad", choices=("energy", "silero"), help="voice activity detector; default [stt].vad")
+    p.add_argument("--language", help="en, auto or a language code (#77); default [stt].language")
     p.add_argument("--reuse", action="store_true", help="reuse cached replay output when present")
     p.add_argument("--compare", action="store_true", help="also score the SPEC's literal cue table")
     p.add_argument("--spec-literal", action="store_true", help="score only the SPEC's literal table")
@@ -300,6 +315,8 @@ def main() -> int:
     args = p.parse_args()
 
     fixtures = args.fixture or list(FIXTURES)
+    if not args.language and any(f in TRANSLATED for f in fixtures):
+        sys.exit("a translated fixture needs --language auto (or its code) and a multilingual --model such as small")
     cache = Path(args.cache) if args.cache else Path(__file__).resolve().parent / ".cache"
 
     def run_all(literal: bool) -> list[Result]:
@@ -336,19 +353,41 @@ def main() -> int:
         print("\npipeline: no replay summary, so latency is unmeasured")
 
     fast = bool(pipeline) and slowest <= LATENCY_BUDGET_MS
-    m1 = recall >= M1_RECALL and precision >= M1_PRECISION and fast
-    m2 = recall >= M2_RECALL and precision >= M2_PRECISION and fast
-    print(
-        f"\nM1 targets (recall >= {M1_RECALL}, precision >= {M1_PRECISION}, "
-        f"detection <= {LATENCY_BUDGET_MS} ms): {'met' if m1 else 'NOT met'} — "
-        f"recall {recall:.2f}, precision {precision:.2f}, slowest {slowest:.2f} ms"
-    )
-    print(
-        f"M2 targets (recall >= {M2_RECALL}, precision >= {M2_PRECISION}, "
-        f"detection <= {LATENCY_BUDGET_MS} ms): {'met' if m2 else 'NOT met'}"
-    )
-    # The milestone in progress sets the exit status.
-    return 0 if m2 or wanted_literal else 1
+
+    def totals(rs: list[Result]) -> tuple[float, float]:
+        m = sum(len(r.matched) for r in rs)
+        mi = sum(len(r.missed) for r in rs)
+        s = sum(len(r.spurious) for r in rs)
+        return (m / (m + mi) if m + mi else 0.0, m / (m + s) if m + s else 0.0)
+
+    ok = True
+    native = [r for r in results if r.fixture not in TRANSLATED]
+    if native:
+        recall, precision = totals(native)
+        m1 = recall >= M1_RECALL and precision >= M1_PRECISION and fast
+        m2 = recall >= M2_RECALL and precision >= M2_PRECISION and fast
+        print(
+            f"\nM1 targets (recall >= {M1_RECALL}, precision >= {M1_PRECISION}, "
+            f"detection <= {LATENCY_BUDGET_MS} ms): {'met' if m1 else 'NOT met'} — "
+            f"recall {recall:.2f}, precision {precision:.2f}, slowest {slowest:.2f} ms"
+        )
+        print(
+            f"M2 targets (recall >= {M2_RECALL}, precision >= {M2_PRECISION}, "
+            f"detection <= {LATENCY_BUDGET_MS} ms): {'met' if m2 else 'NOT met'}"
+        )
+        # The milestone in progress sets the exit status.
+        ok = ok and m2
+    translated = [r for r in results if r.fixture in TRANSLATED]
+    if translated:
+        recall, precision = totals(translated)
+        met = recall >= M1_RECALL and precision >= M1_PRECISION and fast
+        print(
+            f"\ntranslated fixtures ({', '.join(r.fixture for r in translated)}; #77, M1 bar: "
+            f"recall >= {M1_RECALL}, precision >= {M1_PRECISION}): {'met' if met else 'NOT met'} — "
+            f"recall {recall:.2f}, precision {precision:.2f}"
+        )
+        ok = ok and met
+    return 0 if ok or wanted_literal else 1
 
 
 if __name__ == "__main__":

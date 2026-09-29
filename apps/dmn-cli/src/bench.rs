@@ -19,6 +19,8 @@ pub struct BenchArgs {
     pub trim_audio_ctx: bool,
     /// `[stt].device` or `--device` (#61).
     pub device: dmn_core::config::SttDevice,
+    /// `[stt].language` or `--language` (#77): the multilingual models detect and translate.
+    pub language: dmn_core::config::SttLanguage,
     pub testdata: PathBuf,
     pub models_dir: PathBuf,
 }
@@ -106,10 +108,13 @@ pub fn run(a: &BenchArgs) -> Result<String, Box<dyn std::error::Error>> {
     )?;
     let audio = load_wav(&dir.join("interviewer.wav"))?;
 
+    let language = crate::pipeline::language_choice(&a.language)?;
+    language.check(model)?;
     let cfg = SttConfig {
         threads: a.threads,
         trim_audio_ctx: a.trim_audio_ctx,
         device: crate::pipeline::device_choice(a.device),
+        language,
     };
     let t_load = Instant::now();
     let mut stt = Transcriber::load(&file, cfg)?;
@@ -124,7 +129,8 @@ pub fn run(a: &BenchArgs) -> Result<String, Box<dyn std::error::Error>> {
         let a1 = ((t.end * sr) as usize).min(audio.len());
         let clip = &audio[a0..a1];
         let started = Instant::now();
-        let tr = stt.transcribe(clip, prompt.as_deref())?;
+        // Each turn is one utterance: whisper detects its language afresh (nothing pinned).
+        let tr = stt.transcribe(clip, prompt.as_deref(), None)?;
         let wall = started.elapsed();
         let dur = Duration::from_secs_f64(clip.len() as f64 / sr);
         rows.push(Row {
@@ -151,8 +157,9 @@ pub fn run(a: &BenchArgs) -> Result<String, Box<dyn std::error::Error>> {
         Backend::Cpu.name()
     };
     Ok(format!(
-        "{}({window}; whisper on {device})\n",
-        render(&a.model, &a.fixture, backend, a.threads, load, &rows)
+        "{}({window}; whisper on {device}; language {})\n",
+        render(&a.model, &a.fixture, backend, a.threads, load, &rows),
+        a.language.label()
     ))
 }
 
@@ -285,7 +292,7 @@ mod tests {
             },
         )
         .unwrap();
-        let tr = stt.transcribe(clip, None).unwrap();
+        let tr = stt.transcribe(clip, None, None).unwrap();
         let wer = word_error_rate(&q.text, &tr.text);
         assert!(wer < 0.25, "WER {wer:.2}: {:?}", tr.text);
         assert!(!tr.low_confidence, "avg_logprob {}", tr.avg_logprob);

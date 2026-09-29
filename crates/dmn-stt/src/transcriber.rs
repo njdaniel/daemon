@@ -9,7 +9,7 @@ use whisper_rs::{
 };
 
 use crate::gpu::{DeviceChoice, Placement, gpu_devices, resolve};
-use crate::{SAMPLE_RATE, SttError};
+use crate::{Model, SAMPLE_RATE, SttError};
 
 /// Segments below this mean token log-probability are flagged; SPEC drops them in #9.
 pub const LOW_CONFIDENCE_LOGPROB: f32 = -1.0;
@@ -46,10 +46,69 @@ impl Backend {
     }
 }
 
+/// What language the audio is in and what whisper emits (`[stt].language`, #77).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Language {
+    /// English audio, English text: `language = "en"`, no translation. The M1 path, unchanged,
+    /// and the only one an English-only (`.en`) model can run.
+    #[default]
+    English,
+    /// Detect the language of each utterance and translate its text to English. Detection runs
+    /// on the utterance's first inference and the worker pins the result for its later partials
+    /// and final, so it is paid once per utterance, not once per partial.
+    Auto,
+    /// The audio is in this language (an ISO 639-1 code whisper knows, `es`, `de`, ...);
+    /// translate its text to English with no detection.
+    Fixed(String),
+}
+
+impl Language {
+    /// `en`, `auto`, or a language code whisper knows.
+    pub fn parse(s: &str) -> Result<Self, SttError> {
+        let s = s.trim();
+        match s {
+            "en" | "english" => Ok(Language::English),
+            "auto" => Ok(Language::Auto),
+            code if whisper_rs::get_lang_id(code).is_some() => Ok(Language::Fixed(code.to_owned())),
+            other => Err(SttError::UnknownLanguage(other.to_owned())),
+        }
+    }
+
+    /// The config spelling: `en`, `auto` or the code.
+    pub fn label(&self) -> &str {
+        match self {
+            Language::English => "en",
+            Language::Auto => "auto",
+            Language::Fixed(code) => code,
+        }
+    }
+
+    /// Whether whisper runs its translate task, which needs a multilingual model.
+    pub fn translates(&self) -> bool {
+        !matches!(self, Language::English)
+    }
+
+    /// An English-only model cannot detect or translate, and `large-v3-turbo` cannot
+    /// translate ([`Model::translates`]).
+    pub fn check(&self, model: Model) -> Result<(), SttError> {
+        if !self.translates() || model.translates() {
+            return Ok(());
+        }
+        let model_name = model.name().to_owned();
+        Err(if model.is_english_only() {
+            SttError::ModelIsEnglishOnly { model: model_name }
+        } else {
+            SttError::ModelCannotTranslate { model: model_name }
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SttConfig {
     /// Decoder threads (`[stt].threads`).
     pub threads: usize,
+    /// The audio's language and whether to translate (#77).
+    pub language: Language,
     /// Where to run (`[stt].device`, #61). A GPU asked for and unavailable, or failing to load,
     /// falls back to the CPU with a warning; [`Transcriber::placement`] says where it ended up.
     pub device: DeviceChoice,
@@ -63,6 +122,7 @@ impl Default for SttConfig {
     fn default() -> Self {
         Self {
             threads: 4,
+            language: Language::English,
             device: DeviceChoice::Auto,
             trim_audio_ctx: true,
         }
@@ -93,6 +153,9 @@ pub struct Transcript {
     pub avg_logprob: f32,
     pub low_confidence: bool,
     pub n_tokens: usize,
+    /// The language whisper detected or was told (ISO 639-1), in any mode but
+    /// [`Language::English`], where it is `None`.
+    pub language: Option<String>,
 }
 
 pub struct Transcriber {
@@ -112,6 +175,20 @@ impl Transcriber {
         let shown = model_file.display().to_string();
         if !model_file.is_file() {
             return Err(SttError::ModelMissing(shown));
+        }
+        // The callers check `Language::check` against the registry entry with a better message;
+        // this is the backstop for a file handed in by path: the `.en` files cannot translate.
+        if cfg.language.translates() {
+            let name = model_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if name.ends_with(".en.bin") {
+                return Err(SttError::ModelIsEnglishOnly { model: shown });
+            }
+            if name.contains("turbo") {
+                return Err(SttError::ModelCannotTranslate { model: shown });
+            }
         }
         whisper_rs::install_logging_hooks();
         let devices = match cfg.device {
@@ -176,10 +253,14 @@ impl Transcriber {
     }
 
     /// Transcribe one utterance (16 kHz mono f32). `prompt` is the previous utterance's text.
+    /// `pinned` is the language already detected earlier in this same utterance under
+    /// [`Language::Auto`] (the worker passes it back so detection runs once per utterance);
+    /// `None` lets whisper detect. It is ignored in the other modes.
     pub fn transcribe(
         &mut self,
         samples: &[f32],
         prompt: Option<&str>,
+        pinned: Option<&str>,
     ) -> Result<Transcript, SttError> {
         let padded;
         let audio = if samples.len() < MIN_SAMPLES {
@@ -211,7 +292,19 @@ impl Transcriber {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(c_int::try_from(self.cfg.threads.max(1)).unwrap_or(4));
-        params.set_language(Some("en"));
+        match &self.cfg.language {
+            Language::English => params.set_language(Some("en")),
+            // A `None` language makes whisper.cpp detect it from the encoder output before
+            // decoding; the translate task then decodes English whatever it heard.
+            Language::Auto => {
+                params.set_translate(true);
+                params.set_language(pinned);
+            }
+            Language::Fixed(code) => {
+                params.set_translate(true);
+                params.set_language(Some(code));
+            }
+        }
         // The previous utterance's text goes in explicitly as `tokens` above. With no_context
         // false whisper.cpp would also prepend its own last decode, which here is usually a
         // partial of this same utterance, and the final would then resume after it and drop
@@ -238,6 +331,10 @@ impl Transcriber {
         self.state
             .full(params, audio)
             .map_err(SttError::Inference)?;
+        let language = match self.cfg.language {
+            Language::English => None,
+            _ => whisper_rs::get_lang_str(self.state.full_lang_id_from_state()).map(str::to_owned),
+        };
 
         let eot = self.ctx.token_eot();
         let mut text = String::new();
@@ -258,7 +355,9 @@ impl Transcriber {
                 }
             }
         }
-        Ok(transcript_from(&text, sum, n))
+        let mut t = transcript_from(&text, sum, n);
+        t.language = language;
+        Ok(t)
     }
 }
 
@@ -320,6 +419,7 @@ fn transcript_from(text: &str, logprob_sum: f32, n_tokens: usize) -> Transcript 
         avg_logprob,
         low_confidence: n_tokens > 0 && avg_logprob < LOW_CONFIDENCE_LOGPROB,
         n_tokens,
+        language: None,
     }
 }
 

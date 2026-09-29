@@ -120,6 +120,9 @@ pub struct SegmentRow {
     pub text: String,
     pub is_final: bool,
     pub avg_logprob: f64,
+    /// The language whisper detected in the audio (#77), when `[stt].language` was not `en`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 /// A row of `questions`: one detector candidate plus, once the LLM fast phase has run, the
@@ -226,6 +229,8 @@ pub struct NewSegment {
     pub text: String,
     pub is_final: bool,
     pub avg_logprob: f64,
+    /// The language whisper detected in the audio (#77), when `[stt].language` was not `en`.
+    pub language: Option<String>,
 }
 
 /// Insert form of [`QuestionRow`]; the id is assigned by SQLite and `text` / `kind` / `focus`
@@ -366,8 +371,8 @@ impl Store {
 
     pub fn insert_segment(&self, segment: &NewSegment) -> Result<i64, StoreError> {
         self.conn.execute(
-            "INSERT INTO segments (session_id, source, start_time, end_time, text, is_final, avg_logprob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO segments (session_id, source, start_time, end_time, text, is_final, avg_logprob, language)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 segment.session_id,
                 segment.source,
@@ -376,6 +381,7 @@ impl Store {
                 segment.text,
                 segment.is_final,
                 segment.avg_logprob,
+                segment.language,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -384,7 +390,7 @@ impl Store {
     /// All segments of a session, in timeline order.
     pub fn segments(&self, session_id: i64) -> Result<Vec<SegmentRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, source, start_time, end_time, text, is_final, avg_logprob
+            "SELECT id, session_id, source, start_time, end_time, text, is_final, avg_logprob, language
              FROM segments WHERE session_id = ?1 ORDER BY start_time, id",
         )?;
         let rows = stmt
@@ -623,6 +629,7 @@ fn segment_from_row(row: &Row<'_>) -> rusqlite::Result<SegmentRow> {
         text: row.get("text")?,
         is_final: row.get("is_final")?,
         avg_logprob: row.get("avg_logprob")?,
+        language: row.get("language")?,
     })
 }
 

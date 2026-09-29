@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 struct Migration {
     version: i64,
@@ -60,6 +60,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         sql: V7,
+    },
+    Migration {
+        version: 8,
+        sql: V8,
     },
 ];
 
@@ -219,6 +223,12 @@ CREATE INDEX idx_summaries_session ON summaries(session_id);
 /// sessions from older builds, and sessions whose guard never fired, read back as none.
 const V7: &str = "
 ALTER TABLE sessions ADD COLUMN echo_dropped INTEGER NOT NULL DEFAULT 0;
+";
+
+/// v8 (#77): the language whisper detected in a segment's audio (ISO 639-1) when
+/// `[stt].language` is not `en`; NULL for rows from older builds and on the English-only path.
+const V8: &str = "
+ALTER TABLE segments ADD COLUMN language TEXT;
 ";
 
 /// Apply every migration newer than the database's `user_version`, each in a transaction.

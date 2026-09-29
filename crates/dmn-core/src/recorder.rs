@@ -205,6 +205,7 @@ impl StoreWriter {
                 text,
                 is_final,
                 avg_logprob,
+                language,
             } => {
                 // Finals only: a partial is superseded by its final within seconds.
                 let Some(session_id) = self.session_id else {
@@ -221,6 +222,7 @@ impl StoreWriter {
                     text: text.clone(),
                     is_final: true,
                     avg_logprob: *avg_logprob,
+                    language: language.clone(),
                 })?;
                 self.segments.insert(segment_key(*speaker, *start), id);
                 self.report.segments += 1;
