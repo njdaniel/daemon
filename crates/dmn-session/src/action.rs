@@ -370,7 +370,7 @@ pub enum Action {
     /// Unpin: the newest queued question (if any) becomes live.
     Unpin,
     /// Interview assistance on or off from now on (#79): dispatched once after `Started` (from
-    /// `[assist].enabled` or `--no-assist`) and again on each `a`. Off, the pipeline runs no
+    /// `[assist].enabled` or `--no-assist`) and again on each Ctrl+Shift+A. Off, the pipeline runs no
     /// detector and asks the LLM nothing, and the screen is the transcript alone.
     Assist { enabled: bool },
     /// A status dot changed.
@@ -380,7 +380,7 @@ pub enum Action {
     Provider { label: ProviderLabel },
     /// How much of the local model Ollama holds in system memory rather than on the GPU, in
     /// percent (#79), once it is loaded: non-zero when whisper took the GPU first (a session
-    /// started with assistance off, then `a`). The status line names it.
+    /// started with assistance off, then Ctrl+Shift+A). The status line names it.
     LlmOffload { cpu_percent: u8 },
     /// Ring-buffer frames dropped so far, over every capture lane (SPEC § Threading rules: a
     /// full ring drops the incoming frame and counts it). Shown beside the dots while non-zero.

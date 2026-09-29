@@ -113,7 +113,7 @@ enum Command {
     /// Run the copilot in this terminal: live question, Approach, transcript and status.
     /// Captures the call live (your mic, the call app's output) until q.
     /// Keys: p pin/unpin, r regenerate, m mute mic, s coding solutions hints/full, w swap the
-    /// STAR story, 1–6 sections, a assistance on/off, q quit
+    /// STAR story, 1–6 sections, Ctrl+Shift+A assistance on/off, q quit
     Run {
         /// Feed the pipeline from two WAV files at 1× instead of live capture
         #[arg(long, num_args = 2, value_names = ["INTERVIEWER", "CANDIDATE"])]
@@ -163,7 +163,7 @@ enum Command {
         solutions: Option<String>,
         /// Start with interview assistance off: transcribe (and translate) only, no question
         /// detection and no LLM request, the transcript on the whole screen; a local Ollama model
-        /// is unloaded so whisper can have the GPU. Overrides [assist].enabled; `a` turns it on
+        /// is unloaded so whisper can have the GPU. Overrides [assist].enabled; Ctrl+Shift+A turns it on
         #[arg(long)]
         no_assist: bool,
     },

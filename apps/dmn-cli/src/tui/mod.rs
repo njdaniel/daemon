@@ -23,7 +23,7 @@
 //! Density rules: every field is cut to its area with `…` instead of growing it, and nothing
 //! expands on its own: a section opens only on its key, one at a time (`Question::open`).
 //!
-//! With interview assistance off (#79, `a` or `--no-assist`) there is no question and no
+//! With interview assistance off (#79, Ctrl+Shift+A or `--no-assist`) there is no question and no
 //! Approach, so the screen is the transcript alone: every line of the session's window, wrapped
 //! rather than cut, the newest just above the same status line, which says `assist off`.
 

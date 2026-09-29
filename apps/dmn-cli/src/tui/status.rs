@@ -16,6 +16,11 @@ use super::{Mode, View};
 const TRANSCRIPT_LINES: usize = 2;
 /// Speaker labels are padded to one width so the text lines up.
 const LABEL_CELLS: usize = 11;
+/// #79: the share of the local LLM in system memory, in percent, from which the status line says
+/// `llm partly on cpu`. The default `qwen3.6:35b-a3b` normally sits at 4 % on the dev 4090
+/// (`ollama ps`, 2026-09-29), and the 2 s budget was measured like that; loaded after GPU
+/// whisper it is far more.
+const LLM_CPU_NOTICE: u8 = 10;
 /// Trails the open utterance's partial text.
 const CURSOR: &str = "▍";
 
@@ -194,7 +199,7 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     // answers come, but slower.
     if view.session.assist_off {
         spans.push(Span::styled(" assist off ", Style::new().fg(Color::Yellow)));
-    } else if st.llm_cpu_percent > 0 {
+    } else if st.llm_cpu_percent >= LLM_CPU_NOTICE {
         spans.push(Span::styled(
             " llm partly on cpu ",
             Style::new().fg(Color::Yellow),
@@ -257,7 +262,7 @@ fn shortcuts(view: &View<'_>) -> String {
         .live()
         .is_some_and(|q| q.star.is_some() && q.stories.len() > 1);
     if view.session.assist_off {
-        return "a assist · q quit ".to_owned();
+        return "ctrl+shift+a assist · q quit ".to_owned();
     }
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),

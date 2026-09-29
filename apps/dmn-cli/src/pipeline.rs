@@ -22,10 +22,10 @@
 //!
 //! Interview assistance (#79) is the layer past the transcript: the detector, the context and
 //! the LLM, held in [`Assistance`]. Off (`[assist].enabled = false`, `dmn run --no-assist`, or
-//! `a`), every segment still reaches the session, the store and the log, but none is scored and
+//! Ctrl+Shift+A), every segment still reaches the session, the store and the log, but none is scored and
 //! nothing is asked of the model; on again, the next question is detected as usual. A run that
 //! starts with it off never warms the LLM, and with a local Ollama asks it to unload before
-//! whisper loads, so whisper can have the GPU; the suggester then starts on the first `a`.
+//! whisper loads, so whisper can have the GPU; the suggester then starts on the first Ctrl+Shift+A.
 //!
 //! A monitor thread watches the lanes while they run (#16): it counts ring-buffer overruns into
 //! the session, turns live capture state into the mic / system dots, moves the [`AudioClock`]'s
@@ -508,7 +508,7 @@ pub enum Command {
     /// `w` (#58): build candidate `candidate`'s STAR block from the story the session moved on
     /// to.
     Swap { candidate: u64 },
-    /// `a` (#79): interview assistance on or off from the next segment.
+    /// Ctrl+Shift+A (#79): interview assistance on or off from the next segment.
     Assist { on: bool },
 }
 
@@ -573,7 +573,7 @@ impl Controls {
         }
     }
 
-    /// `a` (#79): interview assistance off (transcribe and translate only) or on again. The
+    /// Ctrl+Shift+A (#79): interview assistance off (transcribe and translate only) or on again. The
     /// session changes at once, so the screen switches layout on the key; the pipeline stops or
     /// resumes detecting from its next segment.
     pub fn toggle_assist(&self) {
@@ -2449,7 +2449,7 @@ mod tests {
         a.command(Command::Assist { on: true }, &log);
         assert!(
             launched.load(Ordering::Acquire),
-            "the first `a` starts the suggester"
+            "the first Ctrl+Shift+A starts the suggester"
         );
         publish(
             &mut a,

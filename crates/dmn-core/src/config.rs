@@ -289,7 +289,7 @@ pub enum AnswerLength {
 /// Interview assistance (#79): the layer over transcription that detects questions and asks the
 /// LLM for an Approach. Off, Daemon is a live transcriber / translator only: no detector, no
 /// context, no LLM request, and the transcript takes the screen. `dmn run --no-assist` starts a
-/// run with it off; `a` toggles it during the call.
+/// run with it off; Ctrl+Shift+A toggles it during the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Assist {
@@ -405,7 +405,7 @@ slow_timeout_ms = 20000              # the six expandable sections; 0 turns the 
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
 [assist]
-enabled = true                       # false = transcribe / translate only: no detector, no LLM (a toggles)
+enabled = true                       # false = transcribe / translate only: no detector, no LLM (Ctrl+Shift+A toggles)
 
 [ui]
 always_on_top = true
@@ -596,7 +596,7 @@ slow_timeout_ms = 20000              # 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
 [assist]
-enabled = true                       # false = transcribe / translate only (a toggles)
+enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
 
 [ui]
 always_on_top = true

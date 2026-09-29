@@ -603,7 +603,7 @@ fn actions(state: &str) -> Vec<Action> {
             });
         }
         "assist-off" | "assist-on-again" => {
-            // A question answered while assistance was on, then `a`: the Spanish call goes on
+            // A question answered while assistance was on, then Ctrl+Shift+A: the Spanish call goes on
             // translated, and the screen is the transcript alone, wrapped, newest at the bottom.
             a.extend(rate_limiter());
             a.push(Action::Assist { enabled: false });
@@ -857,7 +857,7 @@ fn tui_behavioral_shows_star_cards_a_clarification_and_error_dots() {
 #[test]
 fn tui_assist_off_is_the_transcript_alone_and_says_so() {
     // #79: no question block, no Approach, the status line says `assist off` with the
-    // translation tag, and the footer offers `a` back.
+    // translation tag, and the footer offers Ctrl+Shift+A back.
     let buf = render(&load("assist-off"), (100, 30));
     let screen = text(&buf);
     for gone in ["LIVE QUESTION", "APPROACH", "rate limiter"] {
@@ -871,7 +871,7 @@ fn tui_assist_off_is_the_transcript_alone_and_says_so() {
         last.contains(" es→en ") && last.contains(" assist off "),
         "{last}"
     );
-    assert!(last.ends_with("a assist · q quit"), "{last}");
+    assert!(last.ends_with("ctrl+shift+a assist · q quit"), "{last}");
     let (x, y) = row_containing(&buf, "assist off");
     assert_eq!(buf[(x, y)].fg, Color::Yellow);
     // The transcript takes the released rows: the first translated line is on screen, the
@@ -913,6 +913,10 @@ fn tui_a_model_partly_in_system_memory_is_named() {
     assert!(
         !text(&with(0)).contains("partly"),
         "all on the GPU says nothing"
+    );
+    assert!(
+        !text(&with(4)).contains("partly"),
+        "the usual few percent on the dev 4090 says nothing either"
     );
 }
 

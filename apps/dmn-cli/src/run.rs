@@ -3,8 +3,8 @@
 //! The pipeline ([`crate::pipeline`], the same one `dmn replay` runs) works on its own thread
 //! and dispatches everything into the session; this thread redraws the TUI from the session's
 //! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
-//! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), `a` interview
-//! assistance on ↔ off (#79), `q` (or Ctrl-C) quit. Nothing else writes to the terminal
+//! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), Ctrl+Shift+A
+//! interview assistance on ↔ off (#79, a chord so it is not hit by accident), `q` (or Ctrl-C) quit. Nothing else writes to the terminal
 //! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
@@ -84,7 +84,9 @@ pub enum Key {
     /// `w`: Swap the STAR block to the next matched story (#58). `s` was taken by coding
     /// solutions; `w` is the other letter of "swap" that is free and sits beside `q`/`r`.
     Swap,
-    /// `a`: interview assistance on ↔ off (#79).
+    /// Ctrl+Shift+A: interview assistance on ↔ off (#79). A chord, not a letter, so a stray
+    /// key mid-call cannot switch the Approach off. Terminals without the kitty keyboard
+    /// protocol (WezTerm's default, tmux) send it as Ctrl+A, so that counts too.
     Assist,
     Quit,
 }
@@ -96,7 +98,11 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         return None;
     }
     if ev.modifiers.contains(KeyModifiers::CONTROL) {
-        return (ev.code == KeyCode::Char('c')).then_some(Key::Quit);
+        return match ev.code {
+            KeyCode::Char('c') => Some(Key::Quit),
+            KeyCode::Char('a' | 'A') => Some(Key::Assist),
+            _ => None,
+        };
     }
     match ev.code {
         KeyCode::Char('p' | 'P') => Some(Key::Pin),
@@ -104,7 +110,6 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('m' | 'M') => Some(Key::Mute),
         KeyCode::Char('s' | 'S') => Some(Key::Solutions),
         KeyCode::Char('w' | 'W') => Some(Key::Swap),
-        KeyCode::Char('a' | 'A') => Some(Key::Assist),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -464,7 +469,17 @@ mod tests {
         assert_eq!(key(press_key('r')), Some(Key::Regenerate));
         assert_eq!(key(press_key('m')), Some(Key::Mute));
         assert_eq!(key(press_key('s')), Some(Key::Solutions));
-        assert_eq!(key(press_key('a')), Some(Key::Assist));
+        assert_eq!(key(press_key('a')), None, "a plain a does nothing (#79)");
+        assert_eq!(key(press_key('A')), None);
+        for (code, mods) in [
+            ('A', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            ('a', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            // Without the kitty keyboard protocol Ctrl+Shift+A arrives as Ctrl+A.
+            ('a', KeyModifiers::CONTROL),
+        ] {
+            let ev = KeyEvent::new(KeyCode::Char(code), mods);
+            assert_eq!(key(ev), Some(Key::Assist), "{mods:?} {code}");
+        }
         assert_eq!(key(press_key('q')), Some(Key::Quit));
         assert_eq!(
             key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -518,7 +533,14 @@ mod tests {
             hub.dispatch(a);
         }
         assert!(
-            !press(key(press_key('a')).unwrap(), &controls),
+            !press(
+                key(KeyEvent::new(
+                    KeyCode::Char('A'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ))
+                .unwrap(),
+                &controls
+            ),
             "a does not quit"
         );
         let off = screen(&hub.snapshot());

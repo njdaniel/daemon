@@ -50,10 +50,10 @@ The default interaction is intentionally small:
 No wall of text while you're trying to listen to another human.
 
 That assistance is a layer over a live transcriber and translator, and it can be switched off:
-press `a` during a call, start with `dmn run --no-assist`, or set `[assist] enabled = false`.
+press Ctrl+Shift+A during a call, start with `dmn run --no-assist`, or set `[assist] enabled = false`.
 Off, Daemon only transcribes (and, with a multilingual model, translates to English) on a
-transcript-only screen; no question detection runs and nothing is sent to the LLM. Press `a`
-again and the next question is answered as usual.
+transcript-only screen; no question detection runs and nothing is sent to the LLM. Press
+Ctrl+Shift+A again and the next question is answered as usual.
 
 ## Current CLI
 
@@ -162,9 +162,9 @@ detection step per utterance.
 To follow a call (or a video) in another language without the interview aid, run
 `dmn run --no-assist --language auto --model small`: the screen is the translated transcript
 alone. With a local Ollama the model is unloaded at start, so a GPU build can give whisper the
-whole card (`--model medium` runs at about 0.13 s per utterance on a 4090). Pressing `a` later
-loads the LLM into what is left; if part of it lands in system memory the status line says
-`llm partly on cpu`.
+whole card (`--model medium` runs at about 0.13 s per utterance on a 4090). Pressing
+Ctrl+Shift+A later loads the LLM into what is left; if a tenth or more of it lands in system
+memory the status line says `llm partly on cpu`.
 
 ### Initialize and inspect your system
 
