@@ -1,5 +1,6 @@
-//! Area 3: the last two transcript lines, then the status dots and shortcuts. With assistance
-//! off (#79) the transcript is the whole screen above the status line, each line wrapped.
+//! Area 3: the transcript, then the status dots and shortcuts. The transcript is the last two
+//! lines under the Approach on a stacked screen, a right-hand column on a wide one (#88), or the
+//! whole screen above the status line with assistance off (#79); the last two are wrapped.
 
 use dmn_session::{Health, Line as TranscriptLine, Section, Speaker};
 use ratatui::buffer::Buffer;
@@ -24,8 +25,29 @@ const LLM_CPU_NOTICE: u8 = 10;
 /// Trails the open utterance's partial text.
 const CURSOR: &str = "▍";
 
-pub(super) fn render_transcript(view: &View<'_>, area: Rect, buf: &mut Buffer) {
-    let block = Block::new().borders(Borders::TOP).title(Span::styled(
+/// Where the transcript is drawn, which decides its shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TranscriptArea {
+    /// Under the Approach: the last two lines, one row each, cut at the front.
+    Strip,
+    /// A right-hand column beside the question and Approach (#88), wrapped, newest at the bottom.
+    Column,
+    /// The whole screen above the status line, assistance off (#79), wrapped the same way.
+    Screen,
+}
+
+pub(super) fn render_transcript(
+    view: &View<'_>,
+    shape: TranscriptArea,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    // The column's left edge is the line between it and the question and Approach.
+    let borders = match shape {
+        TranscriptArea::Column => Borders::TOP | Borders::LEFT,
+        TranscriptArea::Strip | TranscriptArea::Screen => Borders::TOP,
+    };
+    let block = Block::new().borders(borders).title(Span::styled(
         " TRANSCRIPT ",
         Style::new().fg(Color::DarkGray),
     ));
@@ -42,7 +64,7 @@ pub(super) fn render_transcript(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         .chain(s.partials.iter().map(|l| (l, true)))
         .collect();
     all.sort_by(|a, b| a.0.start.total_cmp(&b.0.start));
-    if s.assist_off {
+    if shape != TranscriptArea::Strip {
         // Bottom-aligned, like a terminal: the newest line sits just above the status line
         // however much of the window there is.
         let rows = wrapped(&all, cells, usize::from(inner.height));
