@@ -1,4 +1,5 @@
-//! Area 3: the last two transcript lines, then the status dots and shortcuts.
+//! Area 3: the last two transcript lines, then the status dots and shortcuts. With assistance
+//! off (#79) the transcript is the whole screen above the status line, each line wrapped.
 
 use dmn_session::{Health, Line as TranscriptLine, Section, Speaker};
 use ratatui::buffer::Buffer;
@@ -8,13 +9,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use super::sections::key_of;
-use super::text::{truncate, truncate_front, width};
+use super::text::{truncate, truncate_front, width, wrap};
 use super::{Mode, View};
 
 /// Transcript rows (SPEC § Transcript & status: the last two segments, one line each).
 const TRANSCRIPT_LINES: usize = 2;
 /// Speaker labels are padded to one width so the text lines up.
 const LABEL_CELLS: usize = 11;
+/// #79: the share of the local LLM in system memory, in percent, from which the status line says
+/// `llm partly on cpu`. The default `qwen3.6:35b-a3b` normally sits at 4 % on the dev 4090
+/// (`ollama ps`, 2026-09-29), and the 2 s budget was measured like that; loaded after GPU
+/// whisper it is far more.
+const LLM_CPU_NOTICE: u8 = 10;
 /// Trails the open utterance's partial text.
 const CURSOR: &str = "▍";
 
@@ -36,6 +42,16 @@ pub(super) fn render_transcript(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         .chain(s.partials.iter().map(|l| (l, true)))
         .collect();
     all.sort_by(|a, b| a.0.start.total_cmp(&b.0.start));
+    if s.assist_off {
+        // Bottom-aligned, like a terminal: the newest line sits just above the status line
+        // however much of the window there is.
+        let rows = wrapped(&all, cells, usize::from(inner.height));
+        let used = u16::try_from(rows.len()).unwrap_or(inner.height);
+        let [_, bottom] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(used)]).areas(inner);
+        Paragraph::new(rows).render(bottom, buf);
+        return;
+    }
     let newest = &all[all.len().saturating_sub(TRANSCRIPT_LINES)..];
 
     let lines: Vec<Line<'static>> = newest
@@ -45,12 +61,63 @@ pub(super) fn render_transcript(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn transcript_line(l: &TranscriptLine, partial: bool, cells: usize) -> Line<'static> {
-    let (label, colour) = match l.speaker {
+/// #79, the transcript-first screen: the newest lines that fit in `rows`, each wrapped under
+/// its speaker label, in speaking order. The oldest line shown loses its first rows when only its
+/// end fits, so the newest words are always on screen.
+fn wrapped(all: &[(&TranscriptLine, bool)], cells: usize, rows: usize) -> Vec<Line<'static>> {
+    let indent = " ".repeat(LABEL_CELLS + 1);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (l, partial) in all.iter().rev() {
+        if out.len() >= rows {
+            break;
+        }
+        let (label, colour) = speaker(l.speaker);
+        let room = cells.saturating_sub(LABEL_CELLS + 1 + if *partial { width(CURSOR) } else { 0 });
+        // Wrapped in full, not to `rows`: `wrap` keeps the first lines and marks the cut with
+        // `…`, and the newest words are the ones to keep (Copilot, PR #80). The rows past the
+        // screen's top are dropped below, oldest first.
+        let mut text = wrap(&l.text, room, usize::MAX);
+        if text.is_empty() {
+            text.push(String::new());
+        }
+        let last = text.len() - 1;
+        let lines: Vec<Line<'static>> = text
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let head = if i == 0 {
+                    Span::styled(
+                        format!("{label:<LABEL_CELLS$} "),
+                        Style::new().fg(colour).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(indent.clone())
+                };
+                let mut spans = vec![head, Span::raw(t)];
+                if *partial && i == last {
+                    spans.push(Span::styled(CURSOR, Style::new().fg(Color::DarkGray)));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        // Newest first while collecting; each line's rows go in bottom-up too.
+        out.extend(lines.into_iter().rev());
+    }
+    out.truncate(rows);
+    out.reverse();
+    out
+}
+
+fn speaker(s: Speaker) -> (&'static str, Color) {
+    match s {
         Speaker::Interviewer => ("Interviewer", Color::Cyan),
         Speaker::You => ("You", Color::Magenta),
         Speaker::Unknown => ("?", Color::DarkGray),
-    };
+    }
+}
+
+fn transcript_line(l: &TranscriptLine, partial: bool, cells: usize) -> Line<'static> {
+    let (label, colour) = speaker(l.speaker);
     let room = cells.saturating_sub(LABEL_CELLS + 1 + if partial { width(CURSOR) } else { 0 });
     let mut spans = vec![
         Span::styled(
@@ -130,6 +197,15 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
             Style::new().fg(Color::DarkGray),
         ));
     }
+    // #79: a local model that loaded partly into system memory (whisper took the GPU first) is
+    // named in amber: answers come, but slower. (Assistance off is said on the right, with the
+    // keys, where nothing cuts it.)
+    if !view.session.assist_off && st.llm_cpu_percent >= LLM_CPU_NOTICE {
+        spans.push(Span::styled(
+            " llm partly on cpu ",
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     // An error's reason first (red); otherwise, when transcript text leaves the machine, the
     // SPEC § Providers notice in words (amber) for as long as it does.
     let note = detail.map(|d| (d, Color::Red)).or_else(|| {
@@ -149,12 +225,21 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         }
     }
     Paragraph::new(Line::from(spans)).render(left, buf);
-    Paragraph::new(Line::from(Span::styled(
-        keys,
+    // #79: the right-hand area is never cut (the left one is, on a narrow pane), so the one
+    // state that changes what the screen is for leads it, in amber.
+    let mut right_spans = Vec::new();
+    if view.session.assist_off {
+        right_spans.push(Span::styled(ASSIST_OFF, Style::new().fg(Color::Yellow)));
+    }
+    right_spans.push(Span::styled(
+        keys.strip_prefix(ASSIST_OFF).unwrap_or(&keys).to_owned(),
         Style::new().fg(Color::DarkGray),
-    )))
-    .render(right, buf);
+    ));
+    Paragraph::new(Line::from(right_spans)).render(right, buf);
 }
+
+/// #79: how the status line names assistance off; it leads the keys.
+const ASSIST_OFF: &str = "assist off";
 
 /// The two most useful keys for the state on screen (SPEC § Transcript & status: "Footer shows
 /// the two most useful shortcuts for the current state"). While a coding question is on screen
@@ -186,6 +271,11 @@ fn shortcuts(view: &View<'_>) -> String {
     let swap = view
         .live()
         .is_some_and(|q| q.star.is_some() && q.stories.len() > 1);
+    if view.session.assist_off {
+        // Ctrl+Shift+A in tmux's notation: short enough that an 80-column pane with every tag
+        // (`system: all audio`, `es→en`) still shows the whole state.
+        return format!("{ASSIST_OFF} · C-S-a on ");
+    }
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
         (_, _, true, Some(sec)) => format!("{sec} · s: {solutions}"),

@@ -21,6 +21,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_KEEP_ALIVE: &str = "30m";
 /// Upper bound on `warm_up`: loading the model from disk, not generation.
 pub const WARM_UP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Upper bound on `unload` and `gpu_share`: bookkeeping on the server, no model load.
+pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Everything the Ollama provider needs from configuration. Built from `[llm]` in the wiring
 /// crate (wired in `dmn-core`, #13); this crate only defines the shape and its defaults.
@@ -151,6 +153,97 @@ impl OllamaProvider {
         }
         body
     }
+
+    /// The unload request body (#79): empty messages with `keep_alive: 0` make Ollama drop the
+    /// model from memory at once, without loading it first when it is not loaded. Public so
+    /// tests can assert it.
+    pub fn build_unload_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "messages": [],
+            "stream": false,
+            "keep_alive": 0,
+        })
+    }
+
+    /// Ask Ollama to unload the model now (#79). Ollama otherwise keeps it for `keep_alive`
+    /// (30 minutes by default) after the last request, holding the GPU memory whisper could use.
+    /// Bounded by [`STATUS_TIMEOUT`].
+    pub async fn unload(&self) -> Result<(), LlmError> {
+        let body = self.build_unload_body();
+        self.within(
+            self.client.post(self.url("/api/chat")).json(&body),
+            "/api/chat",
+        )
+        .await?;
+        tracing::info!(model = %self.model, "ollama unloaded");
+        Ok(())
+    }
+
+    /// Send `req` under [`STATUS_TIMEOUT`]; a non-success status is an error with its body.
+    /// The same bound is set on the request itself, so reading the reply's body afterwards
+    /// (`gpu_share`'s JSON) cannot hang either: reqwest's per-request timeout runs until the
+    /// body has been read.
+    async fn within(
+        &self,
+        req: reqwest::RequestBuilder,
+        path: &str,
+    ) -> Result<reqwest::Response, LlmError> {
+        let deadline = Instant::now() + STATUS_TIMEOUT;
+        let cancel = CancellationToken::new();
+        let url = self.url(path);
+        let send = req.timeout(STATUS_TIMEOUT).send();
+        let resp = send_within(NAME, &url, send, &cancel, deadline, STATUS_TIMEOUT).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = error_body_within(resp, &cancel, deadline).await;
+            return Err(LlmError::HttpStatus {
+                provider: NAME,
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(resp)
+    }
+}
+
+/// `/api/ps`: the models Ollama holds in memory.
+#[derive(Debug, Deserialize)]
+struct Loaded {
+    #[serde(default)]
+    models: Vec<LoadedModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadedModel {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: String,
+    /// Bytes in memory, GPU and system together.
+    #[serde(default)]
+    size: u64,
+    /// Of which on the GPU.
+    #[serde(default)]
+    size_vram: u64,
+}
+
+/// The GPU share of `model` in an `/api/ps` reply; `None` when it is not loaded. A name with no
+/// tag matches its `:latest`, as Ollama lists it.
+fn gpu_share_in(ps: &Loaded, model: &str) -> Option<f32> {
+    let latest = format!("{model}:latest");
+    let m = ps.models.iter().find(|m| {
+        [&m.name, &m.model]
+            .iter()
+            .any(|n| *n == model || **n == latest)
+    })?;
+    if m.size == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)] // model sizes are far below f64's exact range
+    let share = (m.size_vram as f64 / m.size as f64).clamp(0.0, 1.0);
+    #[allow(clippy::cast_possible_truncation)]
+    Some(share as f32)
 }
 
 /// One NDJSON line from `/api/chat`.
@@ -300,6 +393,22 @@ impl Provider for OllamaProvider {
             Ok(())
         })
     }
+
+    /// `/api/ps` (#79): how much of the model sits on the GPU, so the status line can say when
+    /// whisper took the room first and part of the model runs on the CPU.
+    fn gpu_share<'a>(&'a self) -> BoxFuture<'a, Result<Option<f32>, LlmError>> {
+        Box::pin(async move {
+            let resp = self
+                .within(self.client.get(self.url("/api/ps")), "/api/ps")
+                .await?;
+            // Bounded by the request's own timeout (`within`).
+            let ps: Loaded = resp.json().await.map_err(|e| LlmError::MalformedStream {
+                provider: NAME,
+                detail: format!("/api/ps: {e}"),
+            })?;
+            Ok(gpu_share_in(&ps, &self.model))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -342,6 +451,68 @@ mod tests {
         assert_eq!(body["messages"], serde_json::json!([]));
         assert_eq!(body["keep_alive"], "2h");
         assert_eq!(body["model"], "test-model");
+    }
+
+    #[test]
+    fn unload_body_asks_for_keep_alive_zero_and_nothing_else() {
+        let body = provider().with_num_ctx(Some(8192)).build_unload_body();
+        assert_eq!(body["keep_alive"], serde_json::json!(0));
+        assert_eq!(body["messages"], serde_json::json!([]));
+        assert_eq!(body["model"], "test-model");
+        assert!(
+            body.get("options").is_none(),
+            "an unload loads nothing: {body}"
+        );
+    }
+
+    /// Copilot on PR #80: `within` bounded the request, not the read of its body, so an Ollama
+    /// that sent `/api/ps`'s headers and then stalled hung the suggester's thread for ever. The
+    /// request's own timeout now covers the body too.
+    #[tokio::test]
+    async fn gpu_share_gives_up_on_a_reply_that_stalls_mid_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(br#"{"models":["#);
+            let _ = stream.flush();
+            // Hold the connection open, sending nothing more, until the client gives up.
+            let _ = stream.set_read_timeout(Some(STATUS_TIMEOUT * 3));
+            let _ = stream.read(&mut buf);
+        });
+        let p = OllamaProvider::new(format!("http://127.0.0.1:{port}"), "test-model").unwrap();
+        let started = std::time::Instant::now();
+        let got = p.gpu_share().await;
+        assert!(got.is_err(), "{got:?}");
+        assert!(
+            started.elapsed() < STATUS_TIMEOUT + Duration::from_secs(2),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn gpu_share_reads_the_models_entry_in_api_ps() {
+        let ps: Loaded = serde_json::from_str(
+            r#"{"models":[
+                {"name":"other:7b","model":"other:7b","size":100,"size_vram":100},
+                {"name":"test-model:latest","model":"test-model:latest","size":2000,"size_vram":1500}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(gpu_share_in(&ps, "test-model"), Some(0.75));
+        assert_eq!(gpu_share_in(&ps, "other:7b"), Some(1.0));
+        assert_eq!(gpu_share_in(&ps, "absent"), None);
+        let empty: Loaded = serde_json::from_str("{}").unwrap();
+        assert_eq!(gpu_share_in(&empty, "test-model"), None);
     }
 
     #[test]

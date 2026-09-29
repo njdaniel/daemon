@@ -369,11 +369,19 @@ pub enum Action {
     CodingSolutions { mode: CodingSolutions },
     /// Unpin: the newest queued question (if any) becomes live.
     Unpin,
+    /// Interview assistance on or off from now on (#79): dispatched once after `Started` (from
+    /// `[assist].enabled` or `--no-assist`) and again on each Ctrl+Shift+A. Off, the pipeline runs no
+    /// detector and asks the LLM nothing, and the screen is the transcript alone.
+    Assist { enabled: bool },
     /// A status dot changed.
     Status { dot: Dot, health: Health },
     /// The LLM provider now answering (#59): at start and after a config reload switched it.
     /// The model dot is named after it, and a remote one says transcript text leaves the machine.
     Provider { label: ProviderLabel },
+    /// How much of the local model Ollama holds in system memory rather than on the GPU, in
+    /// percent (#79), once it is loaded: non-zero when whisper took the GPU first (a session
+    /// started with assistance off, then Ctrl+Shift+A). The status line names it.
+    LlmOffload { cpu_percent: u8 },
     /// Ring-buffer frames dropped so far, over every capture lane (SPEC § Threading rules: a
     /// full ring drops the incoming frame and counts it). Shown beside the dots while non-zero.
     Overruns { total: u64 },

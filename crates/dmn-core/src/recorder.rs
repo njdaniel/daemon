@@ -418,8 +418,13 @@ impl StoreWriter {
             | Action::SwapStory { .. }
             // Which provider answered is status-line state, like the dots (#59).
             | Action::Provider { .. }
-            // Where whisper runs is status-line state too (#61).
+            // Where whisper runs is status-line state too (#61), and so is how much of the
+            // local LLM ended up in system memory (#79).
             | Action::Transcriber { .. }
+            | Action::LlmOffload { .. }
+            // Assistance on or off is screen and pipeline state (#79); a question asked while it
+            // was off never becomes a candidate, so no row needs to say so.
+            | Action::Assist { .. }
             // #63: both halves of a split question keep their question rows, as every candidate
             // does; the link is screen state and stays in the action log.
             | Action::Continues { .. }

@@ -309,6 +309,30 @@ struct SlowJob {
     answered: Option<Answered>,
 }
 
+/// #79: how much of the model now answering sits in system memory rather than on the GPU, for
+/// the status line: a model loaded after whisper took the GPU (assistance turned on
+/// mid-session) may not fit, and that is said rather than failed or hidden. A provider that
+/// cannot tell (a remote one, or a model not loaded) counts as none, so switching to one clears
+/// an earlier notice; a failed `/api/ps` changes nothing.
+fn report_offload(rt: &tokio::runtime::Runtime, provider: &dyn Provider, hub: &SessionHub) {
+    let Ok(share) = rt.block_on(provider.gpu_share()) else {
+        return;
+    };
+    let cpu_percent = share.map_or(0, cpu_percent);
+    if cpu_percent > 0 {
+        tracing::warn!(cpu_percent, "LLM partly in system memory");
+    }
+    hub.dispatch(Action::LlmOffload { cpu_percent });
+}
+
+/// The part of the model not on the GPU, in whole percent; a sliver under 1 % is rounding.
+fn cpu_percent(gpu_share: f32) -> u8 {
+    let cpu = ((1.0 - gpu_share.clamp(0.0, 1.0)) * 100.0).round();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // 0.0 ..= 100.0
+    let cpu = cpu as u8;
+    cpu
+}
+
 pub struct Suggester {
     tx: mpsc::Sender<Job>,
     cancel: CancellationToken,
@@ -347,7 +371,7 @@ impl Suggester {
     /// Serve jobs on `provider` directly, with no warm-up, no context and no slow phase: the
     /// tests' way in.
     #[cfg(test)]
-    fn start_with<P: Provider + Send + 'static>(
+    pub(crate) fn start_with<P: Provider + Send + 'static>(
         provider: P,
         policy: Policy,
         hub: Arc<SessionHub>,
@@ -653,6 +677,7 @@ fn worker(
         dot: Dot::Model,
         health: Health::Ok,
     });
+    report_offload(&rt, &*provider, hub);
     announce(llm, hub, output);
 
     // #54: the sources and job requirements, loaded once before the first question. A new job
@@ -932,6 +957,8 @@ impl Answerer<'_> {
             "provider switched by config reload"
         );
         self.provider = next;
+        // The new model may sit differently on the GPU, or be remote (Copilot, PR #80).
+        report_offload(self.rt, &*self.provider, self.hub);
         r.llm = cfg.llm;
         self.hub.dispatch(Action::Status {
             dot: Dot::Model,
@@ -1939,6 +1966,53 @@ mod tests {
         submit_with_candidate(&s, &hub, 2);
         assert_eq!(s.finish().shown, 1);
         assert_eq!(hub.snapshot().status.model, Health::Ok);
+    }
+
+    // --- LLM offload notice (#79) -------------------------------------------------------------
+
+    /// A provider that only answers `gpu_share`, with a fixed share.
+    struct Placed(Option<f32>);
+
+    impl Provider for Placed {
+        fn name(&self) -> &'static str {
+            "placed"
+        }
+
+        fn chat<'a>(
+            &'a self,
+            _req: dmn_llm::ChatRequest,
+            _cancel: dmn_llm::CancellationToken,
+        ) -> dmn_llm::BoxFuture<'a, Result<dmn_llm::DeltaStream<'a>, dmn_llm::LlmError>> {
+            Box::pin(async { Err(dmn_llm::LlmError::Cancelled) })
+        }
+
+        fn gpu_share<'a>(
+            &'a self,
+        ) -> dmn_llm::BoxFuture<'a, Result<Option<f32>, dmn_llm::LlmError>> {
+            let share = self.0;
+            Box::pin(async move { Ok(share) })
+        }
+    }
+
+    #[test]
+    fn the_offload_notice_follows_the_provider_now_answering() {
+        // Copilot on PR #80: a reload to a provider that sits differently, or a remote one that
+        // cannot tell, must not leave the previous model's notice on the status line.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = SessionHub::default();
+        report_offload(&rt, &Placed(Some(0.6)), &hub);
+        assert_eq!(hub.snapshot().status.llm_cpu_percent, 40);
+        report_offload(&rt, &Placed(None), &hub);
+        assert_eq!(hub.snapshot().status.llm_cpu_percent, 0, "remote: cleared");
+        report_offload(&rt, &Placed(Some(0.999)), &hub);
+        assert_eq!(
+            hub.snapshot().status.llm_cpu_percent,
+            0,
+            "under 1 % is rounding"
+        );
     }
 
     // --- Provider reload (#59) --------------------------------------------------------------

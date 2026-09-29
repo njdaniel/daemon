@@ -20,6 +20,13 @@
 //! pipeline thread (which owns the candidates and the transcript window the request needs), and
 //! quit stops the audio sources so the run ends early and cleanly.
 //!
+//! Interview assistance (#79) is the layer past the transcript: the detector, the context and
+//! the LLM, held in [`Assistance`]. Off (`[assist].enabled = false`, `dmn run --no-assist`, or
+//! Ctrl+Shift+A), every segment still reaches the session, the store and the log, but none is scored and
+//! nothing is asked of the model; on again, the next question is detected as usual. A run that
+//! starts with it off never warms the LLM, and with a local Ollama asks it to unload before
+//! whisper loads, so whisper can have the GPU; the suggester then starts on the first Ctrl+Shift+A.
+//!
 //! A monitor thread watches the lanes while they run (#16): it counts ring-buffer overruns into
 //! the session, turns live capture state into the mic / system dots, moves the [`AudioClock`]'s
 //! anchor as the interviewer lane consumes frames (so [`Action::Timing`] marks are on the clock
@@ -206,6 +213,9 @@ pub struct Options {
     pub spec_literal_detector: bool,
     /// Skip the LLM fast phase (#12): transcribe and detect only.
     pub no_llm: bool,
+    /// Interview assistance at the start (#79), over `[assist].enabled`: `Some(false)` is
+    /// `dmn run --no-assist`. Off, nothing is detected and the LLM is never asked.
+    pub assist: Option<bool>,
     /// Keep the session in memory only: write nothing to `dmn.sqlite` (#13).
     pub no_store: bool,
     /// Where the fast phase prints (`dmn replay`) or not (`dmn run`).
@@ -411,6 +421,13 @@ impl Detecting {
         last.continues = true;
     }
 
+    /// Forget the line held for its follower and the question being asked (#79): assistance
+    /// went off, and whatever follows the gap must not complete a question from before it.
+    fn pause(&mut self) {
+        self.pending = None;
+        self.chain = None;
+    }
+
     /// Score whatever is still held after the audio ends.
     fn flush(&mut self) -> usize {
         let before = self.found.len();
@@ -491,6 +508,8 @@ pub enum Command {
     /// `w` (#58): build candidate `candidate`'s STAR block from the story the session moved on
     /// to.
     Swap { candidate: u64 },
+    /// Ctrl+Shift+A (#79): interview assistance on or off from the next segment.
+    Assist { on: bool },
 }
 
 /// The TUI's handle on a running pipeline. Cheap to clone; safe from any thread.
@@ -552,6 +571,15 @@ impl Controls {
         if live.stories.len() > 1 {
             let _ = self.commands.send(Command::Swap { candidate });
         }
+    }
+
+    /// Ctrl+Shift+A (#79): interview assistance off (transcribe and translate only) or on again. The
+    /// session changes at once, so the screen switches layout on the key; the pipeline stops or
+    /// resumes detecting from its next segment.
+    pub fn toggle_assist(&self) {
+        let on = self.hub.snapshot().assist_off;
+        self.hub.dispatch(Action::Assist { enabled: on });
+        let _ = self.commands.send(Command::Assist { on });
     }
 
     /// `1`–`6`: open `section` under the live question's Approach (closing the open one), or
@@ -699,12 +727,29 @@ pub struct Pipeline {
     clock: wire::SessionClock,
     /// Audio time for [`Action::Timing`] and the headless latency report.
     audio: AudioClock,
-    suggester: Option<Suggester>,
-    detecting: Detecting,
     /// Between the bus and everything downstream (#60); `[audio].echo_guard`.
     echo: EchoGuard,
     flushed: bool,
     log: TranscriptLog,
+    /// The detector and the LLM (#79): on or off, the transcript above is the same.
+    assist: Assistance,
+}
+
+/// Starts the suggester the first time assistance is on (#79).
+type Launch = Box<dyn FnOnce() -> Suggester + Send>;
+
+/// Interview assistance (#79): the detector, the candidates it emits and the suggester that
+/// answers them. Fed every published segment; off, it ignores them all and asks nothing.
+pub struct Assistance {
+    on: bool,
+    hub: Arc<SessionHub>,
+    /// Audio time for [`Action::Timing`].
+    audio: AudioClock,
+    detecting: Detecting,
+    /// `None` under `--no-llm`, and until the first time assistance is on.
+    suggester: Option<Suggester>,
+    /// How to start the suggester, until it has been.
+    launch: Option<Launch>,
     candidates_tx: crossbeam_channel::Sender<Candidate>,
     candidates_rx: Receiver<Candidate>,
     next_candidate: u64,
@@ -793,8 +838,16 @@ impl Pipeline {
         // #61: whisper may take GPU memory. Load the local LLM first, so that if it (re)loads —
         // a `num_ctx` different from what is loaded, or a cold start — it sizes itself against a
         // GPU whisper has not claimed yet, rather than pushing more of itself onto the CPU.
-        if !opts.no_llm && stt_cfg.device != DeviceChoice::Cpu {
-            warm_local_llm(&cfg.llm);
+        // #79: with assistance off the LLM is not wanted at all, so a local one is asked to
+        // leave instead (Ollama keeps a model 30 minutes after its last request), and whisper
+        // gets the whole GPU.
+        let assist = opts.assist.unwrap_or(cfg.assist.enabled);
+        if !opts.no_llm {
+            if !assist {
+                unload_local_llm(&cfg.llm);
+            } else if stt_cfg.device != DeviceChoice::Cpu {
+                warm_local_llm(&cfg.llm);
+            }
         }
 
         // Load both whisper models and spawn every worker first, then start both sources back
@@ -873,6 +926,7 @@ impl Pipeline {
         hub.dispatch(Action::CodingSolutions {
             mode: opts.coding_solutions.unwrap_or(cfg.ui.coding_solutions),
         });
+        hub.dispatch(Action::Assist { enabled: assist });
         // #61: where whisper ended up, for the status line; a GPU that fell back says so.
         hub.dispatch(Action::Transcriber {
             device: stt_device.clone(),
@@ -904,26 +958,47 @@ impl Pipeline {
             &done,
             &stop,
         );
-        let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
         // #12: each candidate goes through the LLM fast phase on its own thread; #54: with the
-        // stored sources and job requirements, read-only under `--no-store`.
-        let suggester = (!opts.no_llm).then(|| {
-            Suggester::start(
-                &cfg.llm,
-                opts.output,
-                opts.policy,
-                Arc::clone(&hub),
-                clock,
-                audio_clock.clone(),
-                ContextSource::Db {
-                    path: paths.db_file.clone(),
-                    write: !opts.no_store,
-                },
-                // #59: `[llm]` changes in the config file swap the provider between requests.
-                Some(paths.config_file.clone()),
-            )
+        // stored sources and job requirements, read-only under `--no-store`. #79: started when
+        // assistance is first on, so a run with it off never loads the model.
+        let launch = (!opts.no_llm).then(|| {
+            let llm = cfg.llm.clone();
+            let (output, policy) = (opts.output, opts.policy);
+            let hub = Arc::clone(&hub);
+            let audio = audio_clock.clone();
+            let context = ContextSource::Db {
+                path: paths.db_file.clone(),
+                write: !opts.no_store,
+            };
+            // #59: `[llm]` changes in the config file swap the provider between requests.
+            let config_file = paths.config_file.clone();
+            Box::new(move || {
+                // Started on a later Ctrl+Shift+A, perhaps long after the config was read: an
+                // `[llm]` edit made meanwhile applies from the first request (Copilot, PR #80).
+                let llm = llm_now(&config_file, llm);
+                Suggester::start(
+                    &llm,
+                    output,
+                    policy,
+                    hub,
+                    clock,
+                    audio,
+                    context,
+                    Some(config_file),
+                )
+            }) as Launch
         });
         let (commands_tx, commands) = mpsc::channel();
+        let assist = Assistance::new(
+            assist,
+            Arc::clone(&hub),
+            audio_clock.clone(),
+            Detecting::new(
+                opts.spec_literal_detector,
+                sensitivity(cfg.detect.sensitivity),
+            ),
+            launch,
+        );
         Ok(Self {
             info: Info {
                 model: name,
@@ -951,22 +1026,11 @@ impl Pipeline {
             recorder,
             hub,
             clock,
+            assist,
             audio: audio_clock,
-            suggester,
-            detecting: Detecting::new(
-                opts.spec_literal_detector,
-                sensitivity(cfg.detect.sensitivity),
-            ),
             echo: EchoGuard::new(cfg.audio.echo_guard),
             flushed: false,
             log: TranscriptLog::new(),
-            candidates_tx,
-            candidates_rx,
-            next_candidate: 0,
-            sent_ids: VecDeque::new(),
-            last_sent: None,
-            dropped_candidates: 0,
-            known: HashMap::new(),
         })
     }
 
@@ -1037,12 +1101,12 @@ impl Pipeline {
         }
     }
 
-    /// A segment the guard let through: session, observer, detector, log.
+    /// A segment the guard let through: session, observer, detector (while assistance is on),
+    /// log.
     fn publish(&mut self, seg: Segment, observer: &mut dyn Observer) {
         self.hub.dispatch(wire::segment(&seg));
         observer.segment(&seg);
-        let new = self.detecting.feed(&seg);
-        self.emit(new, observer);
+        self.assist.feed(&seg, &self.log, observer);
         self.log.apply(seg);
     }
 
@@ -1070,134 +1134,11 @@ impl Pipeline {
         // the detector's last line is scored against.
         let verdicts = self.echo.finish();
         self.verdicts(verdicts, observer);
-        let new = self.detecting.flush();
-        self.emit(new, observer);
-    }
-
-    /// Send the last `new` candidates through the detector's channel into the session and the
-    /// fast phase, with the last 60 s of transcript.
-    fn emit(&mut self, new: usize, observer: &mut dyn Observer) {
-        let found = self.detecting.found();
-        for f in &found[found.len() - new..] {
-            self.next_candidate += 1;
-            if self.candidates_tx.try_send(f.candidate.clone()).is_ok() {
-                self.sent_ids.push_back((self.next_candidate, f.continues));
-            } else {
-                self.dropped_candidates += 1;
-            }
-            observer.candidate(self.next_candidate, f);
-        }
-        for candidate in self.candidates_rx.try_iter() {
-            let Some((id, continues)) = self.sent_ids.pop_front() else {
-                break;
-            };
-            self.hub.dispatch(wire::candidate(id, &candidate));
-            // #63: the same question, split at a pause. Its reply replaces the earlier one's
-            // question where it is, instead of arriving as a second question.
-            let continued = if continues {
-                self.last_sent.inspect(|&prev| {
-                    self.hub.dispatch(Action::Continues {
-                        candidate: id,
-                        continued: prev,
-                    });
-                })
-            } else {
-                None
-            };
-            self.last_sent = Some(id);
-            self.hub.dispatch(Action::Timing {
-                candidate: id,
-                stage: Stage::Emitted,
-                at: self.audio.now(),
-            });
-            if let Some(s) = &self.suggester {
-                // A continuation is the question still being asked: nothing has been answered.
-                let answered = match continued {
-                    Some(_) => None,
-                    None => self.answered(&candidate),
-                };
-                s.submit_after(
-                    id,
-                    &candidate,
-                    self.log.render_window(DEFAULT_WINDOW),
-                    answered,
-                    continued.is_some(),
-                );
-            }
-            self.known.insert(id, candidate);
-        }
-    }
-
-    /// #57, session memory: the question on screen as `next` arrives, and what the candidate
-    /// has said since it was asked. The next question's slow phase summarises it.
-    fn answered(&self, next: &Candidate) -> Option<Answered> {
-        let live = self.hub.snapshot().live?;
-        let asked = self.known.get(&live.candidate)?.start;
-        Some(Answered {
-            id: live.candidate,
-            question: live.text,
-            focus: live.focus,
-            at: asked.as_secs_f64(),
-            answer: answer_between(self.log.finals(), asked, next.start),
-        })
+        self.assist.flush(&self.log, observer);
     }
 
     fn command(&mut self, cmd: Command) {
-        match cmd {
-            Command::Regenerate => {
-                let Some(s) = &self.suggester else {
-                    return;
-                };
-                let snap = self.hub.snapshot();
-                let Some(live) = snap.live else {
-                    return;
-                };
-                let Some(candidate) = self.known.get(&live.candidate) else {
-                    return;
-                };
-                let Some(kind) = kind(&live.kind) else {
-                    return;
-                };
-                self.hub.dispatch(Action::Regenerate {
-                    candidate: live.candidate,
-                });
-                s.regenerate(
-                    live.candidate,
-                    candidate,
-                    self.log.render_window(DEFAULT_WINDOW),
-                    CurrentQuestion {
-                        question: live.text,
-                        kind,
-                    },
-                );
-            }
-            Command::Swap { candidate: id } => {
-                let Some(s) = &self.suggester else {
-                    return;
-                };
-                let snap = self.hub.snapshot();
-                let Some(q) = snap
-                    .live
-                    .into_iter()
-                    .chain(snap.queued)
-                    .find(|q| q.candidate == id)
-                else {
-                    return;
-                };
-                let (Some(candidate), Some(kind)) = (self.known.get(&id), kind(&q.kind)) else {
-                    return;
-                };
-                s.swap(
-                    id,
-                    candidate,
-                    self.log.render_window(DEFAULT_WINDOW),
-                    CurrentQuestion {
-                        question: q.text,
-                        kind,
-                    },
-                );
-            }
-        }
+        self.assist.command(cmd, &self.log);
     }
 
     /// Drain and join every stage, end the session, and report.
@@ -1237,10 +1178,7 @@ impl Pipeline {
         let wall = self.audio_zero.elapsed();
         // Answer whatever is still queued; the transcript is complete by now. A stopped run
         // cancels instead.
-        let tally = self
-            .suggester
-            .take()
-            .map(|s| if stopped { s.stop() } else { s.finish() });
+        let (detecting, tally, dropped_candidates) = self.assist.finish(stopped);
         let session = self.recorder.finish(self.clock.now())?;
         Ok(Report {
             stats,
@@ -1248,13 +1186,220 @@ impl Pipeline {
             wall,
             tally,
             session,
-            detecting: self.detecting,
+            detecting,
             log: self.log,
             bus_dropped: self.bus.dropped(),
-            dropped_candidates: self.dropped_candidates,
+            dropped_candidates,
             echo_dropped: self.echo.dropped(),
             stopped,
         })
+    }
+}
+
+impl Assistance {
+    /// `launch` starts the suggester (`None` under `--no-llm`): now when `on`, else on the first
+    /// [`Command::Assist`] that turns assistance on.
+    pub fn new(
+        on: bool,
+        hub: Arc<SessionHub>,
+        audio: AudioClock,
+        detecting: Detecting,
+        launch: Option<Launch>,
+    ) -> Self {
+        let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
+        let mut a = Self {
+            on: false,
+            hub,
+            audio,
+            detecting,
+            suggester: None,
+            launch,
+            candidates_tx,
+            candidates_rx,
+            next_candidate: 0,
+            sent_ids: VecDeque::new(),
+            last_sent: None,
+            dropped_candidates: 0,
+            known: HashMap::new(),
+        };
+        a.set(on);
+        a
+    }
+
+    /// On or off from the next segment. Off forgets the line the detector holds, so nothing
+    /// said before the gap completes a question after it; on starts the suggester the first
+    /// time. A request already streaming finishes; nothing new is asked while off.
+    fn set(&mut self, on: bool) {
+        self.on = on;
+        if !on {
+            self.detecting.pause();
+        } else if let Some(launch) = self.launch.take() {
+            self.suggester = Some(launch());
+        }
+    }
+
+    /// One published segment: scored, and any candidate it completes sent on, while on.
+    /// `log` is the transcript before `seg`.
+    fn feed(&mut self, seg: &Segment, log: &TranscriptLog, observer: &mut dyn Observer) {
+        if !self.on {
+            return;
+        }
+        let new = self.detecting.feed(seg);
+        self.emit(new, log, observer);
+    }
+
+    /// Score the line the detector still holds once the audio has ended.
+    fn flush(&mut self, log: &TranscriptLog, observer: &mut dyn Observer) {
+        if !self.on {
+            return;
+        }
+        let new = self.detecting.flush();
+        self.emit(new, log, observer);
+    }
+
+    /// Send the last `new` candidates through the detector's channel into the session and the
+    /// fast phase, with the last 60 s of transcript.
+    fn emit(&mut self, new: usize, log: &TranscriptLog, observer: &mut dyn Observer) {
+        let found = self.detecting.found();
+        for f in &found[found.len() - new..] {
+            self.next_candidate += 1;
+            if self.candidates_tx.try_send(f.candidate.clone()).is_ok() {
+                self.sent_ids.push_back((self.next_candidate, f.continues));
+            } else {
+                self.dropped_candidates += 1;
+            }
+            observer.candidate(self.next_candidate, f);
+        }
+        for candidate in self.candidates_rx.try_iter() {
+            let Some((id, continues)) = self.sent_ids.pop_front() else {
+                break;
+            };
+            self.hub.dispatch(wire::candidate(id, &candidate));
+            // #63: the same question, split at a pause. Its reply replaces the earlier one's
+            // question where it is, instead of arriving as a second question.
+            let continued = if continues {
+                self.last_sent.inspect(|&prev| {
+                    self.hub.dispatch(Action::Continues {
+                        candidate: id,
+                        continued: prev,
+                    });
+                })
+            } else {
+                None
+            };
+            self.last_sent = Some(id);
+            self.hub.dispatch(Action::Timing {
+                candidate: id,
+                stage: Stage::Emitted,
+                at: self.audio.now(),
+            });
+            if let Some(s) = &self.suggester {
+                // A continuation is the question still being asked: nothing has been answered.
+                let answered = match continued {
+                    Some(_) => None,
+                    None => self.answered(&candidate, log),
+                };
+                s.submit_after(
+                    id,
+                    &candidate,
+                    log.render_window(DEFAULT_WINDOW),
+                    answered,
+                    continued.is_some(),
+                );
+            }
+            self.known.insert(id, candidate);
+        }
+    }
+
+    /// #57, session memory: the question on screen as `next` arrives, and what the candidate
+    /// has said since it was asked. The next question's slow phase summarises it.
+    fn answered(&self, next: &Candidate, log: &TranscriptLog) -> Option<Answered> {
+        let live = self.hub.snapshot().live?;
+        let asked = self.known.get(&live.candidate)?.start;
+        Some(Answered {
+            id: live.candidate,
+            question: live.text,
+            focus: live.focus,
+            at: asked.as_secs_f64(),
+            answer: answer_between(log.finals(), asked, next.start),
+        })
+    }
+
+    /// A key's work on the pipeline thread. `r` and `w` ask the model nothing while off.
+    fn command(&mut self, cmd: Command, log: &TranscriptLog) {
+        if let Command::Assist { on } = cmd {
+            self.set(on);
+            return;
+        }
+        if !self.on {
+            return;
+        }
+        match cmd {
+            Command::Assist { .. } => {}
+            Command::Regenerate => {
+                let Some(s) = &self.suggester else {
+                    return;
+                };
+                let snap = self.hub.snapshot();
+                let Some(live) = snap.live else {
+                    return;
+                };
+                let Some(candidate) = self.known.get(&live.candidate) else {
+                    return;
+                };
+                let Some(kind) = kind(&live.kind) else {
+                    return;
+                };
+                self.hub.dispatch(Action::Regenerate {
+                    candidate: live.candidate,
+                });
+                s.regenerate(
+                    live.candidate,
+                    candidate,
+                    log.render_window(DEFAULT_WINDOW),
+                    CurrentQuestion {
+                        question: live.text,
+                        kind,
+                    },
+                );
+            }
+            Command::Swap { candidate: id } => {
+                let Some(s) = &self.suggester else {
+                    return;
+                };
+                let snap = self.hub.snapshot();
+                let Some(q) = snap
+                    .live
+                    .into_iter()
+                    .chain(snap.queued)
+                    .find(|q| q.candidate == id)
+                else {
+                    return;
+                };
+                let (Some(candidate), Some(kind)) = (self.known.get(&id), kind(&q.kind)) else {
+                    return;
+                };
+                s.swap(
+                    id,
+                    candidate,
+                    log.render_window(DEFAULT_WINDOW),
+                    CurrentQuestion {
+                        question: q.text,
+                        kind,
+                    },
+                );
+            }
+        }
+    }
+
+    /// End assistance: answer what is still queued (or cancel it, when `stopped`), and hand
+    /// back the detector, the suggester's tally, and how many candidates the channel dropped.
+    fn finish(mut self, stopped: bool) -> (Detecting, Option<Tally>, u64) {
+        let tally = self
+            .suggester
+            .take()
+            .map(|s| if stopped { s.stop() } else { s.finish() });
+        (self.detecting, tally, self.dropped_candidates)
     }
 }
 
@@ -1592,6 +1737,47 @@ fn warm_local_llm(llm: &dmn_core::config::Llm) {
     match warmed {
         Ok(()) => tracing::info!(model = %llm.model, "LLM loaded before GPU whisper"),
         Err(e) => tracing::warn!(error = %e, "LLM warm-up before GPU whisper failed"),
+    }
+}
+
+/// `[llm]` as the config file says now, for a suggester started after the run began (#79).
+/// The file wins only when it exists and parses; otherwise the settings the run started with
+/// stand, so a missing file (the tests', or one deleted mid-run) never swaps in the defaults, and
+/// a half-written edit is ignored rather than fatal.
+fn llm_now(config_file: &Path, started_with: dmn_core::config::Llm) -> dmn_core::config::Llm {
+    if !config_file.is_file() {
+        return started_with;
+    }
+    match Config::load(config_file) {
+        Ok(cfg) => cfg.llm,
+        Err(e) => {
+            tracing::warn!(error = %e, "config unreadable when assistance started; keeping [llm] from start-up");
+            started_with
+        }
+    }
+}
+
+/// #79: ask a local Ollama to drop `[llm].model` from memory, for a run that starts with
+/// assistance off, before whisper loads. Ollama on another machine, or any other provider, holds
+/// nothing here and is left alone. A failure (Ollama not running, say) is a warning: there is
+/// then nothing loaded to free.
+fn unload_local_llm(llm: &dmn_core::config::Llm) {
+    if llm.provider != dmn_core::config::Provider::Ollama || llm.leaves_machine() {
+        return;
+    }
+    let unloaded = dmn_llm::OllamaProvider::new(llm.endpoint(), llm.model.clone())
+        .map_err(|e| e.to_string())
+        .and_then(|p| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?
+                .block_on(p.unload())
+                .map_err(|e| e.to_string())
+        });
+    match unloaded {
+        Ok(()) => tracing::info!(model = %llm.model, "assistance off: LLM unloaded before whisper"),
+        Err(e) => tracing::warn!(error = %e, "assistance off: LLM unload failed"),
     }
 }
 
@@ -2102,6 +2288,7 @@ mod tests {
                 language: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
+                assist: None,
                 no_llm: true,
                 no_store: true,
                 output: Output::Quiet,
@@ -2159,5 +2346,269 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(Command::Regenerate));
         controls.quit();
         assert!(controls.is_stopped());
+    }
+
+    // --- Interview assistance on and off (#79) ----------------------------------------------
+
+    #[test]
+    fn controls_assist_flips_the_session_and_tells_the_pipeline() {
+        let (controls, rx) = Controls::for_test();
+        let hub = Arc::clone(controls.hub());
+        assert!(!hub.snapshot().assist_off, "on by default");
+        controls.toggle_assist();
+        assert!(hub.snapshot().assist_off);
+        assert_eq!(rx.try_recv(), Ok(Command::Assist { on: false }));
+        controls.toggle_assist();
+        assert!(!hub.snapshot().assist_off);
+        assert_eq!(rx.try_recv(), Ok(Command::Assist { on: true }));
+    }
+
+    /// Assistance over a mock model that records every request, and whether the suggester was
+    /// ever started.
+    fn assistance(on: bool) -> (Assistance, dmn_llm::MockProvider, Arc<AtomicBool>) {
+        let hub = Arc::new(SessionHub::default());
+        let mock = dmn_llm::MockProvider::new(vec![dmn_llm::mock::Step::Error("mock".into())]);
+        let launched = Arc::new(AtomicBool::new(false));
+        let launch = {
+            let (hub, mock, launched) = (Arc::clone(&hub), mock.clone(), Arc::clone(&launched));
+            Box::new(move || {
+                launched.store(true, Ordering::Release);
+                Suggester::start_with(mock, Policy::AnswerAll, hub)
+            }) as Launch
+        };
+        let a = Assistance::new(
+            on,
+            hub,
+            AudioClock::new(Instant::now(), 1.0),
+            detecting(),
+            Some(launch),
+        );
+        (a, mock, launched)
+    }
+
+    /// Publish `seg` into `a` as the pipeline does: assistance first, then the log.
+    fn publish(a: &mut Assistance, log: &mut TranscriptLog, seg: Segment) {
+        a.feed(&seg, log, &mut Quiet);
+        log.apply(seg);
+    }
+
+    const LATER: &str = "How would you shard the database behind the limiter?";
+
+    #[test]
+    fn with_assistance_on_a_question_is_detected_and_answered_as_before() {
+        let (mut a, mock, launched) = assistance(true);
+        let mut log = TranscriptLog::new();
+        assert!(
+            launched.load(Ordering::Acquire),
+            "on at start: the suggester starts at once"
+        );
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        a.flush(&log, &mut Quiet);
+        let (d, tally, _) = a.finish(false);
+        assert_eq!(d.found().len(), 1);
+        assert!(tally.is_some());
+        assert_eq!(mock.requests().len(), 1, "one fast-phase request");
+    }
+
+    #[test]
+    fn with_assistance_off_nothing_is_detected_and_the_model_is_never_asked() {
+        let (mut a, mock, launched) = assistance(false);
+        let hub = Arc::clone(&a.hub);
+        let mut log = TranscriptLog::new();
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        publish(
+            &mut a,
+            &mut log,
+            final_at(
+                Source::You,
+                27_000,
+                30_000,
+                "I'd start with a token bucket.",
+            ),
+        );
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 31_000, 36_000, LATER),
+        );
+        a.flush(&log, &mut Quiet);
+        a.command(Command::Regenerate, &log);
+        assert_eq!(log.finals().len(), 3, "the transcript itself is untouched");
+        assert!(
+            !launched.load(Ordering::Acquire),
+            "no suggester, so no warm-up either"
+        );
+        assert_eq!(
+            hub.snapshot().counts.candidates,
+            0,
+            "no candidate reached the session"
+        );
+        let (d, tally, _) = a.finish(false);
+        assert!(d.found().is_empty(), "no detector candidates");
+        assert!(tally.is_none());
+        assert!(mock.requests().is_empty(), "no provider request");
+    }
+
+    #[test]
+    fn assistance_on_again_resumes_detection_with_the_next_question() {
+        let (mut a, mock, launched) = assistance(false);
+        let mut log = TranscriptLog::new();
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        a.command(Command::Assist { on: true }, &log);
+        assert!(
+            launched.load(Ordering::Acquire),
+            "the first Ctrl+Shift+A starts the suggester"
+        );
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 40_000, 45_000, LATER),
+        );
+        a.flush(&log, &mut Quiet);
+        let (d, _, _) = a.finish(false);
+        let found: Vec<&str> = d
+            .found()
+            .iter()
+            .map(|f| f.candidate.text.as_str())
+            .collect();
+        assert_eq!(
+            found,
+            [LATER],
+            "the question asked while off is not answered retroactively"
+        );
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    /// #79 with #77: the Spanish fixture replayed with `language = "auto"` and assistance off.
+    /// The translated transcript flows as it does with assistance on; nothing is detected and
+    /// the LLM is never started. Run with `just probe` on a dev machine.
+    #[test]
+    #[ignore = "needs the es fixture WAVs (just fixtures-fetch) and the multilingual model (dmn doctor --fetch small)"]
+    fn the_spanish_fixture_is_translated_with_assistance_off_and_nothing_is_asked() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/es");
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            models_dir: Paths::from_xdg().unwrap().models_dir,
+            ..Paths::under(dir.path())
+        };
+        // A local Ollama no one listens on: the start-up unload fails quietly instead of
+        // unloading the dev machine's model, and any request would fail loudly.
+        let mut cfg = Config::default();
+        cfg.llm.base_url = "http://127.0.0.1:9".into();
+        let mut pipeline = Pipeline::start(
+            &cfg,
+            &paths,
+            &Options {
+                input: Input::Files {
+                    interviewer: fixture.join("interviewer.wav"),
+                    candidate: fixture.join("candidate.wav"),
+                },
+                // 10:45 of audio in about a minute; whisper small keeps up on 8 threads.
+                speed: 10.0,
+                model: Some("small".into()),
+                threads: None,
+                vad_close_ms: None,
+                vad: None,
+                device: Some(dmn_core::config::SttDevice::Cpu),
+                language: Some(dmn_core::config::SttLanguage::Auto),
+                partials: Partials::Off,
+                spec_literal_detector: false,
+                assist: Some(false),
+                no_llm: false,
+                no_store: true,
+                output: Output::Quiet,
+                policy: Policy::AnswerAll,
+                coding_solutions: None,
+            },
+        )
+        .unwrap();
+        let hub = pipeline.hub();
+        pipeline.run(&mut Quiet, false);
+        let report = pipeline.finish(&mut Quiet).unwrap();
+        let finals: Vec<&Segment> = report
+            .log
+            .finals()
+            .iter()
+            .filter(|s| !s.text.trim().is_empty())
+            .collect();
+        let es = finals
+            .iter()
+            .filter(|s| s.language.as_deref() == Some("es"))
+            .count();
+        assert!(finals.len() >= 20, "only {} finals", finals.len());
+        assert!(
+            es * 10 >= finals.len() * 9,
+            "{es} of {} detected as es",
+            finals.len()
+        );
+        assert!(
+            report.detecting.found().is_empty(),
+            "no detector candidates"
+        );
+        assert!(report.tally.is_none(), "the suggester never started");
+        let snap = hub.snapshot();
+        assert!(snap.assist_off);
+        assert_eq!(snap.counts.candidates, 0);
+        assert!(snap.live.is_none());
+        assert_eq!(snap.status.language, "es");
+    }
+
+    #[test]
+    fn a_suggester_started_later_reads_llm_from_the_config_file_as_it_is_now() {
+        // Copilot on PR #80: assistance off at start, `[llm]` edited, then Ctrl+Shift+A.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let started_with = Config::default().llm;
+        assert_eq!(
+            llm_now(&file, started_with.clone()),
+            started_with,
+            "no file: the start-up settings, not the defaults"
+        );
+        std::fs::write(&file, "[llm]\nmodel = \"llama3.1:8b\"\n").unwrap();
+        assert_eq!(llm_now(&file, started_with.clone()).model, "llama3.1:8b");
+        std::fs::write(&file, "[llm]\nmodel = ").unwrap();
+        assert_eq!(
+            llm_now(&file, started_with.clone()),
+            started_with,
+            "a half-written edit keeps the start-up settings"
+        );
+    }
+
+    #[test]
+    fn assistance_off_forgets_the_question_being_asked() {
+        // FIRST opens a question; its second half arrives after assistance went off and on
+        // again. It is a question of its own, not a continuation of one the screen never showed.
+        let (mut a, _, _) = assistance(true);
+        let mut log = TranscriptLog::new();
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        a.command(Command::Assist { on: false }, &log);
+        a.command(Command::Assist { on: true }, &log);
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 26_600, 31_000, SECOND),
+        );
+        let (d, _, _) = a.finish(false);
+        assert_eq!(d.found().len(), 2);
+        assert!(
+            !d.found()[1].continues,
+            "the chain was forgotten when assistance went off"
+        );
     }
 }

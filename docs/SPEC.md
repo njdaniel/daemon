@@ -65,6 +65,8 @@ flowchart LR
 
 Audio enters as two labelled streams, so speaker attribution is a property of the source, not an inference. The detector only proposes; the LLM's fast phase confirms and extracts the question; the UI shows the fast phase within the latency budget and fills expandable sections from the slow phase afterwards.
 
+**Interview assistance is a layer, not the pipeline (#79).** Everything up to the transcript bus (capture, VAD, whisper, translation under `[stt].language`, the echo guard, the session and the store) always runs. The detector, the context assembler and the LLM sit on top and can be switched off: `[assist].enabled = false`, `dmn run --no-assist`, or Ctrl+Shift+A during a call (a chord, so a stray key cannot switch it; terminals without the kitty keyboard protocol send it as Ctrl+A, which counts too). Off, every segment still reaches the session, the store and the transcript, but none is scored, no context is assembled and no fast- or slow-phase request is made; `r` and `w` ask nothing. Turning it off forgets the line the detector holds and the question being asked, so nothing said before the gap completes a question after it; on again, detection resumes with the next interviewer final, and questions asked while it was off are not answered retroactively. A run that starts with assistance off never starts the suggester (no warm-up either) and, with a local Ollama, sends it one `keep_alive: 0` request before whisper loads, since Ollama otherwise holds the model 30 minutes after its last request: whisper can then take the GPU (`medium` at 0.13 s per utterance there against 2.6 s on the CPU). The first Ctrl+Shift+A starts the suggester, which loads the model into what whisper left; when Ollama's `/api/ps` shows 10 % or more of it in system memory the status line says `llm partly on cpu` (answers come, slower; the default model normally sits at 4 % on the dev 4090, which says nothing). The toggle never moves whisper between devices, and turning assistance off mid-call does not unload the model.
+
 **Repo layout** (`daemon` repo, one Cargo workspace, binary `dmn`)
 
 | Path | Holds |
@@ -216,7 +218,7 @@ Timeouts: fast phase 4 s, slow phase 20 s; on timeout the UI keeps the previous 
 
 The window is 440 px wide, 760 px tall by default, frameless with a 36 px custom title bar, always-on-top where the compositor allows, and it never grows on its own. The [canvas](https://claude.ai/artifact/Kya3g5rdSzQ7k9tGPqZV2B) is the visual source of truth; this section states the behavior.
 
-**Terminal MVP (M1–M2)** renders the same three areas in a ratatui TUI, sized for a 100 × 30 pane beside the call: question + focus in a top block (2–4 lines), the numbered Approach in the middle, the last two transcript lines and the mic / system / model status in a one-line footer. Keys: `p` pin, `r` regenerate, `1`–`6` toggle one section, `m` mute mic, `s` coding solutions hints ↔ full, `w` swap the STAR story (#58), `q` quit. The same density rules apply: no paragraph over 3 sentences, one section open at a time, nothing auto-expands. Everything below describes the M3 window.
+**Terminal MVP (M1–M2)** renders the same three areas in a ratatui TUI, sized for a 100 × 30 pane beside the call: question + focus in a top block (2–4 lines), the numbered Approach in the middle, the last two transcript lines and the mic / system / model status in a one-line footer. Keys: `p` pin, `r` regenerate, `1`–`6` toggle one section, `m` mute mic, `s` coding solutions hints ↔ full, `w` swap the STAR story (#58), Ctrl+Shift+A interview assistance on ↔ off (#79), `q` quit. The same density rules apply: no paragraph over 3 sentences, one section open at a time, nothing auto-expands. With assistance off the TUI has a second layout, transcript first: no question block and no Approach, the transcript wrapped over every row above the status line (the session's last 60 s, newest line at the bottom), and the status line says `assist off` beside the STT device and any `es→en` tag, with `ctrl+shift+a assist · q quit` as its keys. Everything below describes the M3 window.
 
 **Window**
 
@@ -312,6 +314,9 @@ fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
+[assist]
+enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
+
 [ui]
 always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above
@@ -396,7 +401,7 @@ Rust Linux interview copilot. M1–M2 is a ratatui TUI; M3 adds a Tauri 2 window
 - No new dependencies without a line in docs/DEPENDENCIES.md saying why; no `unsafe` outside `dmn-audio` and `dmn-stt`, and every `unsafe` block has a `// SAFETY:` comment.
 - Every crate's `lib.rs` doc comment states its input, output and the channel it owns.
 - Tests use testdata WAVs, never a microphone; CI has no PipeWire. Anything that needs PipeWire is behind `#[ignore]` and run by `just probe` on a dev machine.
-- Keep the TUI's three-area layout (question / approach / transcript+status); the M3 window follows docs/design/.
+- Keep the TUI's three-area layout (question / approach / transcript+status); the one exception is the transcript-first screen while interview assistance is off (#79). The M3 window follows docs/design/.
 
 ## Done means
 - `just check`, `just test` and `just lint` pass; the issue's acceptance criteria are met and stated in the PR body.
