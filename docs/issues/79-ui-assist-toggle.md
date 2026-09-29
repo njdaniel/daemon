@@ -109,7 +109,7 @@ Describe interview assistance as an optional layer over Daemon's transcription/t
 ## Acceptance
 
 - [ ] Existing default behavior is unchanged with assistance enabled
-- [ ] Pressing `a` toggles assistance without restarting Daemon
+- [ ] Pressing `a` toggles assistance without restarting Daemon (decided 2026-09-29: the key is Ctrl+Shift+A, sent as Ctrl+A by most terminals, so a stray `a` cannot switch it; comment on #79)
 - [ ] With assistance off, live/replay transcript continues updating normally
 - [ ] With multilingual STT enabled, translation continues while assistance is off
 - [ ] With assistance off, new transcript segments do not run through question detection
