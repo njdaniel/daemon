@@ -26,7 +26,7 @@ pub mod worker;
 
 pub use filter::{Dropped, FilterConfig, should_drop};
 pub use gpu::{DeviceChoice, GpuDevice, Placement, gpu_devices};
-pub use model::{Model, download_file, download_model, model_path};
+pub use model::{Model, download_file, download_model, model_path, verify_model};
 pub use transcriber::{Backend, Language, SttConfig, Transcriber, Transcript};
 pub use wer::word_error_rate;
 pub use worker::{Speech, SttStats, SttWorker, SttWorkerConfig};
@@ -67,6 +67,16 @@ pub enum SttError {
         path: String,
         got: u64,
         expected: u64,
+    },
+    /// #84: the right size and the wrong bytes (seen on the dev box as single flipped bits in a
+    /// 1.5 GB model, which then transcribed nothing).
+    #[error(
+        "{path} has sha256 {got}, not the published {expected}; fix: dmn doctor --fetch <model>"
+    )]
+    ChecksumMismatch {
+        path: String,
+        got: String,
+        expected: String,
     },
     #[error("{path}: {source}")]
     Io {

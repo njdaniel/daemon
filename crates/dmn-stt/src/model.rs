@@ -24,13 +24,19 @@
 //! | ggml-medium.bin | 1533763059 | 6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208 |
 //! | ggml-large-v3.bin | 3095033483 | 64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2 |
 //!
-//! The download is checked by size, which catches the realistic failure (a truncated or HTML
-//! error body); the hashes are recorded for manual checks rather than adding a hash crate.
+//! #84: both are checked. The size catches a truncated or HTML error body at once; the SHA-256
+//! catches a file of the right size with wrong bytes, which on the dev box (2026-09-29) was three
+//! models with a handful of flipped bits each, and `medium` then returned nothing but `,` and
+//! `!!!!`. [`Model::sha256`] holds the hashes below, and a test keeps this table and the code
+//! in step. The download hashes as it streams; a file already in place is re-hashed before it
+//! is trusted, so `dmn doctor --fetch` replaces a damaged one instead of leaving it.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use sha2::{Digest, Sha256};
 
 use crate::SttError;
 
@@ -150,6 +156,24 @@ impl Model {
         }
     }
 
+    /// SHA-256 of the published file, lowercase hex (see the module table).
+    pub fn sha256(self) -> &'static str {
+        match self {
+            Model::TinyEn => "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+            Model::BaseEn => "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+            Model::SmallEn => "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+            Model::MediumEn => "cc37e93478338ec7700281a7ac30a10128929eb8f427dda2e865faa8f6da4356",
+            Model::Tiny => "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
+            Model::Base => "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+            Model::Small => "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+            Model::Medium => "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
+            Model::LargeV3 => "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
+            Model::LargeV3Turbo => {
+                "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+            }
+        }
+    }
+
     pub fn url(self, base: &str) -> String {
         format!("{}/{}", base.trim_end_matches('/'), self.file_name())
     }
@@ -158,6 +182,54 @@ impl Model {
 /// `<models_dir>/ggml-<name>.bin`.
 pub fn model_path(models_dir: &Path, model: Model) -> PathBuf {
     models_dir.join(model.file_name())
+}
+
+/// #84: the file at `path` is exactly `model`'s published file: its size first (cheap, and the
+/// usual failure), then its SHA-256 (about a second per GB). What `dmn doctor` runs.
+pub fn verify_model(path: &Path, model: Model) -> Result<(), SttError> {
+    verify_file(path, model.size_bytes(), model.sha256())
+}
+
+/// [`verify_model`] for any file: `expected` bytes whose SHA-256 is `sha256`.
+pub fn verify_file(path: &Path, expected: u64, sha256: &str) -> Result<(), SttError> {
+    let len = std::fs::metadata(path)
+        .map_err(|source| io(path, source))?
+        .len();
+    if len != expected {
+        return Err(SttError::SizeMismatch {
+            path: path.display().to_string(),
+            got: len,
+            expected,
+        });
+    }
+    let got = file_sha256(path)?;
+    if got != sha256 {
+        return Err(SttError::ChecksumMismatch {
+            path: path.display().to_string(),
+            got,
+            expected: sha256.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// SHA-256 of the file at `path`, lowercase hex, read in 1 MB pieces.
+pub fn file_sha256(path: &Path) -> Result<String, SttError> {
+    let mut f = File::open(path).map_err(|source| io(path, source))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).map_err(|source| io(path, source))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Download `model` into `models_dir` from `base_url`, streaming to `<file>.part` and renaming
@@ -184,24 +256,37 @@ pub fn download_model_with(
         &model_path(models_dir, model),
         &model.url(base_url),
         model.size_bytes(),
+        Some(model.sha256()),
         deadline,
         progress,
     )
 }
 
 /// Download `url` to `dest` the way [`download_model`] does: stream to a per-process
-/// `<file>.part.<pid>`, rename only once `expected` bytes arrived, leave a finished file of the
-/// right size alone. Any model file uses it, not only whisper's (#62: the Silero VAD model).
+/// `<file>.part.<pid>`, hashing as the bytes arrive, and rename only once `expected` bytes with
+/// the SHA-256 `sha256` (when given) are there. A file already in place is left alone only when
+/// it passes the same check, so a damaged one is downloaded again (#84). Any model file uses it,
+/// not only whisper's (#62: the Silero VAD model).
 pub fn download_file(
     dest: &Path,
     url: &str,
     expected: u64,
+    sha256: Option<&str>,
     deadline: Duration,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<PathBuf, SttError> {
     let dest = dest.to_path_buf();
     if std::fs::metadata(&dest).is_ok_and(|m| m.len() == expected) {
-        return Ok(dest);
+        match sha256.map(|want| (want, file_sha256(&dest))) {
+            None => return Ok(dest),
+            Some((want, Ok(got))) if got == want => return Ok(dest),
+            Some((want, got)) => tracing::warn!(
+                path = %dest.display(),
+                got = ?got.ok(),
+                expected = want,
+                "model file has the right size and the wrong sha256; downloading it again"
+            ),
+        }
     }
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(|source| io(dir, source))?;
@@ -232,11 +317,13 @@ pub fn download_file(
     let mut out = File::create(part.path()).map_err(|source| io(part.path(), source))?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done: u64 = 0;
+    let mut hasher = Sha256::new();
     loop {
         let n = resp.read(&mut buf).map_err(|e| fail(e.to_string()))?;
         if n == 0 {
             break;
         }
+        hasher.update(&buf[..n]);
         out.write_all(&buf[..n])
             .map_err(|source| io(part.path(), source))?;
         done += n as u64;
@@ -251,6 +338,16 @@ pub fn download_file(
             got: done,
             expected,
         });
+    }
+    if let Some(want) = sha256 {
+        let got = hex(&hasher.finalize());
+        if got != want {
+            return Err(SttError::ChecksumMismatch {
+                path: part.path().display().to_string(),
+                got,
+                expected: want.to_owned(),
+            });
+        }
     }
     part.rename_to(&dest)?;
     Ok(dest)
@@ -587,17 +684,122 @@ mod tests {
         assert!(err.to_string().contains("404"), "{err}");
     }
 
+    /// The SHA-256 of `bytes`, as [`file_sha256`] writes it.
+    fn sha_of(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    const GOOD: &[u8] = b"a whisper model, as published";
+
     #[test]
-    fn present_file_of_right_size_is_not_downloaded() {
+    fn a_present_file_that_verifies_is_not_downloaded_again() {
         let dir = tempfile::tempdir().unwrap();
-        let path = model_path(dir.path(), Model::TinyEn);
-        let f = File::create(&path).unwrap();
-        f.set_len(Model::TinyEn.size_bytes()).unwrap();
-        // Unroutable base URL: any network attempt would fail the test.
-        let got = download_model(dir.path(), Model::TinyEn, "http://127.0.0.1:9", |_, _| {
-            panic!("no download expected")
-        })
+        let dest = dir.path().join("m.bin");
+        std::fs::write(&dest, GOOD).unwrap();
+        // Unroutable URL: any network attempt would fail the test.
+        let got = download_file(
+            &dest,
+            "http://127.0.0.1:9/m.bin",
+            GOOD.len() as u64,
+            Some(&sha_of(GOOD)),
+            MIN_DEADLINE,
+            |_, _| panic!("no download expected"),
+        )
         .unwrap();
-        assert_eq!(got, path);
+        assert_eq!(got, dest);
+    }
+
+    /// #84: the dev box's `medium` was the right size with a few flipped bits. Right size is no
+    /// longer enough to be left alone: `--fetch` downloads it again and the good file replaces it.
+    #[test]
+    fn a_present_file_of_the_right_size_and_wrong_bytes_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("m.bin");
+        let mut damaged = GOOD.to_vec();
+        damaged[3] ^= 0x20;
+        std::fs::write(&dest, &damaged).unwrap();
+        let base = serve_once("200 OK", GOOD.to_vec());
+        download_file(
+            &dest,
+            &format!("{base}/m.bin"),
+            GOOD.len() as u64,
+            Some(&sha_of(GOOD)),
+            MIN_DEADLINE,
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), GOOD);
+    }
+
+    /// #84: a download of the right length whose bytes are wrong is refused and leaves nothing:
+    /// no file in place and no partial.
+    #[test]
+    fn a_download_with_the_wrong_checksum_is_refused_and_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("m.bin");
+        let base = serve_once("200 OK", b"a whisper model, as publishes".to_vec());
+        let err = download_file(
+            &dest,
+            &format!("{base}/m.bin"),
+            GOOD.len() as u64,
+            Some(&sha_of(GOOD)),
+            MIN_DEADLINE,
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, SttError::ChecksumMismatch { .. }), "{err}");
+        assert!(err.to_string().contains("dmn doctor --fetch"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn verify_file_checks_the_size_then_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("m.bin");
+        std::fs::write(&file, GOOD).unwrap();
+        let (len, sha) = (GOOD.len() as u64, sha_of(GOOD));
+        verify_file(&file, len, &sha).unwrap();
+        assert!(matches!(
+            verify_file(&file, len + 1, &sha),
+            Err(SttError::SizeMismatch { .. })
+        ));
+        let err = verify_file(&file, len, &sha_of(b"other")).unwrap_err();
+        assert!(
+            matches!(&err, SttError::ChecksumMismatch { got, .. } if *got == sha),
+            "{err}"
+        );
+        assert!(matches!(
+            verify_file(&dir.path().join("absent"), len, &sha),
+            Err(SttError::Io { .. })
+        ));
+    }
+
+    /// The module doc's table (what anyone checks by hand) and [`Model::size_bytes`] /
+    /// [`Model::sha256`] (what the code checks) must never drift apart.
+    #[test]
+    fn the_doc_table_and_the_code_agree_for_every_model() {
+        let rows: Vec<(String, u64, String)> = include_str!("model.rs")
+            .lines()
+            .filter_map(|l| l.strip_prefix("//! | ggml-"))
+            .map(|row| {
+                let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+                (
+                    format!("ggml-{}", cells[0]),
+                    cells[1].parse().unwrap(),
+                    cells[2].to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(rows.len(), Model::ALL.len(), "{rows:?}");
+        for m in Model::ALL {
+            let row = rows
+                .iter()
+                .find(|(file, ..)| *file == m.file_name())
+                .unwrap_or_else(|| panic!("{} not in the doc table", m.file_name()));
+            assert_eq!(row.1, m.size_bytes(), "{}", m.name());
+            assert_eq!(row.2, m.sha256(), "{}", m.name());
+            assert_eq!(m.sha256().len(), 64, "{}", m.name());
+        }
     }
 }
