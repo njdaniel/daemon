@@ -867,11 +867,8 @@ fn tui_assist_off_is_the_transcript_alone_and_says_so() {
         );
     }
     let last = screen.lines().nth(29).unwrap_or_default();
-    assert!(
-        last.contains(" es→en ") && last.contains(" assist off "),
-        "{last}"
-    );
-    assert!(last.ends_with("ctrl+shift+a assist · q quit"), "{last}");
+    assert!(last.contains(" es→en "), "{last}");
+    assert!(last.ends_with("assist off · C-S-a on"), "{last}");
     let (x, y) = row_containing(&buf, "assist off");
     assert_eq!(buf[(x, y)].fg, Color::Yellow);
     // The transcript takes the released rows: the first translated line is on screen, the
@@ -885,6 +882,21 @@ fn tui_assist_off_is_the_transcript_alone_and_says_so() {
         on.contains("LIVE QUESTION") && !on.contains("assist off"),
         "{on}"
     );
+}
+
+#[test]
+fn tui_assist_off_is_never_cut_on_a_narrow_pane() {
+    // #79, found live: at 80 columns with every tag on the left (`system: all audio`, `es→en`,
+    // the model dot's name), `assist off` ran into the keys as `assi`. It leads the keys now.
+    let mut a = actions("assist-off");
+    a.push(Action::Status {
+        dot: Dot::System,
+        health: Health::AllAudio,
+    });
+    let screen = text(&render(&Session::replay(&a), (80, 23)));
+    let last = screen.lines().nth(22).unwrap_or_default();
+    assert!(last.ends_with("assist off · C-S-a on"), "{last}");
+    assert!(last.contains("system: all audio"), "{last}");
 }
 
 #[test]

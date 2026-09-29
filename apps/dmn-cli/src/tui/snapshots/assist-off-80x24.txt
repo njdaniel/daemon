@@ -21,4 +21,4 @@ You         One batch job still pointed at the old database, so we paused it and
             replayed its writes.
 Interviewer Good. Let's talk about how you would test that.
 Interviewer And what about the▍
- ● mic  ● system  ● model  es→en  assist off       ctrl+shift+a assist · q quit
+ ● mic  ● system  ● model  es→en                          assist off · C-S-a on

@@ -194,12 +194,10 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
             Style::new().fg(Color::DarkGray),
         ));
     }
-    // #79: assistance off says so; on, the question and Approach areas say it. A local model
-    // that loaded partly into system memory (whisper took the GPU first) is named in amber:
-    // answers come, but slower.
-    if view.session.assist_off {
-        spans.push(Span::styled(" assist off ", Style::new().fg(Color::Yellow)));
-    } else if st.llm_cpu_percent >= LLM_CPU_NOTICE {
+    // #79: a local model that loaded partly into system memory (whisper took the GPU first) is
+    // named in amber: answers come, but slower. (Assistance off is said on the right, with the
+    // keys, where nothing cuts it.)
+    if !view.session.assist_off && st.llm_cpu_percent >= LLM_CPU_NOTICE {
         spans.push(Span::styled(
             " llm partly on cpu ",
             Style::new().fg(Color::Yellow),
@@ -224,12 +222,21 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         }
     }
     Paragraph::new(Line::from(spans)).render(left, buf);
-    Paragraph::new(Line::from(Span::styled(
-        keys,
+    // #79: the right-hand area is never cut (the left one is, on a narrow pane), so the one
+    // state that changes what the screen is for leads it, in amber.
+    let mut right_spans = Vec::new();
+    if view.session.assist_off {
+        right_spans.push(Span::styled(ASSIST_OFF, Style::new().fg(Color::Yellow)));
+    }
+    right_spans.push(Span::styled(
+        keys.strip_prefix(ASSIST_OFF).unwrap_or(&keys).to_owned(),
         Style::new().fg(Color::DarkGray),
-    )))
-    .render(right, buf);
+    ));
+    Paragraph::new(Line::from(right_spans)).render(right, buf);
 }
+
+/// #79: how the status line names assistance off; it leads the keys.
+const ASSIST_OFF: &str = "assist off";
 
 /// The two most useful keys for the state on screen (SPEC § Transcript & status: "Footer shows
 /// the two most useful shortcuts for the current state"). While a coding question is on screen
@@ -262,7 +269,9 @@ fn shortcuts(view: &View<'_>) -> String {
         .live()
         .is_some_and(|q| q.star.is_some() && q.stories.len() > 1);
     if view.session.assist_off {
-        return "ctrl+shift+a assist · q quit ".to_owned();
+        // Ctrl+Shift+A in tmux's notation: short enough that an 80-column pane with every tag
+        // (`system: all audio`, `es→en`) still shows the whole state.
+        return format!("{ASSIST_OFF} · C-S-a on ");
     }
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
