@@ -281,23 +281,36 @@ pub fn whisper_model(
         );
     }
     let file = dmn_stt::model_path(models_dir, m);
-    match std::fs::metadata(&file) {
-        Ok(meta) if meta.len() == m.size_bytes() => {
-            Check::pass("whisper model", file.display().to_string())
-        }
-        Ok(meta) => Check::fail(
-            "whisper model",
-            format!(
-                "{} is {} bytes, expected {} (partial download?)",
-                file.display(),
-                meta.len(),
-                m.size_bytes()
-            ),
-            format!("rm {} && dmn doctor --fetch {model}", file.display()),
-        ),
-        Err(_) => Check::fail(
+    if !file.exists() {
+        return Check::fail(
             "whisper model",
             format!("{} missing", file.display()),
+            format!("dmn doctor --fetch {model}"),
+        );
+    }
+    // #84: the size, then the SHA-256 against the published file: a model with a few wrong
+    // bytes loads fine and transcribes nothing, so the size alone is not enough.
+    match dmn_stt::verify_model(&file, m) {
+        Ok(()) => Check::pass("whisper model", format!("{} (sha256 ok)", file.display())),
+        Err(dmn_stt::SttError::SizeMismatch { got, expected, .. }) => Check::fail(
+            "whisper model",
+            format!(
+                "{} is {got} bytes, expected {expected} (partial download?)",
+                file.display()
+            ),
+            format!("dmn doctor --fetch {model}"),
+        ),
+        Err(dmn_stt::SttError::ChecksumMismatch { got, expected, .. }) => Check::fail(
+            "whisper model",
+            format!(
+                "{} has the right size but sha256 {got}, not the published {expected} (damaged file)",
+                file.display()
+            ),
+            format!("dmn doctor --fetch {model}"),
+        ),
+        Err(e) => Check::fail(
+            "whisper model",
+            e.to_string(),
             format!("dmn doctor --fetch {model}"),
         ),
     }
@@ -769,6 +782,12 @@ mod tests {
             "{}",
             partial.detail
         );
+        assert_eq!(
+            partial.fix.as_deref(),
+            Some("dmn doctor --fetch small.en"),
+            "--fetch replaces a wrong-sized file itself"
+        );
+        // #84: the right size and the wrong bytes (zeros) is a damaged file, not a pass.
         std::fs::File::options()
             .write(true)
             .open(&file)
@@ -776,7 +795,12 @@ mod tests {
             .set_len(dmn_stt::Model::SmallEn.size_bytes())
             .unwrap();
         use dmn_core::config::SttLanguage;
-        assert!(whisper_model(dir.path(), "small.en", &SttLanguage::English).ok);
+        let damaged = whisper_model(dir.path(), "small.en", &SttLanguage::English);
+        assert!(
+            !damaged.ok && damaged.detail.contains("damaged file"),
+            "{damaged:?}"
+        );
+        assert_eq!(damaged.fix.as_deref(), Some("dmn doctor --fetch small.en"));
         assert!(
             !whisper_model(dir.path(), "smallish", &SttLanguage::English).ok,
             "unknown names fail"

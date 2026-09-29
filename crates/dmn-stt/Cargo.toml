@@ -18,6 +18,7 @@ crossbeam-channel = { workspace = true }
 dmn-audio = { path = "../dmn-audio" }
 dmn-transcript = { path = "../dmn-transcript" }
 dmn-vad = { path = "../dmn-vad" }
+sha2 = "0.10"
 tracing = { workspace = true }
 whisper-rs = { version = "=0.16.0", features = ["tracing_backend", "raw-api"] }
 # Blocking client for model downloads: `dmn doctor --fetch` is a one-shot CLI step with no

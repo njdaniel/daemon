@@ -551,6 +551,7 @@ fn fetch_silero(paths: &Paths) -> Result<(), CliError> {
         &dest,
         silero::MODEL_URL,
         silero::MODEL_SIZE,
+        Some(silero::MODEL_SHA256),
         dmn_stt::model::MIN_DEADLINE,
         |_, _| {},
     )?;
@@ -595,7 +596,9 @@ fn fetch_model(paths: &Paths, name: &str) -> Result<(), CliError> {
     )?;
     let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     tracing::info!(path = %path.display(), bytes = len, "whisper model ready");
-    println!("model:    {} ({len} bytes)", path.display());
+    // #84: `download_model` checked the SHA-256 before the file was put in place (or re-hashed
+    // the one already there), so reaching this line means it verified.
+    println!("model:    {} ({len} bytes, sha256 ok)", path.display());
     Ok(())
 }
 
