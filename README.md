@@ -167,7 +167,7 @@ detection step per utterance.
 To follow a call (or a video) in another language without the interview aid, run
 `dmn run --no-assist --language auto --model small`: the screen is the translated transcript
 alone. With a local Ollama the model is unloaded at start, so a GPU build can give whisper the
-whole card (`--model medium` runs at about 0.13 s per utterance on a 4090). Pressing
+whole card (`--model medium` runs at about 0.14 s per utterance on a 4090). Pressing
 Ctrl+Shift+A later loads the LLM into what is left; if a tenth or more of it lands in system
 memory the status line says `llm partly on cpu`.
 
