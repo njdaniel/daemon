@@ -333,7 +333,12 @@ fn large_v3_turbo_under_the_translate_task_keeps_the_spanish() {
     let neutral = dir.path().join("ggml-measured.bin");
     std::os::unix::fs::symlink(&model, &neutral).expect("symlink");
     let segments = transcribe_lane_in(&wav, Source::Interviewer, &neutral, Language::Auto);
-    let finals: Vec<&Segment> = segments.iter().filter(|s| !s.text.is_empty()).collect();
+    // `transcribe_lane_in` runs with partials off, so these are all finals already; the filter
+    // says so rather than relying on it.
+    let finals: Vec<&Segment> = segments
+        .iter()
+        .filter(|s| s.is_final && !s.text.is_empty())
+        .collect();
     assert!(!finals.is_empty(), "the lane produced no transcript");
     // The best overlap of `text` with any interviewer turn, as scripted in English or as
     // spoken in Spanish.
