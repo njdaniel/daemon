@@ -885,6 +885,34 @@ fn tui_assist_off_is_the_transcript_alone_and_says_so() {
 }
 
 #[test]
+fn tui_assist_off_keeps_the_end_of_an_utterance_taller_than_the_screen() {
+    // Copilot on PR #80: one final longer than every row available kept its first rows and lost
+    // its newest words.
+    let words: Vec<String> = (1..=120).map(|n| format!("w{n}")).collect();
+    let mut a = actions("assist-off");
+    a.push(Action::Segment {
+        speaker: Speaker::Interviewer,
+        start: 95.0,
+        end: 107.0,
+        text: words.join(" "),
+        is_final: true,
+        avg_logprob: -0.2,
+        language: Some("es".into()),
+    });
+    let screen = text(&render(&Session::replay(&a), (60, 8)));
+    let rows: Vec<&str> = screen.lines().collect();
+    assert!(
+        rows[6].ends_with("w120"),
+        "the newest word on the last row:\n{screen}"
+    );
+    assert!(
+        !screen.contains("w1 "),
+        "the oldest words scrolled off:\n{screen}"
+    );
+    assert!(!screen.contains('…'), "nothing cut mid-screen:\n{screen}");
+}
+
+#[test]
 fn tui_assist_off_is_never_cut_on_a_narrow_pane() {
     // #79, found live: at 80 columns with every tag on the left (`system: all audio`, `es→en`,
     // the model dot's name), `assist off` ran into the keys as `assi`. It leads the keys now.

@@ -973,6 +973,9 @@ impl Pipeline {
             // #59: `[llm]` changes in the config file swap the provider between requests.
             let config_file = paths.config_file.clone();
             Box::new(move || {
+                // Started on a later Ctrl+Shift+A, perhaps long after the config was read: an
+                // `[llm]` edit made meanwhile applies from the first request (Copilot, PR #80).
+                let llm = llm_now(&config_file, llm);
                 Suggester::start(
                     &llm,
                     output,
@@ -1734,6 +1737,23 @@ fn warm_local_llm(llm: &dmn_core::config::Llm) {
     match warmed {
         Ok(()) => tracing::info!(model = %llm.model, "LLM loaded before GPU whisper"),
         Err(e) => tracing::warn!(error = %e, "LLM warm-up before GPU whisper failed"),
+    }
+}
+
+/// `[llm]` as the config file says now, for a suggester started after the run began (#79).
+/// The file wins only when it exists and parses; otherwise the settings the run started with
+/// stand, so a missing file (the tests', or one deleted mid-run) never swaps in the defaults, and
+/// a half-written edit is ignored rather than fatal.
+fn llm_now(config_file: &Path, started_with: dmn_core::config::Llm) -> dmn_core::config::Llm {
+    if !config_file.is_file() {
+        return started_with;
+    }
+    match Config::load(config_file) {
+        Ok(cfg) => cfg.llm,
+        Err(e) => {
+            tracing::warn!(error = %e, "config unreadable when assistance started; keeping [llm] from start-up");
+            started_with
+        }
     }
 }
 
@@ -2543,6 +2563,27 @@ mod tests {
         assert_eq!(snap.counts.candidates, 0);
         assert!(snap.live.is_none());
         assert_eq!(snap.status.language, "es");
+    }
+
+    #[test]
+    fn a_suggester_started_later_reads_llm_from_the_config_file_as_it_is_now() {
+        // Copilot on PR #80: assistance off at start, `[llm]` edited, then Ctrl+Shift+A.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let started_with = Config::default().llm;
+        assert_eq!(
+            llm_now(&file, started_with.clone()),
+            started_with,
+            "no file: the start-up settings, not the defaults"
+        );
+        std::fs::write(&file, "[llm]\nmodel = \"llama3.1:8b\"\n").unwrap();
+        assert_eq!(llm_now(&file, started_with.clone()).model, "llama3.1:8b");
+        std::fs::write(&file, "[llm]\nmodel = ").unwrap();
+        assert_eq!(
+            llm_now(&file, started_with.clone()),
+            started_with,
+            "a half-written edit keeps the start-up settings"
+        );
     }
 
     #[test]

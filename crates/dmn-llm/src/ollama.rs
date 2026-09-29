@@ -181,6 +181,9 @@ impl OllamaProvider {
     }
 
     /// Send `req` under [`STATUS_TIMEOUT`]; a non-success status is an error with its body.
+    /// The same bound is set on the request itself, so reading the reply's body afterwards
+    /// (`gpu_share`'s JSON) cannot hang either: reqwest's per-request timeout runs until the
+    /// body has been read.
     async fn within(
         &self,
         req: reqwest::RequestBuilder,
@@ -189,7 +192,8 @@ impl OllamaProvider {
         let deadline = Instant::now() + STATUS_TIMEOUT;
         let cancel = CancellationToken::new();
         let url = self.url(path);
-        let resp = send_within(NAME, &url, req.send(), &cancel, deadline, STATUS_TIMEOUT).await?;
+        let send = req.timeout(STATUS_TIMEOUT).send();
+        let resp = send_within(NAME, &url, send, &cancel, deadline, STATUS_TIMEOUT).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = error_body_within(resp, &cancel, deadline).await;
@@ -397,6 +401,7 @@ impl Provider for OllamaProvider {
             let resp = self
                 .within(self.client.get(self.url("/api/ps")), "/api/ps")
                 .await?;
+            // Bounded by the request's own timeout (`within`).
             let ps: Loaded = resp.json().await.map_err(|e| LlmError::MalformedStream {
                 provider: NAME,
                 detail: format!("/api/ps: {e}"),
@@ -457,6 +462,40 @@ mod tests {
         assert!(
             body.get("options").is_none(),
             "an unload loads nothing: {body}"
+        );
+    }
+
+    /// Copilot on PR #80: `within` bounded the request, not the read of its body, so an Ollama
+    /// that sent `/api/ps`'s headers and then stalled hung the suggester's thread for ever. The
+    /// request's own timeout now covers the body too.
+    #[tokio::test]
+    async fn gpu_share_gives_up_on_a_reply_that_stalls_mid_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(br#"{"models":["#);
+            let _ = stream.flush();
+            // Hold the connection open, sending nothing more, until the client gives up.
+            let _ = stream.set_read_timeout(Some(STATUS_TIMEOUT * 3));
+            let _ = stream.read(&mut buf);
+        });
+        let p = OllamaProvider::new(format!("http://127.0.0.1:{port}"), "test-model").unwrap();
+        let started = std::time::Instant::now();
+        let got = p.gpu_share().await;
+        assert!(got.is_err(), "{got:?}");
+        assert!(
+            started.elapsed() < STATUS_TIMEOUT + Duration::from_secs(2),
+            "gave up after {:?}",
+            started.elapsed()
         );
     }
 

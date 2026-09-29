@@ -73,7 +73,10 @@ fn wrapped(all: &[(&TranscriptLine, bool)], cells: usize, rows: usize) -> Vec<Li
         }
         let (label, colour) = speaker(l.speaker);
         let room = cells.saturating_sub(LABEL_CELLS + 1 + if *partial { width(CURSOR) } else { 0 });
-        let mut text = wrap(&l.text, room, rows);
+        // Wrapped in full, not to `rows`: `wrap` keeps the first lines and marks the cut with
+        // `…`, and the newest words are the ones to keep (Copilot, PR #80). The rows past the
+        // screen's top are dropped below, oldest first.
+        let mut text = wrap(&l.text, room, usize::MAX);
         if text.is_empty() {
             text.push(String::new());
         }
