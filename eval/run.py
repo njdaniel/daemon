@@ -15,6 +15,7 @@ Usage:
     python3 eval/run.py --compare            # also score the SPEC's literal cue table
     python3 eval/run.py --fixture mixed      # one fixture
     python3 eval/run.py --reuse              # reuse cached replay output
+    python3 eval/run.py --features vulkan    # build the replay with GPU whisper (#85)
 
 Stdlib only, by design: the harness must run on a clean checkout with no Python environment.
 """
@@ -150,7 +151,7 @@ def fingerprint(args) -> str:
     h = hashlib.sha256()
     h.update(
         repr(
-            (args.speed, args.model, args.threads, args.spec_literal, args.vad_close_ms, args.vad, args.language)
+            (args.speed, args.model, args.threads, args.spec_literal, args.vad_close_ms, args.vad, args.language, args.features)
         ).encode()
     )
     for cmd in (["git", "rev-parse", "HEAD"], ["git", "diff", "HEAD"]):
@@ -175,6 +176,9 @@ def replay(fixture: str, cache: Path, args) -> list[dict]:
         "--quiet",
         "-p",
         "dmn-cli",
+        # #85: the same features `just build` picked, so this run neither replaces a GPU binary
+        # with a CPU one nor transcribes large models on the CPU.
+        *(["--features", args.features] if args.features else []),
         "--",
         "replay",
         str(REPO / "testdata" / fixture / "interviewer.wav"),
@@ -309,6 +313,7 @@ def main() -> int:
     p.add_argument("--vad", choices=("energy", "silero"), help="voice activity detector; default [stt].vad")
     p.add_argument("--language", help="en, auto or a language code (#77); default [stt].language")
     p.add_argument("--reuse", action="store_true", help="reuse cached replay output when present")
+    p.add_argument("--features", help="cargo features for the replay build, e.g. vulkan (#85); default none (CPU)")
     p.add_argument("--compare", action="store_true", help="also score the SPEC's literal cue table")
     p.add_argument("--spec-literal", action="store_true", help="score only the SPEC's literal table")
     p.add_argument("--cache", default=None, help="directory for replay output (default: eval/.cache)")

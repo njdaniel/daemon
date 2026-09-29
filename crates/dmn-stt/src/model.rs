@@ -104,7 +104,8 @@ impl Model {
     /// Whether whisper's translate task works on this model. `large-v3-turbo` is multilingual
     /// but was trained without translation data: given the translate task it transcribes in
     /// the language it hears (measured 2026-09-28 on the Spanish fixture: Spanish text back,
-    /// WER 99 % against the English reference), so it cannot serve `[stt].language` other
+    /// WER 99 % against the English reference; re-measured on a checksum-verified file
+    /// 2026-09-29, #85: 21 of 21 finals in Spanish), so it cannot serve `[stt].language` other
     /// than `en` either.
     pub fn translates(self) -> bool {
         matches!(

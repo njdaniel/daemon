@@ -295,3 +295,76 @@ fn silence_between_turns_produces_no_hallucinated_segments() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs the es fixture WAVs (just fixtures-fetch) and the large-v3-turbo model (dmn doctor --fetch large-v3-turbo)"]
+fn large_v3_turbo_under_the_translate_task_keeps_the_spanish() {
+    // #85: PR #78 refuses large-v3-turbo for `[stt].language` other than `en` because, given
+    // whisper's translate task on the Spanish fixture, it returned Spanish (2026-09-28). That
+    // run used a model file later found corrupt (#84), so this re-runs it on a verified file,
+    // straight through the transcriber (the guard lives in its callers). Each final is scored
+    // against the scripted interviewer turns in English and in the Spanish that was spoken; the
+    // refusal stands while most finals read as Spanish.
+    let fixture = testdata().join("es");
+    let wav = fixture.join("interviewer.wav");
+    let model = model_path(&models_dir(), Model::LargeV3Turbo);
+    assert!(
+        wav.is_file(),
+        "missing {}: run just fixtures-fetch",
+        wav.display()
+    );
+    assert!(
+        model.is_file(),
+        "missing {}: run dmn doctor --fetch large-v3-turbo",
+        model.display()
+    );
+    let turns: Vec<serde_json::Value> =
+        serde_json::from_reader(std::fs::File::open(fixture.join("turns.json")).expect("open"))
+            .expect("parse turns.json");
+    let interviewer: Vec<(&str, &str)> = turns
+        .iter()
+        .filter(|t| t["speaker"] == "interviewer")
+        .filter_map(|t| Some((t["text"].as_str()?, t["spoken"].as_str()?)))
+        .collect();
+    // `Transcriber::load` refuses a file named `*turbo*` under the translate task (the backstop
+    // for the same refusal); a neutral name for the same verified bytes gets past it, which is
+    // the point of this measurement.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let neutral = dir.path().join("ggml-measured.bin");
+    std::os::unix::fs::symlink(&model, &neutral).expect("symlink");
+    let segments = transcribe_lane_in(&wav, Source::Interviewer, &neutral, Language::Auto);
+    // `transcribe_lane_in` runs with partials off, so these are all finals already; the filter
+    // says so rather than relying on it.
+    let finals: Vec<&Segment> = segments
+        .iter()
+        .filter(|s| s.is_final && !s.text.is_empty())
+        .collect();
+    assert!(!finals.is_empty(), "the lane produced no transcript");
+    // The best overlap of `text` with any interviewer turn, as scripted in English or as
+    // spoken in Spanish.
+    let best = |text: &str, spanish: bool| {
+        interviewer
+            .iter()
+            .map(|&(en, es)| overlap(if spanish { es } else { en }, text))
+            .fold(0.0_f64, f64::max)
+    };
+    let mut spanish = 0usize;
+    for (i, s) in finals.iter().enumerate() {
+        let en = best(&s.text, false);
+        let es = best(&s.text, true);
+        if es > en {
+            spanish += 1;
+        }
+        if i < 3 {
+            println!("{:?} en {en:.2} es {es:.2}: {}", s.language, s.text);
+        }
+    }
+    println!("{spanish} of {} finals read as Spanish", finals.len());
+    assert!(
+        spanish * 2 > finals.len(),
+        "large-v3-turbo translated {} of {} finals to English: the refusal in Model::translates \
+         (#78) no longer holds on a verified file",
+        finals.len() - spanish,
+        finals.len()
+    );
+}
