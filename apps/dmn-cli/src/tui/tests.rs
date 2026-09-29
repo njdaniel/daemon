@@ -50,6 +50,9 @@ const STATES: [&str; 22] = [
     "assist-on-again",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
+/// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
+const WIDE_STATES: [&str; 4] = ["live", "pinned", "sections-open-1", "behavioral"];
+const WIDE: (u16, u16) = (140, 30);
 
 fn updating() -> bool {
     std::env::var_os("DMN_UPDATE_SNAPSHOTS").is_some()
@@ -733,20 +736,22 @@ fn fixtures_are_what_the_reducer_builds() {
 #[test]
 fn tui_snapshots_match() {
     let mut failures = Vec::new();
-    for state in STATES {
-        let session = load(state);
-        for size in SIZES {
-            let got = text(&render(&session, size));
-            let path = snapshot_path(state, size);
-            if updating() {
-                std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
-                std::fs::write(&path, &got).expect("write snapshot");
-                continue;
-            }
-            let want = std::fs::read_to_string(&path).unwrap_or_default();
-            if got != want {
-                failures.push(format!("--- {} ---\n{got}", path.display()));
-            }
+    let wide = WIDE_STATES.iter().map(|s| (*s, WIDE));
+    let every = STATES
+        .iter()
+        .flat_map(|s| SIZES.iter().map(move |size| (*s, *size)))
+        .chain(wide);
+    for (state, size) in every {
+        let got = text(&render(&load(state), size));
+        let path = snapshot_path(state, size);
+        if updating() {
+            std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+            std::fs::write(&path, &got).expect("write snapshot");
+            continue;
+        }
+        let want = std::fs::read_to_string(&path).unwrap_or_default();
+        if got != want {
+            failures.push(format!("--- {} ---\n{got}", path.display()));
         }
     }
     assert!(
@@ -881,6 +886,56 @@ fn tui_assist_off_is_the_transcript_alone_and_says_so() {
     assert!(
         on.contains("LIVE QUESTION") && !on.contains("assist off"),
         "{on}"
+    );
+}
+
+#[test]
+fn tui_a_wide_pane_puts_the_transcript_in_a_right_hand_column() {
+    // #88: from 120 columns the transcript leaves the strip under the Approach for a column on
+    // the right; one column narrower, the stacked layout is what it always was.
+    let session = load("live");
+    let wide = render(&session, (120, 30));
+    let screen = text(&wide);
+    let (x, y) = row_containing(&wide, "TRANSCRIPT");
+    assert!(
+        y == 0 && x > 60,
+        "the column starts top-right ({x}, {y}):\n{screen}"
+    );
+    assert_eq!(row_containing(&wide, "LIVE QUESTION"), (2, 0), "{screen}");
+    assert_eq!(
+        row_containing(&wide, "● mic").1,
+        29,
+        "status full-width at the foot"
+    );
+    let narrow = render(&session, (119, 30));
+    assert_eq!(
+        row_containing(&narrow, "TRANSCRIPT").1,
+        26,
+        "stacked below 120 columns:\n{}",
+        text(&narrow)
+    );
+}
+
+#[test]
+fn tui_the_side_column_keeps_the_end_of_an_utterance_taller_than_it() {
+    let words: Vec<String> = (1..=200).map(|n| format!("w{n}")).collect();
+    let mut a = actions("live");
+    a.push(seg(
+        Speaker::Interviewer,
+        40.0,
+        52.0,
+        &words.join(" "),
+        true,
+    ));
+    let screen = text(&render(&Session::replay(&a), (120, 12)));
+    let rows: Vec<&str> = screen.lines().collect();
+    assert!(
+        rows[10].ends_with("w200"),
+        "the newest word at the column's foot:\n{screen}"
+    );
+    assert!(
+        !screen.contains("w1 "),
+        "the oldest words scrolled off:\n{screen}"
     );
 }
 

@@ -20,6 +20,11 @@
 //! 3. Transcript and status: the last two transcript lines, then one line with the mic, system
 //!    and model dots and the two most useful shortcuts for the current state.
 //!
+//! From 120 columns (#88) the transcript is a right-hand column instead, 40 % of the width and
+//! the full height above the status line, wrapped with the newest line at the bottom; the
+//! question, the Approach and the sections keep the left in the same order, and the status line
+//! stays full-width. Narrower panes (the 100 × 30 and 80 × 24 above) are stacked as listed.
+//!
 //! Density rules: every field is cut to its area with `…` instead of growing it, and nothing
 //! expands on its own: a section opens only on its key, one at a time (`Question::open`).
 //!
@@ -39,11 +44,18 @@ use dmn_session::{Progress, Question, Session};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
+use status::TranscriptArea;
 
 /// Rows the question block takes: four content lines inside a border.
 const QUESTION_ROWS: u16 = 6;
 /// Rows the transcript takes: a rule with its title, then two lines.
 const TRANSCRIPT_ROWS: u16 = 3;
+/// From this many columns the transcript is a right-hand column instead of two lines under the
+/// Approach (#88): below it the question and Approach would get too narrow beside it, so 100 × 30
+/// and 80 × 24 panes keep the stacked layout.
+const SIDE_MIN_COLS: u16 = 120;
+/// The transcript column's share of the width on a wide pane.
+const SIDE_PERCENT: u16 = 40;
 /// The status line.
 const STATUS_ROWS: u16 = 1;
 /// The Approach block never gets less than a border and one line.
@@ -117,17 +129,34 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
         // stale), so their rows go to the transcript.
         let [t, s] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_ROWS)]).areas(area);
-        status::render_transcript(&view, t, buf);
+        status::render_transcript(&view, TranscriptArea::Screen, t, buf);
         status::render_status(&view, s, buf);
         return;
     }
-    let [q, a, t, s] = Layout::vertical([
-        Constraint::Length(QUESTION_ROWS),
-        Constraint::Min(3),
-        Constraint::Length(TRANSCRIPT_ROWS),
-        Constraint::Length(STATUS_ROWS),
-    ])
-    .areas(area);
+    let (left, s) = if area.width >= SIDE_MIN_COLS {
+        // #88: question and Approach on the left, where they are read first; the transcript in a
+        // column on the right, the full height above the full-width status line.
+        let [body, s] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_ROWS)]).areas(area);
+        let [left, right] = Layout::horizontal([
+            Constraint::Percentage(100 - SIDE_PERCENT),
+            Constraint::Percentage(SIDE_PERCENT),
+        ])
+        .areas(body);
+        status::render_transcript(&view, TranscriptArea::Column, right, buf);
+        (left, s)
+    } else {
+        let [left, t, s] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(TRANSCRIPT_ROWS),
+            Constraint::Length(STATUS_ROWS),
+        ])
+        .areas(area);
+        status::render_transcript(&view, TranscriptArea::Strip, t, buf);
+        (left, s)
+    };
+    let [q, a] =
+        Layout::vertical([Constraint::Length(QUESTION_ROWS), Constraint::Min(3)]).areas(left);
     question::render(&view, q, buf);
     match sections::plan(&view, a.width) {
         None => approach::render(&view, a, buf),
@@ -137,7 +166,6 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
             sections::render(&plan, grid, body, buf);
         }
     }
-    status::render_transcript(&view, t, buf);
     status::render_status(&view, s, buf);
 }
 
