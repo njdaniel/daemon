@@ -19,9 +19,28 @@ lint:
 fmt:
     cargo fmt --all
 
-# Release build of the CLI
-build:
-    cargo build --release -p dmn-cli
+# #82: `auto` adds --features vulkan when libvulkan-dev and glslc are installed; `cpu` / `gpu`
+# force a variant. Where whisper runs stays [stt].device (default cpu) or --device gpu: the
+# Vulkan binary does both. CI runs cargo directly and never uses this recipe.
+# Release build of the CLI, with GPU whisper when the machine can build it
+build variant="auto":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    have_vulkan() { command -v glslc >/dev/null && pkg-config --exists vulkan 2>/dev/null; }
+    case "{{variant}}" in
+      auto) if have_vulkan; then gpu=1; else gpu=0; fi ;;
+      gpu) gpu=1 ;;
+      cpu) gpu=0 ;;
+      *) echo "just build [auto|cpu|gpu], not {{variant}}" >&2; exit 2 ;;
+    esac
+    if [ "$gpu" = 1 ]; then
+      cargo build --release -p dmn-cli --features vulkan
+      echo "built target/release/dmn: cpu + gpu (vulkan); whisper runs where [stt].device says (default cpu, --device gpu)"
+    else
+      cargo build --release -p dmn-cli
+      why=""; [ "{{variant}}" = auto ] && why=" (no libvulkan-dev + glslc; sudo apt install libvulkan-dev glslc for gpu)"
+      echo "built target/release/dmn: cpu only$why"
+    fi
 
 # Tests that need a live PipeWire server (marked #[ignore]); dev machine only
 probe:

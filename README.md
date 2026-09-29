@@ -102,17 +102,22 @@ target/release/dmn
 
 #### Optional: whisper on the GPU
 
-The default build transcribes on the CPU. With an NVIDIA GPU, a Vulkan build can run the
-interviewer's whisper on the GPU, which cuts the transcription step on the question → Approach
-path from about 0.8 s to about 0.35 s (#61, measured on an RTX 4090 beside
-`qwen3.6:35b-a3b`). Install the Vulkan headers and shader compiler, then build with the feature:
+Whisper runs on the CPU unless you ask for the GPU. With an NVIDIA GPU, a Vulkan build can run
+the interviewer's whisper on the GPU, which cuts the transcription step on the question →
+Approach path from about 0.8 s to about 0.35 s (#61, measured on an RTX 4090 beside
+`qwen3.6:35b-a3b`). Install the Vulkan headers and shader compiler, and `just build` includes
+GPU support from then on (it says which it built):
 
 ```bash
 sudo apt install libvulkan-dev glslc vulkan-tools
-cargo build --release -p dmn-cli --features vulkan
+just build           # cpu + gpu when those are installed, else cpu only
+just build cpu       # force the plain build; `just build gpu` forces Vulkan
 ```
 
-(`--features cuda` works too, with the CUDA toolkit on `PATH`; it measured no faster here.)
+The Vulkan binary still transcribes on the CPU by default. Choose the GPU per run with
+`dmn run --device gpu`, or for every run with `[stt].device` below. By hand, the build is
+`cargo build --release -p dmn-cli --features vulkan`. (`--features cuda` works too, with the
+CUDA toolkit on `PATH`; it measured no faster here.)
 
 Whisper only fits beside a large local model when the model's context is smaller than
 Ollama's default, so set both in `~/.config/dmn/config.toml`:
@@ -213,7 +218,7 @@ The project uses `just` as its task runner.
 just check     # cargo check --workspace --all-targets
 just test      # cargo test --workspace
 just lint      # clippy + rustfmt check
-just build     # release build of dmn
+just build     # release build of dmn; with GPU whisper when libvulkan-dev + glslc are installed
 just probe     # ignored tests that need a live PipeWire server
 just eval      # offline evaluation harness
 ```
