@@ -309,6 +309,14 @@ struct SlowJob {
     answered: Option<Answered>,
 }
 
+/// The part of the model not on the GPU, in whole percent; a sliver under 1 % is rounding.
+fn cpu_percent(gpu_share: f32) -> u8 {
+    let cpu = ((1.0 - gpu_share.clamp(0.0, 1.0)) * 100.0).round();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // 0.0 ..= 100.0
+    let cpu = cpu as u8;
+    cpu
+}
+
 pub struct Suggester {
     tx: mpsc::Sender<Job>,
     cancel: CancellationToken,
@@ -347,7 +355,7 @@ impl Suggester {
     /// Serve jobs on `provider` directly, with no warm-up, no context and no slow phase: the
     /// tests' way in.
     #[cfg(test)]
-    fn start_with<P: Provider + Send + 'static>(
+    pub(crate) fn start_with<P: Provider + Send + 'static>(
         provider: P,
         policy: Policy,
         hub: Arc<SessionHub>,
@@ -653,6 +661,15 @@ fn worker(
         dot: Dot::Model,
         health: Health::Ok,
     });
+    // #79: a model loaded after whisper took the GPU (assistance turned on mid-session) may not
+    // fit; say how much of it runs from system memory rather than fail or hide it.
+    if let Ok(Some(share)) = rt.block_on(provider.gpu_share()) {
+        let cpu_percent = cpu_percent(share);
+        if cpu_percent > 0 {
+            tracing::warn!(cpu_percent, "LLM partly in system memory");
+        }
+        hub.dispatch(Action::LlmOffload { cpu_percent });
+    }
     announce(llm, hub, output);
 
     // #54: the sources and job requirements, loaded once before the first question. A new job

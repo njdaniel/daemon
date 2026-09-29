@@ -41,6 +41,7 @@ pub struct Config {
     pub stt: Stt,
     pub detect: Detect,
     pub llm: Llm,
+    pub assist: Assist,
     pub ui: Ui,
     pub privacy: Privacy,
 }
@@ -285,6 +286,22 @@ pub enum AnswerLength {
     Minimal,
 }
 
+/// Interview assistance (#79): the layer over transcription that detects questions and asks the
+/// LLM for an Approach. Off, Daemon is a live transcriber / translator only: no detector, no
+/// context, no LLM request, and the transcript takes the screen. `dmn run --no-assist` starts a
+/// run with it off; `a` toggles it during the call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Assist {
+    pub enabled: bool,
+}
+
+impl Default for Assist {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ui {
@@ -386,6 +403,9 @@ answer_length = "concise"            # concise (5 lines) | minimal (3 lines)
 fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # the six expandable sections; 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
+
+[assist]
+enabled = true                       # false = transcribe / translate only: no detector, no LLM (a toggles)
 
 [ui]
 always_on_top = true
@@ -575,6 +595,9 @@ fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
+[assist]
+enabled = true                       # false = transcribe / translate only (a toggles)
+
 [ui]
 always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above
@@ -598,6 +621,14 @@ keep_transcripts = true
             Config::default(),
             "every key in the spec example is a default"
         );
+    }
+
+    #[test]
+    fn assistance_defaults_to_on_and_parses_off() {
+        assert!(Config::default().assist.enabled);
+        let c = Config::from_toml("[assist]\nenabled = false\n", "off").unwrap();
+        assert!(!c.assist.enabled);
+        assert!(c.to_toml().unwrap().contains("enabled = false"));
     }
 
     #[test]
@@ -635,7 +666,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 27, "spec example has 27 keys: {keys:?}");
+        assert_eq!(keys.len(), 28, "spec example has 28 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

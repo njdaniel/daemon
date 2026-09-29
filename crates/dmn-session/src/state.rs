@@ -353,6 +353,14 @@ pub struct Status {
     /// `en`.
     #[serde(default)]
     pub language: String,
+    /// Percent of the local LLM in system memory rather than on the GPU (#79); 0 when it all
+    /// fits, or before it is loaded.
+    #[serde(default, skip_serializing_if = "no_offload")]
+    pub llm_cpu_percent: u8,
+}
+
+fn no_offload(cpu_percent: &u8) -> bool {
+    *cpu_percent == 0
 }
 
 /// Running totals, for the status line and the end-of-run summary.
@@ -401,6 +409,11 @@ pub struct Session {
     /// replaces the continued one's where it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuing: Option<(u64, u64)>,
+    /// Interview assistance is off (#79): the pipeline runs no detector and no LLM request, and
+    /// the UI shows the transcript alone. Stored inverted so a default session, and every log
+    /// from before #79, has assistance on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assist_off: bool,
 }
 
 impl Session {
@@ -767,6 +780,8 @@ pub fn reduce(s: &mut Session, action: &Action) {
             s.status.stt_fallback = *fallback;
         }
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
+        Action::Assist { enabled } => s.assist_off = !enabled,
+        Action::LlmOffload { cpu_percent } => s.status.llm_cpu_percent = *cpu_percent,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}
     }

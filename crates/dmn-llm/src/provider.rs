@@ -172,6 +172,13 @@ pub trait Provider: Send + Sync {
     fn warm_up<'a>(&'a self) -> BoxFuture<'a, Result<(), LlmError>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// The share of the loaded model held on the GPU, 0.0 – 1.0, when the provider can tell
+    /// (#79: Ollama's `/api/ps`); `None` for a remote provider or a model not loaded. Default:
+    /// `None`.
+    fn gpu_share<'a>(&'a self) -> BoxFuture<'a, Result<Option<f32>, LlmError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Wrap a provider's raw stream with the cancellation and deadline rules every provider shares:

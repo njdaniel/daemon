@@ -89,6 +89,8 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             language: args.language.clone(),
             partials: args.partials,
             spec_literal_detector: args.spec_literal_detector,
+            // `dmn replay` measures the detector and the fast phase: assistance is always on.
+            assist: Some(true),
             no_llm: args.no_llm,
             no_store: args.no_store,
             output: Output::Print { json: args.json },

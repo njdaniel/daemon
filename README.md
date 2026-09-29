@@ -30,7 +30,7 @@ flowchart LR
   AUDIO --> VAD[Voice activity detection]
   VAD --> STT[Speech-to-text]
   STT --> TRANSCRIPT[Transcript]
-  TRANSCRIPT --> DETECT[Question detection]
+  TRANSCRIPT --> DETECT[Question detection<br/>when assistance is on]
   DETECT --> CONTEXT[Context retrieval]
   CONTEXT --> LLM[LLM]
   LLM --> SESSION[Session state]
@@ -49,6 +49,12 @@ The default interaction is intentionally small:
 
 No wall of text while you're trying to listen to another human.
 
+That assistance is a layer over a live transcriber and translator, and it can be switched off:
+press `a` during a call, start with `dmn run --no-assist`, or set `[assist] enabled = false`.
+Off, Daemon only transcribes (and, with a multilingual model, translates to English) on a
+transcript-only screen; no question detection runs and nothing is sent to the LLM. Press `a`
+again and the next question is answered as usual.
+
 ## Current CLI
 
 The `dmn` CLI currently includes:
@@ -58,6 +64,7 @@ dmn doctor [--init | --probe | --fetch small.en|small|silero]
 dmn config show
 dmn devices
 dmn run [--mic NODE] [--app APP]          # live: your mic + the call's audio, until q
+dmn run --no-assist                       # transcribe / translate only; a turns assistance on
 dmn run --replay INTERVIEWER.wav CANDIDATE.wav [--headless]
 dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
@@ -151,6 +158,13 @@ detected, answered and shown exactly as for an English call; the transcript tags
 replay` and `dmn bench` overrides the config for one run. Keep `language = "en"` with `small.en`
 for English calls: the multilingual `small` is a little less accurate on English and pays a
 detection step per utterance.
+
+To follow a call (or a video) in another language without the interview aid, run
+`dmn run --no-assist --language auto --model small`: the screen is the translated transcript
+alone. With a local Ollama the model is unloaded at start, so a GPU build can give whisper the
+whole card (`--model medium` runs at about 0.13 s per utterance on a 4090). Pressing `a` later
+loads the LLM into what is left; if part of it lands in system memory the status line says
+`llm partly on cpu`.
 
 ### Initialize and inspect your system
 

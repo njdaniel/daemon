@@ -3,8 +3,8 @@
 //! The pipeline ([`crate::pipeline`], the same one `dmn replay` runs) works on its own thread
 //! and dispatches everything into the session; this thread redraws the TUI from the session's
 //! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
-//! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), `q` (or Ctrl-C)
-//! quit. Nothing else writes to the terminal
+//! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), `a` interview
+//! assistance on ↔ off (#79), `q` (or Ctrl-C) quit. Nothing else writes to the terminal
 //! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
@@ -67,6 +67,8 @@ pub struct Args {
     pub duration: Option<u64>,
     /// `--solutions <hints|full>`: coding solutions for this run, over `[ui].coding_solutions`.
     pub solutions: Option<CodingSolutions>,
+    /// `--no-assist` (#79): start with interview assistance off, over `[assist].enabled`.
+    pub no_assist: bool,
 }
 
 /// A key the TUI acts on.
@@ -82,6 +84,8 @@ pub enum Key {
     /// `w`: Swap the STAR block to the next matched story (#58). `s` was taken by coding
     /// solutions; `w` is the other letter of "swap" that is free and sits beside `q`/`r`.
     Swap,
+    /// `a`: interview assistance on ↔ off (#79).
+    Assist,
     Quit,
 }
 
@@ -100,6 +104,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('m' | 'M') => Some(Key::Mute),
         KeyCode::Char('s' | 'S') => Some(Key::Solutions),
         KeyCode::Char('w' | 'W') => Some(Key::Swap),
+        KeyCode::Char('a' | 'A') => Some(Key::Assist),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -119,6 +124,7 @@ pub fn press(k: Key, controls: &Controls) -> bool {
         Key::Solutions => controls.toggle_coding_solutions(),
         Key::Section(s) => controls.toggle_section(s),
         Key::Swap => controls.swap_story(),
+        Key::Assist => controls.toggle_assist(),
         Key::Quit => {
             controls.quit();
             return true;
@@ -183,6 +189,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             language: args.language.clone(),
             partials: Partials::Auto,
             spec_literal_detector: false,
+            assist: args.no_assist.then_some(false),
             no_llm: false,
             no_store: args.no_store,
             output: Output::Quiet,
@@ -413,6 +420,7 @@ fn headless(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::Command;
     use dmn_session::{Action, Health};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -456,6 +464,7 @@ mod tests {
         assert_eq!(key(press_key('r')), Some(Key::Regenerate));
         assert_eq!(key(press_key('m')), Some(Key::Mute));
         assert_eq!(key(press_key('s')), Some(Key::Solutions));
+        assert_eq!(key(press_key('a')), Some(Key::Assist));
         assert_eq!(key(press_key('q')), Some(Key::Quit));
         assert_eq!(
             key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -498,6 +507,36 @@ mod tests {
         assert!(unpinned.contains("LIVE QUESTION"), "{unpinned}");
         assert!(unpinned.contains("Design a URL shortener"), "{unpinned}");
         assert!(!unpinned.contains("1 new"), "{unpinned}");
+    }
+
+    #[test]
+    fn a_turns_assistance_off_to_the_transcript_alone_and_on_again() {
+        // #79: the screen switches on the key; the pipeline hears about it on its channel.
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        for a in question(1, "Design a rate limiter") {
+            hub.dispatch(a);
+        }
+        assert!(
+            !press(key(press_key('a')).unwrap(), &controls),
+            "a does not quit"
+        );
+        let off = screen(&hub.snapshot());
+        assert!(
+            !off.contains("LIVE QUESTION") && !off.contains("APPROACH"),
+            "{off}"
+        );
+        assert!(off.contains("assist off"), "{off}");
+        assert_eq!(commands.try_recv(), Ok(Command::Assist { on: false }));
+
+        press(Key::Assist, &controls);
+        let on = screen(&hub.snapshot());
+        assert!(
+            on.contains("LIVE QUESTION") && on.contains("Design a rate limiter"),
+            "{on}"
+        );
+        assert!(!on.contains("assist off"), "{on}");
+        assert_eq!(commands.try_recv(), Ok(Command::Assist { on: true }));
     }
 
     #[test]
@@ -589,6 +628,7 @@ mod tests {
             headless: false,
             duration: None,
             solutions: None,
+            no_assist: false,
         }
     }
 

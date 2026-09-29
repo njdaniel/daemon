@@ -25,7 +25,7 @@ Rust Linux interview copilot. M1–M2 is a ratatui TUI; M3 adds a Tauri 2 window
 - No new dependencies without a line in docs/DEPENDENCIES.md saying why; no `unsafe` outside `dmn-audio` and `dmn-stt`, and every `unsafe` block has a `// SAFETY:` comment.
 - Every crate's `lib.rs` doc comment states its input, output and the channel it owns.
 - Tests use testdata WAVs, never a microphone; CI has no PipeWire. Anything that needs PipeWire is behind `#[ignore]` and run by `just probe` on a dev machine.
-- Keep the TUI's three-area layout (question / approach / transcript+status); the M3 window follows docs/design/.
+- Keep the TUI's three-area layout (question / approach / transcript+status); the one exception is the transcript-first screen while interview assistance is off (#79). The M3 window follows docs/design/.
 - One issue per run, on branch `issue/<n>-<slug>`; PR body starts with `Closes #n` and ticks each acceptance criterion with its verify command. Never merge or force-push. If the spec and the issue disagree, the issue wins, and say so in the PR.
 
 ## Done means

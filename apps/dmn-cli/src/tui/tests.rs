@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 20] = [
+const STATES: [&str; 22] = [
     "listening",
     "live",
     "pinned",
@@ -45,6 +45,9 @@ const STATES: [&str; 20] = [
     // #58: STAR built from a matched story, and Swap with no other story.
     "star-story",
     "star-no-other",
+    // #79: assistance off, transcript first; and on again, back to the three areas.
+    "assist-off",
+    "assist-on-again",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 
@@ -599,10 +602,67 @@ fn actions(state: &str) -> Vec<Action> {
                 section: Section::Deeper,
             });
         }
+        "assist-off" | "assist-on-again" => {
+            // A question answered while assistance was on, then `a`: the Spanish call goes on
+            // translated, and the screen is the transcript alone, wrapped, newest at the bottom.
+            a.extend(rate_limiter());
+            a.push(Action::Assist { enabled: false });
+            for (i, (speaker, text)) in ASSIST_OFF_TURNS.iter().enumerate() {
+                let start = 40.0 + 6.0 * i as f64;
+                a.push(Action::Segment {
+                    speaker: *speaker,
+                    start,
+                    end: start + 5.0,
+                    text: (*text).into(),
+                    is_final: true,
+                    avg_logprob: -0.2,
+                    language: Some("es".into()),
+                });
+            }
+            a.push(seg(
+                Speaker::Interviewer,
+                90.0,
+                92.0,
+                "And what about the",
+                false,
+            ));
+            if state == "assist-on-again" {
+                a.push(Action::Assist { enabled: true });
+            }
+        }
         other => panic!("no actions for state {other}"),
     }
     a
 }
+
+/// #79's fixture: a translated exchange, some lines long enough to wrap at 80 columns.
+const ASSIST_OFF_TURNS: [(Speaker, &str); 7] = [
+    (
+        Speaker::Interviewer,
+        "Let's move on. Tell me about the team you worked with on the payments migration.",
+    ),
+    (
+        Speaker::You,
+        "There were five of us: two backend engineers, a data engineer, a product manager and me leading the cut-over plan.",
+    ),
+    (Speaker::Interviewer, "How long did the migration take?"),
+    (
+        Speaker::You,
+        "About four months, with the last three weeks running both systems side by side and comparing every ledger entry.",
+    ),
+    (
+        Speaker::Interviewer,
+        "And did anything go wrong on the day?",
+    ),
+    (
+        Speaker::You,
+        "One batch job still pointed at the old database, so we paused it and replayed its writes.",
+    ),
+    (
+        Speaker::Interviewer,
+        "Good. Let's talk about how you would test that.",
+    ),
+];
 
 fn build(state: &str) -> Session {
     Session::replay(&actions(state))
@@ -792,6 +852,68 @@ fn tui_behavioral_shows_star_cards_a_clarification_and_error_dots() {
     assert_eq!(buf[(x, y)].fg, Color::Red);
     assert!(screen.contains("model: ollama unreachable"), "{screen}");
     assert!(screen.contains("mic muted"), "{screen}");
+}
+
+#[test]
+fn tui_assist_off_is_the_transcript_alone_and_says_so() {
+    // #79: no question block, no Approach, the status line says `assist off` with the
+    // translation tag, and the footer offers `a` back.
+    let buf = render(&load("assist-off"), (100, 30));
+    let screen = text(&buf);
+    for gone in ["LIVE QUESTION", "APPROACH", "rate limiter"] {
+        assert!(
+            !screen.contains(gone),
+            "{gone:?} still on screen:\n{screen}"
+        );
+    }
+    let last = screen.lines().nth(29).unwrap_or_default();
+    assert!(
+        last.contains(" es→en ") && last.contains(" assist off "),
+        "{last}"
+    );
+    assert!(last.ends_with("a assist · q quit"), "{last}");
+    let (x, y) = row_containing(&buf, "assist off");
+    assert_eq!(buf[(x, y)].fg, Color::Yellow);
+    // The transcript takes the released rows: the first translated line is on screen, the
+    // newest (a partial) is the last line above the status.
+    assert!(screen.contains("Tell me about the team"), "{screen}");
+    let above = screen.lines().nth(28).unwrap_or_default();
+    assert!(above.contains("And what about the▍"), "{screen}");
+
+    let on = text(&render(&load("assist-on-again"), (100, 30)));
+    assert!(
+        on.contains("LIVE QUESTION") && !on.contains("assist off"),
+        "{on}"
+    );
+}
+
+#[test]
+fn tui_assist_off_keeps_the_newest_words_when_the_window_overflows() {
+    // A short terminal: only the newest rows fit, and the oldest line shown is cut from the top.
+    let screen = text(&render(&load("assist-off"), (80, 8)));
+    let rows: Vec<&str> = screen.lines().collect();
+    assert!(rows[6].contains("And what about the▍"), "{screen}");
+    assert!(
+        !screen.contains("payments migration"),
+        "the oldest lines scroll off: {screen}"
+    );
+}
+
+#[test]
+fn tui_a_model_partly_in_system_memory_is_named() {
+    // #79: whisper took the GPU first, the LLM loaded after it into what was left.
+    let with = |cpu_percent: u8| {
+        let mut a = actions("live");
+        a.push(Action::LlmOffload { cpu_percent });
+        render(&Session::replay(&a), (100, 30))
+    };
+    let buf = with(35);
+    let (x, y) = row_containing(&buf, "llm partly on cpu");
+    assert_eq!(buf[(x, y)].fg, Color::Yellow);
+    assert!(
+        !text(&with(0)).contains("partly"),
+        "all on the GPU says nothing"
+    );
 }
 
 #[test]
