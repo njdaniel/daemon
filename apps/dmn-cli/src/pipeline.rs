@@ -2855,7 +2855,7 @@ mod tests {
         let found = you.detecting.found();
         assert!(!found.is_empty());
         assert!(found.iter().all(|f| f.candidate.source == Source::You));
-        for asked in ["limit per calling service", "on-call rotation"] {
+        for asked in ["one global limit", "on-call rotation"] {
             assert!(
                 found.iter().any(|f| f.candidate.line.contains(asked)),
                 "the candidate's question about the {asked}"
