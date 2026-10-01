@@ -1,7 +1,55 @@
 //! Weights, threshold and sensitivity. Every number the detector uses lives here so #16 can
 //! retune on a real call without touching a matcher.
 
+use dmn_audio::Source;
+
 use crate::cue::Cue;
+
+/// Whose questions the detector scores (`[detect].question_source` in config.toml, #90). It
+/// selects eligible lanes, not voice identities: the mic is always labelled You and the call's
+/// output always Interviewer, whoever is actually speaking on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestionSource {
+    /// The call's output lane only: the behaviour before #90.
+    #[default]
+    Interviewer,
+    /// The mic lane only. Lets the user ask Daemon directly, and lets a mock interview played
+    /// from a phone into the microphone drive a whole session.
+    You,
+    /// Either lane.
+    Both,
+}
+
+impl QuestionSource {
+    /// Whether a final from `source` is scored at all.
+    pub fn allows(self, source: Source) -> bool {
+        match self {
+            QuestionSource::Interviewer => source == Source::Interviewer,
+            QuestionSource::You => source == Source::You,
+            QuestionSource::Both => matches!(source, Source::Interviewer | Source::You),
+        }
+    }
+
+    /// Parse `[detect].question_source`. As with [`Sensitivity::from_name`], `dmn-core` owns the
+    /// config type and this keeps the crates apart.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "interviewer" => Some(QuestionSource::Interviewer),
+            "you" => Some(QuestionSource::You),
+            "both" => Some(QuestionSource::Both),
+            _ => None,
+        }
+    }
+
+    /// The config-file spelling, for the status line and the replay header.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuestionSource::Interviewer => "interviewer",
+            QuestionSource::You => "you",
+            QuestionSource::Both => "both",
+        }
+    }
+}
 
 /// How eager the detector is (`[detect].sensitivity` in config.toml). The sensitivity shifts the
 /// threshold, not the weights: the cues mean the same thing at every setting.
@@ -51,6 +99,9 @@ pub struct DetectConfig {
     /// A line is a candidate at or above this score.
     pub threshold: i32,
     pub sensitivity: Sensitivity,
+    /// Whose finals are scored (#90). Default [`QuestionSource::Interviewer`], the SPEC's
+    /// "every final Interviewer segment".
+    pub question_source: QuestionSource,
     /// Require at least one question-form cue (`?`, an opener, or a hand-off phrase) before a line
     /// can be a candidate, whatever its score.
     ///
@@ -88,6 +139,7 @@ impl Default for DetectConfig {
             small_talk: -2,
             threshold: 2,
             sensitivity: Sensitivity::Balanced,
+            question_source: QuestionSource::Interviewer,
             require_question_form: true,
             rhetorical_vetoes: true,
             small_talk_vetoes: true,
@@ -128,6 +180,11 @@ impl DetectConfig {
 
     pub fn with_sensitivity(mut self, sensitivity: Sensitivity) -> Self {
         self.sensitivity = sensitivity;
+        self
+    }
+
+    pub fn with_question_source(mut self, source: QuestionSource) -> Self {
+        self.question_source = source;
         self
     }
 }
@@ -179,5 +236,42 @@ mod tests {
         );
         assert_eq!(Sensitivity::from_name("strict"), Some(Sensitivity::Strict));
         assert_eq!(Sensitivity::from_name("aggressive"), None);
+    }
+
+    #[test]
+    fn the_default_question_source_is_the_interviewer_lane_alone() {
+        let c = DetectConfig::default();
+        assert_eq!(c.question_source, QuestionSource::Interviewer);
+        assert!(c.question_source.allows(Source::Interviewer));
+        assert!(!c.question_source.allows(Source::You));
+        assert!(!c.question_source.allows(Source::Unknown));
+    }
+
+    #[test]
+    fn question_source_selects_lanes_and_parses_its_three_names() {
+        assert!(QuestionSource::You.allows(Source::You));
+        assert!(!QuestionSource::You.allows(Source::Interviewer));
+        assert!(QuestionSource::Both.allows(Source::You));
+        assert!(QuestionSource::Both.allows(Source::Interviewer));
+        // A single-stream fallback has no lane to select, so it is never scored.
+        assert!(!QuestionSource::Both.allows(Source::Unknown));
+
+        assert_eq!(
+            QuestionSource::from_name(" Interviewer "),
+            Some(QuestionSource::Interviewer)
+        );
+        assert_eq!(QuestionSource::from_name("you"), Some(QuestionSource::You));
+        assert_eq!(
+            QuestionSource::from_name("both"),
+            Some(QuestionSource::Both)
+        );
+        assert_eq!(QuestionSource::from_name("everyone"), None);
+        for s in [
+            QuestionSource::Interviewer,
+            QuestionSource::You,
+            QuestionSource::Both,
+        ] {
+            assert_eq!(QuestionSource::from_name(s.as_str()), Some(s));
+        }
     }
 }

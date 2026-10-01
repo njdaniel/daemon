@@ -206,6 +206,31 @@ pub enum Vad {
 #[serde(default, deny_unknown_fields)]
 pub struct Detect {
     pub sensitivity: Sensitivity,
+    /// Whose questions are detected and answered (#90). A detector input, like `sensitivity`:
+    /// it selects eligible lanes, and never changes a transcript label or the audio routing.
+    pub question_source: QuestionSource,
+}
+
+/// `[detect].question_source` (#90): the mic lane (`you`), the call's output lane
+/// (`interviewer`, the default) or either (`both`). Fixed for a session, like `[stt].language`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionSource {
+    #[default]
+    Interviewer,
+    You,
+    Both,
+}
+
+impl QuestionSource {
+    /// The config-file spelling, for the status line and `dmn config show`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuestionSource::Interviewer => "interviewer",
+            QuestionSource::You => "you",
+            QuestionSource::Both => "both",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -393,6 +418,7 @@ language = "en"                      # en | auto | es, de, ...: auto detects and
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
+question_source = "interviewer"      # interviewer | you | both: whose questions are detected and answered
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic. Only ollama keeps transcripts local.
@@ -584,6 +610,7 @@ language = "en"                      # en | auto | es, de, ...: auto detects and
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
+question_source = "interviewer"      # interviewer | you | both: whose questions trigger an answer
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic
@@ -632,6 +659,37 @@ keep_transcripts = true
     }
 
     #[test]
+    fn question_source_defaults_to_the_interviewer_and_round_trips_its_three_values() {
+        assert_eq!(
+            Config::default().detect.question_source,
+            QuestionSource::Interviewer
+        );
+        for (name, want) in [
+            ("interviewer", QuestionSource::Interviewer),
+            ("you", QuestionSource::You),
+            ("both", QuestionSource::Both),
+        ] {
+            let cfg = Config::from_toml(&format!("[detect]\nquestion_source = \"{name}\"\n"), name)
+                .unwrap();
+            assert_eq!(cfg.detect.question_source, want);
+            let toml = cfg.to_toml().unwrap();
+            assert!(
+                toml.contains(&format!("question_source = \"{name}\"")),
+                "{toml}"
+            );
+            assert_eq!(Config::from_toml(&toml, name).unwrap(), cfg);
+            assert_eq!(want.as_str(), name);
+        }
+        // An unknown value names the three choices rather than falling back to a default.
+        let err = Config::from_toml("[detect]\nquestion_source = \"candidate\"\n", "bad")
+            .expect_err("an unknown question source is a config error")
+            .to_string();
+        for name in ["interviewer", "you", "both"] {
+            assert!(err.contains(name), "{err}");
+        }
+    }
+
+    #[test]
     fn stt_language_parses_en_auto_and_codes_and_rejects_the_rest() {
         assert_eq!("en".parse::<SttLanguage>().unwrap(), SttLanguage::English);
         assert_eq!("auto".parse::<SttLanguage>().unwrap(), SttLanguage::Auto);
@@ -666,7 +724,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 28, "spec example has 28 keys: {keys:?}");
+        assert_eq!(keys.len(), 29, "spec example has 29 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

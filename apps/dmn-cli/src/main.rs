@@ -82,6 +82,25 @@ impl From<VadArg> for dmn_core::config::Vad {
     }
 }
 
+/// `--question-source` (#90): whose questions are detected and answered, over
+/// `[detect].question_source`. clap limits the value to these three names.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum QuestionSourceArg {
+    Interviewer,
+    You,
+    Both,
+}
+
+impl From<QuestionSourceArg> for dmn_core::config::QuestionSource {
+    fn from(q: QuestionSourceArg) -> Self {
+        match q {
+            QuestionSourceArg::Interviewer => dmn_core::config::QuestionSource::Interviewer,
+            QuestionSourceArg::You => dmn_core::config::QuestionSource::You,
+            QuestionSourceArg::Both => dmn_core::config::QuestionSource::Both,
+        }
+    }
+}
+
 /// `--device` (#61): where whisper runs, over `[stt].device`.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum DeviceArg {
@@ -145,6 +164,10 @@ enum Command {
         /// es; default is [stt].language. Anything but en needs a multilingual model (small)
         #[arg(long)]
         language: Option<dmn_core::config::SttLanguage>,
+        /// Whose questions are detected and answered: interviewer (default), you or both;
+        /// overrides [detect].question_source. Transcript labels and audio routing never change
+        #[arg(long, value_enum)]
+        question_source: Option<QuestionSourceArg>,
         /// Keep the session in memory: write nothing to ~/.local/share/dmn/dmn.sqlite
         #[arg(long)]
         no_store: bool,
@@ -282,6 +305,10 @@ enum Command {
         /// and no vetoes on rhetorical tags or small talk
         #[arg(long)]
         spec_literal_detector: bool,
+        /// Whose questions are detected and answered: interviewer (default), you or both;
+        /// overrides [detect].question_source. Transcript labels and audio routing never change
+        #[arg(long, value_enum)]
+        question_source: Option<QuestionSourceArg>,
         /// Skip the LLM fast phase; by default each candidate goes to [llm] (Ollama) and the
         /// question + approach JSON is printed
         #[arg(long)]
@@ -391,6 +418,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             transcript,
             json,
             spec_literal_detector,
+            question_source,
             no_llm,
             no_store,
         }) => {
@@ -413,6 +441,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     transcript,
                     json,
                     spec_literal_detector,
+                    question_source: question_source.map(Into::into),
                     no_llm,
                     no_store,
                 },
@@ -429,6 +458,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             vad,
             device,
             language,
+            question_source,
             no_store,
             headless,
             duration,
@@ -462,6 +492,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     vad: vad.map(Into::into),
                     device: device.map(Into::into),
                     language,
+                    question_source: question_source.map(Into::into),
                     no_store,
                     headless,
                     duration,

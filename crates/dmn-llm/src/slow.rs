@@ -199,7 +199,8 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
         user.push('\n');
     }
     vec![
-        Message::system(prompt::system_prompt(None)),
+        // #90: the lane that asked chooses the base rules, as it does for the fast phase.
+        Message::system(prompt::system_prompt(None, req.context.asker)),
         Message::user(user),
     ]
 }
@@ -662,6 +663,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_question_from_the_you_lane_keeps_its_rules_and_header_in_the_slow_request() {
+        // #90: the asker rides in `context`; the caller (`dmn-cli`'s `SlowJob`) sets it.
+        let mock = MockProvider::json(&reply());
+        let mut req = request(Kind::SystemDesign);
+        req.context.asker = prompt::Asker::You;
+        let _ = run(&mock, &req).await;
+        let sent = &mock.requests()[0];
+        assert_eq!(
+            sent.messages[0].content,
+            prompt::system_prompt(None, prompt::Asker::You)
+        );
+        assert_ne!(
+            sent.messages[0].content,
+            prompt::system_prompt(None, prompt::Asker::Interviewer)
+        );
+        let user = &sent.messages[1].content;
+        assert!(user.contains("## You just said\n"), "{user}");
+        assert!(!user.contains("## Interviewer just said"), "{user}");
+    }
+
+    #[tokio::test]
     async fn the_request_shares_the_fast_prompt_and_adds_the_question_on_screen() {
         let mock = MockProvider::json(&reply());
         let req = request(Kind::SystemDesign);
@@ -672,7 +694,7 @@ mod tests {
         assert_eq!(sent.schema, Some(slow_schema(false, false)));
         assert_eq!(
             sent.messages[0].content,
-            prompt::system_prompt(None),
+            prompt::system_prompt(None, req.context.asker),
             "the fast phase's system prompt, word for word"
         );
         let user = &sent.messages[1].content;

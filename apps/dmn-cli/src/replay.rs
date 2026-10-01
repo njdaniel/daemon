@@ -40,6 +40,8 @@ pub struct Args {
     pub json: bool,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
+    /// `--question-source` (#90), over `[detect].question_source`.
+    pub question_source: Option<dmn_core::config::QuestionSource>,
     /// Skip the LLM fast phase (#12): transcribe and detect only.
     pub no_llm: bool,
     /// Keep the session in memory only: write nothing to `dmn.sqlite` (#13). The eval harness
@@ -89,6 +91,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             language: args.language.clone(),
             partials: args.partials,
             spec_literal_detector: args.spec_literal_detector,
+            question_source: args.question_source,
             // `dmn replay` measures the detector and the fast phase: assistance is always on.
             assist: Some(true),
             no_llm: args.no_llm,
@@ -249,26 +252,38 @@ fn print_segment_json(seg: &Segment) {
     );
 }
 
+/// The `--json` candidate event. `source` names the lane the question came from (#90):
+/// "Interviewer" or "You", the transcript's own labels.
+fn candidate_json(found: &Found) -> serde_json::Value {
+    let c = &found.candidate;
+    serde_json::json!({
+        "type": "candidate",
+        "source": c.source.label(),
+        "start": c.start.as_secs_f64(),
+        "end": c.end.as_secs_f64(),
+        "text": c.text,
+        "line": c.line,
+        "score": c.score,
+        "cues": c.cues.iter().map(|q| q.label()).collect::<Vec<_>>(),
+        "detect_us": found.latency.as_micros() as u64,
+        "late": found.late,
+        "continues": found.continues,
+    })
+}
+
 fn print_candidate(found: &Found, json: bool) {
     let c = &found.candidate;
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "type": "candidate",
-                "source": c.source.label(),
-                "start": c.start.as_secs_f64(),
-                "end": c.end.as_secs_f64(),
-                "text": c.text,
-                "line": c.line,
-                "score": c.score,
-                "cues": c.cues.iter().map(|q| q.label()).collect::<Vec<_>>(),
-                "detect_us": found.latency.as_micros() as u64,
-                "late": found.late,
-                "continues": found.continues,
-            })
-        );
+        println!("{}", candidate_json(found));
     } else {
+        // #90: name the lane whenever it is not the Interviewer, so a `you` or `both` run shows
+        // which stream triggered. An Interviewer candidate's line is unchanged (and its own
+        // `interviewer` cue already names the lane).
+        let lane = if c.source == Source::Interviewer {
+            String::new()
+        } else {
+            format!("[{}] ", c.source.label().to_ascii_lowercase())
+        };
         let when = if found.late {
             " (after the next final)"
         } else {
@@ -279,7 +294,7 @@ fn print_candidate(found: &Found, json: bool) {
         } else {
             ""
         };
-        println!("  -> candidate {}{when}{cont}", c.render());
+        println!("  -> candidate {lane}{}{when}{cont}", c.render());
     }
 }
 
@@ -433,6 +448,29 @@ pub fn pretty(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_json_candidate_event_names_the_lane() {
+        for (source, label) in [(Source::You, "You"), (Source::Interviewer, "Interviewer")] {
+            let found = Found {
+                candidate: dmn_detect::Candidate {
+                    source,
+                    start: Duration::from_secs(1),
+                    end: Duration::from_secs(3),
+                    text: "What is the SLA?".into(),
+                    line: "What is the SLA?".into(),
+                    score: 4,
+                    cues: Vec::new(),
+                },
+                latency: Duration::from_micros(40),
+                late: false,
+                continues: false,
+            };
+            let event = candidate_json(&found);
+            assert_eq!(event["type"], "candidate");
+            assert_eq!(event["source"], label);
+        }
+    }
 
     #[test]
     fn durations_render_compactly() {

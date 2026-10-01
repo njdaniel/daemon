@@ -12,8 +12,8 @@
 use std::path::{Path, PathBuf};
 
 use dmn_session::{
-    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, Section, Session,
-    SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, QuestionSource, Section,
+    Session, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 22] = [
+const STATES: [&str; 24] = [
     "listening",
     "live",
     "pinned",
@@ -48,6 +48,10 @@ const STATES: [&str; 22] = [
     // #79: assistance off, transcript first; and on again, back to the three areas.
     "assist-off",
     "assist-on-again",
+    // #90: the mic lane asks (nothing eligible heard yet), and either lane asks (a You question
+    // answered).
+    "asks-you",
+    "asks-both",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -633,6 +637,54 @@ fn actions(state: &str) -> Vec<Action> {
                 a.push(Action::Assist { enabled: true });
             }
         }
+        "asks-you" => {
+            // The interviewer's greeting is in the transcript, but that lane cannot ask: the
+            // question area still waits for the mic.
+            a.insert(
+                1,
+                Action::QuestionSource {
+                    source: QuestionSource::You,
+                },
+            );
+            a.pop();
+        }
+        "asks-both" => {
+            a.insert(
+                1,
+                Action::QuestionSource {
+                    source: QuestionSource::Both,
+                },
+            );
+            a.push(seg(
+                Speaker::You,
+                19.0,
+                23.0,
+                "How does a token bucket differ from a sliding window?",
+                true,
+            ));
+            // The candidate came from the mic lane; the answer is drawn as any other.
+            let mut reply = answered(
+                1,
+                "How does a token bucket differ from a sliding window?",
+                "knowledge",
+                "burst handling, memory per key, accuracy at the window edge",
+                &[
+                    "Token bucket: refill at a fixed rate, spend one per request",
+                    "It allows bursts up to the bucket size",
+                    "Sliding window: count requests in the last N seconds",
+                    "It is stricter at the edges, and costs more memory per key",
+                ],
+            );
+            reply[0] = Action::Candidate {
+                id: 1,
+                speaker: Speaker::You,
+                start: 19.0,
+                end: 23.0,
+                text: "How does a token bucket differ from a sliding window?".into(),
+                score: 5,
+            };
+            a.extend(reply);
+        }
         other => panic!("no actions for state {other}"),
     }
     a
@@ -1012,6 +1064,49 @@ fn tui_a_model_partly_in_system_memory_is_named() {
     assert!(
         !text(&with(4)).contains("partly"),
         "the usual few percent on the dev 4090 says nothing either"
+    );
+}
+
+#[test]
+fn tui_the_status_line_names_a_question_source_other_than_the_interviewer() {
+    // #90: `asks: you` / `asks: both`; nothing for the default, nothing while assistance is off.
+    for size in SIZES {
+        assert!(text(&render(&load("asks-you"), size)).contains(" asks: you "));
+        assert!(text(&render(&load("asks-both"), size)).contains(" asks: both "));
+        for state in ["listening", "live", "assist-off"] {
+            let screen = text(&render(&load(state), size));
+            assert!(!screen.contains("asks:"), "{state}:\n{screen}");
+        }
+    }
+    let mut off = actions("asks-both");
+    off.push(Action::Assist { enabled: false });
+    let screen = text(&render(&Session::replay(&off), (100, 30)));
+    assert!(!screen.contains("asks:"), "{screen}");
+    assert!(screen.contains("assist off"), "{screen}");
+}
+
+#[test]
+fn tui_the_listening_placeholder_names_who_can_ask() {
+    // #90: before anything is heard on a lane that can ask.
+    let waiting = |source: Option<QuestionSource>| {
+        let mut a = vec![Action::Started {
+            label: "mock".into(),
+            at: 1_790_200_000,
+        }];
+        a.extend(source.map(|source| Action::QuestionSource { source }));
+        text(&render(&Session::replay(&a), (100, 30)))
+    };
+    assert!(waiting(None).contains("Waiting for the interviewer…"));
+    assert!(waiting(Some(QuestionSource::Interviewer)).contains("Waiting for the interviewer…"));
+    assert!(waiting(Some(QuestionSource::You)).contains("Waiting for your question…"));
+    assert!(waiting(Some(QuestionSource::Both)).contains("Waiting for a question…"));
+    // The interviewer's greeting does not fill the question area when only the mic can ask, and
+    // it is in the transcript under its own label all the same.
+    let screen = text(&render(&load("asks-you"), (100, 30)));
+    assert!(screen.contains("Waiting for your question…"), "{screen}");
+    assert!(
+        screen.contains("Interviewer Hi, thanks for making"),
+        "{screen}"
     );
 }
 

@@ -2,7 +2,7 @@
 //! lines under the Approach on a stacked screen, a right-hand column on a wide one (#88), or the
 //! whole screen above the status line with assistance off (#79); the last two are wrapped.
 
-use dmn_session::{Health, Line as TranscriptLine, Section, Speaker};
+use dmn_session::{Health, Line as TranscriptLine, QuestionSource, Section, Speaker};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -216,6 +216,14 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     if !st.language.is_empty() && st.language != "en" {
         spans.push(Span::styled(
             format!(" {}→en ", st.language),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    // #90: whose questions this run answers, when it is not the default. Nothing is shown while
+    // assistance is off: nothing is detected then, whatever the source.
+    if !view.session.assist_off && view.session.question_source != QuestionSource::Interviewer {
+        spans.push(Span::styled(
+            format!(" asks: {} ", view.session.question_source.as_str()),
             Style::new().fg(Color::DarkGray),
         ));
     }

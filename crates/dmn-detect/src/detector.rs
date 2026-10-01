@@ -72,9 +72,20 @@ impl Following {
         }
     }
 
-    /// docs/SPEC.md: "Interviewer segment followed by >= 1.5 s of silence or a You segment".
-    fn matches(self, gap: Duration) -> bool {
-        self.silence.is_some_and(|s| s >= gap) || self.next_speaker == Some(Source::You)
+    /// docs/SPEC.md: a segment followed by >= 1.5 s of silence or by the other lane. `source` is
+    /// the line's own lane (#90), so for an Interviewer line this is the SPEC's "followed by ... a
+    /// You segment" exactly, and a You line is followed when the Interviewer answers it.
+    fn matches(self, gap: Duration, source: Source) -> bool {
+        self.silence.is_some_and(|s| s >= gap) || self.next_speaker == Some(other_lane(source))
+    }
+}
+
+/// The lane that is not `source`. `Unknown` has no opposite lane; it keeps the SPEC's You, which
+/// is what the detector did before #90 (and nothing scores an `Unknown` line anyway).
+fn other_lane(source: Source) -> Source {
+    match source {
+        Source::You => Source::Interviewer,
+        Source::Interviewer | Source::Unknown => Source::You,
     }
 }
 
@@ -112,12 +123,13 @@ impl Detector {
         &self.cfg
     }
 
-    /// Score a final interviewer segment and return a candidate when it clears the bar.
+    /// Score a final segment from an eligible lane and return a candidate when it clears the bar.
     ///
-    /// Partials, empty lines and anything the candidate said are ignored: the SPEC runs the
-    /// detector "on every final Interviewer segment".
+    /// Partials, empty lines and finals from a lane `[detect].question_source` does not select
+    /// are ignored. With the default source that is the SPEC's "every final Interviewer segment";
+    /// `you` or `both` (#90) widens it without changing any weight.
     pub fn observe(&self, segment: &Segment, following: Following) -> Option<Candidate> {
-        if !segment.is_final || segment.source != Source::Interviewer {
+        if !segment.is_final || !self.cfg.question_source.allows(segment.source) {
             return None;
         }
         let best = self.score_line(&segment.text, segment.source, following)?;
@@ -209,7 +221,7 @@ impl Detector {
             cues.push(Cue::Long);
         }
         // Only the last sentence of a line is followed by whatever came after the line.
-        if s.last && following.matches(FOLLOW_SILENCE) {
+        if s.last && following.matches(FOLLOW_SILENCE, source) {
             cues.push(Cue::Followed);
         }
         if is_rhetorical(s.text) {
@@ -231,6 +243,7 @@ impl Detector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QuestionSource;
 
     fn seg(text: &str) -> Segment {
         Segment {
@@ -416,5 +429,117 @@ mod tests {
             .observe(&statement, Following::speaker(Source::You))
             .expect("the SPEC table alone makes this a candidate");
         assert_eq!(c.score, 3, "interviewer + long + followed");
+    }
+
+    fn with_source(source: QuestionSource) -> Detector {
+        Detector::new(DetectConfig::default().with_question_source(source))
+    }
+
+    fn lane(source: Source, text: &str) -> Segment {
+        Segment {
+            source,
+            ..seg(text)
+        }
+    }
+
+    #[test]
+    fn question_source_chooses_which_lanes_observe_scores() {
+        let question = "How would you design a rate limiter for a globally distributed API?";
+        let from_you = lane(Source::You, question);
+        let from_them = lane(Source::Interviewer, question);
+
+        let only_them = with_source(QuestionSource::Interviewer);
+        assert!(
+            only_them
+                .observe(&from_you, Following::speaker(Source::Interviewer))
+                .is_none()
+        );
+        assert!(
+            only_them
+                .observe(&from_them, Following::speaker(Source::You))
+                .is_some()
+        );
+
+        let only_you = with_source(QuestionSource::You);
+        assert!(
+            only_you
+                .observe(&from_them, Following::speaker(Source::You))
+                .is_none()
+        );
+        let c = only_you
+            .observe(&from_you, Following::speaker(Source::Interviewer))
+            .expect("a question on the mic lane");
+        assert_eq!(c.source, Source::You);
+        assert!(
+            !c.cues.contains(&Cue::Interviewer),
+            "the Interviewer cue is the lane's, and a You line does not get it"
+        );
+        assert_eq!(c.score, 6, "? + opener + long + followed");
+
+        let both = with_source(QuestionSource::Both);
+        assert!(
+            both.observe(&from_you, Following::speaker(Source::Interviewer))
+                .is_some()
+        );
+        assert!(
+            both.observe(&from_them, Following::speaker(Source::You))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_you_line_is_followed_by_silence_or_by_the_interviewer() {
+        let d = with_source(QuestionSource::You);
+        let s = lane(Source::You, "What would you check first?");
+
+        let by_them = d
+            .observe(&s, Following::speaker(Source::Interviewer))
+            .expect("still a question");
+        assert!(by_them.cues.contains(&Cue::Followed), "the other lane");
+
+        let by_you = d
+            .observe(&s, Following::speaker(Source::You))
+            .expect("still a question");
+        assert!(
+            !by_you.cues.contains(&Cue::Followed),
+            "the same lane speaking again has not handed the floor back"
+        );
+
+        let quiet = d
+            .observe(&s, Following::silence(Duration::from_millis(1500)))
+            .expect("still a question");
+        assert!(quiet.cues.contains(&Cue::Followed));
+
+        let short = d
+            .observe(&s, Following::silence(Duration::from_millis(900)))
+            .expect("still a question");
+        assert!(!short.cues.contains(&Cue::Followed));
+    }
+
+    #[test]
+    fn the_form_gate_and_the_vetoes_apply_to_the_you_lane_too() {
+        let d = with_source(QuestionSource::Both);
+        let statement = lane(Source::You, "First I'd clarify the scope of the limiter.");
+        assert!(
+            d.observe(&statement, Following::speaker(Source::Interviewer))
+                .is_none(),
+            "a statement on an enabled lane is not a question"
+        );
+        assert!(
+            d.observe(
+                &lane(Source::You, "Can you hear me?"),
+                Following::speaker(Source::Interviewer)
+            )
+            .is_none(),
+            "small talk is vetoed on either lane"
+        );
+        assert!(
+            d.observe(
+                &lane(Source::You, "That's a decent scale, right?"),
+                Following::speaker(Source::Interviewer)
+            )
+            .is_none(),
+            "a rhetorical tag is vetoed on either lane"
+        );
     }
 }

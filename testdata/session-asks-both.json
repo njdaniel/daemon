@@ -1,0 +1,71 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    },
+    {
+      "speaker": "you",
+      "start": 19.0,
+      "end": 23.0,
+      "text": "How does a token bucket differ from a sliding window?"
+    }
+  ],
+  "partials": [],
+  "last_interviewer": "How does a token bucket differ from a sliding window?",
+  "live": {
+    "candidate": 1,
+    "text": "How does a token bucket differ from a sliding window?",
+    "kind": "knowledge",
+    "focus": "burst handling, memory per key, accuracy at the window edge",
+    "approach": [
+      "Token bucket: refill at a fixed rate, spend one per request",
+      "It allows bursts up to the bucket size",
+      "Sliding window: count requests in the last N seconds",
+      "It is stricter at the edges, and costs more memory per key"
+    ],
+    "star": null,
+    "clarifications": [],
+    "progress": {
+      "state": "done"
+    }
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 1,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "hints",
+  "question_source": "both"
+}

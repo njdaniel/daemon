@@ -19,6 +19,37 @@ pub enum Speaker {
     Unknown,
 }
 
+/// Whose questions are detected and answered (#90), as `[detect].question_source` spells it. It
+/// selects eligible lanes, not voice identities: a line's [`Speaker`] never depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionSource {
+    #[default]
+    Interviewer,
+    You,
+    Both,
+}
+
+impl QuestionSource {
+    /// Whether a final from `speaker` is scored at all.
+    pub fn allows(self, speaker: Speaker) -> bool {
+        match self {
+            QuestionSource::Interviewer => speaker == Speaker::Interviewer,
+            QuestionSource::You => speaker == Speaker::You,
+            QuestionSource::Both => matches!(speaker, Speaker::Interviewer | Speaker::You),
+        }
+    }
+
+    /// The config-file spelling, which is also the status line's tag (`asks: you`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuestionSource::Interviewer => "interviewer",
+            QuestionSource::You => "you",
+            QuestionSource::Both => "both",
+        }
+    }
+}
+
 /// A status dot (SPEC § Transcript & status): mic, system audio, model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -373,6 +404,11 @@ pub enum Action {
     /// `[assist].enabled` or `--no-assist`) and again on each Ctrl+Shift+A. Off, the pipeline runs no
     /// detector and asks the LLM nothing, and the screen is the transcript alone.
     Assist { enabled: bool },
+    /// Whose questions this session detects and answers (#90): dispatched once after `Started`,
+    /// from `[detect].question_source` or `--question-source`. Fixed for the session, so
+    /// rendering stays a function of session state. Labels, routing and the transcript are the
+    /// same whatever it is.
+    QuestionSource { source: QuestionSource },
     /// A status dot changed.
     Status { dot: Dot, health: Health },
     /// The LLM provider now answering (#59): at start and after a config reload switched it.

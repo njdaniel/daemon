@@ -1,5 +1,6 @@
 //! Area 1: the question, its focus line and the latest clarification.
 
+use dmn_session::QuestionSource;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -63,18 +64,28 @@ fn right_title(view: &View<'_>) -> Option<Line<'static>> {
     (!spans.is_empty()).then(|| Line::from(spans))
 }
 
+/// The LISTENING placeholder before anything has been heard, per `[detect].question_source` (#90).
+fn waiting(source: QuestionSource) -> &'static str {
+    match source {
+        QuestionSource::Interviewer => "Waiting for the interviewer…",
+        QuestionSource::You => "Waiting for your question…",
+        QuestionSource::Both => "Waiting for a question…",
+    }
+}
+
 fn lines(view: &View<'_>, width_cells: usize) -> Vec<Line<'static>> {
     let muted = Style::new().fg(Color::DarkGray);
     let Some(q) = view.live() else {
-        // LISTENING: the last interviewer sentence in muted text, so the user sees the app hears.
-        let heard = view.session.last_interviewer.as_deref();
+        // LISTENING: the last sentence from a lane that can ask, in muted text, so the user sees
+        // the app hears. The placeholder names that lane (#90).
+        let heard = view.session.last_heard.as_deref();
         return match heard {
             Some(t) => wrap(t, width_cells, QUESTION_LINES)
                 .into_iter()
                 .map(|l| Line::from(Span::styled(l, muted)))
                 .collect(),
             None => vec![Line::from(Span::styled(
-                "Waiting for the interviewer…",
+                waiting(view.session.question_source),
                 muted,
             ))],
         };

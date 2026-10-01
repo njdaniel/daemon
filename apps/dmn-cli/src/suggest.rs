@@ -61,8 +61,8 @@ use dmn_detect::Candidate;
 use dmn_llm::fast::FAST_PHASE_TIMEOUT;
 use dmn_llm::schema::Star;
 use dmn_llm::{
-    CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason, Kind,
-    LlmError, PreviousAnswer, Provider, SlowFields, SlowOutcome, SlowRequest, Suggestion,
+    Asker, CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason,
+    Kind, LlmError, PreviousAnswer, Provider, SlowFields, SlowOutcome, SlowRequest, Suggestion,
     run_fast_phase, run_slow_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
@@ -292,8 +292,10 @@ impl SlowGate {
 /// A shown question whose slow phase is still to run (#55).
 struct SlowJob {
     id: u64,
-    /// What the Interviewer said (the candidate text) and where it starts in the audio.
+    /// What was said (the candidate text) and where it starts in the audio.
     said: String,
+    /// The lane that said it (#90): the slow phase uses the same base rules as the fast one.
+    asker: Asker,
     start: f64,
     transcript: String,
     question: String,
@@ -892,7 +894,18 @@ fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
         current: job.regenerate.clone().or_else(|| current.cloned()),
         regenerate: job.regenerate.is_some() && !job.swap,
         swap: job.swap,
+        // #90: which lane asked, so the prompt's last header names it.
+        asker: asker(job.candidate.source),
         ..FastRequest::new(job.candidate.text.clone(), job.candidate.score)
+    }
+}
+
+/// The candidate's lane as the prompt names it (#90). `Unknown` never reaches the detector, and
+/// the SPEC's single-stream fallback is the interviewer's side of the call.
+fn asker(source: dmn_audio::Source) -> Asker {
+    match source {
+        dmn_audio::Source::You => Asker::You,
+        dmn_audio::Source::Interviewer | dmn_audio::Source::Unknown => Asker::Interviewer,
     }
 }
 
@@ -1166,6 +1179,7 @@ impl Answerer<'_> {
                         slow = Some(SlowJob {
                             id: job.id,
                             said: job.candidate.text.clone(),
+                            asker: asker(job.candidate.source),
                             start: job.candidate.start.as_secs_f64(),
                             transcript: job.transcript.clone(),
                             question: suggestion.question.clone(),
@@ -1300,6 +1314,7 @@ impl Answerer<'_> {
             job_requirements: context.requirements().to_vec(),
             chunks: retrieval.chunks.clone(),
             story: retrieval.story.clone(),
+            asker: job.asker,
             ..FastRequest::new(job.said.clone(), 0)
         };
         req.focus = job.focus.clone();
@@ -2212,6 +2227,40 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         done(&hub.snapshot())
+    }
+
+    #[test]
+    fn a_you_question_keeps_its_lanes_rules_in_the_slow_phase() {
+        // Copilot on PR #91: the slow request was rebuilt without the asker and fell back to
+        // the Interviewer's base rules.
+        for (source, asker) in [
+            (dmn_audio::Source::You, Asker::You),
+            (dmn_audio::Source::Interviewer, Asker::Interviewer),
+        ] {
+            let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
+                .then_json(&slow_json_reply());
+            let hub = Arc::new(SessionHub::default());
+            let s = Suggester::start_with_context(
+                provider.clone(),
+                Policy::AnswerAll,
+                Arc::clone(&hub),
+                Context::empty(),
+                Some(Duration::from_secs(20)),
+            );
+            let asked = Candidate {
+                source,
+                ..candidate()
+            };
+            hub.dispatch(wire::candidate(1, &asked));
+            s.submit(1, &asked, String::new());
+            assert_eq!(s.finish().slow_done, 1);
+            let sent = provider.requests();
+            assert_eq!(sent.len(), 2, "fast, then slow");
+            let rules = dmn_llm::prompt::system_prompt(None, asker);
+            for req in &sent {
+                assert_eq!(req.messages[0].content, rules, "{source:?}");
+            }
+        }
     }
 
     #[test]

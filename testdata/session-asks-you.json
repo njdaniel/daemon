@@ -1,0 +1,43 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    }
+  ],
+  "partials": [],
+  "last_interviewer": null,
+  "live": null,
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
+  },
+  "counts": {
+    "candidates": 0,
+    "shown": 0,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "hints",
+  "question_source": "you"
+}
