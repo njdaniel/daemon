@@ -61,8 +61,8 @@ use dmn_detect::Candidate;
 use dmn_llm::fast::FAST_PHASE_TIMEOUT;
 use dmn_llm::schema::Star;
 use dmn_llm::{
-    CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason, Kind,
-    LlmError, PreviousAnswer, Provider, SlowFields, SlowOutcome, SlowRequest, Suggestion,
+    Asker, CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason,
+    Kind, LlmError, PreviousAnswer, Provider, SlowFields, SlowOutcome, SlowRequest, Suggestion,
     run_fast_phase, run_slow_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
@@ -892,7 +892,18 @@ fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
         current: job.regenerate.clone().or_else(|| current.cloned()),
         regenerate: job.regenerate.is_some() && !job.swap,
         swap: job.swap,
+        // #90: which lane asked, so the prompt's last header names it.
+        asker: asker(job.candidate.source),
         ..FastRequest::new(job.candidate.text.clone(), job.candidate.score)
+    }
+}
+
+/// The candidate's lane as the prompt names it (#90). `Unknown` never reaches the detector, and
+/// the SPEC's single-stream fallback is the interviewer's side of the call.
+fn asker(source: dmn_audio::Source) -> Asker {
+    match source {
+        dmn_audio::Source::You => Asker::You,
+        dmn_audio::Source::Interviewer | dmn_audio::Source::Unknown => Asker::Interviewer,
     }
 }
 

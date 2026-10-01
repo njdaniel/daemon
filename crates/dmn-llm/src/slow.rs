@@ -199,7 +199,8 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
         user.push('\n');
     }
     vec![
-        Message::system(prompt::system_prompt(None)),
+        // #90: the lane that asked chooses the base rules, as it does for the fast phase.
+        Message::system(prompt::system_prompt(None, req.context.asker)),
         Message::user(user),
     ]
 }
@@ -672,7 +673,7 @@ mod tests {
         assert_eq!(sent.schema, Some(slow_schema(false, false)));
         assert_eq!(
             sent.messages[0].content,
-            prompt::system_prompt(None),
+            prompt::system_prompt(None, req.context.asker),
             "the fast phase's system prompt, word for word"
         );
         let user = &sent.messages[1].content;

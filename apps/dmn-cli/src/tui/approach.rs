@@ -1,6 +1,6 @@
 //! Area 2: the numbered Approach, or the STAR cards for a behavioral question.
 
-use dmn_session::{Question, StarCards};
+use dmn_session::{Question, QuestionSource, StarCards};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -61,7 +61,14 @@ fn content(view: &View<'_>, cells: usize) -> Vec<Line<'static>> {
     };
     if lines.is_empty() && !view.loading {
         let note = match view.mode {
-            Mode::Listening => "The Approach appears here when the interviewer asks a question.",
+            // #90: who can ask depends on `[detect].question_source`.
+            Mode::Listening => match view.session.question_source {
+                QuestionSource::Interviewer => {
+                    "The Approach appears here when the interviewer asks a question."
+                }
+                QuestionSource::You => "The Approach appears here when you ask a question.",
+                QuestionSource::Both => "The Approach appears here when a question is asked.",
+            },
             Mode::Live | Mode::Pinned => "…",
         };
         lines.push(Line::from(Span::styled(

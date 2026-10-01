@@ -8,21 +8,54 @@ use crate::provider::Message;
 use crate::schema::Kind;
 
 const BASE: &str = include_str!("../prompts/base.md");
+/// The base rules worded for a question asked on the mic lane (#90). A separate file rather than
+/// a substitution so the Interviewer prompt stays byte for byte what it was before #90.
+const BASE_YOU: &str = include_str!("../prompts/base_you.md");
 
-fn section(kind: Kind) -> &'static str {
-    match kind {
-        Kind::SystemDesign => include_str!("../prompts/system_design.md"),
-        Kind::Coding => include_str!("../prompts/coding.md"),
-        Kind::Behavioral => include_str!("../prompts/behavioral.md"),
-        Kind::Knowledge => include_str!("../prompts/knowledge.md"),
-        Kind::Clarification => include_str!("../prompts/clarification.md"),
-        Kind::SmallTalk => include_str!("../prompts/small_talk.md"),
+/// Which lane the candidate line came from (#90): the user message's last header, and which base
+/// rules the system prompt carries. [`Asker::Interviewer`] is the default, so every prompt built
+/// before #90 is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Asker {
+    #[default]
+    Interviewer,
+    You,
+}
+
+impl Asker {
+    /// The transcript's own label for the lane, which is also the `## <label> just said` header.
+    pub fn label(self) -> &'static str {
+        match self {
+            Asker::Interviewer => "Interviewer",
+            Asker::You => "You",
+        }
+    }
+
+    fn base(self) -> &'static str {
+        match self {
+            Asker::Interviewer => BASE,
+            Asker::You => BASE_YOU,
+        }
     }
 }
 
-/// The system prompt for `kind`, or for a candidate whose kind is not known yet (`None`).
-pub fn system_prompt(kind: Option<Kind>) -> String {
-    let mut out = String::from(BASE.trim_end());
+fn section(kind: Kind, asker: Asker) -> &'static str {
+    match (kind, asker) {
+        (Kind::SystemDesign, _) => include_str!("../prompts/system_design.md"),
+        (Kind::Coding, _) => include_str!("../prompts/coding.md"),
+        (Kind::Behavioral, _) => include_str!("../prompts/behavioral.md"),
+        (Kind::Knowledge, _) => include_str!("../prompts/knowledge.md"),
+        // The only per-kind rule that names who asked.
+        (Kind::Clarification, Asker::Interviewer) => include_str!("../prompts/clarification.md"),
+        (Kind::Clarification, Asker::You) => include_str!("../prompts/clarification_you.md"),
+        (Kind::SmallTalk, _) => include_str!("../prompts/small_talk.md"),
+    }
+}
+
+/// The system prompt for `kind`, or for a candidate whose kind is not known yet (`None`), worded
+/// for the lane that asked (#90).
+pub fn system_prompt(kind: Option<Kind>, asker: Asker) -> String {
+    let mut out = String::from(asker.base().trim_end());
     out.push_str("\n\nPer kind:\n");
     let kinds: &[Kind] = match kind {
         Some(ref k) => std::slice::from_ref(k),
@@ -30,7 +63,7 @@ pub fn system_prompt(kind: Option<Kind>) -> String {
     };
     for k in kinds {
         out.push_str("- ");
-        out.push_str(section(*k).trim());
+        out.push_str(section(*k, asker).trim());
         out.push('\n');
     }
     out
@@ -56,8 +89,11 @@ pub struct StoryText {
 /// candidate, the transcript and (from M2) the context assembler; this crate only defines it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FastRequest {
-    /// The Interviewer text the detector proposed.
+    /// The text the detector proposed.
     pub candidate: String,
+    /// Which lane `candidate` came from (#90). Names the last header and chooses the base rules;
+    /// [`Asker::Interviewer`] is the default and the only value before #90.
+    pub asker: Asker,
     /// The detector's score for `candidate`, logged when the model says it is not a question.
     pub score: i32,
     /// The last 60 s of transcript, one `Speaker: text` line per segment.
@@ -134,7 +170,7 @@ pub fn user_message(req: &FastRequest) -> String {
         out.push_str(req.transcript.trim());
         out.push_str("\n\n");
     }
-    out.push_str("## Interviewer just said\n");
+    out.push_str(&format!("## {} just said\n", req.asker.label()));
     out.push_str(req.candidate.trim());
     out.push('\n');
     if req.swap {
@@ -156,7 +192,7 @@ pub fn fast_messages(req: &FastRequest) -> Vec<Message> {
         None
     };
     vec![
-        Message::system(system_prompt(kind)),
+        Message::system(system_prompt(kind, req.asker)),
         Message::user(user_message(req)),
     ]
 }
@@ -167,7 +203,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_prompt_carries_every_kind_and_the_rules() {
-        let p = system_prompt(None);
+        let p = system_prompt(None, Asker::Interviewer);
         for k in Kind::ALL {
             assert!(p.contains(&format!("- {}:", k.as_str())), "missing {k:?}");
         }
@@ -177,9 +213,68 @@ mod tests {
 
     #[test]
     fn known_kind_prompt_carries_only_that_kind() {
-        let p = system_prompt(Some(Kind::Coding));
+        let p = system_prompt(Some(Kind::Coding), Asker::Interviewer);
         assert!(p.contains("- coding:"));
         assert!(!p.contains("- behavioral:"));
+    }
+
+    #[test]
+    fn the_last_header_names_the_lane_that_asked() {
+        let them = FastRequest::new("How would you shard the counters?", 5);
+        let you = FastRequest {
+            asker: Asker::You,
+            ..them.clone()
+        };
+        assert!(user_message(&them).contains("## Interviewer just said\n"));
+        assert!(!user_message(&them).contains("## You just said"));
+        assert!(user_message(&you).contains("## You just said\n"));
+        assert!(!user_message(&you).contains("## Interviewer just said"));
+        // The default is the Interviewer, so nothing built before #90 moved.
+        assert_eq!(FastRequest::default().asker, Asker::Interviewer);
+        assert_eq!(
+            user_message(&them),
+            user_message(&FastRequest {
+                asker: Asker::default(),
+                ..them.clone()
+            })
+        );
+    }
+
+    #[test]
+    fn the_you_base_rules_replace_the_interviewer_ones_and_only_for_that_lane() {
+        let them = system_prompt(None, Asker::Interviewer);
+        let you = system_prompt(None, Asker::You);
+        assert_ne!(them, you);
+        assert!(you.contains("the candidate's own microphone lane"));
+        assert!(you.contains(r#"the "You just said" section"#));
+        assert!(them.contains(r#"the "Interviewer just said" section"#));
+        // Both wordings still state every schema field and the density rules.
+        for rule in [
+            "- is_question:",
+            "- kind:",
+            "- question:",
+            "- focus:",
+            "- approach:",
+        ] {
+            assert!(you.contains(rule), "missing {rule}");
+            assert!(them.contains(rule), "missing {rule}");
+        }
+        assert!(you.contains("three to five lines"));
+        assert!(you.contains("No numbering, no paragraphs"));
+        // Only the clarification rule names who asked, so only it has a You wording.
+        assert!(
+            system_prompt(Some(Kind::Clarification), Asker::You)
+                .contains("when the latest line only refines")
+        );
+        for kind in [
+            Kind::SystemDesign,
+            Kind::Coding,
+            Kind::Behavioral,
+            Kind::Knowledge,
+            Kind::SmallTalk,
+        ] {
+            assert_eq!(section(kind, Asker::Interviewer), section(kind, Asker::You));
+        }
     }
 
     #[test]

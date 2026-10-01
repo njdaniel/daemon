@@ -374,10 +374,70 @@ fn partials_are_replaced_by_their_final_and_the_window_is_60_s() {
         1,
         "the line that ended at 3 s is out of the window"
     );
-    assert_eq!(s.last_interviewer.as_deref(), Some("Okay."));
+    assert_eq!(s.last_heard.as_deref(), Some("Okay."));
 
     reduce(&mut s, &seg(Speaker::You, 83.0, 84.0, "", true));
     assert_eq!(s.transcript.len(), 1, "an empty final adds nothing");
+}
+
+#[test]
+fn the_listening_line_follows_the_question_source() {
+    // The default: the interviewer's lane alone, as before #90.
+    let mut s = Session::default();
+    assert_eq!(s.question_source, QuestionSource::Interviewer);
+    reduce(&mut s, &seg(Speaker::You, 1.0, 2.0, "Sure.", true));
+    assert_eq!(s.last_heard, None);
+    reduce(&mut s, &seg(Speaker::Interviewer, 2.0, 3.0, "Okay.", true));
+    assert_eq!(s.last_heard.as_deref(), Some("Okay."));
+    // At its default the source is left out of the log, so a pre-#90 session reads the same.
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(!json.contains("question_source"), "{json}");
+    assert!(json.contains("\"last_interviewer\""), "the wire name holds");
+
+    let mut you = Session {
+        question_source: QuestionSource::You,
+        ..Session::default()
+    };
+    reduce(
+        &mut you,
+        &seg(Speaker::Interviewer, 1.0, 2.0, "Okay.", true),
+    );
+    assert_eq!(
+        you.last_heard, None,
+        "the lane that cannot ask is not shown"
+    );
+    reduce(
+        &mut you,
+        &seg(Speaker::You, 2.0, 3.0, "What's the SLA?", true),
+    );
+    assert_eq!(you.last_heard.as_deref(), Some("What's the SLA?"));
+    // Labels are untouched: both lines are in the transcript under their own speaker.
+    assert_eq!(you.transcript.len(), 2);
+    assert_eq!(you.transcript[0].speaker, Speaker::Interviewer);
+    assert_eq!(you.transcript[1].speaker, Speaker::You);
+
+    let mut both = Session::default();
+    reduce(
+        &mut both,
+        &Action::QuestionSource {
+            source: QuestionSource::Both,
+        },
+    );
+    reduce(&mut both, &seg(Speaker::You, 1.0, 2.0, "Mine.", true));
+    assert_eq!(both.last_heard.as_deref(), Some("Mine."));
+    reduce(
+        &mut both,
+        &seg(Speaker::Interviewer, 2.0, 3.0, "Theirs.", true),
+    );
+    assert_eq!(both.last_heard.as_deref(), Some("Theirs."));
+    let json = serde_json::to_string(&both).unwrap();
+    assert!(json.contains("\"question_source\":\"both\""), "{json}");
+    assert_eq!(
+        serde_json::from_str::<Session>(&json)
+            .unwrap()
+            .question_source,
+        QuestionSource::Both
+    );
 }
 
 #[test]

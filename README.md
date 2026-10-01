@@ -55,6 +55,13 @@ Off, Daemon only transcribes (and, with a multilingual model, translates to Engl
 transcript-only screen; no question detection runs and nothing is sent to the LLM. Press
 Ctrl+Shift+A again and the next question is answered as usual.
 
+By default only the interviewer's questions (the call's audio) are answered. Set
+`[detect] question_source = "you"` or start with `dmn run --question-source you` to have Daemon
+answer questions asked on your microphone instead, for asking it directly or for practising with
+a mock interview played from a phone; `both` answers either. The setting picks audio streams,
+not voices: everything on the mic is "You", so in `you` or `both` your own questions to the
+interviewer are answered too. The status line shows `asks: you` or `asks: both`.
+
 ## Current CLI
 
 The `dmn` CLI currently includes:
@@ -65,6 +72,7 @@ dmn config show
 dmn devices
 dmn run [--mic NODE] [--app APP]          # live: your mic + the call's audio, until q
 dmn run --no-assist                       # transcribe / translate only; a turns assistance on
+dmn run --question-source you|both        # answer questions from your mic, or from either stream
 dmn run --replay INTERVIEWER.wav CANDIDATE.wav [--headless]
 dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session

@@ -40,6 +40,8 @@ pub struct Args {
     pub json: bool,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
+    /// `--question-source` (#90), over `[detect].question_source`.
+    pub question_source: Option<dmn_core::config::QuestionSource>,
     /// Skip the LLM fast phase (#12): transcribe and detect only.
     pub no_llm: bool,
     /// Keep the session in memory only: write nothing to `dmn.sqlite` (#13). The eval harness
@@ -89,6 +91,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             language: args.language.clone(),
             partials: args.partials,
             spec_literal_detector: args.spec_literal_detector,
+            question_source: args.question_source,
             // `dmn replay` measures the detector and the fast phase: assistance is always on.
             assist: Some(true),
             no_llm: args.no_llm,
@@ -269,6 +272,14 @@ fn print_candidate(found: &Found, json: bool) {
             })
         );
     } else {
+        // #90: name the lane whenever it is not the Interviewer, so a `you` or `both` run shows
+        // which stream triggered. An Interviewer candidate's line is unchanged (and its own
+        // `interviewer` cue already names the lane).
+        let lane = if c.source == Source::Interviewer {
+            String::new()
+        } else {
+            format!("[{}] ", c.source.label().to_ascii_lowercase())
+        };
         let when = if found.late {
             " (after the next final)"
         } else {
@@ -279,7 +290,7 @@ fn print_candidate(found: &Found, json: bool) {
         } else {
             ""
         };
-        println!("  -> candidate {}{when}{cont}", c.render());
+        println!("  -> candidate {lane}{}{when}{cont}", c.render());
     }
 }
 

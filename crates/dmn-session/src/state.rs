@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
-    ProviderLabel, Section, SectionState, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
+    ProviderLabel, QuestionSource, Section, SectionState, SlowEnd, SlowField, Speaker, StarCards,
+    TradeoffItem,
 };
 use crate::memory::{self, Promise, SummaryLine};
 
@@ -384,8 +385,11 @@ pub struct Session {
     pub transcript: Vec<Line>,
     /// The open utterance of each speaker, if any (its latest partial).
     pub partials: Vec<Line>,
-    /// The last thing the interviewer said, for the `LISTENING` state before any question.
-    pub last_interviewer: Option<String>,
+    /// The last thing said on a lane [`Session::question_source`] selects, for the `LISTENING`
+    /// state before any question (#90). Keeps its `last_interviewer` wire name: with the default
+    /// source it is exactly the last Interviewer line, which is every session log before #90.
+    #[serde(rename = "last_interviewer")]
+    pub last_heard: Option<String>,
     /// The question on screen.
     pub live: Option<Question>,
     /// While pinned, new questions queue instead of replacing the live one.
@@ -414,6 +418,15 @@ pub struct Session {
     /// from before #79, has assistance on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assist_off: bool,
+    /// Whose questions this session detects and answers (#90). Fixed for the session; left out
+    /// of the log at its default, so every session log from before #90 reads as `interviewer`.
+    #[serde(default, skip_serializing_if = "is_default_source")]
+    pub question_source: QuestionSource,
+}
+
+/// The default question source is left out of a serialised session.
+fn is_default_source(source: &QuestionSource) -> bool {
+    *source == QuestionSource::default()
 }
 
 impl Session {
@@ -526,8 +539,10 @@ pub fn reduce(s: &mut Session, action: &Action) {
             if text.is_empty() {
                 return;
             }
-            if *speaker == Speaker::Interviewer {
-                s.last_interviewer = Some(text.clone());
+            // #90: the LISTENING screen shows the last line from a lane that can ask, so under
+            // `you` or `both` your own last line is what the user sees Daemon heard.
+            if s.question_source.allows(*speaker) {
+                s.last_heard = Some(text.clone());
             }
             if *speaker == Speaker::You {
                 let kept: Vec<Promise> = s
@@ -781,6 +796,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
         }
         Action::CodingSolutions { mode } => s.coding_solutions = *mode,
         Action::Assist { enabled } => s.assist_off = !enabled,
+        Action::QuestionSource { source } => s.question_source = *source,
         Action::LlmOffload { cpu_percent } => s.status.llm_cpu_percent = *cpu_percent,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}

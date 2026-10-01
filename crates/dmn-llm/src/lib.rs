@@ -55,7 +55,7 @@ pub use futures_util::stream::BoxStream;
 pub use mock::MockProvider;
 pub use ollama::{OllamaProvider, OllamaSettings};
 pub use openai::OpenAiProvider;
-pub use prompt::{CurrentQuestion, FastRequest, StoryText};
+pub use prompt::{Asker, CurrentQuestion, FastRequest, StoryText};
 pub use provider::{
     ChatRequest, Delta, DeltaStream, LlmError, Message, Provider, Role, Usage, guard, guard_until,
 };

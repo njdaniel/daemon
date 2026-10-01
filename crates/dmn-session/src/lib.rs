@@ -20,8 +20,8 @@ mod tests;
 
 pub use action::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
-    ProviderLabel, Section, SectionState, SlowEnd, SlowField, Speaker, Stage, StarCards,
-    TradeoffItem,
+    ProviderLabel, QuestionSource, Section, SectionState, SlowEnd, SlowField, Speaker, Stage,
+    StarCards, TradeoffItem,
 };
 pub use hub::{DEFAULT_ACTION_CAPACITY, SessionHub};
 pub use memory::{Promise, SummaryLine};

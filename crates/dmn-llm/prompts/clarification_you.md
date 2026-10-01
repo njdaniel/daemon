@@ -1,0 +1,1 @@
+clarification: use this kind when the latest line only refines the current question (for example "and what if Redis goes down?"). question is then just the refinement, and approach answers the refinement within the current question.

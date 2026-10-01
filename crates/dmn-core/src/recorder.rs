@@ -425,6 +425,9 @@ impl StoreWriter {
             // Assistance on or off is screen and pipeline state (#79); a question asked while it
             // was off never becomes a candidate, so no row needs to say so.
             | Action::Assist { .. }
+            // #90: which lane may ask is a detector input, in the action log; every question
+            // row already records the speaker and start its own segment has.
+            | Action::QuestionSource { .. }
             // #63: both halves of a split question keep their question rows, as every candidate
             // does; the link is screen state and stays in the action log.
             | Action::Continues { .. }

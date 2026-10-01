@@ -703,6 +703,66 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
     assert_eq!(modes, [Some("hints".into()), Some("full".into())]);
 }
 
+/// #90: with `question_source = "both"`, two lanes' finals can start at the same instant. Each
+/// question row links to the segment of the lane that asked, and the segments keep their labels.
+#[test]
+fn a_question_from_the_you_lane_links_to_the_you_segment() {
+    use dmn_session::{QuestionSource, Speaker};
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let rec = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+    let hub = rec.hub();
+    hub.dispatch(Action::Started {
+        label: "both".into(),
+        at: 1_700_000_000,
+    });
+    hub.dispatch(Action::QuestionSource {
+        source: QuestionSource::Both,
+    });
+    let lines = [
+        (Speaker::Interviewer, "How would you shard the counters?"),
+        (Speaker::You, "What is the SLA for the limiter?"),
+    ];
+    for (speaker, text) in lines {
+        hub.dispatch(Action::Segment {
+            speaker,
+            start: 20.0,
+            end: 24.0,
+            text: text.into(),
+            is_final: true,
+            avg_logprob: -0.2,
+            language: None,
+        });
+    }
+    hub.dispatch(Action::Candidate {
+        id: 1,
+        speaker: Speaker::You,
+        start: 20.0,
+        end: 24.0,
+        text: lines[1].1.into(),
+        score: 4,
+    });
+    let report = rec.finish(1_700_000_030).unwrap().unwrap();
+    assert_eq!(report.errors, 0);
+    let store = open_store(&paths).unwrap();
+    let session = report.session_id.unwrap();
+    let segments = store.segments(session).unwrap();
+    let sources: Vec<dmn_store::Source> = segments.iter().map(|s| s.source).collect();
+    assert_eq!(
+        sources,
+        [dmn_store::Source::Interviewer, dmn_store::Source::You],
+        "labels as captured"
+    );
+    let questions = store.questions(session).unwrap();
+    assert_eq!(questions.len(), 1);
+    let asked = segments
+        .iter()
+        .find(|s| s.id == questions[0].segment_id)
+        .unwrap();
+    assert_eq!(asked.source, dmn_store::Source::You);
+    assert_eq!(asked.text, lines[1].1);
+}
+
 /// #55: the slow phase on a `MockProvider`, dispatched as the pipeline does, lands in the session
 /// as sections and in the store as one `slow` suggestion row; a stopped one stores nothing.
 #[tokio::test]

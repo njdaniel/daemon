@@ -61,6 +61,8 @@ pub struct Args {
     pub device: Option<dmn_core::config::SttDevice>,
     /// `--language` (#77), over `[stt].language`.
     pub language: Option<dmn_core::config::SttLanguage>,
+    /// `--question-source` (#90), over `[detect].question_source`.
+    pub question_source: Option<dmn_core::config::QuestionSource>,
     pub no_store: bool,
     pub headless: bool,
     /// Live: stop after this many seconds, as if `q` had been pressed.
@@ -194,6 +196,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             language: args.language.clone(),
             partials: Partials::Auto,
             spec_literal_detector: false,
+            question_source: args.question_source,
             assist: args.no_assist.then_some(false),
             no_llm: false,
             no_store: args.no_store,
@@ -651,6 +654,7 @@ mod tests {
             duration: None,
             solutions: None,
             no_assist: false,
+            question_source: None,
         }
     }
 

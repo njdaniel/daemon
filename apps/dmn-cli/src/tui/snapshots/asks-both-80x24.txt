@@ -1,0 +1,24 @@
+┌ LIVE QUESTION ──────────────────────────────────────────────────── knowledge ┐
+│ How does a token bucket differ from a sliding window?                        │
+│ Focus: burst handling, memory per key, accuracy at the window edge           │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────┐
+│ 1  Token bucket: refill at a fixed rate, spend one per request               │
+│ 2  It allows bursts up to the bucket size                                    │
+│ 3  Sliding window: count requests in the last N seconds                      │
+│ 4  It is stricter at the edges, and costs more memory per key                │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+You         Sounds great.
+You         How does a token bucket differ from a sliding window?
+ ● mic  ● system  ● model  asks: both                            p pin · r redo

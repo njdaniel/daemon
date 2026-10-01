@@ -139,7 +139,7 @@ STT runs per utterance, not per fixed chunk: the VAD (Silero by default since #6
 - Output: `Segment { source, start, end, text, is_final, avg_logprob, language }`; `language` is the ISO 639-1 code whisper detected (`None` on the English-only path) and rides through the session action, the store (`segments.language`, schema v8), the JSONL export and replay `--json`. The transcript line and the status line tag it when it is not `en` (`Interviewer (es→en):`, `es→en` beside the STT device). Segments with `avg_logprob < -1.0`, or fewer than 3 words that match whisper's known hallucination phrases ("Thank you.", "Thanks for watching."), are dropped.
 - Model files live in `~/.cache/dmn/models/`; `dmn doctor --fetch small.en` downloads (`--fetch small` the multilingual one). Default `small.en`; `dmn bench` measures real-time factor on the target machine at M0 and records it in `doctor` output. GPU: build with `--features vulkan` (or `cuda`) and the same code path applies.
 
-**Question detector (Tier-C, runs on every final Interviewer segment)**
+**Question detector (Tier-C, runs on every final segment of the lanes `[detect].question_source` selects; the Interviewer lane by default)**
 
 Score = sum of matched cues; a segment becomes a candidate at score ≥ 2:
 
@@ -150,9 +150,11 @@ Score = sum of matched cues; a segment becomes a candidate at score ≥ 2:
 | Contains a hand-off phrase ("let's switch gears", "next question", "I'd like to hear", "talk me through") | 1 |
 | Source is Interviewer | 1 |
 | Longer than 6 words | 1 |
-| Interviewer segment followed by ≥ 1.5 s of silence or a You segment | 1 |
+| Segment followed by ≥ 1.5 s of silence or by a segment from the other lane (for an Interviewer segment: a You segment) | 1 |
 | Ends with "...right?" or "you know?" (rhetorical) | −2 |
 | Mostly small talk vocabulary (weather, weekend, coffee, can you hear me) | −2 |
+
+**Question source (#90).** `[detect].question_source = "interviewer" | "you" | "both"` (default `interviewer`; `--question-source` on `dmn run` and `dmn replay` overrides it for one run) chooses whose finals are scored and answered. It selects lanes, not voices: the mic is always labelled You and the call's output always Interviewer, and the transcript, the routing and the stored segments are the same under all three. `you` lets the user ask Daemon directly through the microphone, and lets a mock interview played from a phone into the mic drive a session; in that case the mock interviewer and the user share the You lane, so the user's own clarifying questions trigger answers too. The source is fixed for the session. The cue table is unchanged: the "Source is Interviewer" point stays the Interviewer lane's, so a You line needs one more point than the same words from the Interviewer (at `strict` a bare "Why?" from the mic is not a candidate), and the question-form gate and the rhetorical and small-talk vetoes apply to both lanes. A split question (below) continues only on its own lane; in `both`, a question on the other lane ends it and is a candidate of its own. The echo guard runs before the detector, so in `both` a mic copy of the interviewer's question is dropped and answered once; it also holds a You final up to 1.5 s (4 s while an Interviewer utterance is open), so a You question's candidate is that much later. The prompt names the lane (`## You just said`, with base rules worded for the mic lane; the Interviewer prompt is byte-identical to before), the status line shows `asks: you` or `asks: both` (nothing for the default or while assistance is off), and the listening screen waits for "the interviewer", "your question" or "a question". With assistance off nothing is detected whatever the source.
 
 **Split questions (#63).** With a 500 ms utterance close, a question with a mid-sentence pause ("And if the limiter's state lived in Redis … and Redis went down, what then?"), a setup followed by the ask ("Imagine a delivery app. Orders change state every few seconds. How would you…?") or a 12 s forced split arrives as two or three finals, and each part that scores became a candidate of its own: two questions on screen for one. An interviewer final that starts within 1.5 s (the hand-back silence above) of the question still being asked, with no You speech in between (judged on audio time) and within 30 s of that question's start, continues it: the detector emits the combined text (earlier candidate, the lines between, this final) as one candidate marked `continues`, the session replaces the first part's question where it is (live, pinned or queued) instead of adding or queueing a second, and the fast phase asks it without the first part as the current question, so the model does not read the whole question as a clarification of its first half. Empty finals (an utterance whisper heard nothing in) neither score nor break a question. `just eval`, energy VAD at 500 ms: precision 0.83 → 0.98, recall 0.97 → 0.96 with `continuous/` added; Silero at 500 ms: 1.00 / 1.00. The shorter 400 ms close that `[stt]` now ships splits more, and this is what keeps its precision up: Silero at 400 ms scores recall 0.96 / precision 0.94.
 
@@ -303,6 +305,7 @@ language = "en"                      # en | auto | es, de, ...: auto detects and
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
+question_source = "interviewer"      # interviewer | you | both: whose questions are detected and answered
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic

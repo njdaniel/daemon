@@ -50,7 +50,9 @@ use dmn_core::config::Vad as VadChoice;
 use dmn_core::recorder::{Recorder, WriterReport, open_store};
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
-use dmn_detect::{Candidate, DetectConfig, Detector, Following, Sensitivity, candidate_channel};
+use dmn_detect::{
+    Candidate, DetectConfig, Detector, Following, QuestionSource, Sensitivity, candidate_channel,
+};
 use dmn_llm::{CurrentQuestion, Kind};
 use dmn_session::{Action, CodingSolutions, Dot, Health, Section, SessionHub, Stage};
 use dmn_stt::{
@@ -211,6 +213,9 @@ pub struct Options {
     pub partials: Partials,
     /// Score with the SPEC's cue table exactly as written, with no form gate and no vetoes.
     pub spec_literal_detector: bool,
+    /// `--question-source` (#90), over `[detect].question_source`: whose finals are scored and
+    /// answered. Fixed for the session.
+    pub question_source: Option<dmn_core::config::QuestionSource>,
     /// Skip the LLM fast phase (#12): transcribe and detect only.
     pub no_llm: bool,
     /// Interview assistance at the start (#79), over `[assist].enabled`: `Some(false)` is
@@ -249,35 +254,78 @@ pub struct Info {
 
 /// Runs the detector over the finals as they arrive.
 ///
-/// Each interviewer final is scored the moment it arrives with [`Following::UNKNOWN`], exactly as
-/// a live session would, and a line that clears the bar is emitted then; that is the latency the
-/// SPEC's 100 ms budget is about. A line that falls short is held until the next final: the
-/// "followed by >= 1.5 s of silence or a You segment" cue can only be judged once something
-/// follows, and if that point lifts it over the bar it is emitted late. Such a candidate cannot
-/// arrive within 100 ms of its final by definition, so it is counted apart.
+/// Each final from a lane `[detect].question_source` selects (#90; the Interviewer lane by
+/// default) is scored the moment it arrives with [`Following::UNKNOWN`], exactly as a live
+/// session would, and a line that clears the bar is emitted then; that is the latency the SPEC's
+/// 100 ms budget is about. A line that falls short is held until the next final: the "followed
+/// by 1.5 s of silence or the other lane" cue can only be judged once something follows, and if
+/// that point lifts it over the bar it is emitted late. Such a candidate cannot arrive within
+/// 100 ms of its final by definition, so it is counted apart.
 pub struct Detecting {
     detector: Detector,
-    /// An interviewer final that did not clear the bar on its own, with when it arrived.
+    /// A final from an eligible lane that did not clear the bar on its own, with when it arrived.
+    /// One slot whatever the source: the next final from either lane resolves it.
     pending: Option<(Segment, Instant)>,
     found: Vec<Found>,
-    /// The question still being asked (#63), if the last interviewer lines were one.
+    /// The question still being asked (#63), if the last lines on one lane were one.
     chain: Option<Chain>,
-    /// Recent You finals' audio spans, for "did the candidate speak in between".
-    you: VecDeque<(Duration, Duration)>,
+    /// Recent finals' audio spans per lane, for "did the other side speak in between".
+    spans: Spans,
 }
 
-/// A question the interviewer may still be asking: the candidate it started from and the
-/// interviewer lines since, until the candidate speaks or a pause hands the floor back.
+/// A question one lane may still be asking: the candidate it started from and that lane's lines
+/// since, until the other side speaks or a pause hands the floor back.
 #[derive(Debug, Clone)]
 struct Chain {
     /// Index in `found` of the candidate the chain started from.
     cand: usize,
-    /// Where the chain's last interviewer final ended.
+    /// The lane the chain is on (#90). A final from the other lane never continues it.
+    source: Source,
+    /// Where the chain's last final ended.
     end: Duration,
-    /// Interviewer lines after that candidate that were not candidates themselves: "Imagine a
-    /// delivery app." (candidate) "Orders change state every few seconds." (this) "How would you
-    /// get those updates to the phone?" (the continuation).
+    /// Lines on the same lane after that candidate that were not candidates themselves:
+    /// "Imagine a delivery app." (candidate) "Orders change state every few seconds." (this)
+    /// "How would you get those updates to the phone?" (the continuation).
     between: Vec<String>,
+}
+
+/// The recent audio spans of each lane's finals (#90). With the default source only the You
+/// lane's are ever read, which is what `Detecting` kept before.
+#[derive(Debug, Clone, Default)]
+struct Spans {
+    you: VecDeque<(Duration, Duration)>,
+    interviewer: VecDeque<(Duration, Duration)>,
+}
+
+impl Spans {
+    fn lane(&mut self, source: Source) -> Option<&mut VecDeque<(Duration, Duration)>> {
+        match source {
+            Source::You => Some(&mut self.you),
+            Source::Interviewer => Some(&mut self.interviewer),
+            // A single-stream fallback is no lane: nothing scores it, and nothing interrupts.
+            Source::Unknown => None,
+        }
+    }
+
+    fn push(&mut self, source: Source, span: (Duration, Duration)) {
+        if let Some(lane) = self.lane(source) {
+            if lane.len() == YOU_SPANS {
+                lane.pop_front();
+            }
+            lane.push_back(span);
+        }
+    }
+
+    /// Whether the lane that is not `source` spoke across `(after, before)`.
+    fn spoke_between(&self, source: Source, after: Duration, before: Duration) -> bool {
+        let other = match source {
+            Source::You => &self.interviewer,
+            Source::Interviewer | Source::Unknown => &self.you,
+        };
+        other
+            .iter()
+            .any(|&(start, stop)| start < before && stop > after)
+    }
 }
 
 /// One emitted candidate and how long after its final it came out.
@@ -303,23 +351,35 @@ pub const CONTINUE_GAP: Duration = dmn_detect::FOLLOW_SILENCE;
 /// monologue's next question is a new question, not a refinement of one asked half a minute ago.
 pub const CONTINUE_SPAN: Duration = Duration::from_secs(30);
 
-/// How many recent You spans [`Detecting`] keeps; only the last few can fall inside a gap.
+/// How many recent spans [`Detecting`] keeps per lane; only the last few can fall inside a gap.
 const YOU_SPANS: usize = 16;
 
 impl Detecting {
-    pub fn new(spec_literal: bool, sensitivity: Sensitivity) -> Self {
+    pub fn new(
+        spec_literal: bool,
+        sensitivity: Sensitivity,
+        question_source: QuestionSource,
+    ) -> Self {
         let cfg = if spec_literal {
             DetectConfig::spec_literal()
         } else {
             DetectConfig::default()
         };
         Self {
-            detector: Detector::new(cfg.with_sensitivity(sensitivity)),
+            detector: Detector::new(
+                cfg.with_sensitivity(sensitivity)
+                    .with_question_source(question_source),
+            ),
             pending: None,
             found: Vec::new(),
             chain: None,
-            you: VecDeque::new(),
+            spans: Spans::default(),
         }
+    }
+
+    /// Whose finals this run scores (#90).
+    pub fn question_source(&self) -> QuestionSource {
+        self.detector.config().question_source
     }
 
     /// Feed one segment; returns how many candidates became decidable because of it (they are
@@ -331,12 +391,7 @@ impl Detecting {
             return 0;
         }
         let before = self.found.len();
-        if seg.source == Source::You {
-            if self.you.len() == YOU_SPANS {
-                self.you.pop_front();
-            }
-            self.you.push_back((seg.start, seg.end));
-        }
+        self.spans.push(seg.source, (seg.start, seg.end));
         if let Some((prev, arrived)) = self.pending.take() {
             let following = Following {
                 silence: Some(seg.start.saturating_sub(prev.end)),
@@ -344,23 +399,33 @@ impl Detecting {
             };
             // A line that only clears the bar once followed starts a question of its own.
             if self.score(&prev, following, arrived, true)
-                && self.chain.as_ref().is_none_or(|c| c.end == prev.end)
+                && self
+                    .chain
+                    .as_ref()
+                    .is_none_or(|c| c.source == prev.source && c.end == prev.end)
             {
                 self.chain = Some(Chain {
                     cand: self.found.len() - 1,
+                    source: prev.source,
                     end: prev.end,
                     between: Vec::new(),
                 });
             }
         }
-        if seg.source == Source::Interviewer {
-            let open = self.chain.take().filter(|c| self.continues_chain(c, seg));
+        if self.question_source().allows(seg.source) {
+            // #90: a chain never crosses lanes. In `both`, a You question asked while an
+            // interviewer chain is open ends that chain and starts its own.
+            let open = self
+                .chain
+                .take()
+                .filter(|c| c.source == seg.source && self.continues_chain(c, seg));
             if self.score(seg, Following::UNKNOWN, Instant::now(), false) {
                 if let Some(chain) = &open {
                     self.continue_from(chain);
                 }
                 self.chain = Some(Chain {
                     cand: self.found.len() - 1,
+                    source: seg.source,
                     end: seg.end,
                     between: Vec::new(),
                 });
@@ -377,10 +442,10 @@ impl Detecting {
     }
 
     /// Whether `seg` is more of the question `chain` holds: it starts within [`CONTINUE_GAP`] of
-    /// the chain's last line, no You final lies in the gap, and the chain stays inside
-    /// [`CONTINUE_SPAN`]. Judged on audio time, not arrival order: at replay speed, or with
-    /// whisper busy, the candidate's answer can be transcribed before the interviewer's second
-    /// half arrives.
+    /// the chain's last line, no final from the *other* lane lies in the gap (#90), and the chain
+    /// stays inside [`CONTINUE_SPAN`]. Judged on audio time, not arrival order: at replay speed,
+    /// or with whisper busy, the answer can be transcribed before the question's second half
+    /// arrives.
     fn continues_chain(&self, chain: &Chain, seg: &Segment) -> bool {
         let gap = seg.start.checked_sub(chain.end).unwrap_or(Duration::ZERO);
         let Some(first) = self.found.get(chain.cand) else {
@@ -390,10 +455,7 @@ impl Detecting {
             .end
             .checked_sub(first.candidate.start)
             .unwrap_or(Duration::ZERO);
-        let spoke = self
-            .you
-            .iter()
-            .any(|&(start, stop)| start < seg.start && stop > chain.end);
+        let spoke = self.spans.spoke_between(chain.source, chain.end, seg.start);
         gap <= CONTINUE_GAP && span <= CONTINUE_SPAN && !spoke
     }
 
@@ -485,6 +547,25 @@ pub fn sensitivity(s: dmn_core::config::Sensitivity) -> Sensitivity {
         dmn_core::config::Sensitivity::Eager => Sensitivity::Eager,
         dmn_core::config::Sensitivity::Balanced => Sensitivity::Balanced,
         dmn_core::config::Sensitivity::Strict => Sensitivity::Strict,
+    }
+}
+
+/// `[detect].question_source` (#90) in the detector's own type, as [`sensitivity`] above.
+pub fn question_source(s: dmn_core::config::QuestionSource) -> QuestionSource {
+    match s {
+        dmn_core::config::QuestionSource::Interviewer => QuestionSource::Interviewer,
+        dmn_core::config::QuestionSource::You => QuestionSource::You,
+        dmn_core::config::QuestionSource::Both => QuestionSource::Both,
+    }
+}
+
+/// `[detect].question_source` (#90) as the session records it, for the status line and the
+/// listening placeholder.
+pub fn session_question_source(s: dmn_core::config::QuestionSource) -> dmn_session::QuestionSource {
+    match s {
+        dmn_core::config::QuestionSource::Interviewer => dmn_session::QuestionSource::Interviewer,
+        dmn_core::config::QuestionSource::You => dmn_session::QuestionSource::You,
+        dmn_core::config::QuestionSource::Both => dmn_session::QuestionSource::Both,
     }
 }
 
@@ -842,6 +923,8 @@ impl Pipeline {
         // leave instead (Ollama keeps a model 30 minutes after its last request), and whisper
         // gets the whole GPU.
         let assist = opts.assist.unwrap_or(cfg.assist.enabled);
+        // #90: `--question-source` over `[detect].question_source`, fixed for the session.
+        let asks = opts.question_source.unwrap_or(cfg.detect.question_source);
         if !opts.no_llm {
             if !assist {
                 unload_local_llm(&cfg.llm);
@@ -927,6 +1010,11 @@ impl Pipeline {
             mode: opts.coding_solutions.unwrap_or(cfg.ui.coding_solutions),
         });
         hub.dispatch(Action::Assist { enabled: assist });
+        // #90: whose questions this session answers, in the log from the start, so the status
+        // line and the listening placeholder are a function of session state alone.
+        hub.dispatch(Action::QuestionSource {
+            source: session_question_source(asks),
+        });
         // #61: where whisper ended up, for the status line; a GPU that fell back says so.
         hub.dispatch(Action::Transcriber {
             device: stt_device.clone(),
@@ -996,6 +1084,7 @@ impl Pipeline {
             Detecting::new(
                 opts.spec_literal_detector,
                 sensitivity(cfg.detect.sensitivity),
+                question_source(asks),
             ),
             launch,
         );
@@ -1905,7 +1994,15 @@ mod tests {
     }
 
     fn detecting() -> Detecting {
-        Detecting::new(false, sensitivity(dmn_core::config::Sensitivity::Balanced))
+        detecting_for(QuestionSource::Interviewer)
+    }
+
+    fn detecting_for(source: QuestionSource) -> Detecting {
+        Detecting::new(
+            false,
+            sensitivity(dmn_core::config::Sensitivity::Balanced),
+            source,
+        )
     }
 
     /// sysdesign's first question as whisper split it at #16's 500 ms close: two finals 0.6 s
@@ -1932,6 +2029,114 @@ mod tests {
         );
         assert_eq!(second.candidate.start, Duration::from_millis(19_980));
         assert_eq!(second.candidate.text, format!("{FIRST} {SECOND}"));
+    }
+
+    /// #90: a question on the mic lane, and the two halves of one split at a pause.
+    const MINE: &str = "How does a token bucket differ from a sliding window counter?";
+    const MINE_REST: &str = "And which one would you pick for a public API?";
+
+    fn sources(d: &Detecting) -> Vec<Source> {
+        d.found().iter().map(|f| f.candidate.source).collect()
+    }
+
+    #[test]
+    fn you_only_scores_the_mic_lane_and_ignores_the_interviewer() {
+        let mut d = detecting_for(QuestionSource::You);
+        assert_eq!(d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST)), 0);
+        assert_eq!(d.feed(&final_at(Source::You, 6_000, 9_000, MINE)), 1);
+        assert_eq!(
+            d.feed(&final_at(
+                Source::You,
+                12_000,
+                15_000,
+                "First I'd clarify the scope of the limiter."
+            )),
+            0,
+            "a statement on the enabled lane is not a question"
+        );
+        d.flush();
+        assert_eq!(sources(&d), [Source::You]);
+        assert_eq!(d.found()[0].candidate.text, MINE);
+    }
+
+    #[test]
+    fn the_default_source_still_ignores_the_mic_lane() {
+        let mut d = detecting();
+        assert_eq!(d.feed(&final_at(Source::You, 0, 3_000, MINE)), 0);
+        assert_eq!(
+            d.feed(&final_at(Source::Interviewer, 4_000, 9_000, FIRST)),
+            1
+        );
+        d.flush();
+        assert_eq!(sources(&d), [Source::Interviewer]);
+    }
+
+    #[test]
+    fn both_scores_each_lane_and_a_chain_never_crosses_lanes() {
+        let mut d = detecting_for(QuestionSource::Both);
+        // An Interviewer question, then a You question 1 s later: inside CONTINUE_GAP, but on
+        // the other lane, so it is a question of its own.
+        assert_eq!(d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST)), 1);
+        assert_eq!(d.feed(&final_at(Source::You, 6_000, 9_000, MINE)), 1);
+        assert_eq!(sources(&d), [Source::Interviewer, Source::You]);
+        assert!(!d.found()[1].continues, "two candidates, not one continued");
+        assert_eq!(d.found()[1].candidate.text, MINE);
+        assert_eq!(d.found()[1].candidate.start, Duration::from_millis(6_000));
+        // The Interviewer's next line does not continue the first question either: You spoke.
+        assert_eq!(
+            d.feed(&final_at(Source::Interviewer, 9_500, 12_000, SECOND)),
+            1
+        );
+        assert!(!d.found()[2].continues);
+    }
+
+    #[test]
+    fn a_you_question_split_at_a_pause_continues_as_one_candidate() {
+        for source in [QuestionSource::You, QuestionSource::Both] {
+            let mut d = detecting_for(source);
+            assert_eq!(d.feed(&final_at(Source::You, 10_000, 14_000, MINE)), 1);
+            assert_eq!(d.feed(&final_at(Source::You, 14_600, 17_000, MINE_REST)), 1);
+            let second = &d.found()[1];
+            assert!(second.continues, "{source:?}: #63's rule on the You lane");
+            assert_eq!(second.candidate.source, Source::You);
+            assert_eq!(second.candidate.start, Duration::from_millis(10_000));
+            assert_eq!(second.candidate.text, format!("{MINE} {MINE_REST}"));
+        }
+    }
+
+    #[test]
+    fn the_interviewer_speaking_in_the_gap_ends_a_you_question() {
+        let mut d = detecting_for(QuestionSource::You);
+        d.feed(&final_at(Source::You, 10_000, 14_000, MINE));
+        d.feed(&final_at(Source::Interviewer, 14_100, 14_500, "Sure."));
+        d.feed(&final_at(Source::You, 14_600, 17_000, MINE_REST));
+        assert!(
+            !d.found()[1].continues,
+            "the other lane spoke: a new question"
+        );
+    }
+
+    #[test]
+    fn a_you_line_that_needs_its_follower_is_scored_once_the_interviewer_answers() {
+        // Strict: `?` alone (2 points, no Interviewer cue) is under the bar of 3 until the
+        // other lane follows it.
+        let mut d = Detecting::new(
+            false,
+            sensitivity(dmn_core::config::Sensitivity::Strict),
+            QuestionSource::You,
+        );
+        assert_eq!(d.feed(&final_at(Source::You, 0, 1_000, "The p99?")), 0);
+        assert_eq!(
+            d.feed(&final_at(
+                Source::Interviewer,
+                1_200,
+                3_000,
+                "About two seconds."
+            )),
+            1
+        );
+        assert!(d.found()[0].late);
+        assert_eq!(d.found()[0].candidate.source, Source::You);
     }
 
     #[test]
@@ -2086,7 +2291,7 @@ mod tests {
     #[test]
     fn the_configured_sensitivity_reaches_the_detector() {
         let threshold = |s| {
-            Detecting::new(false, sensitivity(s))
+            Detecting::new(false, sensitivity(s), QuestionSource::Interviewer)
                 .detector()
                 .config()
                 .effective_threshold()
@@ -2288,6 +2493,7 @@ mod tests {
                 language: None,
                 partials: Partials::Auto,
                 spec_literal_detector: false,
+                question_source: None,
                 assist: None,
                 no_llm: true,
                 no_store: true,
@@ -2366,6 +2572,14 @@ mod tests {
     /// Assistance over a mock model that records every request, and whether the suggester was
     /// ever started.
     fn assistance(on: bool) -> (Assistance, dmn_llm::MockProvider, Arc<AtomicBool>) {
+        assistance_for(on, QuestionSource::Interviewer)
+    }
+
+    /// [`assistance`] with `[detect].question_source` set (#90).
+    fn assistance_for(
+        on: bool,
+        source: QuestionSource,
+    ) -> (Assistance, dmn_llm::MockProvider, Arc<AtomicBool>) {
         let hub = Arc::new(SessionHub::default());
         let mock = dmn_llm::MockProvider::new(vec![dmn_llm::mock::Step::Error("mock".into())]);
         let launched = Arc::new(AtomicBool::new(false));
@@ -2380,7 +2594,7 @@ mod tests {
             on,
             hub,
             AudioClock::new(Instant::now(), 1.0),
-            detecting(),
+            detecting_for(source),
             Some(launch),
         );
         (a, mock, launched)
@@ -2491,6 +2705,184 @@ mod tests {
         assert_eq!(mock.requests().len(), 1);
     }
 
+    #[test]
+    fn you_only_answers_the_mic_question_and_never_asks_about_the_interviewers() {
+        let (mut a, mock, _) = assistance_for(true, QuestionSource::You);
+        let hub = Arc::clone(&a.hub);
+        let mut log = TranscriptLog::new();
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::You, 27_000, 30_000, MINE),
+        );
+        a.flush(&log, &mut Quiet);
+        // Labels and the transcript are the source's business not at all.
+        let lanes: Vec<Source> = log.finals().iter().map(|s| s.source).collect();
+        assert_eq!(lanes, [Source::Interviewer, Source::You]);
+        assert_eq!(hub.snapshot().counts.candidates, 1);
+        let (d, _, _) = a.finish(false);
+        assert_eq!(sources(&d), [Source::You]);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1, "one request, for the mic question");
+        let user = &requests[0].messages[1].content;
+        assert!(
+            user.contains(&format!("## You just said\n{MINE}")),
+            "{user}"
+        );
+        assert!(!user.contains("## Interviewer just said"), "{user}");
+    }
+
+    #[test]
+    fn with_assistance_off_no_source_detects_or_asks_anything() {
+        for source in [QuestionSource::You, QuestionSource::Both] {
+            let (mut a, mock, launched) = assistance_for(false, source);
+            let hub = Arc::clone(&a.hub);
+            let mut log = TranscriptLog::new();
+            publish(
+                &mut a,
+                &mut log,
+                final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            );
+            publish(
+                &mut a,
+                &mut log,
+                final_at(Source::You, 27_000, 30_000, MINE),
+            );
+            a.flush(&log, &mut Quiet);
+            assert_eq!(
+                log.finals().len(),
+                2,
+                "{source:?}: the transcript is untouched"
+            );
+            assert!(
+                !launched.load(Ordering::Acquire),
+                "{source:?}: no suggester"
+            );
+            assert_eq!(hub.snapshot().counts.candidates, 0, "{source:?}");
+            // On again: the next eligible question, and only that one.
+            a.command(Command::Assist { on: true }, &log);
+            publish(
+                &mut a,
+                &mut log,
+                final_at(Source::You, 40_000, 44_000, MINE_REST),
+            );
+            a.flush(&log, &mut Quiet);
+            let (d, _, _) = a.finish(false);
+            let found: Vec<&str> = d
+                .found()
+                .iter()
+                .map(|f| f.candidate.text.as_str())
+                .collect();
+            assert_eq!(found, [MINE_REST], "{source:?}");
+            assert_eq!(mock.requests().len(), 1, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn in_both_an_echoed_interviewer_question_is_one_candidate_not_two() {
+        // No headphones: the mic hears the interviewer's question a moment later. The echo
+        // guard sits above assistance, so the copy is dropped before the detector sees it.
+        let (mut a, mock, _) = assistance_for(true, QuestionSource::Both);
+        let mut log = TranscriptLog::new();
+        let mut echo = EchoGuard::new(true);
+        let now = Duration::from_secs(27);
+        let mut verdicts = echo.observe(final_at(Source::Interviewer, 20_000, 26_000, FIRST), now);
+        verdicts.extend(echo.observe(final_at(Source::You, 20_150, 26_200, FIRST), now));
+        verdicts.extend(echo.finish());
+        for verdict in verdicts {
+            let seg = match verdict {
+                Verdict::Publish(seg) => seg,
+                Verdict::Drop(seg) => retraction(seg),
+            };
+            publish(&mut a, &mut log, seg);
+        }
+        a.flush(&log, &mut Quiet);
+        assert_eq!(echo.dropped(), 1, "the mic copy");
+        let (d, _, _) = a.finish(false);
+        assert_eq!(sources(&d), [Source::Interviewer]);
+        assert_eq!(mock.requests().len(), 1);
+    }
+
+    /// #90: `continuous/` under `you`. Only the candidate's own lines are scored, among them the
+    /// two questions the script gives the candidate (turns.json: 25.2 s and 432.4 s), and the
+    /// transcript is what the default source produces. Run with `just probe` on a dev machine.
+    #[test]
+    #[ignore = "needs the fixture WAVs (just fixtures-fetch) and the whisper model (dmn doctor --fetch small.en)"]
+    fn the_continuous_fixture_under_you_scores_only_the_candidates_lane() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/continuous");
+        let run = |question_source| {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths {
+                models_dir: Paths::from_xdg().unwrap().models_dir,
+                ..Paths::under(dir.path())
+            };
+            let mut pipeline = Pipeline::start(
+                &Config::default(),
+                &paths,
+                &Options {
+                    input: Input::Files {
+                        interviewer: fixture.join("interviewer.wav"),
+                        candidate: fixture.join("candidate.wav"),
+                    },
+                    speed: 8.0,
+                    model: None,
+                    threads: None,
+                    vad_close_ms: None,
+                    vad: None,
+                    device: Some(dmn_core::config::SttDevice::Cpu),
+                    language: None,
+                    partials: Partials::Off,
+                    spec_literal_detector: false,
+                    question_source,
+                    assist: Some(true),
+                    no_llm: true,
+                    no_store: true,
+                    output: Output::Quiet,
+                    policy: Policy::AnswerAll,
+                    coding_solutions: None,
+                },
+            )
+            .unwrap();
+            pipeline.run(&mut Quiet, false);
+            pipeline.finish(&mut Quiet).unwrap()
+        };
+        let you = run(Some(dmn_core::config::QuestionSource::You));
+        let found = you.detecting.found();
+        assert!(!found.is_empty());
+        assert!(found.iter().all(|f| f.candidate.source == Source::You));
+        for asked in ["limit per calling service", "on-call rotation"] {
+            assert!(
+                found.iter().any(|f| f.candidate.line.contains(asked)),
+                "the candidate's question about the {asked}"
+            );
+        }
+        let default = run(None);
+        assert!(
+            default
+                .detecting
+                .found()
+                .iter()
+                .all(|f| f.candidate.source == Source::Interviewer)
+        );
+        let lines = |r: &Report| -> Vec<(Source, String)> {
+            r.log
+                .finals()
+                .iter()
+                .map(|s| (s.source, s.text.clone()))
+                .collect()
+        };
+        assert_eq!(
+            lines(&you),
+            lines(&default),
+            "the transcript and its labels do not depend on the source"
+        );
+    }
+
     /// #79 with #77: the Spanish fixture replayed with `language = "auto"` and assistance off.
     /// The translated transcript flows as it does with assistance on; nothing is detected and
     /// the LLM is never started. Run with `just probe` on a dev machine.
@@ -2525,6 +2917,7 @@ mod tests {
                 language: Some(dmn_core::config::SttLanguage::Auto),
                 partials: Partials::Off,
                 spec_literal_detector: false,
+                question_source: None,
                 assist: Some(false),
                 no_llm: false,
                 no_store: true,
