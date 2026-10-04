@@ -21,7 +21,8 @@ M | Opus | 60
 - **Decided**: the key is Enter.
 - **Decided**: the candidate's text is the asking lane's last turn: its most recent finals with no final from the other lane between them, newest last, going back at most `CONTINUE_SPAN` (30 s). The fast phase already reduces "what the Interviewer just said" to one question, so a turn that opens with remarks and ends with the question needs no rule here. The asking lane follows `[detect].question_source` (#90); with `both` it is whichever lane spoke last.
 - The candidate takes the normal path after that: `wire::candidate`, the 60 s transcript window, `submit_after` with what was answered before it (#57), the slow phase, the store. Under a pin it queues like any other.
-- **Decided**: Enter does nothing when that turn already produced the live question (that is `r`), when the lane has said nothing yet, and while assistance is off (#79), like `r` and `w`.
+- **Decided**: Enter does nothing when that turn's last line already has its question (on screen, which is what `r` is for; queued behind a pin; or still on its way), when the lane has said nothing yet, and while assistance is off (#79), like `r` and `w`. If the interviewer has said more since the live question's candidate, that is a new turn and Enter sends it.
+- **Decided** (2026-10-04, on PR #98): a second Enter on the same turn sends nothing while the first is in flight, once it was shown, or after the model declined it (the same prompt at temperature 0 gets the same answer). It sends again when the first one's request failed (a timeout, an unreachable model, a malformed reply): the key is for the moment the tool let the user down, and must not go dead until the interviewer speaks again.
 - **Decided**: when the model answers `is_question: false` or `small_talk` to a key press, the status line says `not a question` for 5 s and the screen keeps what it had. A detector candidate that is ignored stays silent as today.
 - The status line's key hints gain `⏎ ask` while assistance is on.
 
@@ -33,7 +34,7 @@ Out of scope: typing or editing a question, choosing an older line, a hand-off f
 ## Acceptance
 - [ ] With the session-24 lines as the transcript and no candidate from them, Enter shows "How would you reserve and then reconcile usage correctly under heavy concurrent traffic across regions?" with its Approach (MockProvider); the store has the question and its suggestion
 - [ ] A turn of three interviewer finals within 30 s is sent as one candidate in spoken order; a You final between them cuts the turn there
-- [ ] Enter while pinned queues the question and the pin badge counts it; Enter twice on the same turn sends one request; Enter with assistance off or before anyone has spoken sends none
+- [ ] Enter while pinned queues the question and the pin badge counts it; Enter twice on the same turn sends one request, unless the first one's request failed, in which case the second sends the turn again; Enter with assistance off or before anyone has spoken sends none
 - [ ] A reply of `is_question: false` to a key press shows `not a question` on the status line for 5 s; the same reply to a detector candidate shows nothing (snapshot tests for both)
 - [ ] `question_source = "you"`: Enter sends the mic lane's last turn
 - [ ] docs/SPEC.md and the README's key list name the key

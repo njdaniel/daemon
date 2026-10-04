@@ -431,6 +431,11 @@ pub struct Session {
     /// [`Action::NoticeExpired`] or the next Enter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_a_question: Option<u64>,
+    /// #96: the request for this candidate, which Enter sent, failed (a timeout, an unreachable
+    /// model, a malformed reply). The key is for the moment the tool let the user down, so the
+    /// pipeline reads this to let Enter send the same turn again; the next Enter clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_failed: Option<u64>,
 }
 
 /// The default question source is left out of a serialised session.
@@ -487,7 +492,10 @@ impl Session {
     }
 
     fn settle(&mut self, candidate: u64, progress: &Progress) {
-        self.take_asked(candidate);
+        // #96: a key press whose request failed can be pressed again for the same turn.
+        if self.take_asked(candidate) && matches!(progress, Progress::Failed(_)) {
+            self.ask_failed = Some(candidate);
+        }
         if self.pending == Some(candidate) {
             self.pending = None;
         }
@@ -596,8 +604,10 @@ pub fn reduce(s: &mut Session, action: &Action) {
         }
         Action::Asked { candidate } => {
             s.asked.push(*candidate);
-            // A new press is a new attempt: the answer to the last one goes.
+            // A new press is a new attempt: the answer to the last one goes, and so does its
+            // failure.
             s.not_a_question = None;
+            s.ask_failed = None;
         }
         Action::NoticeExpired { candidate } => {
             if s.not_a_question == Some(*candidate) {

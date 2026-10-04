@@ -683,7 +683,8 @@ impl Controls {
     /// Enter (#96): make the last thing the interviewer said (the asking lane's last turn) the
     /// question, for when the detector missed it. The pipeline thread builds the candidate from
     /// its transcript log; it sends nothing while assistance is off, before that lane has
-    /// spoken, or when that turn already has its question.
+    /// spoken, or when that turn already has its question. A press whose request failed can be
+    /// pressed again.
     pub fn ask(&self) {
         let _ = self.commands.send(Command::Ask);
     }
@@ -912,9 +913,9 @@ pub struct Assistance {
     dropped_candidates: u64,
     /// Every candidate by session id, for `r`.
     known: HashMap<u64, Candidate>,
-    /// The turn Enter last sent (#96), as its lane and where it ends: a second press on the same
-    /// turn sends nothing, whatever became of the first.
-    asked: Option<(Source, Duration)>,
+    /// The turn Enter last sent (#96), as its candidate, its lane and where it ends: a second
+    /// press on the same turn sends nothing, unless that candidate's request failed.
+    asked: Option<(u64, Source, Duration)>,
     /// The session as the screen has it, to see `not a question` go up (#96).
     session: watch::Receiver<Session>,
     /// The `not a question` notice now up, as its candidate and when this thread first saw it.
@@ -1499,9 +1500,15 @@ impl Assistance {
 
     /// Enter (#96): send the asking lane's last turn ([`last_turn`]) to the fast phase as a
     /// candidate, without the detector; from there it is a candidate like any other. Nothing is
-    /// sent before that lane has spoken, a second time for the same turn, or when the turn's
-    /// last line already has its question: on screen (`r` asks that one again), queued behind a
-    /// pin, or on its way.
+    /// sent before that lane has spoken, or when the turn's last line already has its question:
+    /// on screen (`r` asks that one again), queued behind a pin, or on its way.
+    ///
+    /// A second press on the same turn sends nothing while the first is in flight, once it was
+    /// shown, or after the model declined it (the same prompt at temperature 0 gets the same
+    /// answer). It sends again when the first one's request failed: a timeout, an unreachable
+    /// model or a malformed reply is the tool letting the user down a second time, and the key
+    /// must not go dead until the interviewer speaks again. The session says which it was
+    /// ([`Session::ask_failed`]).
     fn ask(&mut self, log: &TranscriptLog) {
         if self.suggester.is_none() {
             return;
@@ -1509,11 +1516,13 @@ impl Assistance {
         let Some(turn) = last_turn(log.finals(), self.detecting.question_source()) else {
             return;
         };
-        let key = (turn.source, turn.end);
-        if self.asked == Some(key) {
+        let snap = self.hub.snapshot();
+        if let Some((id, source, end)) = self.asked
+            && (source, end) == (turn.source, turn.end)
+            && snap.ask_failed != Some(id)
+        {
             return;
         }
-        let snap = self.hub.snapshot();
         let has_question = snap
             .live
             .iter()
@@ -1527,8 +1536,8 @@ impl Assistance {
         if has_question {
             return;
         }
-        self.asked = Some(key);
         self.next_candidate += 1;
+        self.asked = Some((self.next_candidate, turn.source, turn.end));
         self.send(self.next_candidate, turn, false, true, log);
     }
 
@@ -3590,6 +3599,46 @@ mod tests {
     }
 
     #[test]
+    fn enter_again_after_a_failed_request_asks_about_the_same_turn_again() {
+        let hub = Arc::new(SessionHub::default());
+        // The first request fails; the second is answered, streaming for about a second.
+        let mock = dmn_llm::MockProvider::new(vec![dmn_llm::mock::Step::Error(
+            "upstream timed out".into(),
+        )])
+        .then_json(&reply(RESERVE))
+        .with_delay(Duration::from_millis(20));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+        hear_session_24(&hub, &mut log);
+        a.command(Command::Ask, &log);
+        let s = wait_until(&hub, "the request to fail", |s| s.counts.failed == 1);
+        assert_eq!(s.ask_failed, Some(1));
+        assert!(s.live.is_none() && s.asked.is_empty());
+
+        // Nothing new was said, and the key is not dead: the same turn goes out again.
+        a.command(Command::Ask, &log);
+        // That one is in flight: a double press is still one request.
+        a.command(Command::Ask, &log);
+        let s = hub.snapshot();
+        assert_eq!((s.counts.candidates, s.ask_failed), (2, None));
+        let s = wait_until(&hub, "the retry's answer", answered);
+        assert_eq!(s.live.as_ref().map(|q| q.text.as_str()), Some(RESERVE));
+        // And once it is on screen, asking again is `r`.
+        a.command(Command::Ask, &log);
+        a.finish(false);
+        assert_eq!(hub.snapshot().counts.candidates, 2);
+        let asked = asked_of(&mock);
+        assert_eq!(asked.len(), 2, "the failed request and its retry");
+        let turn = [SESSION_24[2].2, SESSION_24[3].2, SESSION_24[4].2].join(" ");
+        for user in &asked {
+            assert!(
+                user.contains(&format!("## Interviewer just said\n{turn}")),
+                "{user}"
+            );
+        }
+    }
+
+    #[test]
     fn enter_on_a_turn_the_detector_already_made_the_question_asks_nothing() {
         let hub = Arc::new(SessionHub::default());
         let mock = dmn_llm::MockProvider::json(&reply(FIRST)).with_delay(Duration::from_millis(20));
@@ -3707,7 +3756,9 @@ mod tests {
         assert_eq!(s.not_a_question, None);
         assert!(!screen(&s).contains("not a question"));
 
-        // The model has answered for that turn: Enter again asks nothing.
+        // The model has answered for that turn, and at temperature 0 would say the same again:
+        // Enter asks nothing, unlike after a request that failed.
+        assert_eq!(s.ask_failed, None);
         a.command(Command::Ask, &log);
         a.finish(false);
         assert_eq!(asked_of(&mock).len(), 2);
