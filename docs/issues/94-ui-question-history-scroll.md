@@ -28,6 +28,7 @@ History:
 Scrolling:
 - **Decided**: `↑` / `↓` scroll the open section by one row, PgUp / PgDn by the rows visible. The offset resets when the section closes or the question changes.
 - The `…` at the cut becomes a position hint (`↓ 6 more`, and `↑ 3` once scrolled), so a body that fits looks exactly as today.
+- **Decided** (2026-10-04, on PR #99): an item of an open section wraps onto as many rows as it needs. The three-row cap per item (`ITEM_ROWS` in `apps/dmn-cli/src/tui/sections.rs`) cut a 240-character item with `…` at 80 columns and in the wide layout's left column, where no scrolling could reach the rest; it is removed, and nothing inside a section body is cut by a count of rows. A row that cannot wrap is still cut to its width: a line of code (it is not re-wrapped), a code block's `Name · language` line, and the one-line note of a section opened before anything arrived.
 
 Out of scope: mouse input (#95), scrolling the transcript, browsing earlier sessions, longer answers (the limits in `crates/dmn-llm/src/limits.rs` stay), re-running the model for an earlier question, the M3 window.
 
@@ -38,7 +39,7 @@ Out of scope: mouse input (#95), scrolling the transcript, browsing earlier sess
 - [ ] After three questions, `←` twice shows the first with its own focus, Approach and sections; `→` twice returns to live; reducer tests cover both ends of the list
 - [ ] A question that arrives while browsing does not change the screen; the status line shows `1 new`; returning to live shows it with its Approach
 - [ ] Browsing with a pinned question: the pin and its queue behave as today once back on live
-- [ ] A section body taller than its area scrolls with `↑ ↓ PgUp PgDn` to its last row and stops at both ends; the hint shows rows above and below
+- [ ] A section body taller than its area scrolls with `↑ ↓ PgUp PgDn` to its last row and stops at both ends; the hint shows rows above and below; every item is whole, so a 240-character item at 80 × 24 is read to its last word
 - [ ] Snapshot tests at 100 × 30 and 140 × 30: an earlier question on screen, a scrolled section, the `n new` badge. Every existing snapshot with no history and no overflow is unchanged
 - [ ] The status line's key hints name the new keys when they apply; docs/SPEC.md § UI, Terminal MVP lists them
 - [ ] `just check`, `just test` and `just lint` green

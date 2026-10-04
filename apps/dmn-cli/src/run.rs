@@ -360,6 +360,17 @@ fn capture(out: &mut impl Write) -> io::Result<()> {
     ratatui::crossterm::execute!(out, EnableMouseCapture)
 }
 
+/// [`capture`] when `[ui].mouse` is on, and nothing at all when it is off (#95): with `false` no
+/// escape sequence is written, so the terminal keeps its selection and wheel.
+fn capture_if(enabled: bool, out: &mut impl Write) -> io::Result<()> {
+    if enabled { capture(out) } else { Ok(()) }
+}
+
+/// [`mouse`] when `[ui].mouse` is on; with it off an event is dropped unread by the session.
+fn mouse_if(enabled: bool, ev: MouseEvent, controls: &Controls, pane: Rect) -> bool {
+    enabled && mouse(ev, controls, pane)
+}
+
 /// Turn mouse capture off if it is on, so the shell gets its own selection and wheel back. The
 /// one place capture is released: [`Restore`] (`q`, Ctrl+C, an error) and the panic hook both
 /// call it. Nothing to report if the terminal is gone.
@@ -398,8 +409,8 @@ fn interactive(pipeline: Pipeline, mouse: bool) -> Result<Report, Box<dyn Error>
         let _restore = Restore;
         if mouse {
             release_on_panic();
-            capture(&mut io::stdout())?;
         }
+        capture_if(mouse, &mut io::stdout())?;
         ui_loop(&mut terminal, &mut session, &controls, mouse)
     })();
     // However the UI ended, stop the pipeline so the session is closed and stored.
@@ -442,9 +453,14 @@ fn ui_loop(
             }
             // With `[ui].mouse = false` capture is never enabled, so none arrive; this guards a
             // terminal that sends them anyway.
-            Event::Mouse(ev) if mouse_on => {
+            Event::Mouse(ev) => {
                 let pane = terminal.size()?;
-                if mouse(ev, controls, Rect::new(0, 0, pane.width, pane.height)) {
+                if mouse_if(
+                    mouse_on,
+                    ev,
+                    controls,
+                    Rect::new(0, 0, pane.width, pane.height),
+                ) {
                     dirty = true;
                 }
             }
@@ -1518,5 +1534,36 @@ mod tests {
         out.clear();
         release(&mut out);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn with_mouse_off_nothing_is_captured_and_a_wheel_or_click_changes_nothing() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        solution(hub, 30);
+        let row = point(&hub.snapshot(), "1 ▸ Deeper Answer");
+        let before = hub.snapshot();
+        let mut actions = hub.subscribe();
+
+        // `[ui].mouse = false`: no capture sequence is written, and events are not acted on.
+        let mut out = Vec::new();
+        capture_if(false, &mut out).unwrap();
+        assert!(out.is_empty());
+        for ev in [click_at(row), at(MouseEventKind::ScrollDown, (10, 6))] {
+            assert!(!mouse_if(false, ev, &controls, PANE));
+        }
+        assert!(actions.try_recv().is_err());
+        assert_eq!(screen(&hub.snapshot()), screen(&before));
+
+        // On, the same events act.
+        assert!(mouse_if(true, click_at(row), &controls, PANE));
+        assert!(screen(&hub.snapshot()).contains("1 ▾ Deeper Answer"));
+        assert!(mouse_if(
+            true,
+            at(MouseEventKind::ScrollDown, (10, 6)),
+            &controls,
+            PANE
+        ));
+        assert_eq!(hub.snapshot().scroll, 3);
     }
 }
