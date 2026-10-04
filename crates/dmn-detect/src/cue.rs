@@ -106,36 +106,59 @@ const RHETORICAL_TAGS: [&str; 6] = [
 /// rest is the same register: the call itself, the calendar, the room, the pleasantries at each
 /// end. It is a vocabulary test, not a topic model; the LLM fast phase is what finally decides a
 /// candidate is small talk (SPEC § Extraction).
-const SMALL_TALK: [&str; 34] = [
+///
+/// A single word stays here only when it has no technical sense (`weather`, `coffee`). Words that
+/// are also system-design vocabulary ("traffic", "connection", "audio", "calendar") are matched
+/// by phrase ("my audio", "calendar invite", "at my door") so that "How would you handle a traffic
+/// spike?" is not vetoed; chatter no phrase covers reaches the fast phase, which answers
+/// `small_talk` and shows nothing (#93).
+const SMALL_TALK: [&str; 51] = [
     "weather",
     "weekend",
     "coffee",
     "hear me",
     "hear you",
     "you there",
-    "audio",
-    "mic",
-    "microphone",
+    "my audio",
+    "your audio",
+    "the audio is",
+    "my mic",
+    "your mic",
+    "my microphone",
+    "your microphone",
     "headset",
-    "connection",
+    "my connection",
+    "your connection",
+    "bad connection",
+    "connection is",
     "cutting out",
-    "frozen",
-    "calendar",
-    "invite",
+    "you're frozen",
+    "you are frozen",
+    "you froze",
+    "my calendar",
+    "your calendar",
+    "calendar invite",
+    "the invite",
     "meeting link",
     "reschedule",
     "running late",
     "double-booked",
     "double booked",
-    "traffic",
+    "bad traffic",
+    "traffic getting",
+    "traffic on the",
     "raining",
     "pouring",
-    "snow",
+    "snowing",
     "sunny",
-    "holiday",
-    "vacation",
-    "lunch",
-    "door",
+    "your holiday",
+    "your vacation",
+    "the holidays",
+    "for lunch",
+    "grab lunch",
+    "had lunch",
+    "at my door",
+    "at the door",
     "one second",
     "hold on",
     "nice to meet",
@@ -223,9 +246,10 @@ pub fn is_rhetorical(sentence: &str) -> bool {
     })
 }
 
-/// Mostly small-talk vocabulary: a small-talk phrase appears and the sentence is not carrying a
-/// technical question around it. Matching is on phrases, so "link" in "the link changed at the
-/// last minute" counts while "linked list" does not.
+/// True when any entry of `SMALL_TALK` appears in the sentence. A one-word entry must be a whole
+/// word; a multi-word entry is matched as a substring. The sentence is not checked for a technical
+/// question around the match, so the list holds only words and phrases that mean chatter on their
+/// own: "traffic", "connection" and "calendar" are not on it alone (see `SMALL_TALK`).
 pub fn is_small_talk(sentence: &str) -> bool {
     let lowered = format!(" {} ", sentence.to_ascii_lowercase());
     SMALL_TALK.iter().any(|phrase| {
@@ -351,6 +375,31 @@ mod tests {
         ));
         assert!(!is_small_talk("How would you design a rate limiter?"));
         assert!(!is_small_talk("Walk me through a linked list deletion."));
+    }
+
+    #[test]
+    fn technical_words_that_also_appear_in_chatter_are_not_small_talk_alone() {
+        for q in [
+            "How would you reserve and then reconcile usage correctly under heavy concurrent traffic across regions?",
+            "How do you handle connection pooling?",
+            "How would you handle a traffic spike?",
+            "Design a calendar app.",
+            "How would you stream audio to a thousand listeners?",
+            "How would you send an invite to a million users?",
+        ] {
+            assert!(!is_small_talk(q), "{q}");
+        }
+        for q in [
+            "Can you hear me okay?",
+            "Did you find the calendar invite okay, the link changed at the last minute?",
+            "Okay, hold on one second, someone's at my door.",
+            "Sorry, my calendar double-booked me and the other call ran over.",
+            "I think my audio is cutting out.",
+            "Sorry, bad connection on my end.",
+            "How was the traffic getting here?",
+        ] {
+            assert!(is_small_talk(q), "{q}");
+        }
     }
 
     #[test]

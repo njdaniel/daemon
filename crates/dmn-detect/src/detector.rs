@@ -355,6 +355,42 @@ mod tests {
     }
 
     #[test]
+    fn technical_questions_with_a_chatter_word_are_candidates() {
+        // #93: "traffic", "connection" and "calendar" are system-design vocabulary.
+        let c = detect(
+            "Control plane versus data plane separation for prompts, policies, and secrets. \
+             Let's zoom into the quota problem. How would you reserve and then reconcile usage \
+             correctly under heavy concurrent traffic across regions?",
+        )
+        .expect("the session-24 question");
+        assert_eq!(
+            c.text,
+            "How would you reserve and then reconcile usage correctly under heavy concurrent \
+             traffic across regions?"
+        );
+        for q in [
+            "How do you handle connection pooling?",
+            "How would you handle a traffic spike?",
+            "Design a calendar app.",
+        ] {
+            assert!(detect(q).is_some(), "{q}");
+        }
+    }
+
+    #[test]
+    fn call_chatter_with_a_calendar_or_door_is_still_dropped() {
+        for q in [
+            "Can you hear me okay?",
+            "How's the weather where you are?",
+            "Did you find the calendar invite okay, the link changed at the last minute?",
+            "Okay, hold on one second, someone's at my door.",
+            "Sorry, my calendar double-booked me and the other call ran over.",
+        ] {
+            assert!(detect(q).is_none(), "{q}");
+        }
+    }
+
+    #[test]
     fn only_final_interviewer_segments_are_scored() {
         let d = Detector::default();
         let mut partial = seg("How would you design a rate limiter?");
