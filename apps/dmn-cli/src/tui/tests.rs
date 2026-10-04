@@ -1913,3 +1913,99 @@ fn tui_nothing_overflows_its_width_at_either_size() {
         }
     }
 }
+
+/// Where `needle` first sits on the drawn screen, as (column, row) in cells.
+fn find(screen: &str, needle: &str) -> Option<(u16, u16)> {
+    screen.lines().enumerate().find_map(|(y, row)| {
+        let at = row.find(needle)?;
+        Some((
+            u16::try_from(row[..at].chars().count()).ok()?,
+            u16::try_from(y).ok()?,
+        ))
+    })
+}
+
+#[test]
+fn tui_a_click_finds_each_of_the_six_rows_where_the_frame_drew_it() {
+    use super::section_at;
+    use ratatui::layout::Rect;
+    // One column (a 50-wide pane), two columns stacked (100 and 80) and the wide layout (#88).
+    for (w, h) in [(50, 24), (100, 30), (80, 24), WIDE] {
+        let s = load("sections");
+        let screen = text(&render(&s, (w, h)));
+        let pane = Rect::new(0, 0, w, h);
+        for (n, section) in Section::ALL.into_iter().enumerate() {
+            let (x, y) = find(&screen, &format!("{} ▸", n + 1))
+                .unwrap_or_else(|| panic!("row {} at {w}x{h}:\n{screen}", n + 1));
+            assert_eq!(
+                section_at(&s, pane, x, y),
+                Some(section),
+                "{w}x{h} key {}",
+                n + 1
+            );
+            // Anywhere along the row counts, not only its number; one row down is another.
+            assert_eq!(section_at(&s, pane, x + 6, y), Some(section), "{w}x{h}");
+            assert_ne!(section_at(&s, pane, x, y + 1), Some(section), "{w}x{h}");
+        }
+        // Outside the grid: the question, the Approach, the transcript, the status line.
+        let (_, first) = find(&screen, "1 ▸").unwrap();
+        for (x, y) in [(0, 0), (5, 2), (5, first - 1), (5, h - 1), (w - 1, 0)] {
+            assert_eq!(section_at(&s, pane, x, y), None, "{w}x{h} at {x},{y}");
+        }
+        if w < super::SIDE_MIN_COLS {
+            // The transcript strip is under the grid; on the wide pane its column is on the right.
+            assert_eq!(section_at(&s, pane, 5, h - 2), None, "{w}x{h}");
+        } else {
+            assert_eq!(section_at(&s, pane, w - 3, first), None, "{w}x{h} column");
+        }
+        // Past the last cell of the pane, with assistance off, and with no question.
+        assert_eq!(section_at(&s, pane, w, first), None);
+        let mut off = s.clone();
+        off.assist_off = true;
+        assert_eq!(section_at(&off, pane, 5, first), None);
+        assert_eq!(section_at(&Session::default(), pane, 5, first), None);
+    }
+}
+
+#[test]
+fn tui_the_wheel_goes_three_rows_a_notch_on_the_left_column_and_stops_at_both_ends() {
+    use super::{Scroll, on_left_column, scroll_to};
+    use ratatui::layout::Rect;
+    for (w, h) in [(100, 30), WIDE] {
+        let pane = Rect::new(0, 0, w, h);
+        let mut s = load("scrolled");
+        s.scroll = 0;
+        assert_eq!(scroll_to(&s, pane, Scroll::WheelUp), None);
+        assert_eq!(scroll_to(&s, pane, Scroll::WheelDown), Some(3));
+        let mut notches = 0;
+        while let Some(to) = scroll_to(&s, pane, Scroll::WheelDown) {
+            assert!(to > s.scroll && to - s.scroll <= 3);
+            s.scroll = to;
+            notches += 1;
+            assert!(notches < 20, "it ends");
+        }
+        // At the last row: no more, and the other way goes back three, or to the top.
+        assert_eq!(scroll_to(&s, pane, Scroll::WheelDown), None);
+        assert_eq!(scroll_to(&s, pane, Scroll::WheelUp), Some(s.scroll - 3));
+        s.scroll = 2;
+        assert_eq!(scroll_to(&s, pane, Scroll::WheelUp), Some(0));
+
+        // With no section open there is nothing to move.
+        assert_eq!(scroll_to(&load("sections"), pane, Scroll::WheelDown), None);
+
+        // The left column: the question and Approach, not the transcript.
+        assert!(on_left_column(&s, pane, 5, 10));
+        assert!(!on_left_column(&s, pane, 5, h - 1), "the status line");
+        if w >= super::SIDE_MIN_COLS {
+            assert!(on_left_column(&s, pane, w * 60 / 100 - 1, 10));
+            assert!(
+                !on_left_column(&s, pane, w - 2, 10),
+                "the transcript column"
+            );
+        } else {
+            assert!(!on_left_column(&s, pane, 5, h - 3), "the transcript strip");
+        }
+        s.assist_off = true;
+        assert!(!on_left_column(&s, pane, 5, 10));
+    }
+}

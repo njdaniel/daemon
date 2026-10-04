@@ -339,6 +339,10 @@ pub struct Ui {
     /// structure, edge cases, complexity, no complete code) or `full` (a worked solution too).
     /// `dmn run --solutions` overrides it for one run and `s` toggles it during a call.
     pub coding_solutions: CodingSolutions,
+    /// `dmn run` reads the mouse (#95): the wheel scrolls the open section and a click on a
+    /// section row opens it. `false` enables no capture, so the terminal keeps selection and
+    /// its own wheel.
+    pub mouse: bool,
 }
 
 impl Default for Ui {
@@ -349,6 +353,7 @@ impl Default for Ui {
             opacity: 1.0,
             never_auto_expand: true,
             coding_solutions: CodingSolutions::Hints,
+            mouse: true,
         }
     }
 }
@@ -439,6 +444,7 @@ force_x11 = false                    # launch under XWayland for keep-above on G
 opacity = 1.0                        # 0.7 – 1.0
 never_auto_expand = true
 coding_solutions = "hints"           # hints | full: worked solutions in Deeper Answer (s toggles)
+mouse = true                         # dmn run: wheel scrolls an open section, a click opens one; false leaves the mouse to the terminal
 
 [privacy]
 record_audio = false                 # write WAVs of the session (shows a red REC dot)
@@ -631,6 +637,7 @@ force_x11 = false                    # launch under XWayland for keep-above
 opacity = 1.0
 never_auto_expand = true
 coding_solutions = "hints"           # hints | full (worked solutions in Deeper Answer)
+mouse = true                         # dmn run: wheel scrolls an open section, a click opens one
 
 [privacy]
 record_audio = false                 # write WAVs of the session
@@ -724,7 +731,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 29, "spec example has 29 keys: {keys:?}");
+        assert_eq!(keys.len(), 30, "spec example has 30 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -756,6 +763,20 @@ keep_transcripts = true
         assert!(c.to_toml().unwrap().contains("coding_solutions = \"full\""));
         let err = Config::from_toml("[ui]\ncoding_solutions = \"all\"\n", "bad").unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_mouse_defaults_to_on_and_parses_off() {
+        assert!(Config::default().ui.mouse);
+        let c = Config::from_toml("[ui]\nmouse = false\n", "off").unwrap();
+        assert!(!c.ui.mouse);
+        assert!(c.to_toml().unwrap().contains("mouse = false"));
+        assert!(
+            Config::default()
+                .to_toml()
+                .unwrap()
+                .contains("mouse = true")
+        );
     }
 
     #[test]
