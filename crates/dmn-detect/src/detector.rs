@@ -372,6 +372,12 @@ mod tests {
             "How do you handle connection pooling?",
             "How would you handle a traffic spike?",
             "Design a calendar app.",
+            "How would you scale your microservices?",
+            "How do you size your connection pool?",
+            "What happens when the connection is lost mid-stream?",
+            "How would you design the invite flow?",
+            "How do you handle traffic on the read path?",
+            "How do you keep video in sync when the audio is delayed?",
         ] {
             assert!(detect(q).is_some(), "{q}");
         }

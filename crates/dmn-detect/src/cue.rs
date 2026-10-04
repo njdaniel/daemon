@@ -110,9 +110,11 @@ const RHETORICAL_TAGS: [&str; 6] = [
 /// A single word stays here only when it has no technical sense (`weather`, `coffee`). Words that
 /// are also system-design vocabulary ("traffic", "connection", "audio", "calendar") are matched
 /// by phrase ("my audio", "calendar invite", "at my door") so that "How would you handle a traffic
-/// spike?" is not vetoed; chatter no phrase covers reaches the fast phase, which answers
+/// spike?" is not vetoed, and a phrase stays only when an interviewer would not plausibly say it
+/// inside a technical question ("your connection", "the invite", "double-booked", "one second" and
+/// "reschedule" are not here). Chatter no phrase covers reaches the fast phase, which answers
 /// `small_talk` and shows nothing (#93).
-const SMALL_TALK: [&str; 51] = [
+const SMALL_TALK: [&str; 33] = [
     "weather",
     "weekend",
     "coffee",
@@ -120,47 +122,29 @@ const SMALL_TALK: [&str; 51] = [
     "hear you",
     "you there",
     "my audio",
-    "your audio",
-    "the audio is",
     "my mic",
     "your mic",
     "my microphone",
     "your microphone",
     "headset",
     "my connection",
-    "your connection",
-    "bad connection",
-    "connection is",
-    "cutting out",
     "you're frozen",
     "you are frozen",
     "you froze",
     "my calendar",
-    "your calendar",
     "calendar invite",
-    "the invite",
     "meeting link",
-    "reschedule",
-    "running late",
-    "double-booked",
-    "double booked",
-    "bad traffic",
-    "traffic getting",
-    "traffic on the",
     "raining",
     "pouring",
     "snowing",
     "sunny",
     "your holiday",
     "your vacation",
-    "the holidays",
     "for lunch",
     "grab lunch",
     "had lunch",
     "at my door",
-    "at the door",
-    "one second",
-    "hold on",
+    "was at the door",
     "nice to meet",
     "good to meet",
     "how are you",
@@ -246,21 +230,20 @@ pub fn is_rhetorical(sentence: &str) -> bool {
     })
 }
 
-/// True when any entry of `SMALL_TALK` appears in the sentence. A one-word entry must be a whole
-/// word; a multi-word entry is matched as a substring. The sentence is not checked for a technical
-/// question around the match, so the list holds only words and phrases that mean chatter on their
-/// own: "traffic", "connection" and "calendar" are not on it alone (see `SMALL_TALK`).
+/// True when any entry of `SMALL_TALK` appears in the sentence as whole words: the characters
+/// on both sides of the match, if any, are not letters or digits, so "my mic" does not match
+/// "my microservices" and "meeting link" does not match "meeting linked". The sentence is not
+/// checked for a technical question around the match, so the list holds only words and phrases
+/// that mean chatter on their own: "traffic", "connection" and "calendar" are not on it alone (see
+/// `SMALL_TALK`).
 pub fn is_small_talk(sentence: &str) -> bool {
-    let lowered = format!(" {} ", sentence.to_ascii_lowercase());
+    let lowered = sentence.to_ascii_lowercase();
     SMALL_TALK.iter().any(|phrase| {
-        if phrase.contains(' ') {
-            lowered.contains(phrase)
-        } else {
-            lowered.contains(&format!(" {phrase} "))
-                || lowered.contains(&format!(" {phrase},"))
-                || lowered.contains(&format!(" {phrase}?"))
-                || lowered.contains(&format!(" {phrase}."))
-        }
+        lowered.match_indices(phrase).any(|(start, m)| {
+            let before = lowered[..start].chars().next_back();
+            let after = lowered[start + m.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
     })
 }
 
@@ -386,6 +369,15 @@ mod tests {
             "Design a calendar app.",
             "How would you stream audio to a thousand listeners?",
             "How would you send an invite to a million users?",
+            "How would you scale your microservices?",
+            "How do you size your connection pool?",
+            "What happens when the connection is lost mid-stream?",
+            "How would you design the invite flow?",
+            "How do you handle traffic on the read path?",
+            "How do you keep video in sync when the audio is delayed?",
+            "How would you reschedule failed jobs?",
+            "How do you prevent double-booked seats?",
+            "How would you return results within one second?",
         ] {
             assert!(!is_small_talk(q), "{q}");
         }
@@ -395,8 +387,8 @@ mod tests {
             "Okay, hold on one second, someone's at my door.",
             "Sorry, my calendar double-booked me and the other call ran over.",
             "I think my audio is cutting out.",
-            "Sorry, bad connection on my end.",
-            "How was the traffic getting here?",
+            "Sorry, my connection is bad.",
+            "Is your mic on?",
         ] {
             assert!(is_small_talk(q), "{q}");
         }
