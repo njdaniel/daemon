@@ -21,4 +21,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
 Interviewer …ing the time today. This session is about an hour of system design.
 
- ● mic  ● system  ● model  asks: you                            m mute · q quit
+ ● mic  ● system  ● model  asks: you                    m mute · q quit · ⏎ ask

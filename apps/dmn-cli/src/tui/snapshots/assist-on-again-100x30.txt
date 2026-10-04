@@ -27,4 +27,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
 Interviewer Good. Let's talk about how you would test that.
 Interviewer And what about the▍
- ● mic  ● system  ● model  es→en                                                     p pin · r redo
+ ● mic  ● system  ● model  es→en                                             p pin · r redo · ⏎ ask

@@ -27,4 +27,4 @@
       in-process cache absorbs hot keys and syncs every 100 ms.                     │You         Sounds great.
       Failure: If Redis is unreachable, fail open to a conservative local limit     │You         Okay, so first I'd want to know what we're
       per node and alert.                                                           │            limiting on.
- ● mic  ● system  ● model                                                                                                   1 close · p pin
+ ● mic  ● system  ● model                                                                                           1 close · p pin · ⏎ ask

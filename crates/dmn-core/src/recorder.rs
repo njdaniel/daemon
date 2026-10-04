@@ -431,6 +431,11 @@ impl StoreWriter {
             // #63: both halves of a split question keep their question rows, as every candidate
             // does; the link is screen state and stays in the action log.
             | Action::Continues { .. }
+            // #96: a candidate Enter sent is stored as any candidate is, through its own
+            // `Candidate`, `Question` and `Answered`; that the key sent it, and the notice a
+            // declined one gets, are screen state.
+            | Action::Asked { .. }
+            | Action::NoticeExpired { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

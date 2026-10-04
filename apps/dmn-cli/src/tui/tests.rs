@@ -12,8 +12,8 @@
 use std::path::{Path, PathBuf};
 
 use dmn_session::{
-    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, QuestionSource, Section,
-    Session, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
+    QuestionSource, Section, Session, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 24] = [
+const STATES: [&str; 26] = [
     "listening",
     "live",
     "pinned",
@@ -52,6 +52,10 @@ const STATES: [&str; 24] = [
     // answered).
     "asks-you",
     "asks-both",
+    // #96: the model answered "not a question" to what Enter sent (the status line says so),
+    // and to a detector candidate (nothing is said).
+    "asked-not-a-question",
+    "detected-not-a-question",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -685,6 +689,44 @@ fn actions(state: &str) -> Vec<Action> {
             };
             a.extend(reply);
         }
+        // #96: the rate-limiter question on screen, then a remark of the interviewer's goes to
+        // the model, sent by Enter or found by the detector, and the model says it is not a
+        // question. The screen keeps what it had; only the key press is answered.
+        "asked-not-a-question" | "detected-not-a-question" => {
+            let asked = state == "asked-not-a-question";
+            a.extend(rate_limiter());
+            a.push(seg(
+                Speaker::You,
+                31.0,
+                36.0,
+                "Okay, so first I'd want to know what we're limiting on.",
+                true,
+            ));
+            a.push(seg(
+                Speaker::Interviewer,
+                37.0,
+                40.5,
+                "Sure. Take whichever you think matters most, right?",
+                true,
+            ));
+            a.push(Action::Candidate {
+                id: 2,
+                speaker: Speaker::Interviewer,
+                start: 37.0,
+                end: 40.5,
+                text: "Sure. Take whichever you think matters most, right?".into(),
+                // The detector never scored what Enter sent.
+                score: if asked { 0 } else { 3 },
+            });
+            if asked {
+                a.push(Action::Asked { candidate: 2 });
+            }
+            a.push(Action::Ignored {
+                candidate: 2,
+                reason: IgnoreReason::NotAQuestion,
+                score: if asked { 0 } else { 3 },
+            });
+        }
         other => panic!("no actions for state {other}"),
     }
     a
@@ -1083,6 +1125,148 @@ fn tui_the_status_line_names_a_question_source_other_than_the_interviewer() {
     let screen = text(&render(&Session::replay(&off), (100, 30)));
     assert!(!screen.contains("asks:"), "{screen}");
     assert!(screen.contains("assist off"), "{screen}");
+}
+
+#[test]
+fn tui_a_declined_key_press_says_not_a_question_and_a_declined_detector_candidate_nothing() {
+    // #96: the same reply (`is_question: false`) to the same line. Sent by Enter, the status
+    // line answers the key in amber; found by the detector, nothing is said, as before.
+    for size in SIZES {
+        let last_row = usize::from(size.1) - 1;
+        let buf = render(&load("asked-not-a-question"), size);
+        let asked = text(&buf);
+        let last = asked.lines().nth(last_row).unwrap_or_default();
+        assert!(
+            last.ends_with("not a question · p pin · r redo · ⏎ ask"),
+            "{last}"
+        );
+        let (x, y) = row_containing(&buf, "not a question");
+        assert_eq!(buf[(x, y)].fg, Color::Yellow);
+        // The screen keeps what it had: the question, and its Approach at full strength.
+        assert!(asked.contains("LIVE QUESTION"), "{asked}");
+        let (x, y) = row_containing(&buf, "Use a token bucket");
+        assert!(!buf[(x, y)].modifier.contains(Modifier::DIM));
+
+        let detected = text(&render(&load("detected-not-a-question"), size));
+        assert!(!detected.contains("not a question"), "{detected}");
+        let last = detected.lines().nth(last_row).unwrap_or_default();
+        assert!(last.ends_with(" p pin · r redo · ⏎ ask"), "{last}");
+
+        // Once the pipeline says the 5 s are up, the two screens are the same.
+        let mut expired = actions("asked-not-a-question");
+        expired.push(Action::NoticeExpired { candidate: 2 });
+        assert_eq!(text(&render(&Session::replay(&expired), size)), detected);
+    }
+}
+
+#[test]
+fn tui_not_a_question_is_never_cut_on_a_narrow_pane() {
+    // As `assist off` (#79): it leads the keys, which are never cut, whatever tags the left
+    // side of an 80-column pane carries.
+    let mut a = actions("asked-not-a-question");
+    a.insert(
+        1,
+        Action::QuestionSource {
+            source: QuestionSource::Both,
+        },
+    );
+    a.push(Action::Status {
+        dot: Dot::System,
+        health: Health::AllAudio,
+    });
+    a.push(Action::Transcriber {
+        device: "CPU".into(),
+        fallback: false,
+    });
+    let screen = text(&render(&Session::replay(&a), (80, 24)));
+    let last = screen.lines().nth(23).unwrap_or_default();
+    assert!(
+        last.ends_with("not a question · p pin · r redo · ⏎ ask"),
+        "{last}"
+    );
+    assert!(last.contains("system: all audio"), "{last}");
+}
+
+/// The status line of `session` at `size`.
+fn status_line(session: &Session, size: (u16, u16)) -> String {
+    text(&render(session, size))
+        .lines()
+        .nth(usize::from(size.1) - 1)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn tui_the_keys_offer_ask_whenever_assistance_is_on() {
+    // #96: in every state of the screen, since the detector's miss can come in any; not while
+    // assistance is off, when Enter sends nothing.
+    for state in STATES {
+        let session = load(state);
+        let last = status_line(&session, (100, 30));
+        assert_eq!(
+            last.ends_with(" · ⏎ ask"),
+            !session.assist_off,
+            "{state}: {last}"
+        );
+    }
+}
+
+#[test]
+fn tui_ask_gives_its_cells_to_a_status_note_that_would_otherwise_be_cut() {
+    // #96 beside #59: at 80 columns the "transcript leaves this machine" notice and an error's
+    // reason had the cells `⏎ ask` would take, and keep them; with room for both, both show.
+    let mut remote = actions("live");
+    remote.push(Action::Provider {
+        label: dmn_session::ProviderLabel {
+            name: "anthropic".into(),
+            model: "m".into(),
+            remote: true,
+        },
+    });
+    let remote = Session::replay(&remote);
+    let narrow = status_line(&remote, (80, 24));
+    assert!(
+        narrow.contains("transcript leaves this machine") && narrow.ends_with(" p pin · r redo"),
+        "{narrow}"
+    );
+    let wide = status_line(&remote, (100, 30));
+    assert!(
+        wide.contains("transcript leaves this machine")
+            && wide.ends_with(" p pin · r redo · ⏎ ask"),
+        "{wide}"
+    );
+    let failed = load("behavioral");
+    let narrow = status_line(&failed, (80, 24));
+    assert!(
+        narrow.contains("model: ollama unreachable") && !narrow.contains("⏎ ask"),
+        "{narrow}"
+    );
+    assert!(status_line(&failed, (100, 30)).ends_with(" · ⏎ ask"));
+
+    // A reason too long for the pane beside any keys is cut as it always was, and the key
+    // stays.
+    let mut long = actions("live");
+    long.push(Action::Status {
+        dot: Dot::Model,
+        health: Health::Error("error sending request for url (http://localhost:11434)".into()),
+    });
+    let cut = status_line(&Session::replay(&long), (80, 24));
+    assert!(cut.contains('…') && cut.ends_with(" · ⏎ ask"), "{cut}");
+
+    // The answer to the key outlasts the keys: beside the notice it stands alone.
+    let mut declined = actions("asked-not-a-question");
+    declined.push(Action::Provider {
+        label: dmn_session::ProviderLabel {
+            name: "anthropic".into(),
+            model: "m".into(),
+            remote: true,
+        },
+    });
+    let both = status_line(&Session::replay(&declined), (80, 24));
+    assert!(
+        both.contains("transcript leaves this machine") && both.ends_with(" not a question"),
+        "{both}"
+    );
 }
 
 #[test]

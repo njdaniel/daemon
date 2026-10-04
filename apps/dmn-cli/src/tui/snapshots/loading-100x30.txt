@@ -27,4 +27,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
 You         Redis in each region, with a small local cache to absorb bursts before it.
 Interviewer And what if it goes down for a whole region, not just one node?
- ● mic  ● system  ● model                                                           m mute · q quit
+ ● mic  ● system  ● model                                                   m mute · q quit · ⏎ ask

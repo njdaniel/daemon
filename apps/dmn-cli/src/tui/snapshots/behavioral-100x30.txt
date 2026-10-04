@@ -27,4 +27,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
 Interviewer Hi, thanks for making the time today. This session is about an hour of system design.
 You         Sounds great.
- ○ mic muted  ● system  ● model  model: ollama unreachable                           p pin · r redo
+ ○ mic muted  ● system  ● model  model: ollama unreachable                   p pin · r redo · ⏎ ask

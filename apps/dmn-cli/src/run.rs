@@ -4,7 +4,9 @@
 //! and dispatches everything into the session; this thread redraws the TUI from the session's
 //! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
 //! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), Ctrl+Shift+A
-//! interview assistance on ↔ off (#79, a chord so it is not hit by accident), `q` (or Ctrl-C) quit. Nothing else writes to the terminal
+//! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
+//! what the interviewer last said when the detector missed the question (#96), `q` (or Ctrl-C)
+//! quit. Nothing else writes to the terminal
 //! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
@@ -90,6 +92,9 @@ pub enum Key {
     /// key mid-call cannot switch the Approach off. Terminals without the kitty keyboard
     /// protocol (WezTerm's default, tmux) send it as Ctrl+A, so that counts too.
     Assist,
+    /// Enter (#96): send what the interviewer last said to the model as the question, for when
+    /// the detector missed it. `r` only reaches a question already on screen.
+    Ask,
     Quit,
 }
 
@@ -117,6 +122,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
             .to_digit(10)
             .and_then(|d| Section::ALL.get(usize::try_from(d).ok()? - 1))
             .map(|s| Key::Section(*s)),
+        KeyCode::Enter => Some(Key::Ask),
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Key::Quit),
         _ => None,
     }
@@ -132,6 +138,7 @@ pub fn press(k: Key, controls: &Controls) -> bool {
         Key::Section(s) => controls.toggle_section(s),
         Key::Swap => controls.swap_story(),
         Key::Assist => controls.toggle_assist(),
+        Key::Ask => controls.ask(),
         Key::Quit => {
             controls.quit();
             return true;
@@ -496,6 +503,12 @@ mod tests {
         let mut release = press_key('p');
         release.kind = KeyEventKind::Release;
         assert_eq!(key(release), None);
+        // #96: Enter asks; its release, on a terminal that reports one, does not ask again.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(key(enter), Some(Key::Ask));
+        let mut release = enter;
+        release.kind = KeyEventKind::Release;
+        assert_eq!(key(release), None);
     }
 
     #[test]
@@ -610,6 +623,27 @@ mod tests {
             commands.try_recv(),
             Ok(crate::pipeline::Command::Regenerate)
         );
+    }
+
+    #[test]
+    fn enter_goes_to_the_pipeline_thread_and_the_screen_waits_for_its_answer() {
+        // #96: the pipeline owns the transcript the turn is cut from, so the key only asks it;
+        // the screen changes when the candidate, and then its reply, reach the session.
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        for a in question(1, "Design a rate limiter") {
+            hub.dispatch(a);
+        }
+        let before = screen(&hub.snapshot());
+        assert!(before.contains("⏎ ask"), "the footer offers it:\n{before}");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            !press(key(enter).unwrap(), &controls),
+            "Enter does not quit"
+        );
+        assert_eq!(commands.try_recv(), Ok(Command::Ask));
+        assert!(commands.try_recv().is_err(), "one press, one command");
+        assert_eq!(screen(&hub.snapshot()), before);
     }
 
     #[test]

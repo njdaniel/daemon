@@ -422,6 +422,15 @@ pub struct Session {
     /// of the log at its default, so every session log from before #90 reads as `interviewer`.
     #[serde(default, skip_serializing_if = "is_default_source")]
     pub question_source: QuestionSource,
+    /// #96: the candidates Enter sent whose reply is still on its way, oldest first. They are
+    /// told apart from the detector's only so that one the model declines is answered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asked: Vec<u64>,
+    /// #96: the model answered `is_question: false` or `small_talk` to this candidate, which
+    /// Enter sent. The status line says `not a question` while it is set: 5 s, until
+    /// [`Action::NoticeExpired`] or the next Enter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_a_question: Option<u64>,
 }
 
 /// The default question source is left out of a serialised session.
@@ -469,7 +478,16 @@ impl Session {
             .find(|c| c.candidate == candidate)
     }
 
+    /// Candidate `candidate`'s reply has ended: if Enter sent it (#96), it is no longer waiting.
+    /// True when it was.
+    fn take_asked(&mut self, candidate: u64) -> bool {
+        let before = self.asked.len();
+        self.asked.retain(|c| *c != candidate);
+        self.asked.len() != before
+    }
+
     fn settle(&mut self, candidate: u64, progress: &Progress) {
+        self.take_asked(candidate);
         if self.pending == Some(candidate) {
             self.pending = None;
         }
@@ -576,6 +594,16 @@ pub fn reduce(s: &mut Session, action: &Action) {
         } => {
             s.continuing = Some((*candidate, *continued));
         }
+        Action::Asked { candidate } => {
+            s.asked.push(*candidate);
+            // A new press is a new attempt: the answer to the last one goes.
+            s.not_a_question = None;
+        }
+        Action::NoticeExpired { candidate } => {
+            if s.not_a_question == Some(*candidate) {
+                s.not_a_question = None;
+            }
+        }
         Action::Question {
             candidate,
             text,
@@ -664,6 +692,10 @@ pub fn reduce(s: &mut Session, action: &Action) {
             s.counts.ignored += 1;
             if s.pending == Some(*candidate) {
                 s.pending = None;
+            }
+            // #96: a key press gets an answer either way; a detector candidate stays silent.
+            if s.take_asked(*candidate) {
+                s.not_a_question = Some(*candidate);
             }
             // A regenerate the model declined leaves the question as it was.
             if let Some(q) = s.question_mut(*candidate).filter(|q| q.regenerating) {

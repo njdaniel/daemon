@@ -27,4 +27,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
 You         Sounds great.
 You         Okay, so first I'd want to know what we're limiting on.
- ● mic  ● system  ● model                                                           1 close · p pin
+ ● mic  ● system  ● model                                                   1 close · p pin · ⏎ ask
