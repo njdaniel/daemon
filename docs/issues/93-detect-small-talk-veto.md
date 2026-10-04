@@ -23,7 +23,7 @@ S | Sonnet | 30
 
 **Decided** (say so on the issue if it should go the other way): the single words that are also technical vocabulary leave the veto list, and chatter that needs them is matched by phrase instead ("can you hear me", "my audio", "calendar invite", "at my door"). A chatter question that no phrase covers ("Is the traffic bad out there?") then reaches the fast phase, which already returns `kind: small_talk` and shows nothing (SPEC § Extraction); that costs one request and is preferred to dropping a real question. Words with no technical sense (`weather`, `weekend`, `coffee`) stay as they are.
 
-Out of scope: logging or counting vetoed lines, a key that sends the last interviewer line to the model by hand, changes to weights or thresholds.
+Out of scope: logging or counting vetoed lines, a key that sends the last interviewer line to the model by hand (#96), changes to weights or thresholds.
 
 ## Depends on
 #10, #63, #90 (all merged)
