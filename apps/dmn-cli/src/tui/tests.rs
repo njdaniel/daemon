@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 29] = [
+const STATES: [&str; 30] = [
     "listening",
     "live",
     "pinned",
@@ -61,10 +61,13 @@ const STATES: [&str; 29] = [
     "earlier",
     "earlier-new",
     "scrolled",
+    // #94: a Deeper Answer of four items at the 240-character limit, each wrapped in full and
+    // scrolled to the last word of the last: at 80 × 24 that is twelve rows down.
+    "long-items",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
-const WIDE_STATES: [&str; 7] = [
+const WIDE_STATES: [&str; 8] = [
     "live",
     "pinned",
     "sections-open-1",
@@ -72,6 +75,7 @@ const WIDE_STATES: [&str; 7] = [
     "earlier",
     "earlier-new",
     "scrolled",
+    "long-items",
 ];
 const WIDE: (u16, u16) = (140, 30);
 
@@ -773,8 +777,72 @@ fn actions(state: &str) -> Vec<Action> {
             });
             a.push(Action::Scroll { offset: 9 });
         }
+        // #94: the issue's own case, a Deeper Answer of four 240-character items. None is cut
+        // inside: each wraps onto the rows it needs and the body scrolls to the end of the last.
+        "long-items" => {
+            a.extend(long_items());
+            a.push(Action::ToggleSection {
+                section: Section::Deeper,
+            });
+            a.push(Action::Scroll { offset: 12 });
+        }
         other => panic!("no actions for state {other}"),
     }
+    a
+}
+
+/// #94: four Deeper Answer items, each exactly the 240 characters `dmn-llm`'s limits allow.
+const LONG_ITEMS: [(&str, &str); 4] = [
+    (
+        "Algorithm",
+        "Token bucket per key: refill r tokens a second up to burst b, and take one per request. \
+         It needs two numbers per key and one atomic update, where a sliding-window log keeps \
+         each timestamp and a fixed window lets a burst through at its edge.",
+    ),
+    (
+        "State",
+        "Keep the counters in a Redis cluster per region and update them in a Lua script, so the \
+         read and the write are one step. A tiny in-process cache in front absorbs hot keys and \
+         cuts the Redis round trips to one per key every few milliseconds.",
+    ),
+    (
+        "Consistency",
+        "Regions do not share counters on the request path. Each one enforces its share of the \
+         quota and reports usage to a reconciler, which moves any unused share to busy regions \
+         every few seconds, so a partition over-admits by one share at worst.",
+    ),
+    (
+        "Failure",
+        "If Redis is unreachable the limiter fails open to a conservative per-instance limit \
+         held in its own memory, sends an alert and marks its decisions as degraded in the \
+         access log, so abuse during the outage can be found and billed afterwards.",
+    ),
+];
+
+/// #94: the rate-limiter question with [`LONG_ITEMS`] as its whole slow phase, none open.
+fn long_items() -> Vec<Action> {
+    let mut a = rate_limiter();
+    a.push(Action::SlowStarted { candidate: 1 });
+    a.push(slow(
+        1,
+        SlowField::Deeper {
+            items: LONG_ITEMS
+                .iter()
+                .map(|(label, text)| DeeperItem {
+                    label: (*label).into(),
+                    text: (*text).into(),
+                })
+                .collect(),
+        },
+    ));
+    a.push(slow_ended(1, SlowEnd::Done));
+    a.push(seg(
+        Speaker::You,
+        31.0,
+        36.0,
+        "Okay, so first I'd want to know what we're limiting on.",
+        true,
+    ));
     a
 }
 
@@ -1896,6 +1964,65 @@ fn tui_scroll_keys_go_a_row_or_the_rows_on_screen_and_stop_at_both_ends() {
         s.assist_off = true;
         assert_eq!(scroll_to(&s, pane, Scroll::Down), None);
     }
+}
+
+#[test]
+fn tui_a_240_character_item_is_read_to_its_last_word_by_scrolling() {
+    use super::{Scroll, scroll_to};
+    use ratatui::layout::Rect;
+    for (_, text) in LONG_ITEMS {
+        assert_eq!(text.chars().count(), 240, "at the limit: {text}");
+    }
+    let whole: Vec<String> = LONG_ITEMS
+        .iter()
+        .map(|(label, text)| format!("{label}: {text}"))
+        .collect();
+    for (w, h) in [(80, 24), (100, 30), WIDE] {
+        let pane = Rect::new(0, 0, w, h);
+        let mut s = load("long-items");
+        s.scroll = 0;
+        // Every body row the user sees on the way down, by its place in the body.
+        let mut rows: Vec<String> = Vec::new();
+        loop {
+            let screen = text(&render(&s, (w, h)));
+            // The body's rows: under the grid's one row, down to the hint (if it is cut) or the
+            // transcript; on the wide pane, left of the transcript column.
+            let body: Vec<String> = screen
+                .lines()
+                .skip_while(|row| !row.contains("1 ▾ Deeper Answer"))
+                .skip(1)
+                .map(|row| row.split('│').next().unwrap_or_default().trim().to_owned())
+                .take_while(|row| !row.contains("TRANSCRIPT") && !row.contains('●'))
+                .filter(|row| !row.is_empty() && !row.starts_with(['↑', '↓']))
+                .collect();
+            for (i, row) in body.into_iter().enumerate() {
+                assert!(!row.contains('…'), "{w}×{h}: cut inside an item:\n{screen}");
+                let at = usize::from(s.scroll) + i;
+                if at == rows.len() {
+                    rows.push(row);
+                } else {
+                    assert_eq!(rows[at], row, "{w}×{h}: the same row at every offset");
+                }
+            }
+            match scroll_to(&s, pane, Scroll::Down) {
+                Some(to) => s.scroll = to,
+                None => break,
+            }
+        }
+        // Read top to bottom, the rows are the four items word for word.
+        assert_eq!(rows.join(" "), whole.join(" "), "{w}×{h}");
+        let end = text(&render(&s, (w, h)));
+        assert!(end.contains("billed afterwards."), "{w}×{h}:\n{end}");
+    }
+    // At 80 × 24 an item takes four rows and the body has four: twelve rows of scrolling, which
+    // is where the fixture stands, on the whole of the last item.
+    let fixture = load("long-items");
+    assert_eq!(fixture.scroll, 12);
+    let pane = Rect::new(0, 0, 80, 24);
+    assert_eq!(scroll_to(&fixture, pane, Scroll::Down), None, "the end");
+    let end = text(&render(&fixture, (80, 24)));
+    assert!(end.contains("Failure: If Redis is unreachable"), "{end}");
+    assert!(end.contains("      ↑ 12\n"), "{end}");
 }
 
 #[test]

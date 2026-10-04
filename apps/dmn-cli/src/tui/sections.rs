@@ -9,6 +9,11 @@
 //! (`Question::open`); its body goes under the grid, taking rows from the Approach area down to
 //! a floor, and is cut rather than growing past it. A cut body scrolls (#94): its last row is
 //! the position hint, `↓ 6 more` at the top, `↑ 3 · ↓ 3 more` on the way, `↑ 6` at the end.
+//!
+//! Inside the body every item wraps onto as many rows as it needs, so scrolling reaches its last
+//! word: nothing is cut by a count of rows. What is still cut is a row that cannot wrap, each to
+//! its width with `…`: a line of code (wrapping would change what it says), a code block's
+//! `Name · language` line, and the one-line note of a section opened before anything arrived.
 
 use dmn_session::{CodeBlock, Question, Section, SectionState};
 use ratatui::buffer::Buffer;
@@ -20,10 +25,6 @@ use ratatui::widgets::{Paragraph, Widget};
 use super::View;
 use super::text::{truncate, width, wrap};
 
-/// Rows one item of an open section wraps onto before it is cut with `…`. Items are ≤ 240
-/// characters (`dmn-llm`'s limits), so three rows hold one even at 80 columns, and no item reads
-/// as a paragraph of more than three sentences (SPEC density rule).
-const ITEM_ROWS: usize = 3;
 /// Below this many cells the rows stack in one column instead of two.
 const TWO_COLUMNS_FROM: usize = 56;
 /// Left and right margin, so the rows line up with the Approach text inside its border.
@@ -313,7 +314,8 @@ fn body(q: &Question, section: Section, cells: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// `label: text`, wrapped to [`ITEM_ROWS`], with the label styled on the first row.
+/// `label: text`, wrapped in full (#94: the body scrolls, so no item is cut by rows; its length
+/// is `dmn-llm`'s limit, 240 characters), with the label styled on the first row.
 fn labelled(label: &str, text: &str, label_style: Style, cells: usize) -> Vec<Line<'static>> {
     let label = label.trim();
     let whole = if label.is_empty() {
@@ -321,7 +323,7 @@ fn labelled(label: &str, text: &str, label_style: Style, cells: usize) -> Vec<Li
     } else {
         format!("{label}: {}", text.trim())
     };
-    wrap(&whole, cells, ITEM_ROWS)
+    wrap(&whole, cells, usize::MAX)
         .into_iter()
         .enumerate()
         .map(|(i, row)| {
@@ -337,9 +339,9 @@ fn labelled(label: &str, text: &str, label_style: Style, cells: usize) -> Vec<Li
         .collect()
 }
 
-/// `• text`, wrapped to [`ITEM_ROWS`] with continuation rows under the text.
+/// `• text`, wrapped in full with continuation rows under the text.
 fn bullet(text: &str, cells: usize) -> Vec<Line<'static>> {
-    wrap(text.trim(), cells.saturating_sub(2), ITEM_ROWS)
+    wrap(text.trim(), cells.saturating_sub(2), usize::MAX)
         .into_iter()
         .enumerate()
         .map(|(i, row)| {
