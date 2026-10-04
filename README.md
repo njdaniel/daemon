@@ -69,6 +69,12 @@ question, and the screen updates as it does for a detected one. The asking lane 
 whichever of the two spoke last. If the model finds no question in it, the status line says
 `not a question` for 5 seconds and nothing else changes.
 
+Every question shown stays within reach for the session: `←` steps back through them, each as
+it was when the next one replaced it, and `→` steps forward again. An earlier question holds the
+screen (the title says `QUESTION 2 of 5`); questions asked meanwhile are answered behind it, the
+status line counts them (`2 new`), and the newest is there when you return. It is read-only:
+`1`–`6` open its sections, while `p`, `r` and `w` wait for the live question.
+
 Keys in `dmn run`:
 
 | Key | What it does |
@@ -77,6 +83,8 @@ Keys in `dmn run`:
 | `r` | Answer the question on screen again, from a different angle |
 | Enter | Ask about what the asking lane last said (the interviewer, by default), when the detector missed the question |
 | `1`–`6` | Open or close one of the six sections under the Approach |
+| `↑` `↓`, PgUp, PgDn | Scroll the open section when it is taller than the screen: a row, or the rows on screen |
+| `←` `→` | Show the question before the one on screen, or the one after; `→` from the newest earlier one returns to the live question |
 | `w` | Swap the STAR story of a behavioral question |
 | `s` | Coding solutions: hints ↔ full |
 | `m` | Mute or unmute your microphone |

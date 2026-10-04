@@ -11,24 +11,31 @@
 //! 1. Question: a bordered block of four lines holding the question (or, before any question,
 //!    the last thing the interviewer said), the focus line and the latest clarification (`↳`).
 //!    Its title is the state label (`LISTENING`, `LIVE QUESTION`, `PINNED QUESTION`), with the
-//!    "N new" badge while pinned questions queue.
+//!    "N new" badge while pinned questions queue. `←` steps back to an earlier question (#94),
+//!    which holds the screen as a pin does under the title `QUESTION 2 of 5`; `→` steps forward,
+//!    and from the newest earlier one back to the live question.
 //! 2. Approach: the numbered lines (or the STAR cards for a behavioral question, the matched
 //!    story in their header). While the next question's reply is on its way the previous
 //!    Approach stays, dimmed, rather than clearing. Under it, once the slow phase has started,
 //!    the six expandable sections (#56): a compact grid of rows, keys `1`–`6`, and the body of
-//!    the one that is open, which takes rows from the Approach down to a floor.
+//!    the one that is open, which takes rows from the Approach down to a floor. A body taller
+//!    than its rows scrolls (#94, `↑ ↓` a row, PgUp / PgDn the rows visible) and its last row
+//!    says how much is above and below (`↑ 3 · ↓ 6 more`).
 //! 3. Transcript and status: the last two transcript lines, then one line with the mic, system
 //!    and model dots and the two most useful shortcuts for the current state, followed by
 //!    `⏎ ask` (#96) and led, for 5 s after the model declined what Enter sent, by
-//!    `not a question`.
+//!    `not a question`. The keys name `←` once there is an earlier question and `↑↓` while the
+//!    open section is cut, and behind an earlier question they are led by the count of
+//!    questions that arrived since (`2 new`).
 //!
 //! From 120 columns (#88) the transcript is a right-hand column instead, 40 % of the width and
 //! the full height above the status line, wrapped with the newest line at the bottom; the
 //! question, the Approach and the sections keep the left in the same order, and the status line
 //! stays full-width. Narrower panes (the 100 × 30 and 80 × 24 above) are stacked as listed.
 //!
-//! Density rules: every field is cut to its area with `…` instead of growing it, and nothing
-//! expands on its own: a section opens only on its key, one at a time (`Question::open`).
+//! Density rules: every field is cut to its area with `…` instead of growing it (an open
+//! section's body with the scroll hint), and nothing expands on its own: a section opens only on
+//! its key, one at a time (`Question::open`).
 //!
 //! With interview assistance off (#79, Ctrl+Shift+A or `--no-assist`) there is no question and no
 //! Approach, so the screen is the transcript alone: every line of the session's window, wrapped
@@ -73,6 +80,17 @@ enum Mode {
     Listening,
     Live,
     Pinned,
+    /// An earlier question holds the screen (#94), whether or not the live one is pinned.
+    Earlier,
+}
+
+/// One press of a scroll key (#94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scroll {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
 }
 
 /// Everything the widgets read, worked out once per frame.
@@ -83,37 +101,46 @@ struct View<'a> {
     loading: bool,
     /// The live question's own reply is still streaming in.
     streaming: bool,
+    /// The open section's body is taller than its rows (#94): the footer offers the scroll
+    /// keys. Known once the frame is laid out.
+    scrollable: bool,
 }
 
 impl<'a> View<'a> {
     fn new(session: &'a Session) -> Self {
         let mode = match (&session.live, session.pinned) {
+            _ if session.earlier().is_some() => Mode::Earlier,
             (None, _) => Mode::Listening,
             (Some(_), true) => Mode::Pinned,
             (Some(_), false) => Mode::Live,
         };
         let live_candidate = session.live.as_ref().map(|q| q.candidate);
         // While pinned, a newer question queues instead of replacing this one, so the pinned
-        // Approach is not "previous" and stays at full strength.
+        // Approach is not "previous" and stays at full strength. So does an earlier question's
+        // (#94): what arrives behind it does not replace it either.
         // `r` dims the Approach on screen the same way until the new reply starts.
-        let loading = (mode != Mode::Pinned
+        let held = matches!(mode, Mode::Pinned | Mode::Earlier);
+        let loading = (!held
             && session
                 .pending
                 .is_some_and(|p| live_candidate.is_none_or(|c| c != p)))
-            || session.live.as_ref().is_some_and(|q| q.regenerating);
-        let streaming = session.live.as_ref().is_some_and(|q| {
-            q.progress == Progress::Streaming && session.pending == Some(q.candidate)
-        });
+            || (mode != Mode::Earlier && session.live.as_ref().is_some_and(|q| q.regenerating));
+        let streaming = mode != Mode::Earlier
+            && session.live.as_ref().is_some_and(|q| {
+                q.progress == Progress::Streaming && session.pending == Some(q.candidate)
+            });
         Self {
             session,
             mode,
             loading,
             streaming,
+            scrollable: false,
         }
     }
 
-    fn live(&self) -> Option<&'a Question> {
-        self.session.live.as_ref()
+    /// The question on screen: the live one, or the earlier one `←` stepped back to (#94).
+    fn shown(&self) -> Option<&'a Question> {
+        self.session.shown()
     }
 }
 
@@ -125,7 +152,7 @@ pub fn draw(frame: &mut Frame, session: &Session) {
 
 /// Draw the whole UI into `buf` within `area`.
 pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
-    let view = View::new(session);
+    let mut view = View::new(session);
     if session.assist_off {
         // #79: transcript first. The question and Approach areas would only ever be empty (or
         // stale), so their rows go to the transcript.
@@ -135,7 +162,45 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
         status::render_status(&view, s, buf);
         return;
     }
-    let (left, s) = if area.width >= SIDE_MIN_COLS {
+    let (left, transcript, shape, s) = frame(area);
+    status::render_transcript(&view, shape, transcript, buf);
+    let m = middle(&view, left);
+    view.scrollable = m.extent().is_some();
+    question::render(&view, m.question, buf);
+    approach::render(&view, m.approach, buf);
+    if let Some((plan, grid, body)) = &m.sections {
+        sections::render(plan, *grid, *body, buf);
+    }
+    status::render_status(&view, s, buf);
+}
+
+/// Where `by` takes the open section's scroll offset on a pane of `area` (#94): a row for the
+/// arrows, the rows visible for PgUp / PgDn, never past either end. `None` when the key moves
+/// nothing (no section open, a body that fits, or already at that end), so nothing is
+/// dispatched for it.
+pub fn scroll_to(session: &Session, area: Rect, by: Scroll) -> Option<u16> {
+    if session.assist_off {
+        return None;
+    }
+    let view = View::new(session);
+    let (left, ..) = frame(area);
+    let extent = middle(&view, left).extent()?;
+    let at = session.scroll.min(extent.max);
+    let page = extent.rows.max(1);
+    let to = match by {
+        Scroll::Up => at.saturating_sub(1),
+        Scroll::Down => at.saturating_add(1),
+        Scroll::PageUp => at.saturating_sub(page),
+        Scroll::PageDown => at.saturating_add(page),
+    }
+    .min(extent.max);
+    (to != session.scroll).then_some(to)
+}
+
+/// The three-area screen: the question and Approach (left on a wide pane), the transcript with
+/// its shape, and the status line.
+fn frame(area: Rect) -> (Rect, Rect, TranscriptArea, Rect) {
+    if area.width >= SIDE_MIN_COLS {
         // #88: question and Approach on the left, where they are read first; the transcript in a
         // column on the right, the full height above the full-width status line.
         let [body, s] =
@@ -145,8 +210,7 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
             Constraint::Percentage(SIDE_PERCENT),
         ])
         .areas(body);
-        status::render_transcript(&view, TranscriptArea::Column, right, buf);
-        (left, s)
+        (left, right, TranscriptArea::Column, s)
     } else {
         let [left, t, s] = Layout::vertical([
             Constraint::Min(0),
@@ -154,21 +218,44 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
             Constraint::Length(STATUS_ROWS),
         ])
         .areas(area);
-        status::render_transcript(&view, TranscriptArea::Strip, t, buf);
-        (left, s)
-    };
-    let [q, a] =
+        (left, t, TranscriptArea::Strip, s)
+    }
+}
+
+/// Areas 1 and 2 laid out: the question block, the Approach and, once the question on screen
+/// has section rows, their grid and the open one's body.
+struct Middle {
+    question: Rect,
+    approach: Rect,
+    sections: Option<(sections::Plan, Rect, Rect)>,
+}
+
+impl Middle {
+    /// How far the open section's body scrolls in the rows it got, if it is cut (#94).
+    fn extent(&self) -> Option<sections::Extent> {
+        let (plan, _, body) = self.sections.as_ref()?;
+        plan.extent(body.height)
+    }
+}
+
+fn middle(view: &View<'_>, left: Rect) -> Middle {
+    let [question, a] =
         Layout::vertical([Constraint::Length(QUESTION_ROWS), Constraint::Min(3)]).areas(left);
-    question::render(&view, q, buf);
-    match sections::plan(&view, a.width) {
-        None => approach::render(&view, a, buf),
+    match sections::plan(view, a.width) {
+        None => Middle {
+            question,
+            approach: a,
+            sections: None,
+        },
         Some(plan) => {
-            let [approach_area, grid, body] = split_middle(&view, &plan, a);
-            approach::render(&view, approach_area, buf);
-            sections::render(&plan, grid, body, buf);
+            let [approach, grid, body] = split_middle(view, &plan, a);
+            Middle {
+                question,
+                approach,
+                sections: Some((plan, grid, body)),
+            }
         }
     }
-    status::render_status(&view, s, buf);
 }
 
 /// Area 2 with sections on screen: the Approach on top, the grid of rows pinned under it, and

@@ -329,6 +329,23 @@ impl Question {
             self.open = None;
         }
     }
+
+    /// The next question takes the screen from this one (#94): it is kept as it stands and
+    /// nothing fills it from here on. A section still loading (the next question cancelled its
+    /// slow phase) settles on what had arrived, so its row never waits on a reply that is not
+    /// coming, and a retry or Swap that had not started is over.
+    fn archive(&mut self) {
+        if self.regenerating {
+            // As in `Session::settle`: what is on screen is the earlier, complete reply.
+            self.regenerating = false;
+            self.progress = Progress::Done;
+        }
+        self.no_other_story = false;
+        if self.sections.started {
+            self.sections.end(&SlowEnd::Done);
+        }
+        self.settle_open();
+    }
 }
 
 /// The three status dots.
@@ -436,6 +453,28 @@ pub struct Session {
     /// pipeline reads this to let Enter send the same turn again; the next Enter clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_failed: Option<u64>,
+    /// #94: every question shown before the live one, oldest first, each as it stood when the
+    /// next one took the screen from it (its focus, Approach, STAR cards, clarifications and
+    /// sections). In memory only: the store has its own rows and does not read these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Question>,
+    /// #94: the earlier question on screen, as its place in `history`; `None` on the live one.
+    /// While it is set it holds the screen the way a pin does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browsing: Option<usize>,
+    /// #94: questions that arrived while an earlier one held the screen; the status line counts
+    /// them (`2 new`) until the user is back on the live question.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unseen: usize,
+    /// #94: rows the open section of the question on screen is scrolled down
+    /// ([`Action::Scroll`]). 0 whenever no section is open, and again when the section closes
+    /// or another question takes the screen.
+    #[serde(default, skip_serializing_if = "not_scrolled")]
+    pub scroll: u16,
+}
+
+fn not_scrolled(rows: &u16) -> bool {
+    *rows == 0
 }
 
 /// The default question source is left out of a serialised session.
@@ -462,7 +501,48 @@ impl Session {
             .collect()
     }
 
-    /// Every question on screen: the live one and those queued behind a pin.
+    /// The earlier question `←` stepped back to (#94), while one holds the screen.
+    pub fn earlier(&self) -> Option<&Question> {
+        self.history.get(self.browsing?)
+    }
+
+    /// The question on screen: the earlier one while browsing (#94), else the live one.
+    pub fn shown(&self) -> Option<&Question> {
+        self.earlier().or(self.live.as_ref())
+    }
+
+    fn shown_mut(&mut self) -> Option<&mut Question> {
+        match self.browsing {
+            Some(at) if at < self.history.len() => self.history.get_mut(at),
+            _ => self.live.as_mut(),
+        }
+    }
+
+    /// Where the earlier question on screen is among every question shown, counted from 1, and
+    /// how many there are with the live one (#94): `(2, 5)` is "QUESTION 2 of 5".
+    pub fn place(&self) -> Option<(usize, usize)> {
+        let at = self.browsing.filter(|at| *at < self.history.len())?;
+        Some((
+            at + 1,
+            self.history.len() + usize::from(self.live.is_some()),
+        ))
+    }
+
+    /// `next` takes the live area (#94): the question it replaces joins the history.
+    fn show(&mut self, next: Question) {
+        if let Some(mut old) = self.live.replace(next) {
+            old.archive();
+            self.history.push(old);
+        }
+    }
+
+    /// What the scroll offset belongs to (#94): one open section of one question.
+    fn scrolled(&self) -> Option<(u64, Section)> {
+        let q = self.shown()?;
+        Some((q.candidate, q.open?))
+    }
+
+    /// Every question still being filled: the live one and those queued behind a pin.
     fn questions_mut(&mut self) -> impl Iterator<Item = &mut Question> {
         self.live.iter_mut().chain(self.queued.iter_mut())
     }
@@ -526,6 +606,16 @@ fn set_line(lines: &mut Vec<String>, index: usize, text: &str) {
 
 /// Apply one action. Pure: the result depends only on `s` and `action`.
 pub fn reduce(s: &mut Session, action: &Action) {
+    let scrolled = s.scrolled();
+    apply(s, action);
+    // #94: whatever closed the section or changed the question on screen (a key, a new
+    // question, an unpin, a row that settled empty), the next thing opened starts at its top.
+    if s.scrolled() != scrolled {
+        s.scroll = 0;
+    }
+}
+
+fn apply(s: &mut Session, action: &Action) {
     match action {
         Action::Started { label, at } => {
             *s = Session {
@@ -643,10 +733,14 @@ pub fn reduce(s: &mut Session, action: &Action) {
             }
             // #57: a new question starts with the promises still open.
             q.sections.add_promises(&s.promises);
+            // #94: behind an earlier question it is answered as any is, and counted.
+            if s.earlier().is_some() {
+                s.unseen += 1;
+            }
             if s.pinned && s.live.is_some() {
                 s.queued.push(q);
             } else {
-                s.live = Some(q);
+                s.show(q);
             }
         }
         Action::Clarification { candidate, text } => match s.live.as_mut() {
@@ -772,7 +866,7 @@ pub fn reduce(s: &mut Session, action: &Action) {
             }
         }
         Action::ToggleSection { section } => {
-            if let Some(q) = s.live.as_mut() {
+            if let Some(q) = s.shown_mut() {
                 if q.open == Some(*section) {
                     q.open = None;
                 } else if q.sections.visible(*section) {
@@ -818,9 +912,32 @@ pub fn reduce(s: &mut Session, action: &Action) {
             s.pinned = false;
             // SPEC § Live Question: "unpin shows the newest".
             if let Some(newest) = s.queued.pop() {
-                s.live = Some(newest);
+                s.show(newest);
             }
             s.queued.clear();
+        }
+        Action::Earlier => {
+            let from = s.place().map_or(s.history.len(), |(at, _)| at - 1);
+            // On the first question of the session there is nothing before it.
+            if let Some(at) = from.checked_sub(1) {
+                s.browsing = Some(at);
+            }
+        }
+        Action::Later => {
+            // `at` counts from 1, so it is the next one's place in `history`; past the newest
+            // earlier question is the live one.
+            s.browsing = s
+                .place()
+                .map(|(at, _)| at)
+                .filter(|at| *at < s.history.len());
+            if s.browsing.is_none() {
+                s.unseen = 0;
+            }
+        }
+        Action::Scroll { offset } => {
+            if s.scrolled().is_some() {
+                s.scroll = *offset;
+            }
         }
         Action::Status { dot, health } => {
             let slot = match dot {

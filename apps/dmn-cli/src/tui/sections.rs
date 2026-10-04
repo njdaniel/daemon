@@ -7,7 +7,8 @@
 //! that timed out a small `slow` tag, and a row with nothing for this question is hidden
 //! (`Sections::visible` decides). Exactly one section is open at a time and only by a key press
 //! (`Question::open`); its body goes under the grid, taking rows from the Approach area down to
-//! a floor, and is cut with `…` rather than growing past it.
+//! a floor, and is cut rather than growing past it. A cut body scrolls (#94): its last row is
+//! the position hint, `↓ 6 more` at the top, `↑ 3 · ↓ 3 more` on the way, `↑ 6` at the end.
 
 use dmn_session::{CodeBlock, Question, Section, SectionState};
 use ratatui::buffer::Buffer;
@@ -30,7 +31,7 @@ const MARGIN: u16 = 2;
 /// The body of an open section sits under its row's title: `1 ▾ ` is four cells.
 const BODY_INDENT: usize = 4;
 
-/// What the sections take on screen for the live question, worked out once per frame.
+/// What the sections take on screen for the question on screen, worked out once per frame.
 pub(super) struct Plan {
     /// The rows on screen, in the fixed order.
     rows: Vec<Section>,
@@ -41,6 +42,18 @@ pub(super) struct Plan {
     body: Vec<Line<'static>>,
     /// The Approach above is the previous question's while a new one loads: dim these too.
     dim: bool,
+    /// Rows the body is scrolled down (#94), as the session has it: [`render`] keeps it within
+    /// the body, which a resize can shorten under it.
+    scroll: u16,
+}
+
+/// How an open section's body that is taller than its area scrolls (#94).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Extent {
+    /// Body rows on screen: the area less the hint's row.
+    pub(super) rows: u16,
+    /// The offset that puts the body's last row on screen.
+    pub(super) max: u16,
 }
 
 impl Plan {
@@ -53,6 +66,15 @@ impl Plan {
     pub(super) fn body_rows(&self) -> u16 {
         u16::try_from(self.body.len()).unwrap_or(u16::MAX)
     }
+
+    /// How the body scrolls in `room` rows: `None` when it fits, and then it is drawn whole.
+    pub(super) fn extent(&self, room: u16) -> Option<Extent> {
+        let rows = room.checked_sub(1)?;
+        (self.body_rows() > room).then(|| Extent {
+            rows,
+            max: self.body_rows() - rows,
+        })
+    }
 }
 
 /// The key that toggles `section`: its place in the fixed order, from 1.
@@ -63,10 +85,10 @@ pub(super) fn key_of(section: Section) -> usize {
         .map_or(0, |i| i + 1)
 }
 
-/// The rows the live question shows, or `None` when it shows none (no question, or no slow
+/// The rows the question on screen shows, or `None` when it shows none (no question, or no slow
 /// phase has started for it).
 pub(super) fn plan(view: &View<'_>, area_width: u16) -> Option<Plan> {
-    let q = view.live()?;
+    let q = view.shown()?;
     let rows: Vec<Section> = Section::ALL
         .into_iter()
         .filter(|s| q.sections.visible(*s))
@@ -95,6 +117,7 @@ pub(super) fn plan(view: &View<'_>, area_width: u16) -> Option<Plan> {
         columns,
         body,
         dim: view.loading,
+        scroll: view.session.scroll,
     })
 }
 
@@ -143,17 +166,31 @@ pub(super) fn render(plan: &Plan, grid: Rect, body_area: Rect, buf: &mut Buffer)
             .saturating_sub(2 * MARGIN + u16::try_from(BODY_INDENT).unwrap_or(0)),
         ..body_area
     };
-    let room = usize::from(body_inner.height);
     let mut lines = plan.body.clone();
-    if lines.len() > room {
-        // Cut to the area, and say so, instead of pushing the transcript off the screen.
-        lines.truncate(room.saturating_sub(1));
+    if let Some(extent) = plan.extent(body_inner.height) {
+        // Cut to the area, and say so, instead of pushing the transcript off the screen: the
+        // rows from the scroll offset, then where that is in the body (#94).
+        let above = plan.scroll.min(extent.max);
+        lines = lines
+            .into_iter()
+            .skip(usize::from(above))
+            .take(usize::from(extent.rows))
+            .collect();
         lines.push(Line::from(Span::styled(
-            "…",
+            position(above, extent.max - above),
             Style::new().fg(Color::DarkGray),
         )));
     }
     Paragraph::new(lines).style(base).render(body_inner, buf);
+}
+
+/// The hint on a cut body's last row: the rows above the first one shown and below the last.
+fn position(above: u16, below: u16) -> String {
+    match (above, below) {
+        (0, _) => format!("↓ {below} more"),
+        (_, 0) => format!("↑ {above}"),
+        _ => format!("↑ {above} · ↓ {below} more"),
+    }
 }
 
 /// `1 ▸ Deeper Answer …` (collapsed, loading) or `2 ▾ Follow-up Questions` (open).
@@ -167,7 +204,7 @@ fn row_line(section: Section, plan: &Plan, cells: usize) -> Line<'static> {
         if open { "▾ " } else { "▸ " },
         Style::new().fg(Color::DarkGray),
     );
-    // `plan` only holds sections of the live question, whose state the tag reads.
+    // `plan` only holds sections of the question on screen, whose state the tag reads.
     let tag = plan_tag(plan, section);
     let tag_cells = tag.as_ref().map_or(0, |t| width(&t.content) + 1);
     let room = cells.saturating_sub(4 + tag_cells);

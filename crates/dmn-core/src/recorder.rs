@@ -410,8 +410,13 @@ impl StoreWriter {
             // The mode lands in the writer's own reduced state; each question row takes it from
             // there when it is inserted.
             | Action::CodingSolutions { .. }
-            // Which section is open is screen state; no row records it.
+            // Which section is open is screen state; no row records it. So are the earlier
+            // question on screen and how far a section is scrolled (#94): the history is kept in
+            // memory, and every question in it already has its rows.
             | Action::ToggleSection { .. }
+            | Action::Earlier
+            | Action::Later
+            | Action::Scroll { .. }
             // The matched story is stored where it matters, on the `star.story` of each
             // `Answered` payload; a swap writes through its `Question` and `Answered` like `r`.
             | Action::Stories { .. }

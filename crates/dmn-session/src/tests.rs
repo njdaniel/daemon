@@ -1573,3 +1573,415 @@ fn the_ask_key_survives_the_action_log_and_a_session_from_before_it_still_loads(
     );
     assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
 }
+
+// --- Earlier questions and scrolling (#94) ------------------------------------------------------
+
+/// Three questions shown one after the other, the first with a slow phase the second cut short:
+/// Deeper Answer had arrived, the other sections were still loading.
+fn three_questions() -> Vec<Action> {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(
+        1,
+        "How would you design a cache?",
+        &["LRU.", "TTLs."],
+    ));
+    log.push(Action::Focus {
+        candidate: 1,
+        text: "eviction, invalidation".into(),
+    });
+    log.push(Action::SlowStarted { candidate: 1 });
+    log.push(slow(1, deeper("Evict with LRU.")));
+    log.push(candidate(2, 60.0, "And how would you warm it?"));
+    log.extend(shown(2, "How would you warm it?", &["From the replica."]));
+    log.push(candidate(3, 120.0, "What breaks at ten times the load?"));
+    log.extend(shown(
+        3,
+        "What breaks at ten times the load?",
+        &["The hot keys.", "The eviction storm."],
+    ));
+    log
+}
+
+/// The question on screen, by its candidate id.
+fn on_screen(s: &Session) -> u64 {
+    s.shown().unwrap().candidate
+}
+
+fn kept(s: &Session) -> Vec<u64> {
+    s.history.iter().map(|q| q.candidate).collect()
+}
+
+#[test]
+fn every_question_shown_is_kept_in_order_as_it_stood_when_it_was_replaced() {
+    let s = Session::replay(&three_questions());
+    assert_eq!(s.live.as_ref().unwrap().candidate, 3);
+    assert_eq!(kept(&s), [1, 2]);
+    let first = &s.history[0];
+    assert_eq!(first.text, "How would you design a cache?");
+    assert_eq!(first.focus, "eviction, invalidation");
+    assert_eq!(first.approach, ["LRU.", "TTLs."]);
+    assert_eq!(first.sections.deeper[0].text, "Evict with LRU.");
+    assert_eq!(s.browsing, None, "nothing steps back on its own");
+    assert_eq!(on_screen(&s), 3);
+    assert_eq!(s.place(), None);
+}
+
+#[test]
+fn earlier_twice_shows_the_first_question_and_later_twice_returns_to_live() {
+    let mut log = three_questions();
+    log.push(Action::Earlier);
+    let s = Session::replay(&log);
+    assert_eq!((on_screen(&s), s.place()), (2, Some((2, 3))));
+
+    log.push(Action::Earlier);
+    let s = Session::replay(&log);
+    assert_eq!((on_screen(&s), s.place()), (1, Some((1, 3))));
+    let first = s.shown().unwrap();
+    assert_eq!(first.focus, "eviction, invalidation", "its own focus");
+    assert_eq!(first.approach, ["LRU.", "TTLs."], "its own Approach");
+    assert_eq!(first.sections.deeper[0].text, "Evict with LRU.");
+    assert_eq!(s.live.as_ref().unwrap().candidate, 3, "live is untouched");
+
+    // The first question of the session: nothing is before it.
+    log.push(Action::Earlier);
+    assert_eq!(Session::replay(&log), s);
+
+    log.push(Action::Later);
+    assert_eq!(on_screen(&Session::replay(&log)), 2);
+    log.push(Action::Later);
+    let back = Session::replay(&log);
+    assert_eq!((on_screen(&back), back.browsing), (3, None));
+    assert_eq!(
+        back,
+        Session::replay(&three_questions()),
+        "as if never left"
+    );
+
+    // The live question: nothing is after it.
+    log.push(Action::Later);
+    assert_eq!(Session::replay(&log), back);
+}
+
+#[test]
+fn the_first_question_of_a_session_has_nothing_before_it() {
+    let mut log = vec![Action::Earlier, Action::Later];
+    assert_eq!(Session::replay(&log), Session::default());
+    log.extend(shown(1, "How would you design a cache?", &["LRU."]));
+    let one = Session::replay(&log);
+    log.push(Action::Earlier);
+    assert_eq!(Session::replay(&log), one);
+}
+
+#[test]
+fn a_question_that_arrives_behind_an_earlier_one_is_answered_and_counted() {
+    let mut log = three_questions();
+    log.push(Action::Earlier);
+    log.push(candidate(4, 180.0, "How would you test it?"));
+    log.extend(shown(4, "How would you test it?", &["Replay traffic."]));
+    let s = Session::replay(&log);
+    assert_eq!(on_screen(&s), 2, "the screen keeps what it had");
+    assert_eq!(s.place(), Some((2, 4)));
+    assert_eq!(s.unseen, 1, "the status line says 1 new");
+    let live = s.live.as_ref().unwrap();
+    assert_eq!(live.candidate, 4);
+    assert_eq!(live.approach, ["Replay traffic."], "answered behind it");
+    assert_eq!(live.progress, Progress::Done);
+
+    // On the way back the question it replaced is one more step; then live, and the count goes.
+    log.push(Action::Later);
+    let s = Session::replay(&log);
+    assert_eq!((on_screen(&s), s.unseen), (3, 1));
+    log.push(Action::Later);
+    let s = Session::replay(&log);
+    assert_eq!((on_screen(&s), s.browsing, s.unseen), (4, None, 0));
+}
+
+#[test]
+fn a_clarification_behind_an_earlier_question_goes_to_the_live_one_uncounted() {
+    let mut log = three_questions();
+    log.push(Action::Earlier);
+    log.push(Action::Clarification {
+        candidate: 4,
+        text: "Read-heavy, you said?".into(),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(on_screen(&s), 2);
+    assert!(s.shown().unwrap().clarifications.is_empty());
+    assert_eq!(s.live.as_ref().unwrap().clarifications.len(), 1);
+    assert_eq!(s.unseen, 0, "it refines a question, it is not a new one");
+}
+
+#[test]
+fn a_split_question_is_one_entry_of_the_history_and_one_new_question() {
+    // #63: the second half replaces the first where it is, so the history never holds a half.
+    let mut log = split_question(false);
+    log.extend(shown(3, "How would you test it?", &["Replay traffic."]));
+    assert_eq!(
+        kept(&Session::replay(&log)),
+        [2],
+        "the whole question, once"
+    );
+
+    // Both halves arriving behind an earlier question count as the one question they are.
+    let mut log = three_questions();
+    log.push(Action::Earlier);
+    log.push(candidate(4, 180.0, "And if the cache"));
+    log.extend(shown(4, "What if the cache?", &["Half an answer."]));
+    log.push(candidate(5, 180.0, "And if the cache is cold, what then?"));
+    log.push(Action::Continues {
+        candidate: 5,
+        continued: 4,
+    });
+    log.extend(shown(5, "What if the cache is cold?", &["Warm it."]));
+    let s = Session::replay(&log);
+    assert_eq!(s.unseen, 1);
+    assert_eq!(kept(&s), [1, 2, 3]);
+    assert_eq!(s.live.as_ref().unwrap().candidate, 5);
+}
+
+#[test]
+fn browsing_with_a_pinned_question_leaves_the_pin_and_its_queue_as_they_were() {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["LRU."]));
+    log.extend(shown(2, "How would you warm it?", &["From the replica."]));
+    log.push(Action::Pin);
+    log.push(Action::Earlier);
+    log.extend(shown(
+        3,
+        "What breaks at ten times the load?",
+        &["Hot keys."],
+    ));
+    log.extend(shown(4, "How would you test it?", &["Replay traffic."]));
+    let s = Session::replay(&log);
+    assert_eq!(on_screen(&s), 1);
+    assert_eq!(s.unseen, 2, "2 new on the status line");
+    assert!(s.pinned);
+    assert_eq!(s.live.as_ref().unwrap().candidate, 2, "the pin holds");
+    assert_eq!(s.place(), Some((1, 2)), "queued questions were not shown");
+
+    // Back on live it is the pinned question with its queue, as if the user had never left.
+    log.push(Action::Later);
+    let back = Session::replay(&log);
+    assert_eq!((on_screen(&back), back.browsing, back.unseen), (2, None, 0));
+    assert!(back.pinned);
+    let queued: Vec<u64> = back.queued.iter().map(|q| q.candidate).collect();
+    assert_eq!(queued, [3, 4], "the badge says 2 new");
+    let never_left: Vec<Action> = log
+        .iter()
+        .filter(|a| !matches!(a, Action::Earlier | Action::Later))
+        .cloned()
+        .collect();
+    assert_eq!(back, Session::replay(&never_left));
+
+    // Unpin shows the newest, as today; the question that was pinned is now an earlier one.
+    log.push(Action::Unpin);
+    let end = Session::replay(&log);
+    assert_eq!(end.live.as_ref().unwrap().candidate, 4);
+    assert!(end.queued.is_empty());
+    assert_eq!(kept(&end), [1, 2]);
+}
+
+#[test]
+fn an_earlier_question_keeps_what_had_arrived_and_nothing_fills_it_afterwards() {
+    let mut log = three_questions();
+    let before = Session::replay(&log);
+    let first = &before.history[0];
+    // The second question cancelled the first's slow phase with five sections still loading:
+    // the one that had arrived is done, and the rest are not waited for.
+    assert_eq!(first.sections.states.deeper, SectionState::Done);
+    assert!(first.sections.visible(Section::Deeper));
+    for section in [Section::Followups, Section::Tradeoffs, Section::Example] {
+        assert_eq!(*first.sections.state(section), SectionState::Empty);
+        assert!(!first.sections.visible(section), "{section:?} has no row");
+    }
+    // A late field for it, a late end, a regenerate, a swap: none of them reach the history.
+    log.push(slow(
+        1,
+        SlowField::Followups {
+            items: vec!["Too late.".into()],
+        },
+    ));
+    log.push(slow_ended(1, SlowEnd::Done));
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::SwapStory { candidate: 1 });
+    assert_eq!(Session::replay(&log), before);
+}
+
+#[test]
+fn a_question_replaced_before_its_retry_started_is_kept_as_the_reply_it_showed() {
+    let mut log = vec![candidate(1, 10.0, "Design a cache?")];
+    log.extend(shown(1, "How would you design a cache?", &["LRU."]));
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(2, "How would you warm it?", &["From the replica."]));
+    let s = Session::replay(&log);
+    let first = &s.history[0];
+    assert!(!first.regenerating, "nothing dims an earlier question");
+    assert_eq!(first.progress, Progress::Done);
+    assert_eq!(first.approach, ["LRU."]);
+}
+
+#[test]
+fn the_section_keys_open_the_rows_of_the_question_on_screen() {
+    let mut log = three_questions();
+    log.push(Action::SlowStarted { candidate: 3 });
+    log.push(slow(3, deeper("Shard the hot keys.")));
+    log.push(Action::Earlier);
+    log.push(Action::Earlier);
+    log.push(toggle(Section::Deeper));
+    let s = Session::replay(&log);
+    assert_eq!(s.shown().unwrap().open, Some(Section::Deeper));
+    assert_eq!(s.live.as_ref().unwrap().open, None, "not the live one's");
+
+    // A row the earlier question does not have stays shut, as on the live one.
+    log.push(toggle(Section::Followups));
+    assert_eq!(
+        Session::replay(&log).shown().unwrap().open,
+        Some(Section::Deeper)
+    );
+
+    // What was open on it is still open when the user comes back to it.
+    log.extend([
+        Action::Later,
+        Action::Later,
+        Action::Earlier,
+        Action::Earlier,
+    ]);
+    let s = Session::replay(&log);
+    assert_eq!(on_screen(&s), 1);
+    assert_eq!(s.shown().unwrap().open, Some(Section::Deeper));
+}
+
+/// A question with Deeper Answer filled and open, scrolled `offset` rows.
+fn scrolled(offset: u16) -> Vec<Action> {
+    let mut log = sections_log(SlowEnd::Done);
+    log.push(toggle(Section::Deeper));
+    log.push(Action::Scroll { offset });
+    log
+}
+
+#[test]
+fn the_scroll_offset_is_kept_for_the_open_section_only() {
+    assert_eq!(Session::replay(&scrolled(4)).scroll, 4);
+    let mut up = scrolled(4);
+    up.push(Action::Scroll { offset: 0 });
+    assert_eq!(Session::replay(&up).scroll, 0);
+
+    // Nothing open, nothing to scroll.
+    let mut closed = sections_log(SlowEnd::Done);
+    closed.push(Action::Scroll { offset: 4 });
+    assert_eq!(Session::replay(&closed).scroll, 0);
+    assert_eq!(
+        Session::replay(&[Action::Scroll { offset: 4 }]),
+        Session::default()
+    );
+}
+
+#[test]
+fn the_scroll_offset_resets_when_the_section_closes_or_the_question_changes() {
+    let after = |more: Vec<Action>| {
+        let mut log = scrolled(4);
+        log.extend(more);
+        Session::replay(&log).scroll
+    };
+    assert_eq!(after(vec![toggle(Section::Deeper)]), 0, "closed");
+    assert_eq!(after(vec![toggle(Section::Followups)]), 0, "another opened");
+    assert_eq!(
+        after(shown(2, "How would you warm it?", &["From the replica."])),
+        0,
+        "a new question took the screen"
+    );
+    assert_eq!(
+        after(vec![slow(1, SlowField::Deeper { items: vec![] })]),
+        0,
+        "the open row settled empty and closed"
+    );
+    assert_eq!(
+        after(vec![Action::Started {
+            label: "next".into(),
+            at: 1_700_000_900,
+        }]),
+        0
+    );
+    // What does not change the section on screen leaves it where the user put it.
+    assert_eq!(after(vec![slow(1, deeper("Evict with LFU."))]), 4);
+    assert_eq!(after(vec![Action::Regenerate { candidate: 1 }]), 4);
+    assert_eq!(after(vec![Action::Pin]), 4);
+    assert_eq!(
+        after(vec![seg(Speaker::You, 30.0, 32.0, "So, LRU.", true)]),
+        4
+    );
+}
+
+#[test]
+fn the_scroll_offset_resets_on_a_step_and_holds_behind_an_earlier_question() {
+    let mut log = scrolled(4);
+    log.extend(shown(2, "How would you warm it?", &["From the replica."]));
+    log.push(Action::Earlier);
+    // The first question is on screen again with Deeper Answer open, from its top.
+    let s = Session::replay(&log);
+    assert_eq!(s.shown().unwrap().open, Some(Section::Deeper));
+    assert_eq!(s.scroll, 0);
+
+    log.push(Action::Scroll { offset: 2 });
+    // A question arriving behind it does not move what the user is reading.
+    log.extend(shown(3, "How would you test it?", &["Replay traffic."]));
+    let s = Session::replay(&log);
+    assert_eq!((on_screen(&s), s.scroll, s.unseen), (1, 2, 1));
+
+    log.push(Action::Later);
+    assert_eq!(
+        Session::replay(&log).scroll,
+        0,
+        "another question on screen"
+    );
+}
+
+#[test]
+fn unpin_resets_the_scroll_when_it_changes_the_question_on_screen() {
+    let mut log = scrolled(4);
+    log.push(Action::Pin);
+    log.extend(shown(2, "How would you warm it?", &["From the replica."]));
+    assert_eq!(Session::replay(&log).scroll, 4, "queued behind the pin");
+    log.push(Action::Unpin);
+    let s = Session::replay(&log);
+    assert_eq!((on_screen(&s), s.scroll), (2, 0));
+    assert_eq!(s.history[0].open, Some(Section::Deeper), "kept as it stood");
+}
+
+#[test]
+fn browsing_and_scrolling_survive_the_action_log_and_older_sessions_still_load() {
+    let mut log = three_questions();
+    log.extend([Action::Earlier, Action::Earlier, toggle(Section::Deeper)]);
+    log.push(Action::Scroll { offset: 3 });
+    log.extend(shown(4, "How would you test it?", &["Replay traffic."]));
+    let text: String = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap() + "\n")
+        .collect();
+    for line in [r#"{"type":"earlier"}"#, r#"{"type":"scroll","offset":3}"#] {
+        assert!(text.contains(line), "{line} in\n{text}");
+    }
+    assert_eq!(
+        serde_json::to_string(&Action::Later).unwrap(),
+        r#"{"type":"later"}"#
+    );
+    let back: Vec<Action> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let s = Session::replay(&back);
+    assert_eq!(s, Session::replay(&log));
+    assert_eq!((s.browsing, s.unseen, s.scroll), (Some(0), 1, 3));
+    let again: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(again, s);
+
+    // A session with one question serialises as it did before #94, and loads the same.
+    let mut one = vec![candidate(1, 10.0, "Design a cache?")];
+    one.extend(shown(1, "How would you design a cache?", &["LRU."]));
+    let bare = Session::replay(&one);
+    let json = serde_json::to_string(&bare).unwrap();
+    for key in ["\"history\"", "\"browsing\"", "\"unseen\"", "\"scroll\""] {
+        assert!(!json.contains(key), "{key} in {json}");
+    }
+    assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
+}

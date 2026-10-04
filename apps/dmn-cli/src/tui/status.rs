@@ -241,9 +241,9 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     });
     let used = Line::from(spans.clone()).width();
     // #96: the keys as long as the note fits whole beside them, `⏎ ask` going first: the note
-    // had those cells before the key did. A note too long for any form is cut, as it always
-    // was, beside the full keys.
-    let forms = shortcuts(view);
+    // had those cells before the key did. `← earlier` (#94) is the next to go. A note too long
+    // for any form is cut, as it always was, beside the full keys.
+    let Keys { lead, forms } = shortcuts(view);
     let whole = |keys: &&String| {
         note.as_ref()
             .is_none_or(|(d, _)| used + 2 + width(d) + width(keys) <= usize::from(area.width))
@@ -270,19 +270,43 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     // #79: the right-hand area is never cut (the left one is, on a narrow pane), so the one
     // state that changes what the screen is for leads it, in amber.
     // #96: the answer to an Enter the model declined leads it the same way, for its 5 s.
-    let mut right_spans = Vec::new();
-    let led = [ASSIST_OFF, NOT_A_QUESTION]
-        .into_iter()
-        .find_map(|lead| Some((lead, keys.strip_prefix(lead)?)));
-    if let Some((lead, _)) = led {
-        right_spans.push(Span::styled(lead, Style::new().fg(Color::Yellow)));
-    }
-    right_spans.push(Span::styled(
-        led.map_or(keys.as_str(), |(_, rest)| rest).to_owned(),
-        Style::new().fg(Color::DarkGray),
-    ));
+    // #94: and so does the count of questions that arrived behind an earlier one.
+    let rest = keys.strip_prefix(lead.as_str()).unwrap_or(&keys).to_owned();
+    let right_spans = vec![
+        Span::styled(lead, Style::new().fg(Color::Yellow)),
+        Span::styled(rest, Style::new().fg(Color::DarkGray)),
+    ];
     Paragraph::new(Line::from(right_spans)).render(right, buf);
 }
+
+/// The status line's right-hand side: the keys in every form they can take, longest first, and
+/// the state that leads each of them in amber (empty when none does).
+struct Keys {
+    lead: String,
+    forms: Vec<String>,
+}
+
+impl Keys {
+    /// `lead`, then `parts`, each form one part shorter than the one before. The lead is the
+    /// last to go; with none, the first part (the two keys for the state) always stays.
+    fn new(lead: &[String], parts: &[String]) -> Self {
+        let least = usize::from(lead.is_empty());
+        let forms = (least..=parts.len())
+            .rev()
+            .map(|n| {
+                let shown: Vec<&str> = lead.iter().chain(&parts[..n]).map(String::as_str).collect();
+                format!("{} ", shown.join(SEP))
+            })
+            .collect();
+        Self {
+            lead: lead.join(SEP),
+            forms,
+        }
+    }
+}
+
+/// Between two keys, and between the state that leads them and the first.
+const SEP: &str = " · ";
 
 /// #79: how the status line names assistance off; it leads the keys.
 const ASSIST_OFF: &str = "assist off";
@@ -301,19 +325,28 @@ const ASK: &str = "⏎ ask";
 /// the second one is `s` with the coding-solutions mode it would switch from (#50), so which
 /// mode Deeper Answer follows is always visible.
 ///
-/// Once the live question has section rows (#56), the first key is about them: `1–6 more`
-/// while all are closed, or the open one's own key to close it (`2 close`).
+/// Once the question on screen has section rows (#56), the first key is about them: `1–6 more`
+/// while all are closed, the open one's own key to close it (`2 close`), or `↑↓ scroll` while
+/// its body is taller than its rows (#94).
 ///
 /// While assistance is on, `⏎ ask` follows the two (#96), and `not a question` leads them for
-/// the 5 s after the model declined what Enter sent. Returned longest first, each form one part
-/// shorter than the one before: [`render_status`] takes the first that leaves the status note
-/// whole.
-fn shortcuts(view: &View<'_>) -> Vec<String> {
-    let coding = view.live().is_some_and(|q| q.kind == CODING);
+/// the 5 s after the model declined what Enter sent. Once the session has an earlier question,
+/// `← earlier` comes before `⏎ ask` (#94).
+///
+/// On an earlier question (#94) the two are the ways out of it, `← earlier` (not on the first)
+/// and `→ later`, or `→ live` from the newest of them, followed by the sections' key and
+/// `⏎ ask`; `p`, `r` and `w` act on the live question and are not offered. The count of
+/// questions that arrived meanwhile (`2 new`) leads.
+///
+/// Returned longest first ([`Keys::new`]): [`render_status`] takes the first form that leaves
+/// the status note whole.
+fn shortcuts(view: &View<'_>) -> Keys {
+    let coding = view.shown().is_some_and(|q| q.kind == CODING);
     let solutions = view.session.coding_solutions.label();
-    let sections = view.live().and_then(|q| {
+    let sections = view.shown().and_then(|q| {
         let visible = |s: &Section| q.sections.visible(*s);
         match q.open.filter(visible) {
+            Some(_) if view.scrollable => Some(SCROLL.to_owned()),
             Some(open) => Some(format!("{} close", key_of(open))),
             None => Section::ALL
                 .iter()
@@ -329,12 +362,42 @@ fn shortcuts(view: &View<'_>) -> Vec<String> {
     // #58: a STAR block built from one of several matched stories offers Swap in place of the
     // pin or redo key.
     let swap = view
-        .live()
+        .shown()
         .is_some_and(|q| q.star.is_some() && q.stories.len() > 1);
     if view.session.assist_off {
         // Ctrl+Shift+A in tmux's notation: short enough that an 80-column pane with every tag
         // (`system: all audio`, `es→en`) still shows the whole state.
-        return vec![format!("{ASSIST_OFF} · C-S-a on ")];
+        return Keys {
+            lead: ASSIST_OFF.to_owned(),
+            forms: vec![format!("{ASSIST_OFF} · C-S-a on ")],
+        };
+    }
+    // What leads the keys is the last part to go: the answer to Enter, and on an earlier
+    // question the count of those that arrived behind it.
+    let mut lead = Vec::new();
+    if view.session.not_a_question.is_some() {
+        lead.push(NOT_A_QUESTION.to_owned());
+    }
+    if let Some((at, of)) = view.session.place() {
+        if view.session.unseen > 0 {
+            lead.push(format!("{} new", view.session.unseen));
+        }
+        // `of` counts the live question, so the one before it is the newest earlier one.
+        let forward = if at + 1 == of {
+            "→ live"
+        } else {
+            "→ later"
+        };
+        let step = if at > 1 {
+            format!("{EARLIER} · {forward}")
+        } else {
+            forward.to_owned()
+        };
+        let parts: Vec<String> = [Some(step), sections, Some(ASK.to_owned())]
+            .into_iter()
+            .flatten()
+            .collect();
+        return Keys::new(&lead, &parts);
     }
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
@@ -345,16 +408,20 @@ fn shortcuts(view: &View<'_>) -> Vec<String> {
         (_, _, false, None) if swap => format!("{pin} · w swap"),
         (_, _, false, None) => format!("{pin} · r redo"),
     };
-    if view.session.not_a_question.is_some() {
-        // The answer to the key is the last part to go.
-        return vec![
-            format!("{NOT_A_QUESTION} · {pair} · {ASK} "),
-            format!("{NOT_A_QUESTION} · {pair} "),
-            format!("{NOT_A_QUESTION} "),
-        ];
-    }
-    vec![format!("{pair} · {ASK} "), format!("{pair} ")]
+    let earlier = (!view.session.history.is_empty()).then(|| EARLIER.to_owned());
+    let parts: Vec<String> = [Some(pair), earlier, Some(ASK.to_owned())]
+        .into_iter()
+        .flatten()
+        .collect();
+    Keys::new(&lead, &parts)
 }
+
+/// #94: `←` shows the question before the one on screen. Offered once there is one.
+const EARLIER: &str = "← earlier";
+
+/// #94: the arrows (and PgUp / PgDn) scroll the open section. Offered in place of its close key
+/// while its body is taller than its rows.
+const SCROLL: &str = "↑↓ scroll";
 
 /// The fast phase's `kind` for a coding question (SPEC § Transcription and question detection).
 const CODING: &str = "coding";

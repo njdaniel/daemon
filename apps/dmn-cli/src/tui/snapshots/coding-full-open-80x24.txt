@@ -17,8 +17,8 @@
       Solution · python
       import heapq
 
-      …
+      ↓ 10 more
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
 You         Sounds great.
 You         So I'd split the numbers into two halves around the median.
- ● mic  ● system  ● model                             1 close · s: full · ⏎ ask
+ ● mic  ● system  ● model                           ↑↓ scroll · s: full · ⏎ ask

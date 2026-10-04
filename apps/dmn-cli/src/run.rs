@@ -6,8 +6,9 @@
 //! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), Ctrl+Shift+A
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
 //! what the asking lane last said (the interviewer, by default) when the detector missed the
-//! question (#96), `q` (or Ctrl-C) quit. Nothing else writes to the terminal
-//! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
+//! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
+//! PgUp / PgDn scroll an open section taller than its rows (#94), `q` (or Ctrl-C) quit. Nothing
+//! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
 //!
@@ -28,6 +29,7 @@ use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths};
 use dmn_session::{CodingSolutions, Section, Session};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 use tokio::sync::watch;
 
 use crate::latency::{self, Screen, Seen};
@@ -97,6 +99,12 @@ pub enum Key {
     /// the mic under `you`, whichever spoke last under `both`. `r` only reaches a question
     /// already on screen.
     Ask,
+    /// `←` (#94): show the question before the one on screen.
+    Earlier,
+    /// `→` (#94): show the question after it; from the newest earlier one, the live question.
+    Later,
+    /// `↑ ↓ PgUp PgDn` (#94): scroll the open section, a row or the rows visible.
+    Scroll(tui::Scroll),
     Quit,
 }
 
@@ -125,13 +133,20 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
             .and_then(|d| Section::ALL.get(usize::try_from(d).ok()? - 1))
             .map(|s| Key::Section(*s)),
         KeyCode::Enter => Some(Key::Ask),
+        KeyCode::Left => Some(Key::Earlier),
+        KeyCode::Right => Some(Key::Later),
+        KeyCode::Up => Some(Key::Scroll(tui::Scroll::Up)),
+        KeyCode::Down => Some(Key::Scroll(tui::Scroll::Down)),
+        KeyCode::PageUp => Some(Key::Scroll(tui::Scroll::PageUp)),
+        KeyCode::PageDown => Some(Key::Scroll(tui::Scroll::PageDown)),
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Key::Quit),
         _ => None,
     }
 }
 
-/// Act on one key. Returns `true` when the TUI should close.
-pub fn press(k: Key, controls: &Controls) -> bool {
+/// Act on one key on a pane of `pane`, which decides how far a scroll key goes (#94). Returns
+/// `true` when the TUI should close.
+pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
     match k {
         Key::Pin => controls.toggle_pin(),
         Key::Regenerate => controls.regenerate(),
@@ -141,6 +156,9 @@ pub fn press(k: Key, controls: &Controls) -> bool {
         Key::Swap => controls.swap_story(),
         Key::Assist => controls.toggle_assist(),
         Key::Ask => controls.ask(),
+        Key::Earlier => controls.earlier(),
+        Key::Later => controls.later(),
+        Key::Scroll(by) => controls.scroll(|session| tui::scroll_to(session, pane, by)),
         Key::Quit => {
             controls.quit();
             return true;
@@ -344,7 +362,8 @@ fn ui_loop(
         match event::read()? {
             Event::Key(ev) => {
                 if let Some(k) = key(ev) {
-                    if press(k, controls) {
+                    let pane = terminal.size()?;
+                    if press(k, controls, Rect::new(0, 0, pane.width, pane.height)) {
                         return Ok(());
                     }
                     dirty = true;
@@ -442,12 +461,25 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    /// The pane every test here draws and presses its keys on: the scroll keys go as far as it
+    /// has rows (#94).
+    const PANE: Rect = Rect::new(0, 0, 100, 30);
+
+    fn press(k: Key, controls: &Controls) -> bool {
+        super::press(k, controls, PANE)
+    }
+
     fn press_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    /// The key an arrow or a page key maps to.
+    fn named(code: KeyCode) -> Key {
+        key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap()
+    }
+
     fn screen(session: &Session) -> String {
-        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut t = Terminal::new(TestBackend::new(PANE.width, PANE.height)).unwrap();
         t.draw(|f| tui::draw(f, session)).unwrap();
         let buf = t.backend().buffer();
         let mut out = String::new();
@@ -646,6 +678,344 @@ mod tests {
         assert_eq!(commands.try_recv(), Ok(Command::Ask));
         assert!(commands.try_recv().is_err(), "one press, one command");
         assert_eq!(screen(&hub.snapshot()), before);
+    }
+
+    /// Three questions shown one after the other, the first with a focus line of its own.
+    fn three_questions(hub: &dmn_session::SessionHub) {
+        for (candidate, text) in [
+            (1, "Design a rate limiter"),
+            (2, "Design a URL shortener"),
+            (3, "Design a job queue"),
+        ] {
+            for a in question(candidate, text) {
+                hub.dispatch(a);
+            }
+            if candidate == 1 {
+                hub.dispatch(Action::Focus {
+                    candidate,
+                    text: "limits, bursts".into(),
+                });
+            }
+        }
+    }
+
+    fn status_line(screen: &str) -> &str {
+        screen.lines().last().unwrap_or_default()
+    }
+
+    #[test]
+    fn the_arrows_and_page_keys_map_to_browsing_and_scrolling() {
+        assert_eq!(named(KeyCode::Left), Key::Earlier);
+        assert_eq!(named(KeyCode::Right), Key::Later);
+        assert_eq!(named(KeyCode::Up), Key::Scroll(tui::Scroll::Up));
+        assert_eq!(named(KeyCode::Down), Key::Scroll(tui::Scroll::Down));
+        assert_eq!(named(KeyCode::PageUp), Key::Scroll(tui::Scroll::PageUp));
+        assert_eq!(named(KeyCode::PageDown), Key::Scroll(tui::Scroll::PageDown));
+        let mut release = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        assert_eq!(key(release), None);
+    }
+
+    #[test]
+    fn left_twice_shows_the_first_question_and_right_twice_returns_to_live() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        three_questions(hub);
+        let live = screen(&hub.snapshot());
+        assert!(live.contains("LIVE QUESTION"), "{live}");
+        assert!(live.contains("Design a job queue"), "{live}");
+        assert!(
+            status_line(&live).contains("← earlier · ⏎ ask"),
+            "the footer names the key once there is an earlier question:\n{live}"
+        );
+
+        assert!(!press(named(KeyCode::Left), &controls), "← does not quit");
+        let second = screen(&hub.snapshot());
+        assert!(second.contains("QUESTION 2 of 3"), "{second}");
+        assert!(!second.contains("LIVE QUESTION"), "{second}");
+        assert!(
+            second.contains("first step for Design a URL shortener"),
+            "{second}"
+        );
+        assert!(!second.contains("job queue"), "{second}");
+        assert!(
+            status_line(&second).contains("← earlier · → live"),
+            "{second}"
+        );
+
+        press(named(KeyCode::Left), &controls);
+        let first = screen(&hub.snapshot());
+        assert!(first.contains("QUESTION 1 of 3"), "{first}");
+        assert!(first.contains("Design a rate limiter"), "{first}");
+        assert!(first.contains("Focus: limits, bursts"), "its own:\n{first}");
+        assert!(
+            first.contains("first step for Design a rate limiter"),
+            "{first}"
+        );
+        assert!(status_line(&first).contains("→ later"), "{first}");
+        assert!(!status_line(&first).contains("← earlier"), "{first}");
+
+        // Nothing is before the first question.
+        press(named(KeyCode::Left), &controls);
+        assert_eq!(screen(&hub.snapshot()), first);
+
+        press(named(KeyCode::Right), &controls);
+        assert_eq!(screen(&hub.snapshot()), second);
+        press(named(KeyCode::Right), &controls);
+        assert_eq!(screen(&hub.snapshot()), live);
+        // Nor anything after the live one.
+        press(named(KeyCode::Right), &controls);
+        assert_eq!(screen(&hub.snapshot()), live);
+    }
+
+    #[test]
+    fn a_question_behind_an_earlier_one_changes_only_the_count_until_the_user_returns() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        three_questions(hub);
+        press(named(KeyCode::Left), &controls);
+        let before = screen(&hub.snapshot());
+        assert!(!status_line(&before).contains("new"), "{before}");
+
+        for a in question(4, "Design a search index") {
+            hub.dispatch(a);
+        }
+        let behind = screen(&hub.snapshot());
+        assert!(status_line(&behind).contains("1 new · "), "{behind}");
+        // The status line apart, the screen is what it was: `2 of 3` is now `2 of 4`.
+        let above = |s: &str| {
+            s.lines()
+                .take(usize::from(PANE.height) - 1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            above(&behind),
+            above(&before).replace("QUESTION 2 of 3", "QUESTION 2 of 4")
+        );
+        assert!(!behind.contains("search index"), "{behind}");
+
+        press(named(KeyCode::Right), &controls);
+        press(named(KeyCode::Right), &controls);
+        let back = screen(&hub.snapshot());
+        assert!(back.contains("LIVE QUESTION"), "{back}");
+        assert!(
+            back.contains("first step for Design a search index"),
+            "with its Approach:\n{back}"
+        );
+        assert!(!status_line(&back).contains("new"), "{back}");
+    }
+
+    #[test]
+    fn an_earlier_question_is_read_only_and_enter_still_asks() {
+        use dmn_session::StarCards;
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        for a in question(1, "Design a rate limiter") {
+            hub.dispatch(a);
+        }
+        // The live question is one `w` and `r` would act on: STAR cards from two stories.
+        hub.dispatch(Action::Question {
+            candidate: 2,
+            text: "Tell me about a time you disagreed with a decision.".into(),
+            kind: "behavioral".into(),
+        });
+        hub.dispatch(Action::Star {
+            candidate: 2,
+            cards: StarCards {
+                action: "Built a two-day spike.".into(),
+                ..StarCards::default()
+            },
+        });
+        hub.dispatch(Action::Stories {
+            candidate: 2,
+            ranked: vec!["stories/broker.md".into(), "stories/replay.md".into()],
+        });
+        press(named(KeyCode::Left), &controls);
+        let earlier = hub.snapshot();
+        assert!(screen(&earlier).contains("QUESTION 1 of 2"));
+
+        for c in ['r', 'w', 'p'] {
+            assert!(!press(key(press_key(c)).unwrap(), &controls));
+            assert!(commands.try_recv().is_err(), "{c} asks the model nothing");
+            assert_eq!(hub.snapshot(), earlier, "{c} changes nothing");
+        }
+        // Enter is about what was just said, not about the question on screen: it asks, and
+        // what it finds arrives behind the earlier question like any other.
+        press(named(KeyCode::Enter), &controls);
+        assert_eq!(commands.try_recv(), Ok(Command::Ask));
+        assert_eq!(hub.snapshot(), earlier);
+
+        // Back on the live question the keys act on it again.
+        press(named(KeyCode::Right), &controls);
+        press(Key::Swap, &controls);
+        assert_eq!(commands.try_recv(), Ok(Command::Swap { candidate: 2 }));
+        press(Key::Regenerate, &controls);
+        assert_eq!(commands.try_recv(), Ok(Command::Regenerate));
+        press(Key::Pin, &controls);
+        assert!(hub.snapshot().pinned);
+    }
+
+    #[test]
+    fn browsing_behind_a_pin_leaves_the_pin_and_its_queue_as_they_were() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        for a in question(1, "Design a rate limiter") {
+            hub.dispatch(a);
+        }
+        for a in question(2, "Design a URL shortener") {
+            hub.dispatch(a);
+        }
+        press(Key::Pin, &controls);
+        press(named(KeyCode::Left), &controls);
+        for a in question(3, "Design a job queue") {
+            hub.dispatch(a);
+        }
+        let earlier = screen(&hub.snapshot());
+        assert!(earlier.contains("QUESTION 1 of 2"), "{earlier}");
+        assert!(!earlier.contains("PINNED"), "{earlier}");
+        assert!(status_line(&earlier).contains("1 new"), "{earlier}");
+
+        press(named(KeyCode::Right), &controls);
+        let pinned = screen(&hub.snapshot());
+        assert!(pinned.contains("PINNED QUESTION"), "{pinned}");
+        assert!(pinned.contains("Design a URL shortener"), "{pinned}");
+        let title = pinned.lines().next().unwrap_or_default();
+        assert!(title.contains("1 new"), "the badge, as today:\n{pinned}");
+        assert!(!status_line(&pinned).contains("new"), "{pinned}");
+
+        press(Key::Pin, &controls);
+        let unpinned = screen(&hub.snapshot());
+        assert!(unpinned.contains("LIVE QUESTION"), "{unpinned}");
+        assert!(unpinned.contains("Design a job queue"), "{unpinned}");
+    }
+
+    /// A coding question whose worked solution is `lines` rows of code, Deeper Answer closed.
+    fn solution(hub: &dmn_session::SessionHub, lines: usize) {
+        use dmn_session::{CodeBlock, SlowEnd, SlowField};
+        hub.dispatch(Action::Question {
+            candidate: 1,
+            text: "Reverse a linked list in place.".into(),
+            kind: "coding".into(),
+        });
+        hub.dispatch(Action::ApproachLine {
+            candidate: 1,
+            index: 0,
+            text: "Walk the list with three pointers.".into(),
+        });
+        hub.dispatch(Action::SlowStarted { candidate: 1 });
+        hub.dispatch(Action::Slow {
+            candidate: 1,
+            field: SlowField::Solution {
+                code: CodeBlock {
+                    language: "python".into(),
+                    code: (1..=lines)
+                        .map(|n| format!("line {n:02}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                },
+            },
+        });
+        hub.dispatch(Action::SlowEnded {
+            candidate: 1,
+            end: SlowEnd::Done,
+            payload: "{}".into(),
+            at: 0,
+        });
+    }
+
+    #[test]
+    fn the_scroll_keys_take_a_tall_section_to_its_last_row_and_stop_at_both_ends() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        // A header row and 30 rows of code, in the 16 rows a 100 × 30 pane leaves the body.
+        solution(hub, 30);
+        press(key(press_key('1')).unwrap(), &controls);
+        let top = screen(&hub.snapshot());
+        assert!(top.contains("Solution · python"), "{top}");
+        assert!(top.contains("line 14") && !top.contains("line 15"), "{top}");
+        assert!(top.contains("↓ 16 more"), "{top}");
+        assert!(
+            status_line(&top).contains("↑↓ scroll · s: hints"),
+            "the footer names the keys while the body is cut:\n{top}"
+        );
+
+        // Already at the top: nothing moves, and nothing is dispatched for it.
+        let mut actions = hub.subscribe();
+        for k in [KeyCode::Up, KeyCode::PageUp] {
+            assert!(!press(named(k), &controls), "{k:?} does not quit");
+        }
+        assert!(actions.try_recv().is_err());
+        assert_eq!(screen(&hub.snapshot()), top);
+
+        press(named(KeyCode::Down), &controls);
+        assert_eq!(hub.snapshot().scroll, 1);
+        let one = screen(&hub.snapshot());
+        assert!(!one.contains("Solution · python"), "{one}");
+        assert!(one.contains("line 01") && one.contains("line 15"), "{one}");
+        assert!(one.contains("↑ 1 · ↓ 15 more"), "{one}");
+
+        // PgDn goes by the 15 rows on screen, which here is all that is left.
+        press(named(KeyCode::PageDown), &controls);
+        assert_eq!(hub.snapshot().scroll, 16);
+        let end = screen(&hub.snapshot());
+        assert!(
+            end.contains("line 16") && end.contains("line 30") && !end.contains("line 15"),
+            "{end}"
+        );
+        assert!(end.contains("↑ 16") && !end.contains("more"), "{end}");
+
+        let mut actions = hub.subscribe();
+        for k in [KeyCode::Down, KeyCode::PageDown] {
+            press(named(k), &controls);
+        }
+        assert!(actions.try_recv().is_err(), "it stops at the last row");
+        assert_eq!(screen(&hub.snapshot()), end);
+
+        press(named(KeyCode::Up), &controls);
+        assert_eq!(hub.snapshot().scroll, 15);
+        press(named(KeyCode::PageUp), &controls);
+        press(named(KeyCode::PageUp), &controls);
+        assert_eq!(screen(&hub.snapshot()), top);
+
+        // Closing the section forgets the offset: opened again, it starts from its top.
+        press(named(KeyCode::PageDown), &controls);
+        press(key(press_key('1')).unwrap(), &controls);
+        assert_eq!(hub.snapshot().scroll, 0);
+        press(key(press_key('1')).unwrap(), &controls);
+        assert_eq!(screen(&hub.snapshot()), top);
+    }
+
+    #[test]
+    fn the_scroll_keys_do_nothing_to_a_section_that_fits_or_with_none_open() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        solution(hub, 5);
+        let mut actions = hub.subscribe();
+        let closed = screen(&hub.snapshot());
+        press(named(KeyCode::Down), &controls);
+        assert!(actions.try_recv().is_err(), "nothing is open");
+        assert_eq!(screen(&hub.snapshot()), closed);
+
+        press(key(press_key('1')).unwrap(), &controls);
+        let open = screen(&hub.snapshot());
+        assert!(open.contains("line 05"), "{open}");
+        assert!(
+            !open.contains("more"),
+            "a body that fits has no hint:\n{open}"
+        );
+        assert!(status_line(&open).contains("1 close · s: hints"), "{open}");
+        let mut actions = hub.subscribe();
+        for k in [
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::Up,
+            KeyCode::PageUp,
+        ] {
+            press(named(k), &controls);
+        }
+        assert!(actions.try_recv().is_err());
+        assert_eq!(screen(&hub.snapshot()), open);
     }
 
     #[test]

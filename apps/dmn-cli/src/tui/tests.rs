@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 26] = [
+const STATES: [&str; 29] = [
     "listening",
     "live",
     "pinned",
@@ -56,10 +56,23 @@ const STATES: [&str; 26] = [
     // and to a detector candidate (nothing is said).
     "asked-not-a-question",
     "detected-not-a-question",
+    // #94: the first of three questions on screen again with one of its sections open; the
+    // second of five, two of which arrived behind it; a solution taller than its rows, scrolled.
+    "earlier",
+    "earlier-new",
+    "scrolled",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
-const WIDE_STATES: [&str; 4] = ["live", "pinned", "sections-open-1", "behavioral"];
+const WIDE_STATES: [&str; 7] = [
+    "live",
+    "pinned",
+    "sections-open-1",
+    "behavioral",
+    "earlier",
+    "earlier-new",
+    "scrolled",
+];
 const WIDE: (u16, u16) = (140, 30);
 
 fn updating() -> bool {
@@ -727,10 +740,167 @@ fn actions(state: &str) -> Vec<Action> {
                 score: if asked { 0 } else { 3 },
             });
         }
+        // #94: three questions, then `←` twice and `2`: the first one again, with its own focus,
+        // Approach and sections, Follow-up Questions open.
+        "earlier" => {
+            a.extend(sections());
+            a.extend(follow_on(2));
+            a.extend(follow_on(3));
+            a.extend([Action::Earlier, Action::Earlier]);
+            a.push(Action::ToggleSection {
+                section: Section::Followups,
+            });
+        }
+        // #94: `←` once from the third question, then two more arrive behind the second: the
+        // screen keeps it, the title counts five and the status line says `2 new`.
+        "earlier-new" => {
+            a.extend(sections());
+            a.extend(follow_on(2));
+            a.extend(follow_on(3));
+            a.push(Action::Earlier);
+            a.extend(follow_on(4));
+            a.extend(follow_on(5));
+        }
+        // #94: a worked solution of 36 lines under two rows of hints, Deeper Answer open and
+        // scrolled nine rows down.
+        "scrolled" => {
+            a.push(Action::CodingSolutions {
+                mode: CodingSolutions::Full,
+            });
+            a.extend(lru_question());
+            a.push(Action::ToggleSection {
+                section: Section::Deeper,
+            });
+            a.push(Action::Scroll { offset: 9 });
+        }
         other => panic!("no actions for state {other}"),
     }
     a
 }
+
+/// #94: the questions that follow the rate limiter's, each answered in full; `id` is the
+/// candidate, 2 to 5.
+fn follow_on(id: u64) -> Vec<Action> {
+    let (question, focus, approach): (&str, &str, &[&str]) = match id {
+        2 => (
+            "Where would you put the limiter in the request path?",
+            "gateway, edge, CDN",
+            &[
+                "Enforce at the gateway, behind the CDN.",
+                "Keep a coarse per-IP limit at the edge for abuse.",
+            ],
+        ),
+        3 => (
+            "How would you test the limiter before rolling it out?",
+            "shadow traffic, staged rollout, kill switch",
+            &[
+                "Replay a day of production traffic against a shadow limiter.",
+                "Compare its decisions with the old limiter's before enforcing.",
+                "Roll out region by region, with a kill switch.",
+            ],
+        ),
+        4 => (
+            "What would you alert on once it is live?",
+            "rejection rate, latency, Redis health",
+            &[
+                "Rejection rate per tier against its baseline.",
+                "Limiter latency at p99, and Redis errors.",
+            ],
+        ),
+        _ => (
+            "How does the design change if there is only one region?",
+            "exact counts, no reconciliation",
+            &["One Redis, exact counts, nothing to reconcile."],
+        ),
+    };
+    answered(id, question, "system_design", focus, approach)
+}
+
+/// #94: a coding question whose worked solution is taller than any pane the tests draw.
+fn lru_question() -> Vec<Action> {
+    let mut a = answered(
+        1,
+        "Implement an LRU cache with O(1) get and put.",
+        "coding",
+        "hash map, doubly linked list, eviction order",
+        &[
+            "Keep a hash map from key to node, and the nodes in a doubly linked list.",
+            "Move a node to the front on every get and put.",
+            "On overflow, drop the node at the back and its key.",
+        ],
+    );
+    a.push(Action::SlowStarted { candidate: 1 });
+    a.push(slow(
+        1,
+        SlowField::Deeper {
+            items: vec![DeeperItem {
+                label: "Insight".into(),
+                text: "The list holds the order and the map finds a node in O(1); two sentinel \
+                       nodes mean no insert or unlink ever checks for an empty list."
+                    .into(),
+            }],
+        },
+    ));
+    a.push(slow(
+        1,
+        SlowField::Solution {
+            code: CodeBlock {
+                language: "python".into(),
+                code: LRU_SOLUTION.into(),
+            },
+        },
+    ));
+    a.push(slow_ended(1, SlowEnd::Done));
+    a.push(seg(
+        Speaker::You,
+        31.0,
+        36.0,
+        "I'd pair a dictionary with a doubly linked list.",
+        true,
+    ));
+    a
+}
+
+const LRU_SOLUTION: &str = "\
+class Node:
+    def __init__(self, key, value):
+        self.key, self.value = key, value
+        self.prev = self.next = None
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.items = {}
+        self.head, self.tail = Node(None, None), Node(None, None)
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _unlink(self, node):
+        node.prev.next, node.next.prev = node.next, node.prev
+
+    def _push_front(self, node):
+        node.prev, node.next = self.head, self.head.next
+        self.head.next.prev = node
+        self.head.next = node
+
+    def get(self, key):
+        node = self.items.get(key)
+        if node is None:
+            return -1
+        self._unlink(node)
+        self._push_front(node)
+        return node.value
+
+    def put(self, key, value):
+        if key in self.items:
+            self._unlink(self.items[key])
+        node = Node(key, value)
+        self.items[key] = node
+        self._push_front(node)
+        if len(self.items) > self.capacity:
+            oldest = self.tail.prev
+            self._unlink(oldest)
+            del self.items[oldest.key]
+";
 
 /// #79's fixture: a translated exchange, some lines long enough to wrap at 80 columns.
 const ASSIST_OFF_TURNS: [(Speaker, &str); 7] = [
@@ -1518,6 +1688,214 @@ fn tui_the_model_dot_names_the_provider_and_a_remote_one_says_text_leaves() {
     // At 80 columns the notice still fits beside the dots.
     let narrow = text(&render(&Session::replay(&actions), (80, 24)));
     assert!(narrow.contains("leaves this machine"), "{narrow}");
+}
+
+// --- #94: earlier questions and a section that scrolls -----------------------------------------
+
+#[test]
+fn tui_an_earlier_question_is_titled_with_its_place_and_is_never_dimmed() {
+    let mut a = actions("earlier");
+    // A candidate out to the model dims the live Approach; the one on screen is not the live one.
+    a.push(Action::Candidate {
+        id: 9,
+        speaker: Speaker::Interviewer,
+        start: 200.0,
+        end: 204.0,
+        text: "And at ten times the load?".into(),
+        score: 5,
+    });
+    for size in [(100, 30), WIDE] {
+        let buf = render(&Session::replay(&a), size);
+        let (x, y) = row_containing(&buf, "QUESTION 1 of 3");
+        assert_eq!((y, buf[(x, y)].fg), (0, Color::Gray));
+        let screen = text(&buf);
+        assert!(!screen.contains("LIVE QUESTION"), "{screen}");
+        assert!(!screen.contains("thinking…"), "{screen}");
+        let (x, y) = row_containing(&buf, "Clarify scope");
+        assert!(!buf[(x, y)].modifier.contains(Modifier::DIM), "{screen}");
+        // Its own focus and sections, the one the key opened among them.
+        assert!(
+            screen.contains("Focus: architecture, consistency"),
+            "{screen}"
+        );
+        assert!(screen.contains("2 ▾ Follow-up Questions"), "{screen}");
+        assert!(
+            screen.contains("• How would you rate-limit a key"),
+            "{screen}"
+        );
+        assert!(!screen.contains("before rolling it out"), "{screen}");
+        let keys = status_line(&Session::replay(&a), size);
+        assert!(keys.ends_with(" → later · 2 close · ⏎ ask"), "{keys}");
+    }
+}
+
+#[test]
+fn tui_questions_behind_an_earlier_one_are_counted_in_amber_on_the_status_line() {
+    for size in [(100, 30), WIDE] {
+        let buf = render(&load("earlier-new"), size);
+        let (x, y) = row_containing(&buf, "2 new");
+        assert_eq!(y, size.1 - 1, "on the status line");
+        assert_eq!(buf[(x, y)].fg, Color::Yellow);
+        let screen = text(&buf);
+        assert!(screen.contains("QUESTION 2 of 5"), "{screen}");
+        assert!(
+            screen.contains("Where would you put the limiter"),
+            "the screen keeps the question it had:\n{screen}"
+        );
+        assert!(!screen.contains("only one region"), "{screen}");
+        assert!(
+            screen.ends_with(" 2 new · ← earlier · → later · ⏎ ask\n"),
+            "{screen}"
+        );
+        // Nothing is counted until something arrives.
+        assert!(!status_line(&load("earlier"), size).contains("new"));
+    }
+}
+
+#[test]
+fn tui_the_earlier_key_is_named_once_there_is_one_and_yields_to_a_status_note_after_ask() {
+    assert!(status_line(&load("live"), (100, 30)).ends_with(" p pin · r redo · ⏎ ask"));
+    let mut two = actions("live");
+    two.extend(follow_on(2));
+    let keys = status_line(&Session::replay(&two), (100, 30));
+    assert!(
+        keys.ends_with(" p pin · r redo · ← earlier · ⏎ ask"),
+        "{keys}"
+    );
+
+    // Beside "transcript leaves this machine" the keys go from the end, one at a time, as far
+    // as the note needs: `⏎ ask` first (#96), then `← earlier`.
+    two.push(Action::Provider {
+        label: dmn_session::ProviderLabel {
+            name: "anthropic".into(),
+            model: "m".into(),
+            remote: true,
+        },
+    });
+    let remote = Session::replay(&two);
+    for (width, keys) in [
+        (100, " p pin · r redo · ← earlier · ⏎ ask"),
+        (90, " p pin · r redo · ← earlier"),
+        (80, " p pin · r redo"),
+    ] {
+        let line = status_line(&remote, (width, 30));
+        assert!(
+            line.contains("transcript leaves this machine") && line.ends_with(keys),
+            "{width}: {line}"
+        );
+    }
+
+    // On an earlier question the count is the last to go, as `not a question` is.
+    let mut behind = actions("earlier-new");
+    behind.push(Action::Provider {
+        label: dmn_session::ProviderLabel {
+            name: "anthropic".into(),
+            model: "m".into(),
+            remote: true,
+        },
+    });
+    let line = status_line(&Session::replay(&behind), (80, 24));
+    assert!(
+        line.contains("transcript leaves this machine") && line.ends_with(" 2 new"),
+        "{line}"
+    );
+}
+
+#[test]
+fn tui_a_cut_section_says_how_much_is_above_and_below_it() {
+    for size in [(100, 30), WIDE] {
+        let mut s = load("scrolled");
+        let buf = render(&s, size);
+        let (x, y) = row_containing(&buf, "↑ 9 · ↓ ");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray);
+        let scrolled = text(&buf);
+        assert!(
+            !scrolled.contains("Insight:") && !scrolled.contains("class LRUCache"),
+            "nine rows are above:\n{scrolled}"
+        );
+        assert!(scrolled.contains("def _unlink(self, node):"), "{scrolled}");
+        assert!(status_line(&s, size).contains("↑↓ scroll"), "{scrolled}");
+
+        // At its top the hint counts only what is below.
+        s.scroll = 0;
+        let top = text(&render(&s, size));
+        assert!(top.contains("Insight:"), "{top}");
+        assert!(top.contains("      ↓ ") && !top.contains("↑ "), "{top}");
+
+        // An offset past the end (the pane grew under it) shows the last row, not a blank.
+        s.scroll = u16::MAX;
+        let end = text(&render(&s, size));
+        assert!(end.contains("del self.items[oldest.key]"), "{end}");
+        assert!(end.contains("      ↑ ") && !end.contains("more"), "{end}");
+    }
+}
+
+#[test]
+fn tui_a_section_that_fits_is_drawn_whole_with_no_hint() {
+    for n in 1..=6 {
+        let s = load(&format!("sections-open-{n}"));
+        let screen = text(&render(&s, (100, 30)));
+        assert!(
+            !screen.contains(" more\n") && !screen.contains('↑'),
+            "section {n}:\n{screen}"
+        );
+        for by in [
+            super::Scroll::Up,
+            super::Scroll::Down,
+            super::Scroll::PageUp,
+            super::Scroll::PageDown,
+        ] {
+            let pane = ratatui::layout::Rect::new(0, 0, 100, 30);
+            assert_eq!(super::scroll_to(&s, pane, by), None, "section {n} {by:?}");
+        }
+    }
+}
+
+#[test]
+fn tui_scroll_keys_go_a_row_or_the_rows_on_screen_and_stop_at_both_ends() {
+    use super::{Scroll, scroll_to};
+    use ratatui::layout::Rect;
+    // The body's rows less the hint's: 13 under the Approach at 100 × 30, 16 on the wide pane.
+    for ((w, h), page) in [((100, 30), 13), (WIDE, 16)] {
+        let pane = Rect::new(0, 0, w, h);
+        let mut s = load("scrolled");
+        s.scroll = 0;
+        assert_eq!(scroll_to(&s, pane, Scroll::Up), None);
+        assert_eq!(scroll_to(&s, pane, Scroll::PageUp), None);
+        assert_eq!(scroll_to(&s, pane, Scroll::Down), Some(1));
+        assert_eq!(scroll_to(&s, pane, Scroll::PageDown), Some(page));
+
+        // PgDn to the end: every press moves, and the last one lands on the last row.
+        let mut presses = 0;
+        while let Some(to) = scroll_to(&s, pane, Scroll::PageDown) {
+            assert!(to > s.scroll && to - s.scroll <= page);
+            s.scroll = to;
+            presses += 1;
+            assert!(presses < 10, "it ends");
+        }
+        let end = text(&render(&s, (w, h)));
+        assert!(end.contains("del self.items[oldest.key]"), "{end}");
+        // The hint's row, up to the transcript column's edge on the wide pane.
+        let hint = format!("↑ {}", s.scroll);
+        assert!(
+            end.lines()
+                .any(|row| row.split('│').next().is_some_and(|l| l.trim() == hint)),
+            "{end}"
+        );
+        assert_eq!(scroll_to(&s, pane, Scroll::Down), None);
+        assert_eq!(scroll_to(&s, pane, Scroll::Up), Some(s.scroll - 1));
+        assert_eq!(scroll_to(&s, pane, Scroll::PageUp), Some(s.scroll - page));
+
+        // An offset left past the end by a resize comes back within the body on the next key.
+        let last = s.scroll;
+        s.scroll = 500;
+        assert_eq!(scroll_to(&s, pane, Scroll::Down), Some(last));
+        assert_eq!(scroll_to(&s, pane, Scroll::Up), Some(last - 1));
+
+        // With assistance off there is no section on screen to scroll.
+        s.assist_off = true;
+        assert_eq!(scroll_to(&s, pane, Scroll::Down), None);
+    }
 }
 
 #[test]

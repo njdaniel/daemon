@@ -399,10 +399,23 @@ pub enum Action {
     /// then the old ones stay, dimmed. With fewer than two stories nothing is asked of the
     /// model, and the STAR header says there is no other story.
     SwapStory { candidate: u64 },
-    /// Keys `1`–`6` (#56): open `section` under the live question's Approach, closing the one
-    /// that was open, or close it if it is the open one. A row that is not on screen (no slow
-    /// phase yet, or nothing for this question) does not open.
+    /// Keys `1`–`6` (#56): open `section` under the Approach of the question on screen (the live
+    /// one, or the earlier one `←` stepped back to, #94), closing the one that was open, or close
+    /// it if it is the open one. A row that is not on screen (no slow phase yet, or nothing for
+    /// this question) does not open.
     ToggleSection { section: Section },
+    /// `←` (#94): show the question before the one on screen, as it stood when the next one
+    /// replaced it. It holds the screen the way a pin does: questions that arrive meanwhile are
+    /// answered behind it and counted. On the first question of the session nothing changes.
+    Earlier,
+    /// `→` (#94): show the question after the earlier one on screen; from the newest earlier one
+    /// that is the live question again. On the live question nothing changes.
+    Later,
+    /// `↑ ↓ PgUp PgDn` (#94): the open section of the question on screen is scrolled `offset`
+    /// rows down. The offset is absolute and already within the body: the UI thread, which knows
+    /// how many rows the pane gives the section, works it out; the reducer knows no pane. It goes
+    /// back to 0 when the section closes or another question takes the screen.
+    Scroll { offset: u16 },
     /// `p`: pin the live question; new questions queue behind it.
     Pin,
     /// The coding-solutions mode from now on: dispatched once after `Started` (from the config
