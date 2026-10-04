@@ -5,8 +5,8 @@
 //! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
 //! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), Ctrl+Shift+A
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
-//! what the interviewer last said when the detector missed the question (#96), `q` (or Ctrl-C)
-//! quit. Nothing else writes to the terminal
+//! what the asking lane last said (the interviewer, by default) when the detector missed the
+//! question (#96), `q` (or Ctrl-C) quit. Nothing else writes to the terminal
 //! while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal is restored on the way out, on an error,
 //! and (through ratatui's panic hook) on a panic.
@@ -92,8 +92,10 @@ pub enum Key {
     /// key mid-call cannot switch the Approach off. Terminals without the kitty keyboard
     /// protocol (WezTerm's default, tmux) send it as Ctrl+A, so that counts too.
     Assist,
-    /// Enter (#96): send what the interviewer last said to the model as the question, for when
-    /// the detector missed it. `r` only reaches a question already on screen.
+    /// Enter (#96): send what the asking lane last said to the model as the question, for when
+    /// the detector missed it. The lane follows `question_source`: the interviewer by default,
+    /// the mic under `you`, whichever spoke last under `both`. `r` only reaches a question
+    /// already on screen.
     Ask,
     Quit,
 }

@@ -370,15 +370,25 @@ pub const NOT_A_QUESTION_FOR: Duration = Duration::from_secs(5);
 /// "Between" is judged on audio time, as a split question's gap is ([`Spans::spoke_between`]):
 /// the other lane's "mm-hm" inside a line does not end the turn, one in the gap before it does.
 /// The detector never scored this candidate, so it has score 0 and no cues.
+///
+/// An empty final (an utterance whisper heard nothing in, or an echo copy's retraction) is no
+/// speech here either, as for a split question (#63): on the other lane it does not cut the
+/// turn, and on the asking lane it is neither the turn's last line nor one of its lines.
+/// [`TranscriptLog`] keeps no such final (dmn-stt trims its text, and the log drops an empty
+/// one), so this holds for any slice, not only the log's.
 fn last_turn(finals: &[Segment], asks: QuestionSource) -> Option<Candidate> {
-    let last = finals
+    let finals: Vec<&Segment> = finals
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
+    let last = *finals
         .iter()
         .filter(|s| asks.allows(s.source))
         .max_by_key(|s| s.end)?;
     let lane = last.source;
     let mut turn = vec![last];
     let mut first = last;
-    for seg in finals
+    for &seg in finals
         .iter()
         .rev()
         .filter(|s| s.source == lane && s.start < last.start)
@@ -400,7 +410,6 @@ fn last_turn(finals: &[Segment], asks: QuestionSource) -> Option<Candidate> {
         .iter()
         .rev()
         .map(|s| s.text.trim())
-        .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     Some(Candidate {
@@ -3377,6 +3386,40 @@ mod tests {
         let log = log_of(&finals);
         let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
         assert_eq!(turn.start, Duration::from_millis(5_000), "{}", turn.text);
+    }
+
+    #[test]
+    fn an_empty_final_neither_cuts_the_turn_nor_is_part_of_it() {
+        // #63's rule for a split question, here: an utterance whisper heard nothing in is no
+        // speech. The transcript log keeps no empty final, so the slice is handed over as is.
+        let whole = "Okay, that covers the happy path. Now say one region loses its Redis. What \
+                     does the limiter do for those callers?";
+        for nothing in ["", "  "] {
+            let mut finals = three_interviewer_finals();
+            // In the gap between the first and the second line, where "Right." cuts the turn.
+            finals.insert(2, final_at(Source::You, 9_100, 9_500, nothing));
+            let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+            assert_eq!(turn.text, whole, "{nothing:?}");
+            assert_eq!(turn.start, Duration::from_millis(5_000));
+
+            // On the asking lane it is not the turn's last line, nor a line of it.
+            finals.push(final_at(Source::Interviewer, 18_400, 18_900, nothing));
+            let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+            assert_eq!(turn.text, whole, "{nothing:?}");
+            assert_eq!(turn.end, Duration::from_millis(18_000));
+            // Alone, it is not a turn at all: that lane has said nothing.
+            assert!(last_turn(&finals[2..3], QuestionSource::You).is_none());
+        }
+        // The same place with something said in it still cuts the turn.
+        let mut finals = three_interviewer_finals();
+        finals.insert(2, final_at(Source::You, 9_100, 9_500, "Right."));
+        let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+        assert_eq!(turn.start, Duration::from_millis(9_600), "{}", turn.text);
+
+        // And the log is where such a final stops: it never holds one.
+        let mut log = log_of(&three_interviewer_finals());
+        log.apply(final_at(Source::You, 9_100, 9_500, ""));
+        assert_eq!(log.finals().len(), 4);
     }
 
     #[test]

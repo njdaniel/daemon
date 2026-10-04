@@ -291,8 +291,9 @@ const ASSIST_OFF: &str = "assist off";
 /// or small talk); it leads the keys while [`dmn_session::Session::not_a_question`] is set.
 const NOT_A_QUESTION: &str = "not a question";
 
-/// #96: Enter asks about what the interviewer last said. Offered whenever assistance is on: the
-/// detector's miss it is for can come in any state of the screen.
+/// #96: Enter asks about what the asking lane last said (the interviewer, by default; the hint
+/// names no lane, so it reads the same under `asks: you` and `asks: both`). Offered whenever
+/// assistance is on: the detector's miss it is for can come in any state of the screen.
 const ASK: &str = "⏎ ask";
 
 /// The two most useful keys for the state on screen (SPEC § Transcript & status: "Footer shows

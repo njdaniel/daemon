@@ -63,9 +63,11 @@ not voices: everything on the mic is "You", so in `you` or `both` your own quest
 interviewer are answered too. The status line shows `asks: you` or `asks: both`.
 
 Question detection is a set of rules, and it can miss a real question. When it does, press
-Enter: what the interviewer last said (their last turn, up to 30 seconds of it) goes to the
-model as the question, and the screen updates as it does for a detected one. If the model finds
-no question in it, the status line says `not a question` for 5 seconds and nothing else changes.
+Enter: the last turn of the asking lane (up to 30 seconds of it) goes to the model as the
+question, and the screen updates as it does for a detected one. The asking lane follows
+`question_source`: the interviewer by default, your microphone with `you`, and with `both`
+whichever of the two spoke last. If the model finds no question in it, the status line says
+`not a question` for 5 seconds and nothing else changes.
 
 Keys in `dmn run`:
 
@@ -73,7 +75,7 @@ Keys in `dmn run`:
 | --- | --- |
 | `p` | Pin the question on screen, or unpin it; new questions queue while one is pinned |
 | `r` | Answer the question on screen again, from a different angle |
-| Enter | Ask about what the interviewer last said, when the detector missed the question |
+| Enter | Ask about what the asking lane last said (the interviewer, by default), when the detector missed the question |
 | `1`–`6` | Open or close one of the six sections under the Approach |
 | `w` | Swap the STAR story of a behavioral question |
 | `s` | Coding solutions: hints ↔ full |
