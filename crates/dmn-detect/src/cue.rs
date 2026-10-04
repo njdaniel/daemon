@@ -114,7 +114,7 @@ const RHETORICAL_TAGS: [&str; 6] = [
 /// inside a technical question ("your connection", "the invite", "double-booked", "one second" and
 /// "reschedule" are not here). Chatter no phrase covers reaches the fast phase, which answers
 /// `small_talk` and shows nothing (#93).
-const SMALL_TALK: [&str; 33] = [
+const SMALL_TALK: [&str; 34] = [
     "weather",
     "weekend",
     "coffee",
@@ -147,7 +147,8 @@ const SMALL_TALK: [&str; 33] = [
     "was at the door",
     "nice to meet",
     "good to meet",
-    "how are you",
+    "how are you doing",
+    "how are you today",
 ];
 
 /// Ends with `?` (whisper's own punctuation).
@@ -244,6 +245,18 @@ pub fn is_small_talk(sentence: &str) -> bool {
             let after = lowered[start + m.len()..].chars().next();
             !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
         })
+    }) || ends_with_how_are_you(&lowered)
+}
+
+/// "Hi, how are you?" is a greeting only when it ends the sentence; "how are you handling
+/// backpressure?" is a question about the system.
+fn ends_with_how_are_you(lowered: &str) -> bool {
+    let trimmed = lowered.trim_end_matches(|c: char| !c.is_alphanumeric());
+    trimmed.strip_suffix("how are you").is_some_and(|before| {
+        !before
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
     })
 }
 
@@ -378,6 +391,8 @@ mod tests {
             "How would you reschedule failed jobs?",
             "How do you prevent double-booked seats?",
             "How would you return results within one second?",
+            "How are you handling backpressure?",
+            "How are you going to scale this to ten regions?",
         ] {
             assert!(!is_small_talk(q), "{q}");
         }
@@ -389,6 +404,9 @@ mod tests {
             "I think my audio is cutting out.",
             "Sorry, my connection is bad.",
             "Is your mic on?",
+            "Hi, how are you?",
+            "So how are you?",
+            "How are you doing today?",
         ] {
             assert!(is_small_talk(q), "{q}");
         }

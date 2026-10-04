@@ -378,6 +378,8 @@ mod tests {
             "How would you design the invite flow?",
             "How do you handle traffic on the read path?",
             "How do you keep video in sync when the audio is delayed?",
+            "How are you handling backpressure?",
+            "How are you going to scale this to ten regions?",
         ] {
             assert!(detect(q).is_some(), "{q}");
         }
@@ -391,6 +393,8 @@ mod tests {
             "Did you find the calendar invite okay, the link changed at the last minute?",
             "Okay, hold on one second, someone's at my door.",
             "Sorry, my calendar double-booked me and the other call ran over.",
+            "Hi, how are you?",
+            "How are you doing today?",
         ] {
             assert!(detect(q).is_none(), "{q}");
         }
