@@ -324,8 +324,9 @@ pub enum Action {
     /// that a key press gets an answer either way: on [`Action::Ignored`] the status line says
     /// `not a question` until [`Action::NoticeExpired`].
     Asked { candidate: u64 },
-    /// The `not a question` notice for candidate `candidate` has been up for its 5 s (#96). The
-    /// pipeline, which has a clock, says when; the reducer has none.
+    /// The `not a question` notice for candidate `candidate` (#96), or its `lookup failed`
+    /// notice (#102), has been up for its 5 s. The pipeline, which has a clock, says when; the
+    /// reducer has none.
     NoticeExpired { candidate: u64 },
     /// Fast phase: the extracted question, first field of a shown reply.
     Question {
@@ -341,6 +342,16 @@ pub enum Action {
     /// `query` is the web search that would settle it. Sent only when the model named one, so
     /// the Approach block shows a `may be out of date` tag only then.
     Lookup { candidate: u64, query: String },
+    /// #102: the web lookup for question `candidate`'s query came back, and the Approach on screen
+    /// now is the reply built on its results. `domain` is the first result's host without
+    /// `www.`; the Approach block says `checked · <domain>` in place of `may be out of date`.
+    /// Dispatched after that reply's [`Action::Answered`], so a later `r` or Swap, which starts
+    /// the question afresh, takes the tag away again.
+    Checked { candidate: u64, domain: String },
+    /// #102: the web lookup for question `candidate` timed out, failed, found nothing or had no
+    /// key. Nothing on screen changes but the status line, which says `lookup failed` until
+    /// [`Action::NoticeExpired`]; the first answer keeps its `may be out of date` tag.
+    LookupFailed { candidate: u64 },
     /// Fast phase: approach line `index` (0-based, contiguous), already length-limited.
     ApproachLine {
         candidate: u64,
@@ -441,6 +452,10 @@ pub enum Action {
     /// The LLM provider now answering (#59): at start and after a config reload switched it.
     /// The model dot is named after it, and a remote one says transcript text leaves the machine.
     Provider { label: ProviderLabel },
+    /// #102: the web lookup is on (`[lookup].enabled`): dispatched by the suggester when it
+    /// starts. The status line says `web` beside the model dot, because a search query may now
+    /// leave the machine.
+    WebLookup { enabled: bool },
     /// How much of the local model Ollama holds in system memory rather than on the GPU, in
     /// percent (#79), once it is loaded: non-zero when whisper took the GPU first (a session
     /// started with assistance off, then Ctrl+Shift+A). The status line names it.

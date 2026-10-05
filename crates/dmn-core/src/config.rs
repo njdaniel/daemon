@@ -41,6 +41,7 @@ pub struct Config {
     pub stt: Stt,
     pub detect: Detect,
     pub llm: Llm,
+    pub lookup: Lookup,
     pub assist: Assist,
     pub ui: Ui,
     pub privacy: Privacy,
@@ -311,6 +312,86 @@ pub enum AnswerLength {
     Minimal,
 }
 
+/// The web lookup (#102): when the fast phase says an answer depends on what is current and names
+/// a search query (#101), send that query, and nothing else, to a web search and answer once more
+/// from the results. Off by default: with it on, a search query leaves the machine even with a
+/// local model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Lookup {
+    pub enabled: bool,
+    pub provider: LookupProvider,
+    /// Where the search goes; Ollama's own service unless pointed elsewhere (tests use loopback).
+    pub base_url: String,
+    /// Name of an environment variable holding the search key. Never the key itself.
+    pub api_key_env: String,
+    /// The whole search: past it the first answer stays and the status line says `lookup
+    /// failed`.
+    pub timeout_ms: u64,
+    /// Results asked for, 1–10; each goes into the prompt as a title, a 300-character snippet
+    /// and its domain.
+    pub max_results: u8,
+}
+
+impl Default for Lookup {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: LookupProvider::Ollama,
+            base_url: "https://ollama.com".into(),
+            api_key_env: "OLLAMA_API_KEY".into(),
+            timeout_ms: 3000,
+            max_results: 3,
+        }
+    }
+}
+
+/// `[lookup].provider`: whose web search answers (#102). One for now; another is one more
+/// `dmn_llm::WebSearch` implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LookupProvider {
+    #[default]
+    Ollama,
+}
+
+impl LookupProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LookupProvider::Ollama => "ollama",
+        }
+    }
+}
+
+impl Lookup {
+    /// The search key from the variable `api_key_env` names. `None` when unset or empty.
+    pub fn api_key(&self) -> Option<ApiKey> {
+        self.api_key_from(|name| std::env::var(name).ok())
+    }
+
+    /// Same as [`Lookup::api_key`] with the environment lookup injected (tests use a closure).
+    pub fn api_key_from(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<ApiKey> {
+        if self.api_key_env.is_empty() {
+            return None;
+        }
+        lookup(&self.api_key_env)
+            .filter(|v| !v.is_empty())
+            .map(ApiKey::new)
+    }
+
+    /// The sentence `dmn run`, `dmn replay` and `dmn config show` print while the lookup is on
+    /// (SPEC § Privacy rules): what leaves, where to, and when.
+    pub fn privacy_notice(&self) -> Option<String> {
+        self.enabled.then(|| {
+            format!(
+                "web lookup on: when an answer depends on what is current, its search query (a \
+                 few words the model writes, no transcript) goes to {} ([lookup].enabled = true)",
+                self.base_url.trim_end_matches('/')
+            )
+        })
+    }
+}
+
 /// Interview assistance (#79): the layer over transcription that detects questions and asks the
 /// LLM for an Approach. Off, Daemon is a live transcriber / translator only: no detector, no
 /// context, no LLM request, and the transcript takes the screen. `dmn run --no-assist` starts a
@@ -434,6 +515,14 @@ answer_length = "concise"            # concise (5 lines) | minimal (3 lines)
 fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # the six expandable sections; 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
+
+[lookup]
+enabled = false                      # true = a question whose answer depends on what is current is searched on the web
+provider = "ollama"                  # Ollama's hosted web search (needs a free ollama.com key)
+base_url = "https://ollama.com"
+api_key_env = "OLLAMA_API_KEY"       # NAME of an env var holding the key; never the key itself
+timeout_ms = 3000                    # past this the first answer stays; nothing is retried
+max_results = 3                      # 1-10 results, each a title, a 300-character snippet and its domain
 
 [assist]
 enabled = true                       # false = transcribe / translate only: no detector, no LLM (Ctrl+Shift+A toggles)
@@ -628,6 +717,14 @@ fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
+[lookup]
+enabled = false                      # true = search the web when an answer depends on what is current
+provider = "ollama"                  # Ollama's hosted web search
+base_url = "https://ollama.com"
+api_key_env = "OLLAMA_API_KEY"       # name of an env var; never the key itself
+timeout_ms = 3000
+max_results = 3
+
 [assist]
 enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
 
@@ -731,7 +828,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 30, "spec example has 30 keys: {keys:?}");
+        assert_eq!(keys.len(), 36, "spec example has 36 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -777,6 +874,67 @@ keep_transcripts = true
                 .unwrap()
                 .contains("mouse = true")
         );
+    }
+
+    #[test]
+    fn config_lookup_is_off_by_default_and_show_prints_its_keys() {
+        let lookup = Config::default().lookup;
+        assert!(!lookup.enabled);
+        assert!(lookup.privacy_notice().is_none(), "off says nothing leaves");
+        assert_eq!(
+            (
+                lookup.provider.as_str(),
+                lookup.base_url.as_str(),
+                lookup.api_key_env.as_str(),
+                lookup.timeout_ms,
+                lookup.max_results
+            ),
+            ("ollama", "https://ollama.com", "OLLAMA_API_KEY", 3000, 3)
+        );
+        // `dmn config show` prints `to_toml`: every `[lookup]` key, at its default.
+        let shown = Config::default().to_toml().unwrap();
+        let section = &shown[shown.find("[lookup]").expect(&shown)..];
+        for key in [
+            "enabled = false",
+            "provider = \"ollama\"",
+            "base_url = \"https://ollama.com\"",
+            "api_key_env = \"OLLAMA_API_KEY\"",
+            "timeout_ms = 3000",
+            "max_results = 3",
+        ] {
+            assert!(section.contains(key), "{key}: {shown}");
+        }
+
+        let on = Config::from_toml(
+            "[lookup]\nenabled = true\nbase_url = \"http://127.0.0.1:9/\"\n",
+            "on",
+        )
+        .unwrap();
+        assert!(on.lookup.enabled);
+        let notice = on.lookup.privacy_notice().unwrap();
+        assert!(notice.contains("http://127.0.0.1:9 "), "{notice}");
+        assert!(notice.contains("no transcript"), "{notice}");
+        assert!(
+            Config::from_toml("[lookup]\nprovider = \"bing\"\n", "bad").is_err(),
+            "one provider for now; anything else is a config error"
+        );
+    }
+
+    #[test]
+    fn config_lookup_key_is_read_from_the_named_variable_and_never_printed() {
+        let env = |name: &str| (name == "OLLAMA_API_KEY").then(|| "ol-secret-value".to_owned());
+        let mut c = Config::default();
+        assert_eq!(
+            c.lookup.api_key_from(env).unwrap().expose(),
+            "ol-secret-value"
+        );
+        assert!(c.lookup.api_key_from(|_| Some(String::new())).is_none());
+        assert!(c.lookup.api_key_from(|_| None).is_none());
+        c.lookup.api_key_env = String::new();
+        assert!(c.lookup.api_key_from(env).is_none());
+        c.lookup.enabled = true;
+        assert!(!c.to_toml().unwrap().contains("secret"));
+        assert!(!format!("{c:?}").contains("secret"));
     }
 
     #[test]

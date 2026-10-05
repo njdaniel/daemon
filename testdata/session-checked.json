@@ -1,0 +1,65 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    }
+  ],
+  "partials": [],
+  "last_interviewer": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "live": {
+    "candidate": 1,
+    "text": "What is the latest stable major version of Go?",
+    "kind": "knowledge",
+    "focus": "Go release cadence, keeping current",
+    "checked": "go.dev",
+    "approach": [
+      "Say the latest stable major release is Go 1.25.",
+      "Mention Go 1.25.1 is its newest patch, from September 2025.",
+      "Add that Go ships a major release every six months."
+    ],
+    "star": null,
+    "clarifications": [],
+    "progress": {
+      "state": "done"
+    }
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": "",
+    "web": true
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 2,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "hints"
+}

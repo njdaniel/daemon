@@ -6,15 +6,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dmn_detect::Candidate;
 use dmn_llm::{
-    AnthropicProvider, FastEvent, FastOutcome, LlmError, OllamaProvider, OllamaSettings,
-    OpenAiProvider, Provider,
+    AnthropicProvider, FastEvent, FastOutcome, LlmError, LookupError, OllamaProvider, OllamaSearch,
+    OllamaSearchSettings, OllamaSettings, OpenAiProvider, Provider, WebSearch,
 };
 use dmn_session::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, IgnoreReason, ProviderLabel, SlowEnd,
     SlowField, Speaker, StarCards, TradeoffItem,
 };
 
-use crate::config::{self, Llm};
+use crate::config::{self, Llm, Lookup};
 use dmn_transcript::Segment;
 
 /// Unix epoch seconds now. Actions carry their times, so this is called by whoever dispatches,
@@ -354,6 +354,26 @@ pub fn provider(llm: &Llm) -> Result<Arc<dyn Provider>, LlmError> {
             key(),
         )?),
     })
+}
+
+/// The web search `[lookup]` names (#102), or `None` while it is off. The key is read now from
+/// the variable `api_key_env` names and goes into the client and nowhere else; unset, the client
+/// is still built, and every lookup fails at once with [`LookupError::NoKey`] without sending
+/// anything, which the status line reports as `lookup failed`.
+pub fn web_search(lookup: &Lookup) -> Result<Option<Arc<dyn WebSearch>>, LookupError> {
+    if !lookup.enabled {
+        return Ok(None);
+    }
+    let search: Arc<dyn WebSearch> = match lookup.provider {
+        config::LookupProvider::Ollama => Arc::new(OllamaSearch::new(&OllamaSearchSettings {
+            base_url: lookup.base_url.clone(),
+            api_key: lookup.api_key().map(|k| k.expose().to_owned()),
+            key_env: lookup.api_key_env.clone(),
+            max_results: usize::from(lookup.max_results),
+            timeout: std::time::Duration::from_millis(lookup.timeout_ms),
+        })?),
+    };
+    Ok(Some(search))
 }
 
 /// What the model dot shows for `llm` (#59).

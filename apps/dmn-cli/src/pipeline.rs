@@ -359,6 +359,31 @@ const YOU_SPANS: usize = 16;
 
 /// #96: how long the status line says `not a question` after the model declined what Enter sent.
 pub const NOT_A_QUESTION_FOR: Duration = Duration::from_secs(5);
+/// #102: how long the status line says `lookup failed`.
+pub const LOOKUP_FAILED_FOR: Duration = Duration::from_secs(5);
+
+/// One status-line notice (#96, #102): `showing` is the candidate whose notice the session has up,
+/// `tracked` the one this thread has seen and since when. Once it has been up for `lasts`, the
+/// notice is taken down with [`Action::NoticeExpired`]. Returns what to track from now.
+fn expire(
+    hub: &SessionHub,
+    showing: Option<u64>,
+    tracked: Option<(u64, Instant)>,
+    now: Instant,
+    lasts: Duration,
+) -> Option<(u64, Instant)> {
+    match (showing, tracked) {
+        (Some(id), Some((seen, since))) if id == seen => {
+            if now.saturating_duration_since(since) < lasts {
+                return tracked;
+            }
+            hub.dispatch(Action::NoticeExpired { candidate: id });
+            None
+        }
+        (Some(id), _) => Some((id, now)),
+        (None, _) => None,
+    }
+}
 
 /// #96: what Enter sends, the asking lane's last turn: that lane's most recent finals with no
 /// final from the other lane between them, in spoken order, going back at most
@@ -972,6 +997,8 @@ pub struct Assistance {
     session: watch::Receiver<Session>,
     /// The `not a question` notice now up, as its candidate and when this thread first saw it.
     notice: Option<(u64, Instant)>,
+    /// #102: the `lookup failed` notice now up, the same way.
+    lookup_notice: Option<(u64, Instant)>,
 }
 
 impl Pipeline {
@@ -1180,7 +1207,7 @@ impl Pipeline {
         // stored sources and job requirements, read-only under `--no-store`. #79: started when
         // assistance is first on, so a run with it off never loads the model.
         let launch = (!opts.no_llm).then(|| {
-            let llm = cfg.llm.clone();
+            let (llm, lookup) = (cfg.llm.clone(), cfg.lookup.clone());
             let (output, policy) = (opts.output, opts.policy);
             let hub = Arc::clone(&hub);
             let audio = audio_clock.clone();
@@ -1193,9 +1220,11 @@ impl Pipeline {
             Box::new(move || {
                 // Started on a later Ctrl+Shift+A, perhaps long after the config was read: an
                 // `[llm]` edit made meanwhile applies from the first request (Copilot, PR #80).
-                let llm = llm_now(&config_file, llm);
+                // #102: and so does a `[lookup]` edit.
+                let (llm, lookup) = llm_now(&config_file, llm, lookup);
                 Suggester::start(
                     &llm,
+                    &lookup,
                     output,
                     policy,
                     hub,
@@ -1431,6 +1460,7 @@ impl Assistance {
             on: false,
             session: hub.watch(),
             notice: None,
+            lookup_notice: None,
             asked: None,
             hub,
             audio,
@@ -1596,19 +1626,20 @@ impl Assistance {
     /// #96: take `not a question` off the status line once it has been up for
     /// [`NOT_A_QUESTION_FOR`]. The reducer has no clock, so the pipeline loop, which comes by
     /// every [`TICK`], says when.
+    /// #102: `lookup failed` the same way, for [`LOOKUP_FAILED_FOR`].
     fn expire_notice(&mut self, now: Instant) {
-        let showing = self.session.borrow().not_a_question;
-        self.notice = match (showing, self.notice) {
-            (Some(id), Some((seen, since))) if id == seen => {
-                if now.saturating_duration_since(since) < NOT_A_QUESTION_FOR {
-                    return;
-                }
-                self.hub.dispatch(Action::NoticeExpired { candidate: id });
-                None
-            }
-            (Some(id), _) => Some((id, now)),
-            (None, _) => None,
+        let (asked, lookup) = {
+            let s = self.session.borrow();
+            (s.not_a_question, s.lookup_failed)
         };
+        self.notice = expire(&self.hub, asked, self.notice, now, NOT_A_QUESTION_FOR);
+        self.lookup_notice = expire(
+            &self.hub,
+            lookup,
+            self.lookup_notice,
+            now,
+            LOOKUP_FAILED_FOR,
+        );
     }
 
     /// #57, session memory: the question on screen as `next` arrives, and what the candidate
@@ -2045,15 +2076,19 @@ fn warm_local_llm(llm: &dmn_core::config::Llm) {
 /// The file wins only when it exists and parses; otherwise the settings the run started with
 /// stand, so a missing file (the tests', or one deleted mid-run) never swaps in the defaults, and
 /// a half-written edit is ignored rather than fatal.
-fn llm_now(config_file: &Path, started_with: dmn_core::config::Llm) -> dmn_core::config::Llm {
+fn llm_now(
+    config_file: &Path,
+    llm: dmn_core::config::Llm,
+    lookup: dmn_core::config::Lookup,
+) -> (dmn_core::config::Llm, dmn_core::config::Lookup) {
     if !config_file.is_file() {
-        return started_with;
+        return (llm, lookup);
     }
     match Config::load(config_file) {
-        Ok(cfg) => cfg.llm,
+        Ok(cfg) => (cfg.llm, cfg.lookup),
         Err(e) => {
-            tracing::warn!(error = %e, "config unreadable when assistance started; keeping [llm] from start-up");
-            started_with
+            tracing::warn!(error = %e, "config unreadable when assistance started; keeping [llm] and [lookup] from start-up");
+            (llm, lookup)
         }
     }
 }
@@ -3175,17 +3210,26 @@ mod tests {
         // Copilot on PR #80: assistance off at start, `[llm]` edited, then Ctrl+Shift+A.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.toml");
-        let started_with = Config::default().llm;
+        let started_with = (Config::default().llm, Config::default().lookup);
+        let now = |started: &(dmn_core::config::Llm, dmn_core::config::Lookup)| {
+            llm_now(&file, started.0.clone(), started.1.clone())
+        };
         assert_eq!(
-            llm_now(&file, started_with.clone()),
+            now(&started_with),
             started_with,
             "no file: the start-up settings, not the defaults"
         );
-        std::fs::write(&file, "[llm]\nmodel = \"llama3.1:8b\"\n").unwrap();
-        assert_eq!(llm_now(&file, started_with.clone()).model, "llama3.1:8b");
+        std::fs::write(
+            &file,
+            "[llm]\nmodel = \"llama3.1:8b\"\n[lookup]\nenabled = true\n",
+        )
+        .unwrap();
+        let (llm, lookup) = now(&started_with);
+        assert_eq!(llm.model, "llama3.1:8b");
+        assert!(lookup.enabled, "#102: `[lookup]` as it is now too");
         std::fs::write(&file, "[llm]\nmodel = ").unwrap();
         assert_eq!(
-            llm_now(&file, started_with.clone()),
+            now(&started_with),
             started_with,
             "a half-written edit keeps the start-up settings"
         );
@@ -3848,6 +3892,24 @@ mod tests {
         a.command(Command::Ask, &log);
         a.finish(false);
         assert_eq!(asked_of(&mock).len(), 2);
+    }
+
+    #[test]
+    fn a_failed_web_lookup_is_said_for_5_s_beside_the_other_notice() {
+        // #102: the suggester says `lookup failed`; this thread takes it down after 5 s, on its
+        // own clock, whatever `not a question` is doing.
+        let (mut a, _, _) = assistance(true);
+        let hub = Arc::clone(&a.hub);
+        hub.dispatch(Action::LookupFailed { candidate: 3 });
+        let seen = Instant::now();
+        a.expire_notice(seen);
+        a.expire_notice(seen + LOOKUP_FAILED_FOR - Duration::from_millis(1));
+        assert_eq!(hub.snapshot().lookup_failed, Some(3), "not yet");
+        assert!(screen(&hub.snapshot()).contains("lookup failed"));
+        a.expire_notice(seen + LOOKUP_FAILED_FOR);
+        let s = hub.snapshot();
+        assert_eq!(s.lookup_failed, None);
+        assert!(!screen(&s).contains("lookup failed"));
     }
 
     #[test]

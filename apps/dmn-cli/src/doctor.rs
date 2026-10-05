@@ -419,6 +419,50 @@ pub fn remote_api_key(cfg: &Config, lookup: impl Fn(&str) -> Option<String>) -> 
     }
 }
 
+/// #102: the web lookup, informational either way: off (nothing is searched), ready (on, with
+/// its key), or on with the key variable unset (every lookup fails and the first answer stays;
+/// nothing else breaks, so this warns rather than fails the run).
+pub fn web_lookup(cfg: &Config, lookup: impl Fn(&str) -> Option<String>) -> Check {
+    let l = &cfg.lookup;
+    if !l.enabled {
+        return Check::pass(
+            "web lookup",
+            "off ([lookup].enabled = false): no search query leaves this machine",
+        )
+        .optional();
+    }
+    let var = &l.api_key_env;
+    let at = l.base_url.trim_end_matches('/');
+    match l.api_key_from(lookup) {
+        Some(_) => Check::pass(
+            "web lookup",
+            format!(
+                "ready: {} web search at {at}, key from ${var} (never logged); a search query leaves this machine",
+                l.provider.as_str()
+            ),
+        )
+        .optional(),
+        None => {
+            let shown = if var.is_empty() {
+                "[lookup].api_key_env is empty".to_owned()
+            } else {
+                format!("${var} is unset or empty")
+            };
+            Check::fail(
+                "web lookup",
+                format!("on, but {shown}: every lookup fails and the first answer stays"),
+                if var.is_empty() {
+                    "set api_key_env = \"OLLAMA_API_KEY\" in [lookup] and export that variable"
+                        .to_owned()
+                } else {
+                    format!("export {var}=<your ollama.com key>, or set [lookup].enabled = false")
+                },
+            )
+            .optional()
+        }
+    }
+}
+
 /// Informational: which GPU features this binary carries and which GPU tools exist.
 pub fn gpu_backend(r: &dyn Runner) -> Check {
     let mut built = Vec::new();
@@ -544,6 +588,19 @@ pub fn endpoint_locality(cfg: &Config, r: &dyn Resolver) -> Locality {
 /// The one-sentence privacy statement in the report header (SPEC § Privacy rules).
 fn privacy_line(cfg: &Config, locality: &Locality) -> String {
     let host = host_of(&cfg.llm.base_url);
+    let line = llm_privacy(host, locality);
+    // #102: what the web lookup sends, while it is on.
+    let search = host_of(&cfg.lookup.base_url);
+    match (cfg.lookup.enabled, locality) {
+        (false, _) => line,
+        (true, Locality::Local) => format!(
+            "nothing leaves this machine but a web search query ([lookup] on: a few words the model writes, no transcript, go to {search})"
+        ),
+        (true, _) => format!("{line}; [lookup] on: a web search query also goes to {search}"),
+    }
+}
+
+fn llm_privacy(host: &str, locality: &Locality) -> String {
     match locality {
         Locality::Local => "nothing leaves this machine".to_owned(),
         Locality::Remote => format!(
@@ -625,6 +682,7 @@ pub fn run_all(
             checks.push(remote_api_key(cfg, |name| std::env::var(name).ok()));
         }
     }
+    checks.push(web_lookup(cfg, |name| std::env::var(name).ok()));
     checks.push(gpu_backend(r));
     checks.push(whisper_device(cfg.stt.device, &dmn_stt::gpu_devices()));
     Report { header, checks }
@@ -886,6 +944,60 @@ mod tests {
         let set = remote_api_key(&cfg, |_| Some("sk-secret".into()));
         assert!(set.ok);
         assert!(!set.detail.contains("secret"));
+    }
+
+    #[test]
+    fn doctor_reports_the_three_web_lookup_states() {
+        let mut cfg = Config::default();
+        let off = web_lookup(&cfg, |_| Some("ol-secret".into()));
+        assert!(off.ok && !off.required, "{off:?}");
+        assert!(off.detail.starts_with("off"), "{}", off.detail);
+
+        cfg.lookup.enabled = true;
+        let ready = web_lookup(&cfg, |name| {
+            (name == "OLLAMA_API_KEY").then(|| "ol-secret".to_owned())
+        });
+        assert!(ready.ok && !ready.required, "{ready:?}");
+        assert!(ready.detail.starts_with("ready"), "{}", ready.detail);
+        assert!(
+            ready.detail.contains("https://ollama.com"),
+            "{}",
+            ready.detail
+        );
+        assert!(ready.detail.contains("$OLLAMA_API_KEY"), "{}", ready.detail);
+        assert!(!ready.detail.contains("ol-secret"));
+
+        let unset = web_lookup(&cfg, |_| None);
+        assert!(
+            !unset.ok && !unset.required,
+            "a warning, not a failure: {unset:?}"
+        );
+        assert!(
+            unset.detail.contains("$OLLAMA_API_KEY is unset"),
+            "{}",
+            unset.detail
+        );
+        assert!(
+            unset
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("export OLLAMA_API_KEY=")
+        );
+
+        // The header says what leaves, only while it is on.
+        let res = FakeResolver::local();
+        let on = privacy_line(&cfg, &endpoint_locality(&cfg, &res));
+        assert!(
+            on.starts_with("nothing leaves this machine but a web search query"),
+            "{on}"
+        );
+        assert!(on.contains("no transcript, go to ollama.com"), "{on}");
+        cfg.lookup.enabled = false;
+        assert_eq!(
+            privacy_line(&cfg, &endpoint_locality(&cfg, &res)),
+            "nothing leaves this machine"
+        );
     }
 
     #[test]

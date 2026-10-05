@@ -1,0 +1,30 @@
+┌ LIVE QUESTION ──────────────────────────────────────────────────────────────────────── knowledge ┐
+│ What is the latest stable major version of Go?                                                   │
+│ Focus: Go release cadence, keeping current                                                       │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────── checked · go.dev ┐
+│ 1  Say the latest stable major release is Go 1.25.                                               │
+│ 2  Mention Go 1.25.1 is its newest patch, from September 2025.                                   │
+│ 3  Add that Go ships a major release every six months.                                           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+Interviewer Hi, thanks for making the time today. This session is about an hour of system design.
+You         Sounds great.
+ ● mic  ● system  ● model  web                                               p pin · r redo · ⏎ ask

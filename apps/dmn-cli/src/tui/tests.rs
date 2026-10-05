@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 31] = [
+const STATES: [&str; 33] = [
     "listening",
     "live",
     "pinned",
@@ -66,6 +66,10 @@ const STATES: [&str; 31] = [
     "long-items",
     // #101: an answer that depends on what is current, tagged `may be out of date`.
     "lookup",
+    // #102, the web lookup on: the same question rebuilt on what go.dev says, tagged `checked ·
+    // go.dev`; and a lookup that failed, the first answer kept and `lookup failed` said.
+    "checked",
+    "lookup-failed",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -452,6 +456,34 @@ fn go_version() -> Vec<Action> {
     a
 }
 
+/// #102: [`go_version`] with the web lookup on, its search come back, and the fast phase asked
+/// once more with the results: the reply replaces the first in place, tagged with the domain.
+fn go_version_checked() -> Vec<Action> {
+    let mut a = vec![Action::WebLookup { enabled: true }];
+    a.extend(go_version());
+    a.push(Action::Regenerate { candidate: 1 });
+    a.extend(
+        answered(
+            1,
+            "What is the latest stable major version of Go?",
+            "knowledge",
+            "Go release cadence, keeping current",
+            &[
+                "Say the latest stable major release is Go 1.25.",
+                "Mention Go 1.25.1 is its newest patch, from September 2025.",
+                "Add that Go ships a major release every six months.",
+            ],
+        )
+        .into_iter()
+        .skip(1),
+    );
+    a.push(Action::Checked {
+        candidate: 1,
+        domain: "go.dev".into(),
+    });
+    a
+}
+
 fn actions(state: &str) -> Vec<Action> {
     let mut a = opening();
     // #56: every section filled, then the key for section N pressed.
@@ -807,6 +839,12 @@ fn actions(state: &str) -> Vec<Action> {
         // #94: the issue's own case, a Deeper Answer of four 240-character items. None is cut
         // inside: each wraps onto the rows it needs and the body scrolls to the end of the last.
         "lookup" => a.extend(go_version()),
+        "checked" => a.extend(go_version_checked()),
+        "lookup-failed" => {
+            a.push(Action::WebLookup { enabled: true });
+            a.extend(go_version());
+            a.push(Action::LookupFailed { candidate: 1 });
+        }
         "long-items" => {
             a.extend(long_items());
             a.push(Action::ToggleSection {
@@ -1217,6 +1255,66 @@ fn tui_an_answer_that_depends_on_what_is_current_is_tagged_dim_on_the_approach_b
         let screen = text(&render(&load(state), (100, 30)));
         assert!(!screen.contains("may be out of date"), "{state}:\n{screen}");
     }
+}
+
+#[test]
+fn tui_lookup_a_checked_answer_names_its_source_and_web_sits_by_the_model_dot() {
+    for size in SIZES {
+        let buf = render(&load("checked"), size);
+        let screen = text(&buf);
+        let (x, y) = row_containing(&buf, "checked · go.dev");
+        let row = screen.lines().nth(usize::from(y)).unwrap_or_default();
+        assert!(
+            row.contains("APPROACH"),
+            "on the Approach border:\n{screen}"
+        );
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "{screen}");
+        assert!(!screen.contains("may be out of date"), "{screen}");
+        assert!(
+            screen.contains("Go 1.25"),
+            "the second answer, in place:\n{screen}"
+        );
+        assert!(!screen.contains("1.24"), "the first is gone:\n{screen}");
+        // `web` right after the model dot, dim.
+        let (x, y) = row_containing(&buf, "● model  web ");
+        let at = x + u16::try_from("● model  ".chars().count()).unwrap();
+        assert_eq!(buf[(at, y)].symbol(), "w");
+        assert_eq!(buf[(at, y)].fg, Color::DarkGray, "{screen}");
+    }
+    // Off, or with assistance off, no `web`: the other fixtures are the snapshots, unchanged.
+    for state in ["live", "lookup", "assist-off"] {
+        let screen = text(&render(&load(state), (100, 30)));
+        assert!(!screen.contains(" web "), "{state}:\n{screen}");
+    }
+    let mut off = actions("checked");
+    off.push(Action::Assist { enabled: false });
+    let screen = text(&render(&Session::replay(&off), (100, 30)));
+    assert!(!screen.contains(" web "), "{screen}");
+}
+
+#[test]
+fn tui_lookup_failed_keeps_the_first_answer_and_says_so_in_amber_until_it_expires() {
+    for size in SIZES {
+        let buf = render(&load("lookup-failed"), size);
+        let screen = text(&buf);
+        assert!(screen.contains("may be out of date"), "{screen}");
+        assert!(
+            screen.contains("Go 1.24"),
+            "the first answer stays:\n{screen}"
+        );
+        let (x, y) = row_containing(&buf, "lookup failed");
+        assert_eq!(buf[(x, y)].fg, Color::Yellow, "{screen}");
+        assert_eq!(
+            usize::from(y) + 1,
+            screen.lines().count(),
+            "on the status line"
+        );
+    }
+    let mut log = actions("lookup-failed");
+    log.push(Action::NoticeExpired { candidate: 1 });
+    let screen = text(&render(&Session::replay(&log), (100, 30)));
+    assert!(!screen.contains("lookup failed"), "{screen}");
+    assert!(screen.contains("may be out of date"), "{screen}");
 }
 
 #[test]

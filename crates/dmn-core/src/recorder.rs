@@ -399,6 +399,12 @@ impl StoreWriter {
             Action::Focus { .. }
             // #101: the query is stored with the suggestion, in its `Answered` payload.
             | Action::Lookup { .. }
+            // #102: the reply built on the search results is stored through its own `Question`
+            // and `Answered`, as a regenerate's is; the tag and the notice are screen state, and
+            // so is whether the lookup is on.
+            | Action::Checked { .. }
+            | Action::LookupFailed { .. }
+            | Action::WebLookup { .. }
             | Action::ApproachLine { .. }
             | Action::Star { .. }
             | Action::Ignored { .. }
