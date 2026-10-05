@@ -1,0 +1,25 @@
+[package]
+name = "dmn-tts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# blocking: the decoder thread reads the WAV body through a blocking `Read` so hound parses it
+# directly off the socket; only the trait's async shell uses tokio.
+reqwest = { workspace = true, features = ["blocking", "multipart"] }
+futures-util = { workspace = true }
+crossbeam-channel = { workspace = true }
+hound = "3.5"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
