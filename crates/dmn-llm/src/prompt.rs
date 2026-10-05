@@ -89,6 +89,10 @@ pub struct StoryText {
 /// candidate, the transcript and (from M2) the context assembler; this crate only defines it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FastRequest {
+    /// Today's date, `YYYY-MM-DD` in local time (#101), from the caller's clock: this crate reads
+    /// none. The user message opens with it under `## Today`, so the model can tell that what it
+    /// remembers about "the latest" anything may be old. Empty leaves the section out.
+    pub today: String,
     /// The text the detector proposed.
     pub candidate: String,
     /// Which lane `candidate` came from (#90). Names the last header and chooses the base rules;
@@ -123,10 +127,15 @@ impl FastRequest {
     }
 }
 
-/// The user message: job requirements, retrieved chunks, session summary, recent transcript,
-/// then the candidate. Empty sections are left out.
+/// The user message: today's date (#101), job requirements, retrieved chunks, session summary,
+/// recent transcript, then the candidate. Empty sections are left out.
 pub fn user_message(req: &FastRequest) -> String {
     let mut out = String::new();
+    if !req.today.trim().is_empty() {
+        out.push_str("## Today\n");
+        out.push_str(req.today.trim());
+        out.push_str("\n\n");
+    }
     if !req.job_requirements.is_empty() {
         out.push_str("## Job requirements\n");
         for r in &req.job_requirements {
@@ -299,6 +308,68 @@ mod tests {
         assert!(!m.contains("## Candidate's material"));
         assert!(!m.contains("## Session so far"));
         assert!(!m.contains("different angle"));
+    }
+
+    #[test]
+    fn the_user_message_opens_with_the_date_the_caller_passed() {
+        let req = FastRequest {
+            today: "2026-10-05".into(),
+            transcript: "Interviewer: hi".into(),
+            job_requirements: vec!["Go services".into()],
+            ..FastRequest::new("What is the latest stable major version of Go?", 6)
+        };
+        let m = user_message(&req);
+        assert!(
+            m.starts_with("## Today\n2026-10-05\n\n## Job requirements\n"),
+            "{m}"
+        );
+        // The date is whatever the caller says: this crate reads no clock.
+        let later = FastRequest {
+            today: "2027-01-31".into(),
+            ..req.clone()
+        };
+        assert!(user_message(&later).starts_with("## Today\n2027-01-31\n\n"));
+        // Without one the section is left out and the rest is unchanged.
+        let none = FastRequest {
+            today: String::new(),
+            ..req.clone()
+        };
+        assert!(!user_message(&none).contains("## Today"));
+        assert_eq!(
+            user_message(&req),
+            format!("## Today\n2026-10-05\n\n{}", user_message(&none))
+        );
+    }
+
+    #[test]
+    fn both_base_prompts_carry_the_rule_for_answers_that_depend_on_what_is_current() {
+        for asker in [Asker::Interviewer, Asker::You] {
+            let p = system_prompt(None, asker);
+            assert!(p.contains("- lookup:"), "{asker:?}");
+            assert!(p.contains(r#"the "Today" section"#), "{asker:?}");
+            // The hedge is in the candidate's voice: the Approach is said out loud.
+            assert!(p.contains("what the candidate says out loud"), "{asker:?}");
+            assert!(p.contains("it may have moved on"), "{asker:?}");
+            // Naming the model's own words ("knowledge cutoff") made the model write them.
+            for word in ["cutoff", "training"] {
+                assert!(!p.contains(word), "{asker:?}: {word}");
+            }
+            assert!(
+                p.find("- focus:") < p.find("- lookup:")
+                    && p.find("- lookup:") < p.find("- approach:"),
+                "the rules list the fields in schema order"
+            );
+        }
+        // The same rule, word for word, whoever asked.
+        let rule = |p: String| {
+            p.lines()
+                .filter(|l| l.starts_with("- lookup:") || l.starts_with("- Current facts:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let them = rule(system_prompt(None, Asker::Interviewer));
+        assert_eq!(them.len(), 2, "{them:?}");
+        assert_eq!(them, rule(system_prompt(None, Asker::You)));
     }
 
     #[test]

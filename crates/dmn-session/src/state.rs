@@ -265,6 +265,13 @@ pub struct Question {
     pub text: String,
     pub kind: String,
     pub focus: String,
+    /// #101: the web search the fast phase named because the answer depends on what is current;
+    /// while it is set the Approach block says `may be out of date`. Empty for every other
+    /// question, and then left out of the JSON, so every session saved before #101 loads and
+    /// serialises unchanged. A regenerate or Swap starts the question afresh, so the tag follows
+    /// the newest reply.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lookup: String,
     pub approach: Vec<String>,
     pub star: Option<StarCards>,
     pub clarifications: Vec<Clarification>,
@@ -309,6 +316,7 @@ impl Question {
             text,
             kind,
             focus: String::new(),
+            lookup: String::new(),
             approach: Vec::new(),
             star: None,
             clarifications: Vec::new(),
@@ -762,6 +770,13 @@ fn apply(s: &mut Session, action: &Action) {
         Action::Focus { candidate, text } => {
             if let Some(q) = s.question_mut(*candidate) {
                 q.focus = text.clone();
+            }
+        }
+        Action::Lookup { candidate, query } => {
+            // A clarification's reply keeps its query in its stored payload only: the tag belongs
+            // to the question whose Approach is on screen.
+            if let Some(q) = s.question_mut(*candidate) {
+                q.lookup.clone_from(query);
             }
         }
         Action::ApproachLine {

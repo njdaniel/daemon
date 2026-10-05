@@ -397,6 +397,8 @@ impl StoreWriter {
                 })?;
             }
             Action::Focus { .. }
+            // #101: the query is stored with the suggestion, in its `Answered` payload.
+            | Action::Lookup { .. }
             | Action::ApproachLine { .. }
             | Action::Star { .. }
             | Action::Ignored { .. }

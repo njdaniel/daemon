@@ -1,4 +1,7 @@
-//! Area 2: the numbered Approach, or the STAR cards for a behavioral question.
+//! Area 2: the numbered Approach, or the STAR cards for a behavioral question. Its border's right
+//! end carries one dim hint: `thinking…` while the next reply is on its way, `…` while this one
+//! streams, `no other story` after a Swap with none (#58), and `may be out of date` while the
+//! question's answer depends on what is current (#101).
 
 use dmn_session::{Question, QuestionSource, StarCards};
 use ratatui::buffer::Buffer;
@@ -29,6 +32,9 @@ fn star<'a>(view: &View<'a>) -> Option<&'a StarCards> {
             .filter(|_| q.kind == BEHAVIORAL || q.approach.is_empty())
     })
 }
+
+/// The tag on the Approach block's border while the question on screen has a `lookup` (#101).
+const OUT_OF_DATE: &str = "may be out of date";
 
 /// The fast phase's `kind` for a behavioral question.
 const BEHAVIORAL: &str = "behavioral";
@@ -81,13 +87,18 @@ fn content(view: &View<'_>, cells: usize) -> Vec<Line<'static>> {
 
 pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     let cards = star(view);
+    // #101: the fast phase said the answer depends on what is current. Shown as soon as the
+    // query arrives (before the Approach lines), in the place the streaming "…" would take.
+    let dated = view.shown().is_some_and(|q| !q.lookup.is_empty());
     let hint = if view.loading {
         Some("thinking…")
-    } else if view.streaming {
+    } else if view.streaming && !dated {
         Some("…")
     } else if cards.is_some() && view.shown().is_some_and(|q| q.no_other_story) {
         // Swap pressed with no other matched story (#58).
         Some("no other story")
+    } else if dated {
+        Some(OUT_OF_DATE)
     } else {
         None
     };
