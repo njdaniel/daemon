@@ -425,8 +425,13 @@ mod tests {
             let p = system_prompt(None, asker);
             assert!(p.contains("- lookup:"), "{asker:?}");
             assert!(p.contains(r#"the "Today" section"#), "{asker:?}");
-            assert!(p.contains("say it may have changed since"), "{asker:?}");
-            assert!(p.contains("never mentions lookup"), "{asker:?}");
+            // The hedge is in the candidate's voice: the Approach is said out loud.
+            assert!(p.contains("what the candidate says out loud"), "{asker:?}");
+            assert!(p.contains("it may have moved on"), "{asker:?}");
+            // Naming the model's own words ("knowledge cutoff") made the model write them.
+            for word in ["cutoff", "training"] {
+                assert!(!p.contains(word), "{asker:?}: {word}");
+            }
             assert!(
                 p.find("- focus:") < p.find("- lookup:")
                     && p.find("- lookup:") < p.find("- approach:"),
