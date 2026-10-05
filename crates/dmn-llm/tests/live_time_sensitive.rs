@@ -100,10 +100,38 @@ const HEDGES: &[&str] = &[
     "confirm",
     "at the time",
     "newer",
+    // As a person says it.
+    "as far as",
+    "moved on",
+    "worked with",
+    "i believe",
 ];
 
 /// Words that make a line's version the one the model remembers, not the current one.
-const REMEMBERED: &[&str] = &["know", "knew", "as of", "last", "may", "might", "training"];
+const REMEMBERED: &[&str] = &[
+    "know",
+    "knew",
+    "as of",
+    "last",
+    "may",
+    "might",
+    "training",
+    "as far as",
+    "worked with",
+    "believe",
+];
+
+/// Words a candidate never says out loud: the Approach is spoken, in their voice, so it names no
+/// knowledge cutoff, no training data and never the schema's `lookup` field.
+const MACHINE_VOICE: &[&str] = &["cutoff", "cut-off", "training", "lookup", "as an ai"];
+
+/// The first Approach line in the model's voice rather than the candidate's, if any.
+fn machine_voice(approach: &[String]) -> Option<&String> {
+    approach.iter().find(|l| {
+        let l = l.to_lowercase();
+        MACHINE_VOICE.iter().any(|w| l.contains(w))
+    })
+}
 
 /// The Approach states a version as the current one: a line calls a version the latest, current
 /// or newest without saying it is only the one the model knows of, or the Approach names a version
@@ -122,13 +150,13 @@ fn states_a_version_as_current(approach: &[String]) -> bool {
 }
 
 /// The Approach a time-sensitive answer should have: it says somewhere that what it remembers
-/// may be old, never calls a remembered version the current one, and never names the `lookup`
-/// field (the candidate reads the Approach, not the schema).
+/// may be old, never calls a remembered version the current one, and says it all in the
+/// candidate's voice ([`machine_voice`]).
 fn honest(approach: &[String]) -> bool {
     let lower: Vec<String> = approach.iter().map(|l| l.to_lowercase()).collect();
     lower.iter().any(|l| HEDGES.iter().any(|h| l.contains(h)))
         && !states_a_version_as_current(approach)
-        && !lower.iter().any(|l| l.contains("lookup"))
+        && machine_voice(approach).is_none()
 }
 
 fn show(q: &str, i: usize, s: &Suggestion, first_line: f64) {
@@ -148,6 +176,11 @@ async fn time_sensitive_latest_go_version_is_flagged_and_not_stated_as_fact() {
     for i in 0..runs() {
         let (s, t) = ask(&p, q, i).await;
         show(q, i, &s, t);
+        assert_eq!(
+            machine_voice(&s.approach),
+            None,
+            "run {i}: an Approach line in the model's voice"
+        );
         if s.lookup.is_empty() || !honest(&s.approach) {
             misses.push(i);
         }
@@ -171,8 +204,8 @@ async fn time_sensitive_b_tree_split_is_not_flagged() {
     assert!(misses.is_empty(), "flagged on runs {misses:?}");
 }
 
-/// More of each sort, for the hit rate in the PR. Prints; asserts nothing, so a miss here is
-/// reported rather than hidden.
+/// More of each sort, for the hit rate in the PR. Prints every count, misses included; the only
+/// assertion, after the report, is that no flagged reply's Approach speaks in the model's voice.
 #[tokio::test]
 #[ignore]
 async fn time_sensitive_survey() {
@@ -190,6 +223,7 @@ async fn time_sensitive_survey() {
         "What is the difference between a process and a thread?",
     ];
     let mut report = Vec::new();
+    let mut voiced = Vec::new();
     for (questions, wants_lookup) in [(&current[..], true), (&stable[..], false)] {
         for q in questions {
             let (mut flagged, mut hedged) = (0, 0);
@@ -198,6 +232,11 @@ async fn time_sensitive_survey() {
                 show(q, i, &s, t);
                 flagged += usize::from(!s.lookup.is_empty());
                 hedged += usize::from(honest(&s.approach));
+                if !s.lookup.is_empty()
+                    && let Some(line) = machine_voice(&s.approach)
+                {
+                    voiced.push(format!("[{i}] {q}: {line}"));
+                }
             }
             let n = runs();
             report.push(if wants_lookup {
@@ -208,6 +247,11 @@ async fn time_sensitive_survey() {
         }
     }
     eprintln!("\n{}", report.join("\n"));
+    assert!(
+        voiced.is_empty(),
+        "Approach lines in the model's voice:\n{}",
+        voiced.join("\n")
+    );
 }
 
 #[test]
@@ -242,6 +286,17 @@ fn the_version_check_reads_versions_and_hedges() {
     assert!(!honest(&lines(&[
         "State Redis changed to SSPL in 2024.",
         "Explain why."
+    ])));
+    for line in [
+        "Note it may have changed since my knowledge cutoff.",
+        "Verify the exact version number via lookup.",
+        "Say newer releases may postdate your training data.",
+    ] {
+        assert!(machine_voice(&lines(&[line])).is_some(), "{line}");
+    }
+    assert!(honest(&lines(&[
+        "Say the latest you've worked with is Go 1.24.",
+        "Add that it may have moved on; you'd confirm on go.dev."
     ])));
     assert!(has_version("Python 3.13 added a JIT"));
     assert!(has_version("since v1.31."));
