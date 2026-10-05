@@ -210,6 +210,32 @@ whole card (`--model medium` runs at about 0.14 s per utterance on a 4090). Pres
 Ctrl+Shift+A later loads the LLM into what is left; if a tenth or more of it lands in system
 memory the status line says `llm partly on cpu`.
 
+#### Checking answers that depend on what is current (web lookup, off by default)
+
+A local model only knows what it was trained on. Asked for "the latest stable version of Go",
+it hedges and tags the Approach `may be out of date` (#101). With the web lookup on, Daemon
+then searches the web for that one question and answers again from what it finds (#102): the
+first Approach still arrives from the local model alone, and a few seconds later it is replaced
+in place by one built on the results, tagged `checked · go.dev`. If the search times out, fails,
+finds nothing or has no key, the first answer stays and the status line says `lookup failed`.
+
+It uses [Ollama's web search](https://docs.ollama.com/capabilities/web-search), which needs a
+key from your ollama.com account. Export it, then turn the lookup on:
+
+```bash
+export OLLAMA_API_KEY=...        # the key stays in the environment; dmn never writes or logs it
+```
+
+```toml
+[lookup]
+enabled = true
+# provider = "ollama"; base_url = "https://ollama.com"; api_key_env = "OLLAMA_API_KEY"
+# timeout_ms = 3000; max_results = 3
+```
+
+`dmn doctor` says whether it is off, ready, or on with the variable unset, and the status line
+says `web` beside the model dot while it is on. What it sends, and to whom, is under Privacy.
+
 ### Initialize and inspect your system
 
 ```bash
@@ -338,6 +364,18 @@ Daemon is being designed with privacy as a core constraint:
 - Ollama is the default LLM provider
 - remote providers are opt-in
 - no accounts, telemetry, or cloud sync are required for v1
+
+What leaves the machine, and when:
+
+- **Audio:** never.
+- **Transcript text** (with the retrieved notes and the session summary): only when you choose a
+  remote model (`[llm].provider` other than `ollama`, or an Ollama on another host).
+- **A web search query:** only with the web lookup on (`[lookup].enabled = true`; off by
+  default). For a question whose answer depends on what is current, the few words the model
+  writes as a search query (at most 80 characters, such as `latest stable Go release`) and the
+  number of results wanted go to Ollama's web search at `https://ollama.com/api/web_search`,
+  with your key from `OLLAMA_API_KEY`. No transcript, no resume or notes, nothing from the
+  session goes with it.
 
 ## Roadmap
 
