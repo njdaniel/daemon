@@ -318,6 +318,15 @@ pub enum Action {
     /// `continued`'s question where it is (live, pinned or queued) instead of arriving as a
     /// second question. Dispatched right after that candidate's [`Action::Candidate`].
     Continues { candidate: u64, continued: u64 },
+    /// Enter (#96): candidate `candidate` was sent by the key, not found by the detector: the
+    /// asking lane's last turn, for a question the detector missed. Dispatched right after that
+    /// candidate's [`Action::Candidate`]. Its reply takes the path any candidate's does, except
+    /// that a key press gets an answer either way: on [`Action::Ignored`] the status line says
+    /// `not a question` until [`Action::NoticeExpired`].
+    Asked { candidate: u64 },
+    /// The `not a question` notice for candidate `candidate` has been up for its 5 s (#96). The
+    /// pipeline, which has a clock, says when; the reducer has none.
+    NoticeExpired { candidate: u64 },
     /// Fast phase: the extracted question, first field of a shown reply.
     Question {
         candidate: u64,
@@ -344,7 +353,8 @@ pub enum Action {
         payload: String,
         at: i64,
     },
-    /// The fast phase decided the candidate is not to be shown.
+    /// The fast phase decided the candidate is not to be shown. Nothing on screen changes for a
+    /// detector candidate; one Enter sent (#96) gets `not a question` on the status line.
     Ignored {
         candidate: u64,
         reason: IgnoreReason,

@@ -18,7 +18,9 @@
 //!    the six expandable sections (#56): a compact grid of rows, keys `1`–`6`, and the body of
 //!    the one that is open, which takes rows from the Approach down to a floor.
 //! 3. Transcript and status: the last two transcript lines, then one line with the mic, system
-//!    and model dots and the two most useful shortcuts for the current state.
+//!    and model dots and the two most useful shortcuts for the current state, followed by
+//!    `⏎ ask` (#96) and led, for 5 s after the model declined what Enter sent, by
+//!    `not a question`.
 //!
 //! From 120 columns (#88) the transcript is a right-hand column instead, 40 % of the width and
 //! the full height above the status line, wrapped with the newest line at the bottom; the

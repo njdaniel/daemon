@@ -21,4 +21,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
 You         Okay, so first I'd want to know what we're limiting on.
 You         Per user or per▍
- ● mic  ● system  ● model                                        p pin · r redo
+ ● mic  ● system  ● model                                p pin · r redo · ⏎ ask

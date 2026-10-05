@@ -27,4 +27,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
 You         Sounds great.
 You         So I'd split the numbers into two halves around the median.
- ● mic  ● system  ● model                                                         1 close · s: full
+ ● mic  ● system  ● model                                                 1 close · s: full · ⏎ ask

@@ -21,4 +21,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
 Interviewer Great. Let me tell you a bit about the team before we start.
 Interviewer We run the platform▍
- ● mic  ● system  ● model                                       m mute · q quit
+ ● mic  ● system  ● model                               m mute · q quit · ⏎ ask

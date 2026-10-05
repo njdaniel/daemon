@@ -18,7 +18,9 @@
 //! [`Controls`] is how the TUI's keys reach the pipeline from another thread: pin and unpin
 //! dispatch straight into the session, mute gates the mic lane's VAD, regenerate goes to the
 //! pipeline thread (which owns the candidates and the transcript window the request needs), and
-//! quit stops the audio sources so the run ends early and cleanly.
+//! quit stops the audio sources so the run ends early and cleanly. Enter (#96) goes to the
+//! pipeline thread too: it sends the asking lane's last turn ([`last_turn`]) to the fast phase
+//! as a candidate the detector never scored, for a question the detector missed.
 //!
 //! Interview assistance (#79) is the layer past the transcript: the detector, the context and
 //! the LLM, held in [`Assistance`]. Off (`[assist].enabled = false`, `dmn run --no-assist`, or
@@ -54,7 +56,7 @@ use dmn_detect::{
     Candidate, DetectConfig, Detector, Following, QuestionSource, Sensitivity, candidate_channel,
 };
 use dmn_llm::{CurrentQuestion, Kind};
-use dmn_session::{Action, CodingSolutions, Dot, Health, Section, SessionHub, Stage};
+use dmn_session::{Action, CodingSolutions, Dot, Health, Section, Session, SessionHub, Stage};
 use dmn_stt::{
     DeviceChoice, Model, Placement, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber,
     model_path,
@@ -63,6 +65,7 @@ use dmn_transcript::{Bus, DEFAULT_WINDOW, EchoGuard, Segment, TranscriptLog, Ver
 use dmn_vad::{
     EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
 };
+use tokio::sync::watch;
 
 use crate::context::ContextSource;
 use crate::suggest::{Answered, Output, Policy, Suggester, Tally};
@@ -354,6 +357,72 @@ pub const CONTINUE_SPAN: Duration = Duration::from_secs(30);
 /// How many recent spans [`Detecting`] keeps per lane; only the last few can fall inside a gap.
 const YOU_SPANS: usize = 16;
 
+/// #96: how long the status line says `not a question` after the model declined what Enter sent.
+pub const NOT_A_QUESTION_FOR: Duration = Duration::from_secs(5);
+
+/// #96: what Enter sends, the asking lane's last turn: that lane's most recent finals with no
+/// final from the other lane between them, in spoken order, going back at most
+/// [`CONTINUE_SPAN`] from the turn's end. It is one candidate whose text is those finals joined;
+/// the fast phase already reduces "what was just said" to the question in it, so a turn that
+/// opens with remarks and ends with the question needs no rule here. The lane is the one `asks`
+/// selects (#90); with `both`, whichever spoke last. `None` until that lane has said something.
+///
+/// "Between" is judged on audio time, as a split question's gap is ([`Spans::spoke_between`]):
+/// the other lane's "mm-hm" inside a line does not end the turn, one in the gap before it does.
+/// The detector never scored this candidate, so it has score 0 and no cues.
+///
+/// An empty final (an utterance whisper heard nothing in, or an echo copy's retraction) is no
+/// speech here either, as for a split question (#63): on the other lane it does not cut the
+/// turn, and on the asking lane it is neither the turn's last line nor one of its lines.
+/// [`TranscriptLog`] keeps no such final (dmn-stt trims its text, and the log drops an empty
+/// one), so this holds for any slice, not only the log's.
+fn last_turn(finals: &[Segment], asks: QuestionSource) -> Option<Candidate> {
+    let finals: Vec<&Segment> = finals
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
+    let last = *finals
+        .iter()
+        .filter(|s| asks.allows(s.source))
+        .max_by_key(|s| s.end)?;
+    let lane = last.source;
+    let mut turn = vec![last];
+    let mut first = last;
+    for &seg in finals
+        .iter()
+        .rev()
+        .filter(|s| s.source == lane && s.start < last.start)
+    {
+        // A single-stream fallback is no lane (see `Spans`): it interrupts nothing.
+        let spoke = finals.iter().any(|o| {
+            o.source != lane
+                && o.source != Source::Unknown
+                && o.start < first.start
+                && o.end > seg.end
+        });
+        if spoke || last.end.saturating_sub(seg.start) > CONTINUE_SPAN {
+            break;
+        }
+        turn.push(seg);
+        first = seg;
+    }
+    let text = turn
+        .iter()
+        .rev()
+        .map(|s| s.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(Candidate {
+        source: lane,
+        start: first.start,
+        end: last.end,
+        line: text.clone(),
+        text,
+        score: 0,
+        cues: Vec::new(),
+    })
+}
+
 impl Detecting {
     pub fn new(
         spec_literal: bool,
@@ -591,6 +660,8 @@ pub enum Command {
     Swap { candidate: u64 },
     /// Ctrl+Shift+A (#79): interview assistance on or off from the next segment.
     Assist { on: bool },
+    /// Enter (#96): send the asking lane's last turn to the model, detector or no detector.
+    Ask,
 }
 
 /// The TUI's handle on a running pipeline. Cheap to clone; safe from any thread.
@@ -616,6 +687,15 @@ impl Controls {
     /// `r`: regenerate the live question (temperature 0.7, "a different angle").
     pub fn regenerate(&self) {
         let _ = self.commands.send(Command::Regenerate);
+    }
+
+    /// Enter (#96): make the last thing the interviewer said (the asking lane's last turn) the
+    /// question, for when the detector missed it. The pipeline thread builds the candidate from
+    /// its transcript log; it sends nothing while assistance is off, before that lane has
+    /// spoken, or when that turn already has its question. A press whose request failed can be
+    /// pressed again.
+    pub fn ask(&self) {
+        let _ = self.commands.send(Command::Ask);
     }
 
     /// `m`: mute or unmute the mic. Muted, the mic lane's VAD hears only silence, so nothing
@@ -842,6 +922,13 @@ pub struct Assistance {
     dropped_candidates: u64,
     /// Every candidate by session id, for `r`.
     known: HashMap<u64, Candidate>,
+    /// The turn Enter last sent (#96), as its candidate, its lane and where it ends: a second
+    /// press on the same turn sends nothing, unless that candidate's request failed.
+    asked: Option<(u64, Source, Duration)>,
+    /// The session as the screen has it, to see `not a question` go up (#96).
+    session: watch::Receiver<Session>,
+    /// The `not a question` notice now up, as its candidate and when this thread first saw it.
+    notice: Option<(u64, Instant)>,
 }
 
 impl Pipeline {
@@ -1154,6 +1241,7 @@ impl Pipeline {
             while let Ok(cmd) = self.commands.try_recv() {
                 self.command(cmd);
             }
+            self.assist.expire_notice(Instant::now());
             if self.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -1298,6 +1386,9 @@ impl Assistance {
         let (candidates_tx, candidates_rx) = candidate_channel(dmn_detect::DEFAULT_CAPACITY);
         let mut a = Self {
             on: false,
+            session: hub.watch(),
+            notice: None,
+            asked: None,
             hub,
             audio,
             detecting,
@@ -1359,45 +1450,122 @@ impl Assistance {
             }
             observer.candidate(self.next_candidate, f);
         }
-        for candidate in self.candidates_rx.try_iter() {
+        while let Ok(candidate) = self.candidates_rx.try_recv() {
             let Some((id, continues)) = self.sent_ids.pop_front() else {
                 break;
             };
-            self.hub.dispatch(wire::candidate(id, &candidate));
-            // #63: the same question, split at a pause. Its reply replaces the earlier one's
-            // question where it is, instead of arriving as a second question.
-            let continued = if continues {
-                self.last_sent.inspect(|&prev| {
-                    self.hub.dispatch(Action::Continues {
-                        candidate: id,
-                        continued: prev,
-                    });
-                })
-            } else {
-                None
-            };
-            self.last_sent = Some(id);
-            self.hub.dispatch(Action::Timing {
-                candidate: id,
-                stage: Stage::Emitted,
-                at: self.audio.now(),
-            });
-            if let Some(s) = &self.suggester {
-                // A continuation is the question still being asked: nothing has been answered.
-                let answered = match continued {
-                    Some(_) => None,
-                    None => self.answered(&candidate, log),
-                };
-                s.submit_after(
-                    id,
-                    &candidate,
-                    log.render_window(DEFAULT_WINDOW),
-                    answered,
-                    continued.is_some(),
-                );
-            }
-            self.known.insert(id, candidate);
+            self.send(id, candidate, continues, false, log);
         }
+    }
+
+    /// Candidate `id` into the session and the fast phase, with the last 60 s of transcript:
+    /// the one path every candidate takes, the detector's and (`asked`, #96) Enter's.
+    fn send(
+        &mut self,
+        id: u64,
+        candidate: Candidate,
+        continues: bool,
+        asked: bool,
+        log: &TranscriptLog,
+    ) {
+        self.hub.dispatch(wire::candidate(id, &candidate));
+        if asked {
+            self.hub.dispatch(Action::Asked { candidate: id });
+        }
+        // #63: the same question, split at a pause. Its reply replaces the earlier one's
+        // question where it is, instead of arriving as a second question.
+        let continued = if continues {
+            self.last_sent.inspect(|&prev| {
+                self.hub.dispatch(Action::Continues {
+                    candidate: id,
+                    continued: prev,
+                });
+            })
+        } else {
+            None
+        };
+        self.last_sent = Some(id);
+        self.hub.dispatch(Action::Timing {
+            candidate: id,
+            stage: Stage::Emitted,
+            at: self.audio.now(),
+        });
+        if let Some(s) = &self.suggester {
+            // A continuation is the question still being asked: nothing has been answered.
+            let answered = match continued {
+                Some(_) => None,
+                None => self.answered(&candidate, log),
+            };
+            s.submit_after(
+                id,
+                &candidate,
+                log.render_window(DEFAULT_WINDOW),
+                answered,
+                continued.is_some(),
+            );
+        }
+        self.known.insert(id, candidate);
+    }
+
+    /// Enter (#96): send the asking lane's last turn ([`last_turn`]) to the fast phase as a
+    /// candidate, without the detector; from there it is a candidate like any other. Nothing is
+    /// sent before that lane has spoken, or when the turn's last line already has its question:
+    /// on screen (`r` asks that one again), queued behind a pin, or on its way.
+    ///
+    /// A second press on the same turn sends nothing while the first is in flight, once it was
+    /// shown, or after the model declined it (the same prompt at temperature 0 gets the same
+    /// answer). It sends again when the first one's request failed: a timeout, an unreachable
+    /// model or a malformed reply is the tool letting the user down a second time, and the key
+    /// must not go dead until the interviewer speaks again. The session says which it was
+    /// ([`Session::ask_failed`]).
+    fn ask(&mut self, log: &TranscriptLog) {
+        if self.suggester.is_none() {
+            return;
+        }
+        let Some(turn) = last_turn(log.finals(), self.detecting.question_source()) else {
+            return;
+        };
+        let snap = self.hub.snapshot();
+        if let Some((id, source, end)) = self.asked
+            && (source, end) == (turn.source, turn.end)
+            && snap.ask_failed != Some(id)
+        {
+            return;
+        }
+        let has_question = snap
+            .live
+            .iter()
+            .flat_map(|q| {
+                std::iter::once(q.candidate).chain(q.clarifications.iter().map(|c| c.candidate))
+            })
+            .chain(snap.queued.iter().map(|q| q.candidate))
+            .chain(snap.pending)
+            .filter_map(|id| self.known.get(&id))
+            .any(|c| c.source == turn.source && c.end >= turn.end);
+        if has_question {
+            return;
+        }
+        self.next_candidate += 1;
+        self.asked = Some((self.next_candidate, turn.source, turn.end));
+        self.send(self.next_candidate, turn, false, true, log);
+    }
+
+    /// #96: take `not a question` off the status line once it has been up for
+    /// [`NOT_A_QUESTION_FOR`]. The reducer has no clock, so the pipeline loop, which comes by
+    /// every [`TICK`], says when.
+    fn expire_notice(&mut self, now: Instant) {
+        let showing = self.session.borrow().not_a_question;
+        self.notice = match (showing, self.notice) {
+            (Some(id), Some((seen, since))) if id == seen => {
+                if now.saturating_duration_since(since) < NOT_A_QUESTION_FOR {
+                    return;
+                }
+                self.hub.dispatch(Action::NoticeExpired { candidate: id });
+                None
+            }
+            (Some(id), _) => Some((id, now)),
+            (None, _) => None,
+        };
     }
 
     /// #57, session memory: the question on screen as `next` arrives, and what the candidate
@@ -1414,7 +1582,7 @@ impl Assistance {
         })
     }
 
-    /// A key's work on the pipeline thread. `r` and `w` ask the model nothing while off.
+    /// A key's work on the pipeline thread. `r`, `w` and Enter ask the model nothing while off.
     fn command(&mut self, cmd: Command, log: &TranscriptLog) {
         if let Command::Assist { on } = cmd {
             self.set(on);
@@ -1425,6 +1593,7 @@ impl Assistance {
         }
         match cmd {
             Command::Assist { .. } => {}
+            Command::Ask => self.ask(log),
             Command::Regenerate => {
                 let Some(s) = &self.suggester else {
                     return;
@@ -3002,6 +3171,683 @@ mod tests {
         assert!(
             !d.found()[1].continues,
             "the chain was forgotten when assistance went off"
+        );
+    }
+
+    // --- The ask key (#96) -------------------------------------------------------------------
+
+    /// What the interviewer said in the mock interview #96 came from (session 24), after the
+    /// candidate's answer ended at about 197 s, as `(start ms, end ms, text)`. The question is
+    /// the end of the last line, and the detector made no candidate from any of them.
+    const SESSION_24: [(u64, u64, &str); 5] = [
+        (
+            197_600,
+            200_700,
+            "Great, let me take a quick look and respond.",
+        ),
+        (
+            202_100,
+            206_300,
+            "Good answer. You covered the core piece as well. Four areas I'd probe.",
+        ),
+        (
+            206_800,
+            210_300,
+            "Quota reconciliation since output tokens aren't known up front.",
+        ),
+        (
+            210_900,
+            220_000,
+            "Tool call like dempotency and safety, especially with retries and side effects. \
+             Streaming failure modes like client disconnects or provider stalls and...",
+        ),
+        (
+            220_500,
+            232_500,
+            "Control plane versus data plane separation for prompts, policies, and secrets. Let's \
+             zoom into the quota problem. How would you reserve and then reconcile usage \
+             correctly under heavy concurrent traffic across regions?",
+        ),
+    ];
+
+    /// The question in [`SESSION_24`]'s last line, as the fast phase extracts it.
+    const RESERVE: &str = "How would you reserve and then reconcile usage correctly under heavy \
+                           concurrent traffic across regions?";
+
+    /// A fast-phase reply that shows `question` with a three-line Approach.
+    fn reply(question: &str) -> serde_json::Value {
+        serde_json::json!({
+            "is_question": true,
+            "kind": "system_design",
+            "question": question,
+            "focus": "reservation, reconciliation, consistency across regions",
+            "approach": [
+                "Reserve an estimate against the tenant's regional quota up front.",
+                "Reconcile to the real usage when the stream ends.",
+                "Expire reservations that never settle."
+            ]
+        })
+    }
+
+    /// Assistance on over `hub`, answered by `mock` under `dmn run`'s policy: a newer unpinned
+    /// question supersedes the one in flight.
+    fn asking(
+        hub: &Arc<SessionHub>,
+        mock: &dmn_llm::MockProvider,
+        source: QuestionSource,
+    ) -> Assistance {
+        let launch = {
+            let (hub, mock) = (Arc::clone(hub), mock.clone());
+            Box::new(move || Suggester::start_with(mock, Policy::Supersede, hub)) as Launch
+        };
+        Assistance::new(
+            true,
+            Arc::clone(hub),
+            AudioClock::new(Instant::now(), 1.0),
+            detecting_for(source),
+            Some(launch),
+        )
+    }
+
+    /// `seg` into the session and the log with no candidate made from it. Whether the detector
+    /// would have found the line is its own tests' business (#93); the key is for when it did
+    /// not.
+    fn hear(hub: &SessionHub, log: &mut TranscriptLog, seg: Segment) {
+        hub.dispatch(wire::segment(&seg));
+        log.apply(seg);
+    }
+
+    fn hear_session_24(hub: &SessionHub, log: &mut TranscriptLog) {
+        for (start, end, text) in SESSION_24 {
+            hear(hub, log, final_at(Source::Interviewer, start, end, text));
+        }
+    }
+
+    fn log_of(finals: &[Segment]) -> TranscriptLog {
+        let mut log = TranscriptLog::new();
+        for seg in finals {
+            log.apply(seg.clone());
+        }
+        log
+    }
+
+    /// Wait, up to 10 s, until the session satisfies `done`.
+    fn wait_until(hub: &SessionHub, what: &str, done: impl Fn(&Session) -> bool) -> Session {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let s = hub.snapshot();
+            if done(&s) {
+                return s;
+            }
+            assert!(Instant::now() < until, "never: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The live question's fast phase has finished.
+    fn answered(s: &Session) -> bool {
+        s.live
+            .as_ref()
+            .is_some_and(|q| q.progress == dmn_session::Progress::Done)
+    }
+
+    /// The TUI's screen for `session` at 100 × 30.
+    fn screen(session: &Session) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| crate::tui::draw(f, session)).unwrap();
+        let buf = t.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The fast-phase requests `mock` received, as their user messages.
+    fn asked_of(mock: &dmn_llm::MockProvider) -> Vec<String> {
+        mock.requests()
+            .iter()
+            .map(|r| r.messages[1].content.clone())
+            .collect()
+    }
+
+    const THREE: [(u64, u64, &str); 3] = [
+        (5_000, 9_000, "Okay, that covers the happy path."),
+        (9_600, 14_000, "Now say one region loses its Redis."),
+        (
+            14_500,
+            18_000,
+            "What does the limiter do for those callers?",
+        ),
+    ];
+
+    fn three_interviewer_finals() -> Vec<Segment> {
+        let mut finals = vec![final_at(
+            Source::You,
+            0,
+            4_000,
+            "I'd start with a token bucket.",
+        )];
+        finals.extend(
+            THREE.map(|(start, end, text)| final_at(Source::Interviewer, start, end, text)),
+        );
+        finals
+    }
+
+    #[test]
+    fn a_turn_of_three_finals_is_one_candidate_in_spoken_order() {
+        let log = log_of(&three_interviewer_finals());
+        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        assert_eq!(
+            turn.text,
+            "Okay, that covers the happy path. Now say one region loses its Redis. What does \
+             the limiter do for those callers?"
+        );
+        assert_eq!(turn.line, turn.text);
+        assert_eq!(turn.source, Source::Interviewer);
+        assert_eq!(
+            (turn.start, turn.end),
+            (Duration::from_millis(5_000), Duration::from_millis(18_000))
+        );
+        assert_eq!(
+            (turn.score, turn.cues.len()),
+            (0, 0),
+            "the detector never scored it"
+        );
+
+        // What the candidate says after the turn is not between its lines.
+        let mut answering = three_interviewer_finals();
+        answering.push(final_at(Source::You, 19_000, 24_000, "Good question."));
+        let log = log_of(&answering);
+        let later = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        assert_eq!(later.text, turn.text);
+    }
+
+    #[test]
+    fn a_you_final_between_the_lines_cuts_the_turn_there() {
+        let mut finals = three_interviewer_finals();
+        finals.push(final_at(Source::You, 9_100, 9_500, "Right."));
+        let log = log_of(&finals);
+        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        assert_eq!(
+            turn.text,
+            "Now say one region loses its Redis. What does the limiter do for those callers?"
+        );
+        assert_eq!(turn.start, Duration::from_millis(9_600));
+
+        // A "mm-hm" while the interviewer is still speaking is inside a line, not between two.
+        let mut finals = three_interviewer_finals();
+        finals.push(final_at(Source::You, 10_000, 10_400, "Mm-hm."));
+        let log = log_of(&finals);
+        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        assert_eq!(turn.start, Duration::from_millis(5_000), "{}", turn.text);
+    }
+
+    #[test]
+    fn an_empty_final_neither_cuts_the_turn_nor_is_part_of_it() {
+        // #63's rule for a split question, here: an utterance whisper heard nothing in is no
+        // speech. The transcript log keeps no empty final, so the slice is handed over as is.
+        let whole = "Okay, that covers the happy path. Now say one region loses its Redis. What \
+                     does the limiter do for those callers?";
+        for nothing in ["", "  "] {
+            let mut finals = three_interviewer_finals();
+            // In the gap between the first and the second line, where "Right." cuts the turn.
+            finals.insert(2, final_at(Source::You, 9_100, 9_500, nothing));
+            let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+            assert_eq!(turn.text, whole, "{nothing:?}");
+            assert_eq!(turn.start, Duration::from_millis(5_000));
+
+            // On the asking lane it is not the turn's last line, nor a line of it.
+            finals.push(final_at(Source::Interviewer, 18_400, 18_900, nothing));
+            let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+            assert_eq!(turn.text, whole, "{nothing:?}");
+            assert_eq!(turn.end, Duration::from_millis(18_000));
+            // Alone, it is not a turn at all: that lane has said nothing.
+            assert!(last_turn(&finals[2..3], QuestionSource::You).is_none());
+        }
+        // The same place with something said in it still cuts the turn.
+        let mut finals = three_interviewer_finals();
+        finals.insert(2, final_at(Source::You, 9_100, 9_500, "Right."));
+        let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+        assert_eq!(turn.start, Duration::from_millis(9_600), "{}", turn.text);
+
+        // And the log is where such a final stops: it never holds one.
+        let mut log = log_of(&three_interviewer_finals());
+        log.apply(final_at(Source::You, 9_100, 9_500, ""));
+        assert_eq!(log.finals().len(), 4);
+    }
+
+    #[test]
+    fn a_turn_goes_back_at_most_30_s() {
+        let finals: Vec<Segment> = SESSION_24
+            .iter()
+            .map(|&(start, end, text)| final_at(Source::Interviewer, start, end, text))
+            .collect();
+        let log = log_of(&finals);
+        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        // 232.5 s back to 206.8 s is 25.7 s; the line before starts 30.4 s back.
+        assert_eq!(turn.start, Duration::from_millis(206_800));
+        assert_eq!(
+            turn.text,
+            [SESSION_24[2].2, SESSION_24[3].2, SESSION_24[4].2].join(" ")
+        );
+        assert!(turn.end - turn.start <= CONTINUE_SPAN);
+    }
+
+    #[test]
+    fn the_turn_is_on_the_lane_the_question_source_selects() {
+        let finals = [
+            final_at(Source::Interviewer, 0, 5_000, FIRST),
+            final_at(Source::You, 6_000, 9_000, MINE),
+            final_at(Source::You, 9_400, 12_000, MINE_REST),
+            final_at(Source::Interviewer, 13_000, 13_600, "Mm-hm."),
+        ];
+        let log = log_of(&finals);
+        let turn = |asks| last_turn(log.finals(), asks).map(|c| (c.source, c.text));
+        assert_eq!(
+            turn(QuestionSource::Interviewer),
+            Some((Source::Interviewer, "Mm-hm.".into())),
+            "your lines in between cut the interviewer's turn"
+        );
+        assert_eq!(
+            turn(QuestionSource::You),
+            Some((Source::You, format!("{MINE} {MINE_REST}"))),
+            "the mic lane's last turn, though the interviewer spoke after it"
+        );
+        assert_eq!(
+            turn(QuestionSource::Both),
+            Some((Source::Interviewer, "Mm-hm.".into())),
+            "both: whichever lane spoke last"
+        );
+        let log = log_of(&finals[..3]);
+        assert_eq!(
+            last_turn(log.finals(), QuestionSource::Both).map(|c| c.source),
+            Some(Source::You)
+        );
+
+        // Until the asking lane has said something there is no turn.
+        assert!(last_turn(&[], QuestionSource::Both).is_none());
+        let log = log_of(&finals[..1]);
+        assert!(last_turn(log.finals(), QuestionSource::You).is_none());
+    }
+
+    #[test]
+    fn controls_ask_goes_to_the_pipeline_thread() {
+        let (controls, rx) = Controls::for_test();
+        controls.ask();
+        assert_eq!(rx.try_recv(), Ok(Command::Ask));
+        assert_eq!(
+            controls.hub().snapshot(),
+            Session::default(),
+            "the session changes only once the pipeline has a turn to send"
+        );
+    }
+
+    #[test]
+    fn enter_asks_the_last_thing_the_interviewer_said_when_the_detector_made_no_candidate() {
+        // The whole path, store included: the session-24 lines are the transcript, nothing was
+        // detected in them, and one key press puts the question and its Approach on screen.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let recorder = Recorder::start(Some(open_store(&paths).unwrap()), Some(&paths.db_file));
+        let hub = recorder.hub();
+        hub.dispatch(Action::Started {
+            label: "session 24".into(),
+            at: 1_790_000_000,
+        });
+        let mock = dmn_llm::MockProvider::json(&reply(RESERVE));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+        hear(
+            &hub,
+            &mut log,
+            final_at(
+                Source::You,
+                185_000,
+                197_000,
+                "So the gateway meters every request per tenant before it reaches a provider.",
+            ),
+        );
+        hear_session_24(&hub, &mut log);
+        let before = hub.snapshot();
+        assert_eq!(before.counts.candidates, 0, "no candidate from them");
+        assert!(screen(&before).contains("LISTENING"));
+
+        a.command(Command::Ask, &log);
+        let s = wait_until(&hub, "the question and its Approach", answered);
+        let live = s.live.clone().unwrap();
+        assert_eq!(live.text, RESERVE);
+        let shown = screen(&s);
+        assert!(shown.contains("LIVE QUESTION"), "{shown}");
+        for part in [
+            "How would you reserve and then reconcile usage correctly",
+            "1  Reserve an estimate against the tenant's regional quota up front.",
+            "3  Expire reservations that never settle.",
+        ] {
+            assert!(shown.contains(part), "{part}:\n{shown}");
+        }
+        assert!(s.asked.is_empty() && s.not_a_question.is_none());
+
+        // What the model was asked: the turn as one candidate, and the 60 s window around it.
+        let asked = asked_of(&mock);
+        assert_eq!(asked.len(), 1);
+        let turn = [SESSION_24[2].2, SESSION_24[3].2, SESSION_24[4].2].join(" ");
+        assert!(
+            asked[0].contains(&format!("## Interviewer just said\n{turn}")),
+            "{}",
+            asked[0]
+        );
+        assert!(
+            asked[0].contains("You: So the gateway meters"),
+            "{}",
+            asked[0]
+        );
+
+        let (d, tally, _) = a.finish(false);
+        assert!(d.found().is_empty(), "the detector made none");
+        assert_eq!(tally.map(|t| t.shown), Some(1));
+        drop(hub);
+        let report = recorder.finish(1_790_000_300).unwrap().unwrap();
+        assert_eq!((report.questions, report.errors), (1, 0), "{report:?}");
+        let store = dmn_store::Store::open(&paths.db_file).unwrap();
+        let questions = store.questions(report.session_id.unwrap()).unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].text.as_deref(), Some(RESERVE));
+        assert_eq!(questions[0].kind.as_deref(), Some("system_design"));
+        let suggestions = store.suggestions_for_question(questions[0].id).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert!(
+            suggestions[0]
+                .payload
+                .contains("Reconcile to the real usage when the stream ends."),
+            "{}",
+            suggestions[0].payload
+        );
+    }
+
+    #[test]
+    fn enter_while_pinned_queues_the_question_and_the_badge_counts_it() {
+        let hub = Arc::new(SessionHub::default());
+        let mock = dmn_llm::MockProvider::json(&reply(FIRST)).then_json(&reply(RESERVE));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        wait_until(&hub, "the detected question", answered);
+        hub.dispatch(Action::Pin);
+        hear_session_24(&hub, &mut log);
+
+        a.command(Command::Ask, &log);
+        let s = wait_until(&hub, "the asked question, queued", |s| {
+            s.queued
+                .first()
+                .is_some_and(|q| q.progress == dmn_session::Progress::Done)
+        });
+        assert!(s.pinned);
+        assert_eq!(s.live.as_ref().map(|q| q.text.as_str()), Some(FIRST));
+        assert_eq!(s.queued.len(), 1);
+        assert_eq!(s.queued[0].text, RESERVE);
+        let shown = screen(&s);
+        assert!(shown.contains("PINNED QUESTION"), "{shown}");
+        assert!(shown.contains("1 new"), "the badge counts it:\n{shown}");
+        assert!(!shown.contains("reserve and then reconcile"), "{shown}");
+
+        // The queued question is that turn's: Enter again asks nothing.
+        a.command(Command::Ask, &log);
+        a.finish(false);
+        assert_eq!(asked_of(&mock).len(), 2, "the detector's and the key's");
+        assert_eq!(hub.snapshot().counts.candidates, 2);
+    }
+
+    #[test]
+    fn enter_twice_on_the_same_turn_sends_one_request() {
+        let hub = Arc::new(SessionHub::default());
+        // Streams for about a second, so the second press comes while the first is in flight.
+        let mock =
+            dmn_llm::MockProvider::json(&reply(RESERVE)).with_delay(Duration::from_millis(20));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+        hear_session_24(&hub, &mut log);
+        a.command(Command::Ask, &log);
+        a.command(Command::Ask, &log);
+        assert_eq!(hub.snapshot().counts.candidates, 1);
+        wait_until(&hub, "the asked question", answered);
+        // On screen now: asking that one again is `r`.
+        a.command(Command::Ask, &log);
+        assert_eq!(hub.snapshot().counts.candidates, 1);
+
+        // A new line from the interviewer is a new turn.
+        hear(
+            &hub,
+            &mut log,
+            final_at(
+                Source::Interviewer,
+                233_400,
+                236_000,
+                "And how would you test that under load?",
+            ),
+        );
+        a.command(Command::Ask, &log);
+        a.finish(false);
+        assert_eq!(hub.snapshot().counts.candidates, 2);
+        assert_eq!(asked_of(&mock).len(), 2);
+    }
+
+    #[test]
+    fn enter_again_after_a_failed_request_asks_about_the_same_turn_again() {
+        let hub = Arc::new(SessionHub::default());
+        // The first request fails; the second is answered, streaming for about a second.
+        let mock = dmn_llm::MockProvider::new(vec![dmn_llm::mock::Step::Error(
+            "upstream timed out".into(),
+        )])
+        .then_json(&reply(RESERVE))
+        .with_delay(Duration::from_millis(20));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+        hear_session_24(&hub, &mut log);
+        a.command(Command::Ask, &log);
+        let s = wait_until(&hub, "the request to fail", |s| s.counts.failed == 1);
+        assert_eq!(s.ask_failed, Some(1));
+        assert!(s.live.is_none() && s.asked.is_empty());
+
+        // Nothing new was said, and the key is not dead: the same turn goes out again.
+        a.command(Command::Ask, &log);
+        // That one is in flight: a double press is still one request.
+        a.command(Command::Ask, &log);
+        let s = hub.snapshot();
+        assert_eq!((s.counts.candidates, s.ask_failed), (2, None));
+        let s = wait_until(&hub, "the retry's answer", answered);
+        assert_eq!(s.live.as_ref().map(|q| q.text.as_str()), Some(RESERVE));
+        // And once it is on screen, asking again is `r`.
+        a.command(Command::Ask, &log);
+        a.finish(false);
+        assert_eq!(hub.snapshot().counts.candidates, 2);
+        let asked = asked_of(&mock);
+        assert_eq!(asked.len(), 2, "the failed request and its retry");
+        let turn = [SESSION_24[2].2, SESSION_24[3].2, SESSION_24[4].2].join(" ");
+        for user in &asked {
+            assert!(
+                user.contains(&format!("## Interviewer just said\n{turn}")),
+                "{user}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_on_a_turn_the_detector_already_made_the_question_asks_nothing() {
+        let hub = Arc::new(SessionHub::default());
+        let mock = dmn_llm::MockProvider::json(&reply(FIRST)).with_delay(Duration::from_millis(20));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        // Its reply is on its way: an impatient Enter must not cancel it and ask again.
+        a.command(Command::Ask, &log);
+        wait_until(&hub, "the detected question", answered);
+        // And once it is the live question, asking it again is `r`.
+        a.command(Command::Ask, &log);
+        a.finish(false);
+        assert_eq!(hub.snapshot().counts.candidates, 1);
+        assert_eq!(asked_of(&mock).len(), 1);
+    }
+
+    #[test]
+    fn enter_sends_nothing_with_assistance_off_or_before_anyone_has_spoken() {
+        let (mut a, mock, _) = assistance(true);
+        let hub = Arc::clone(&a.hub);
+        let mut log = TranscriptLog::new();
+        a.command(Command::Ask, &log);
+        // Your own greeting is not the asking lane speaking.
+        hear(
+            &hub,
+            &mut log,
+            final_at(Source::You, 1_000, 3_000, "Hi, can you hear me?"),
+        );
+        a.command(Command::Ask, &log);
+        assert_eq!(hub.snapshot().counts.candidates, 0, "nobody to ask about");
+
+        a.command(Command::Assist { on: false }, &log);
+        hear_session_24(&hub, &mut log);
+        a.command(Command::Ask, &log);
+        assert_eq!(hub.snapshot().counts.candidates, 0, "assistance is off");
+        let (_, tally, _) = a.finish(false);
+        assert_eq!(tally.map(|t| t.shown + t.ignored + t.failed), Some(0));
+        assert!(mock.requests().is_empty(), "no provider request");
+
+        // Off from the start: the key does not start the suggester either.
+        let (mut a, mock, launched) = assistance(false);
+        a.command(Command::Ask, &log);
+        assert!(!launched.load(Ordering::Acquire));
+        a.finish(false);
+        assert!(mock.requests().is_empty());
+    }
+
+    #[test]
+    fn a_declined_key_press_says_not_a_question_for_5_s_and_a_declined_detector_candidate_nothing()
+    {
+        let hub = Arc::new(SessionHub::default());
+        let mock = dmn_llm::MockProvider::json(&serde_json::json!({
+            "is_question": false,
+            "kind": "small_talk"
+        }));
+        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut log = TranscriptLog::new();
+
+        // The detector's candidate, declined: nothing is said, as before #96.
+        publish(
+            &mut a,
+            &mut log,
+            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+        );
+        let s = wait_until(&hub, "the detector's candidate declined", |s| {
+            s.counts.ignored == 1
+        });
+        assert_eq!(s.not_a_question, None);
+        assert!(!screen(&s).contains("not a question"));
+        let now = Instant::now();
+        a.expire_notice(now);
+        a.expire_notice(now + NOT_A_QUESTION_FOR);
+        assert_eq!(hub.snapshot(), s, "no notice, so nothing to take down");
+
+        // The same reply to a key press: the status line answers it.
+        hear(
+            &hub,
+            &mut log,
+            final_at(Source::You, 27_000, 30_000, "A token bucket per API key."),
+        );
+        hear(
+            &hub,
+            &mut log,
+            final_at(
+                Source::Interviewer,
+                31_000,
+                33_000,
+                "Okay, that makes sense.",
+            ),
+        );
+        a.command(Command::Ask, &log);
+        let s = wait_until(&hub, "the key's candidate declined", |s| {
+            s.counts.ignored == 2
+        });
+        assert_eq!(s.not_a_question, Some(2));
+        assert!(s.live.is_none(), "the screen keeps what it had");
+        let shown = screen(&s);
+        assert!(shown.contains("LISTENING"), "{shown}");
+        assert!(
+            shown.contains("not a question · m mute · q quit · ⏎ ask"),
+            "{shown}"
+        );
+
+        // Up for 5 s from when the pipeline first sees it, then taken down.
+        let seen = Instant::now();
+        a.expire_notice(seen);
+        a.expire_notice(seen + NOT_A_QUESTION_FOR - Duration::from_millis(1));
+        assert_eq!(hub.snapshot().not_a_question, Some(2), "not yet");
+        a.expire_notice(seen + NOT_A_QUESTION_FOR);
+        let s = hub.snapshot();
+        assert_eq!(s.not_a_question, None);
+        assert!(!screen(&s).contains("not a question"));
+
+        // The model has answered for that turn, and at temperature 0 would say the same again:
+        // Enter asks nothing, unlike after a request that failed.
+        assert_eq!(s.ask_failed, None);
+        a.command(Command::Ask, &log);
+        a.finish(false);
+        assert_eq!(asked_of(&mock).len(), 2);
+    }
+
+    #[test]
+    fn under_you_enter_sends_the_mic_lanes_last_turn() {
+        let hub = Arc::new(SessionHub::default());
+        let mock = dmn_llm::MockProvider::json(&reply(MINE));
+        let mut a = asking(&hub, &mock, QuestionSource::You);
+        let mut log = TranscriptLog::new();
+        for seg in [
+            final_at(Source::Interviewer, 0, 5_000, FIRST),
+            final_at(
+                Source::You,
+                6_000,
+                9_000,
+                "So for the limiter I keep going back and forth.",
+            ),
+            final_at(
+                Source::You,
+                9_400,
+                13_000,
+                "Token bucket or sliding window for a public API.",
+            ),
+            final_at(Source::Interviewer, 14_000, 14_600, "Mm-hm."),
+        ] {
+            hear(&hub, &mut log, seg);
+        }
+        a.command(Command::Ask, &log);
+        wait_until(&hub, "the answer to the mic lane's turn", answered);
+        a.finish(false);
+        let asked = asked_of(&mock);
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0].contains(
+                "## You just said\nSo for the limiter I keep going back and forth. Token bucket \
+                 or sliding window for a public API."
+            ),
+            "{}",
+            asked[0]
+        );
+        assert!(
+            !asked[0].contains("## Interviewer just said"),
+            "{}",
+            asked[0]
         );
     }
 }

@@ -21,4 +21,4 @@
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
 Interviewer …ing the time today. This session is about an hour of system design.
 You         Sounds great.
- ● mic  ● system  ● model                                        p pin · w swap
+ ● mic  ● system  ● model                                p pin · w swap · ⏎ ask

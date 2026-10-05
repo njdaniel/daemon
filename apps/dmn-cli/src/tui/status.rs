@@ -155,11 +155,6 @@ fn transcript_line(l: &TranscriptLine, partial: bool, cells: usize) -> Line<'sta
 }
 
 pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
-    let keys = shortcuts(view);
-    let keys_cells = u16::try_from(width(&keys)).unwrap_or(u16::MAX);
-    let [left, right] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(keys_cells)]).areas(area);
-
     let st = &view.session.status;
     let mut spans = Vec::new();
     let mut detail = None;
@@ -244,8 +239,25 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
             .filter(|p| p.remote)
             .map(|_| ("transcript leaves this machine".to_owned(), Color::Yellow))
     });
+    let used = Line::from(spans.clone()).width();
+    // #96: the keys as long as the note fits whole beside them, `⏎ ask` going first: the note
+    // had those cells before the key did. A note too long for any form is cut, as it always
+    // was, beside the full keys.
+    let forms = shortcuts(view);
+    let whole = |keys: &&String| {
+        note.as_ref()
+            .is_none_or(|(d, _)| used + 2 + width(d) + width(keys) <= usize::from(area.width))
+    };
+    let keys = forms
+        .iter()
+        .find(whole)
+        .or(forms.first())
+        .cloned()
+        .unwrap_or_default();
+    let keys_cells = u16::try_from(width(&keys)).unwrap_or(u16::MAX);
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(keys_cells)]).areas(area);
     if let Some((d, color)) = note {
-        let used = Line::from(spans.clone()).width();
         let room = usize::from(left.width).saturating_sub(used + 2);
         if room > 3 {
             spans.push(Span::styled(
@@ -257,12 +269,16 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     Paragraph::new(Line::from(spans)).render(left, buf);
     // #79: the right-hand area is never cut (the left one is, on a narrow pane), so the one
     // state that changes what the screen is for leads it, in amber.
+    // #96: the answer to an Enter the model declined leads it the same way, for its 5 s.
     let mut right_spans = Vec::new();
-    if view.session.assist_off {
-        right_spans.push(Span::styled(ASSIST_OFF, Style::new().fg(Color::Yellow)));
+    let led = [ASSIST_OFF, NOT_A_QUESTION]
+        .into_iter()
+        .find_map(|lead| Some((lead, keys.strip_prefix(lead)?)));
+    if let Some((lead, _)) = led {
+        right_spans.push(Span::styled(lead, Style::new().fg(Color::Yellow)));
     }
     right_spans.push(Span::styled(
-        keys.strip_prefix(ASSIST_OFF).unwrap_or(&keys).to_owned(),
+        led.map_or(keys.as_str(), |(_, rest)| rest).to_owned(),
         Style::new().fg(Color::DarkGray),
     ));
     Paragraph::new(Line::from(right_spans)).render(right, buf);
@@ -271,6 +287,15 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
 /// #79: how the status line names assistance off; it leads the keys.
 const ASSIST_OFF: &str = "assist off";
 
+/// #96: what the status line says when the model declined what Enter sent (`is_question: false`
+/// or small talk); it leads the keys while [`dmn_session::Session::not_a_question`] is set.
+const NOT_A_QUESTION: &str = "not a question";
+
+/// #96: Enter asks about what the asking lane last said (the interviewer, by default; the hint
+/// names no lane, so it reads the same under `asks: you` and `asks: both`). Offered whenever
+/// assistance is on: the detector's miss it is for can come in any state of the screen.
+const ASK: &str = "⏎ ask";
+
 /// The two most useful keys for the state on screen (SPEC § Transcript & status: "Footer shows
 /// the two most useful shortcuts for the current state"). While a coding question is on screen
 /// the second one is `s` with the coding-solutions mode it would switch from (#50), so which
@@ -278,7 +303,12 @@ const ASSIST_OFF: &str = "assist off";
 ///
 /// Once the live question has section rows (#56), the first key is about them: `1–6 more`
 /// while all are closed, or the open one's own key to close it (`2 close`).
-fn shortcuts(view: &View<'_>) -> String {
+///
+/// While assistance is on, `⏎ ask` follows the two (#96), and `not a question` leads them for
+/// the 5 s after the model declined what Enter sent. Returned longest first, each form one part
+/// shorter than the one before: [`render_status`] takes the first that leaves the status note
+/// whole.
+fn shortcuts(view: &View<'_>) -> Vec<String> {
     let coding = view.live().is_some_and(|q| q.kind == CODING);
     let solutions = view.session.coding_solutions.label();
     let sections = view.live().and_then(|q| {
@@ -304,7 +334,7 @@ fn shortcuts(view: &View<'_>) -> String {
     if view.session.assist_off {
         // Ctrl+Shift+A in tmux's notation: short enough that an 80-column pane with every tag
         // (`system: all audio`, `es→en`) still shows the whole state.
-        return format!("{ASSIST_OFF} · C-S-a on ");
+        return vec![format!("{ASSIST_OFF} · C-S-a on ")];
     }
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
@@ -315,7 +345,15 @@ fn shortcuts(view: &View<'_>) -> String {
         (_, _, false, None) if swap => format!("{pin} · w swap"),
         (_, _, false, None) => format!("{pin} · r redo"),
     };
-    format!("{pair} ")
+    if view.session.not_a_question.is_some() {
+        // The answer to the key is the last part to go.
+        return vec![
+            format!("{NOT_A_QUESTION} · {pair} · {ASK} "),
+            format!("{NOT_A_QUESTION} · {pair} "),
+            format!("{NOT_A_QUESTION} "),
+        ];
+    }
+    vec![format!("{pair} · {ASK} "), format!("{pair} ")]
 }
 
 /// The fast phase's `kind` for a coding question (SPEC § Transcription and question detection).

@@ -1420,3 +1420,156 @@ fn summary_lines_and_promises_survive_the_action_log_and_json() {
         "{json}"
     );
 }
+
+// --- The ask key (#96) -------------------------------------------------------------------------
+
+fn declined(candidate: u64) -> Action {
+    Action::Ignored {
+        candidate,
+        reason: IgnoreReason::NotAQuestion,
+        score: 0,
+    }
+}
+
+/// Question 1 on screen, then candidate 2 (a statement), sent by Enter when `asked`.
+fn second_candidate(asked: bool) -> Vec<Action> {
+    let mut log = vec![candidate(1, 20.0, "q")];
+    log.extend(shown(1, "Q", &["a", "b"]));
+    log.push(candidate(2, 40.0, "Okay, that makes sense."));
+    if asked {
+        log.push(Action::Asked { candidate: 2 });
+    }
+    log
+}
+
+#[test]
+fn a_key_press_the_model_declines_says_not_a_question_until_the_notice_expires() {
+    for reason in [IgnoreReason::NotAQuestion, IgnoreReason::SmallTalk] {
+        let mut log = second_candidate(true);
+        let before = Session::replay(&log);
+        assert_eq!(before.asked, [2], "waiting for its reply");
+        assert_eq!(before.not_a_question, None);
+
+        log.push(Action::Ignored {
+            candidate: 2,
+            reason,
+            score: 0,
+        });
+        let said = Session::replay(&log);
+        assert_eq!(said.not_a_question, Some(2), "{reason:?}");
+        assert!(said.asked.is_empty());
+        assert_eq!(said.live, before.live, "the screen keeps what it had");
+        assert_eq!((said.pending, said.counts.ignored), (None, 1));
+
+        // Another candidate's expiry is not this notice's.
+        log.push(Action::NoticeExpired { candidate: 1 });
+        assert_eq!(Session::replay(&log).not_a_question, Some(2));
+        log.push(Action::NoticeExpired { candidate: 2 });
+        assert_eq!(Session::replay(&log).not_a_question, None);
+    }
+}
+
+#[test]
+fn a_detector_candidate_the_model_declines_stays_silent() {
+    let mut log = second_candidate(false);
+    log.push(declined(2));
+    let s = Session::replay(&log);
+    assert_eq!(s.not_a_question, None);
+    assert_eq!(s.counts.ignored, 1);
+}
+
+fn timed_out(candidate: u64) -> Action {
+    Action::Failed {
+        candidate,
+        error: "timeout after 4 s".into(),
+    }
+}
+
+#[test]
+fn a_key_press_that_is_answered_or_fails_leaves_no_notice() {
+    let mut answered = second_candidate(true);
+    answered.extend(shown(2, "Q2", &["c"]));
+    let mut failed = second_candidate(true);
+    failed.push(timed_out(2));
+    for log in [answered, failed] {
+        let s = Session::replay(&log);
+        assert!(s.asked.is_empty(), "its reply ended");
+        assert_eq!(s.not_a_question, None);
+    }
+}
+
+#[test]
+fn a_key_press_whose_request_failed_is_remembered_until_the_next_press() {
+    // Only a failure: the pipeline lets Enter send that turn again.
+    let mut failed = second_candidate(true);
+    failed.push(timed_out(2));
+    assert_eq!(Session::replay(&failed).ask_failed, Some(2));
+    let mut answered = second_candidate(true);
+    answered.extend(shown(2, "Q2", &["c"]));
+    assert_eq!(Session::replay(&answered).ask_failed, None);
+    let mut refused = second_candidate(true);
+    refused.push(declined(2));
+    assert_eq!(Session::replay(&refused).ask_failed, None);
+    // A detector candidate that fails is not the key's.
+    let mut detected = second_candidate(false);
+    detected.push(timed_out(2));
+    assert_eq!(Session::replay(&detected).ask_failed, None);
+
+    // The retry is a new press: it starts clean, and its own outcome stands.
+    failed.push(candidate(3, 40.0, "Okay, that makes sense."));
+    failed.push(Action::Asked { candidate: 3 });
+    assert_eq!(Session::replay(&failed).ask_failed, None);
+    failed.extend(shown(3, "Q2", &["c"]));
+    let s = Session::replay(&failed);
+    assert_eq!(s.ask_failed, None);
+    assert_eq!(s.live.as_ref().map(|q| q.candidate), Some(3));
+}
+
+#[test]
+fn the_next_key_press_replaces_the_answer_to_the_last_one() {
+    let mut log = second_candidate(true);
+    log.push(declined(2));
+    log.push(candidate(3, 60.0, "And how would you test it?"));
+    log.push(Action::Asked { candidate: 3 });
+    let s = Session::replay(&log);
+    assert_eq!(s.not_a_question, None);
+    assert_eq!(s.asked, [3]);
+
+    // Behind a pin both replies come: each declined press is answered, the latest standing.
+    let mut pinned = second_candidate(true);
+    pinned.insert(pinned.len() - 2, Action::Pin);
+    pinned.push(candidate(3, 60.0, "Right."));
+    pinned.push(Action::Asked { candidate: 3 });
+    assert_eq!(Session::replay(&pinned).asked, [2, 3]);
+    pinned.extend([declined(2), declined(3)]);
+    assert_eq!(Session::replay(&pinned).not_a_question, Some(3));
+}
+
+#[test]
+fn the_ask_key_survives_the_action_log_and_a_session_from_before_it_still_loads() {
+    let mut log = second_candidate(true);
+    log.push(declined(2));
+    let text: String = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap() + "\n")
+        .collect();
+    assert!(text.contains(r#"{"type":"asked","candidate":2}"#), "{text}");
+    let back: Vec<Action> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let s = Session::replay(&back);
+    assert_eq!(s, Session::replay(&log));
+    let again: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(again, s);
+    // A session no key was pressed in serialises as it did before #96, and loads the same.
+    let bare = Session::replay(&second_candidate(false));
+    let json = serde_json::to_string(&bare).unwrap();
+    assert!(
+        !json.contains("\"asked\"")
+            && !json.contains("\"not_a_question\"")
+            && !json.contains("\"ask_failed\""),
+        "{json}"
+    );
+    assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
+}
