@@ -233,7 +233,7 @@ do), then:
 enabled = true
 provider = "searxng"
 # base_url = "http://localhost:8888"   # the default for searxng
-# timeout_ms = 6000                    # what the default 3000 means for searxng
+# timeout_ms = 6000                    # the default for searxng when left out
 ```
 
 With Ollama's search instead, export the key, then turn the lookup on:
@@ -246,7 +246,7 @@ export OLLAMA_API_KEY=...        # the key stays in the environment; dmn never w
 [lookup]
 enabled = true
 # provider = "ollama"; base_url = "https://ollama.com"; api_key_env = "OLLAMA_API_KEY"
-# timeout_ms = 3000; max_results = 3
+# timeout_ms = 3000; max_results = 5
 ```
 
 `dmn doctor` says whether it is off, ready, or on with the variable unset (for SearXNG: whether

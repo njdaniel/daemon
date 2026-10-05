@@ -3845,7 +3845,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(body).unwrap(),
-            serde_json::json!({"query": "latest stable Go release", "max_results": 3})
+            serde_json::json!({"query": "latest stable Go release", "max_results": 5})
         );
         for said in ["Bluebird", "Java", GO] {
             assert!(!requests[0].contains(said), "{said} left the machine");

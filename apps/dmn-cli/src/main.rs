@@ -518,7 +518,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
             if let Some(notice) = cfg.lookup.privacy_notice() {
                 println!("# NOTE: {notice}");
             }
-            print!("{}", cfg.to_toml()?);
+            // #102: values that depend on another (the lookup's timeout) as they take effect.
+            print!("{}", cfg.effective().to_toml()?);
             Ok(())
         }
         Some(Command::Bench {

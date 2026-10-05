@@ -143,7 +143,7 @@ impl Default for OllamaSearchSettings {
             base_url: OllamaSearch::DEFAULT_BASE_URL.to_owned(),
             api_key: None,
             key_env: "OLLAMA_API_KEY".to_owned(),
-            max_results: 3,
+            max_results: 5,
             timeout: Duration::from_millis(3000),
         }
     }
@@ -315,7 +315,7 @@ impl Default for SearxngSettings {
     fn default() -> Self {
         Self {
             base_url: SearxngSearch::DEFAULT_BASE_URL.to_owned(),
-            max_results: 3,
+            max_results: 5,
             // A stock SearXNG waits up to 3 s on slow engines itself.
             timeout: Duration::from_millis(6000),
         }
@@ -540,7 +540,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"query": "latest stable Go release", "max_results": 3}),
+            serde_json::json!({"query": "latest stable Go release", "max_results": 5}),
             "the query and the count, nothing else"
         );
     }
@@ -679,7 +679,11 @@ mod tests {
     #[tokio::test]
     async fn lookup_searxng_gets_the_encoded_query_with_no_key_and_keeps_the_first_results() {
         let server = serve_once("200 OK", "application/json", SEARXNG_REPLY.to_owned(), 3);
-        let results = search_searxng(&searxng(&server.url), "latest stable Go release & co")
+        let three = SearxngSettings {
+            max_results: 3,
+            ..searxng(&server.url)
+        };
+        let results = search_searxng(&three, "latest stable Go release & co")
             .await
             .unwrap();
         let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();

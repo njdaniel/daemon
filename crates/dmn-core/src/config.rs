@@ -328,12 +328,15 @@ pub struct Lookup {
     /// search needs one; SearXNG has none, and this is ignored for it.
     pub api_key_env: String,
     /// The whole search: past it the first answer stays and the status line says `lookup
-    /// failed`. For `searxng` left at the default 3000, [`Lookup::timeout`] gives 6000: a stock
-    /// SearXNG waits up to its own 3 s `request_timeout` on slow engines, so 3000 would lose
-    /// exactly those searches.
-    pub timeout_ms: u64,
+    /// failed`. Left out of the file, it depends on the provider ([`Lookup::timeout`]): 3000 for
+    /// `ollama`, 6000 for `searxng`, because a stock SearXNG waits up to its own 3 s
+    /// `request_timeout` on slow engines and 3000 would lose exactly those searches. Written in
+    /// the file, it is used as written. `dmn config show` prints the value in effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     /// Results asked for, 1–10; each goes into the prompt as a title, a 300-character snippet
-    /// and its domain.
+    /// and its domain. 5 since PR #104's measurement: with 3, the page that named the newest
+    /// release was often not among them.
     pub max_results: u8,
 }
 
@@ -344,8 +347,8 @@ impl Default for Lookup {
             provider: LookupProvider::Ollama,
             base_url: OLLAMA_SEARCH_URL.into(),
             api_key_env: "OLLAMA_API_KEY".into(),
-            timeout_ms: LOOKUP_TIMEOUT_MS,
-            max_results: 3,
+            timeout_ms: None,
+            max_results: 5,
         }
     }
 }
@@ -376,9 +379,9 @@ impl LookupProvider {
     }
 }
 
-/// `[lookup].timeout_ms`'s default.
-const LOOKUP_TIMEOUT_MS: u64 = 3000;
-/// What `timeout_ms` left at its default means for SearXNG (see [`Lookup::timeout_ms`]).
+/// `[lookup].timeout_ms` left out, for `ollama`.
+pub const LOOKUP_TIMEOUT_MS: u64 = 3000;
+/// `[lookup].timeout_ms` left out, for `searxng` (see [`Lookup::timeout_ms`]).
 pub const SEARXNG_TIMEOUT_MS: u64 = 6000;
 
 /// `[lookup].base_url`'s default: Ollama's web search.
@@ -405,14 +408,18 @@ impl Lookup {
         self.api_key_from(|name| std::env::var(name).ok())
     }
 
-    /// The search's deadline: `timeout_ms`, except that for `searxng` the default 3000 means
-    /// [`SEARXNG_TIMEOUT_MS`]. Any other value is used as written.
+    /// The search's deadline: `timeout_ms` as written, or when it is left out
+    /// [`LOOKUP_TIMEOUT_MS`] for `ollama` and [`SEARXNG_TIMEOUT_MS`] for `searxng`.
     pub fn timeout(&self) -> std::time::Duration {
-        let ms = match self.provider {
-            LookupProvider::Searxng if self.timeout_ms == LOOKUP_TIMEOUT_MS => SEARXNG_TIMEOUT_MS,
-            _ => self.timeout_ms,
-        };
-        std::time::Duration::from_millis(ms)
+        std::time::Duration::from_millis(self.timeout_ms())
+    }
+
+    /// [`Lookup::timeout`] in milliseconds.
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(match self.provider {
+            LookupProvider::Ollama => LOOKUP_TIMEOUT_MS,
+            LookupProvider::Searxng => SEARXNG_TIMEOUT_MS,
+        })
     }
 
     /// Same as [`Lookup::api_key`] with the environment lookup injected (tests use a closure).
@@ -573,8 +580,8 @@ enabled = false                      # true = a question whose answer depends on
 provider = "ollama"                  # ollama (hosted, needs an ollama.com key) | searxng (your own instance, no key)
 base_url = "https://ollama.com"      # with provider = "searxng", left as is: http://localhost:8888
 api_key_env = "OLLAMA_API_KEY"       # NAME of an env var holding the key; never the key itself; unused by searxng
-timeout_ms = 3000                    # past this the first answer stays; nothing is retried; with searxng, 3000 means 6000
-max_results = 3                      # 1-10 results, each a title, a 300-character snippet and its domain
+# timeout_ms = 3000                  # past this the first answer stays, nothing retried; left out: 3000 for ollama, 6000 for searxng
+max_results = 5                      # 1-10 results, each a title, a 300-character snippet and its domain
 
 [assist]
 enabled = true                       # false = transcribe / translate only: no detector, no LLM (Ctrl+Shift+A toggles)
@@ -653,7 +660,16 @@ impl Config {
         })
     }
 
-    /// The effective config as TOML (no comments).
+    /// This config with every value that depends on another written out as it takes effect
+    /// (#102: `[lookup].timeout_ms` left out is the provider's own): what `dmn config show`
+    /// prints, so it shows what runs.
+    pub fn effective(&self) -> Self {
+        let mut cfg = self.clone();
+        cfg.lookup.timeout_ms = Some(self.lookup.timeout_ms());
+        cfg
+    }
+
+    /// The config as TOML (no comments).
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(self)?)
     }
@@ -774,8 +790,8 @@ enabled = false                      # true = search the web when an answer depe
 provider = "ollama"                  # ollama (hosted, key) | searxng (your own instance, no key)
 base_url = "https://ollama.com"      # searxng: left as is, http://localhost:8888
 api_key_env = "OLLAMA_API_KEY"       # name of an env var; never the key itself
-timeout_ms = 3000
-max_results = 3
+# timeout_ms = 3000                  # left out: 3000 for ollama, 6000 for searxng
+max_results = 5
 
 [assist]
 enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
@@ -880,7 +896,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 36, "spec example has 36 keys: {keys:?}");
+        assert_eq!(keys.len(), 35, "spec example has 35 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -938,13 +954,14 @@ keep_transcripts = true
                 lookup.provider.as_str(),
                 lookup.base_url.as_str(),
                 lookup.api_key_env.as_str(),
-                lookup.timeout_ms,
+                lookup.timeout_ms(),
                 lookup.max_results
             ),
-            ("ollama", "https://ollama.com", "OLLAMA_API_KEY", 3000, 3)
+            ("ollama", "https://ollama.com", "OLLAMA_API_KEY", 3000, 5)
         );
-        // `dmn config show` prints `to_toml`: every `[lookup]` key, at its default.
-        let shown = Config::default().to_toml().unwrap();
+        // `dmn config show` prints the effective config: every `[lookup]` key, the timeout as
+        // it takes effect.
+        let shown = Config::default().effective().to_toml().unwrap();
         let section = &shown[shown.find("[lookup]").expect(&shown)..];
         for key in [
             "enabled = false",
@@ -952,7 +969,7 @@ keep_transcripts = true
             "base_url = \"https://ollama.com\"",
             "api_key_env = \"OLLAMA_API_KEY\"",
             "timeout_ms = 3000",
-            "max_results = 3",
+            "max_results = 5",
         ] {
             assert!(section.contains(key), "{key}: {shown}");
         }
@@ -1018,8 +1035,22 @@ keep_transcripts = true
         assert_eq!(Lookup::default().endpoint(), "https://ollama.com");
         // A stock SearXNG waits up to 3 s on slow engines itself: its default deadline is longer.
         assert_eq!(only.timeout(), std::time::Duration::from_millis(6000));
+        let effective = Config {
+            lookup: only.clone(),
+            ..Config::default()
+        }
+        .effective()
+        .to_toml()
+        .unwrap();
+        assert!(effective.contains("timeout_ms = 6000"), "{effective}");
+        // Written in the file, even 3000, it is used as written.
+        let written =
+            Config::from_toml("[lookup]\nprovider = \"searxng\"\ntimeout_ms = 3000\n", "w")
+                .unwrap()
+                .lookup;
+        assert_eq!(written.timeout(), std::time::Duration::from_millis(3000));
         let set = Lookup {
-            timeout_ms: 4500,
+            timeout_ms: Some(4500),
             ..only.clone()
         };
         assert_eq!(
