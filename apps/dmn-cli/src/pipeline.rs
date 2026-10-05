@@ -764,6 +764,14 @@ impl Controls {
         self.hub.dispatch(Action::ToggleSection { section });
     }
 
+    /// A left click (#95): toggle the section `at` finds under the pointer in the session as it
+    /// is now, as its number key does. `None` (a click on no row) dispatches nothing.
+    pub fn click(&self, at: impl FnOnce(&Session) -> Option<Section>) {
+        if let Some(section) = at(&self.hub.snapshot()) {
+            self.toggle_section(section);
+        }
+    }
+
     /// `←` (#94): show the question before the one on screen. It holds the screen as a pin
     /// does: the pipeline goes on answering behind it, and the status line counts what arrives.
     pub fn earlier(&self) {

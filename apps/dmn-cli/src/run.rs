@@ -7,10 +7,10 @@
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
 //! what the asking lane last said (the interviewer, by default) when the detector missed the
 //! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
-//! PgUp / PgDn scroll an open section taller than its rows (#94), `q` (or Ctrl-C) quit. Nothing
+//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `q` (or Ctrl-C) quit. Nothing
 //! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
-//! errors show only as the status dots. The terminal is restored on the way out, on an error,
-//! and (through ratatui's panic hook) on a panic.
+//! errors show only as the status dots. The terminal, mouse capture included, is restored on the
+//! way out, on an error, and (through ratatui's panic hook and ours) on a panic.
 //!
 //! With no flags it captures the call live (#16): the mic as You and the call's app output as the
 //! Interviewer, from `[audio].mic` / `[audio].app_stream` or `--mic` / `--app` (`dmn devices`
@@ -20,7 +20,9 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -28,7 +30,10 @@ use dmn_audio::CaptureTarget;
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths};
 use dmn_session::{CodingSolutions, Section, Session};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use tokio::sync::watch;
 
@@ -167,6 +172,36 @@ pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
     false
 }
 
+/// Act on one mouse event on a pane of `pane` (#95): the wheel scrolls the open section by
+/// [`tui::Scroll::WheelUp`] / `WheelDown` when the pointer is on the left column, a left press on
+/// a section row does what its number key does. Everything else (drag, other buttons, hover,
+/// clicks elsewhere) does nothing. Returns whether it acted, so the screen redraws.
+pub fn mouse(ev: MouseEvent, controls: &Controls, pane: Rect) -> bool {
+    let (x, y) = (ev.column, ev.row);
+    match ev.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let by = if ev.kind == MouseEventKind::ScrollUp {
+                tui::Scroll::WheelUp
+            } else {
+                tui::Scroll::WheelDown
+            };
+            controls.scroll(|session| {
+                if tui::on_left_column(session, pane, x, y) {
+                    tui::scroll_to(session, pane, by)
+                } else {
+                    None
+                }
+            });
+            true
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            controls.click(|session| tui::section_at(session, pane, x, y));
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The live input from the config and the `--mic` / `--app` overrides.
 pub fn live_input(cfg: &Config, args: &Args) -> Result<Input, String> {
     if !cfg.audio.system_audio && args.app.is_none() {
@@ -267,7 +302,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         }
         report
     } else {
-        let report = interactive(pipeline)?;
+        let report = interactive(pipeline, cfg.ui.mouse)?;
         // At 1× the audio delivered is the wall time, up to the file's length: `q` can end the
         // run early, and after the audio ends the TUI stays up until `q`. A live call's audio is
         // its wall time.
@@ -314,23 +349,69 @@ fn join<T>(worker: Worker<T>) -> Result<(Report, T), Box<dyn Error>> {
     Ok((report?, extra))
 }
 
+/// Whether mouse capture is on (#95), so the one release function, which every exit path calls,
+/// writes the escape sequences once and only if they were asked for.
+static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+/// Turn mouse capture on (`[ui].mouse`). The flag is set first: if the write fails halfway, the
+/// release still runs.
+fn capture(out: &mut impl Write) -> io::Result<()> {
+    CAPTURED.store(true, Ordering::Release);
+    ratatui::crossterm::execute!(out, EnableMouseCapture)
+}
+
+/// [`capture`] when `[ui].mouse` is on, and nothing at all when it is off (#95): with `false` no
+/// escape sequence is written, so the terminal keeps its selection and wheel.
+fn capture_if(enabled: bool, out: &mut impl Write) -> io::Result<()> {
+    if enabled { capture(out) } else { Ok(()) }
+}
+
+/// [`mouse`] when `[ui].mouse` is on; with it off an event is dropped unread by the session.
+fn mouse_if(enabled: bool, ev: MouseEvent, controls: &Controls, pane: Rect) -> bool {
+    enabled && mouse(ev, controls, pane)
+}
+
+/// Turn mouse capture off if it is on, so the shell gets its own selection and wheel back. The
+/// one place capture is released: [`Restore`] (`q`, Ctrl+C, an error) and the panic hook both
+/// call it. Nothing to report if the terminal is gone.
+fn release(out: &mut impl Write) {
+    if CAPTURED.swap(false, Ordering::AcqRel) {
+        let _ = ratatui::crossterm::execute!(out, DisableMouseCapture);
+    }
+}
+
+/// Make a panic release the mouse before ratatui's own hook leaves the alternate screen (#95).
+/// Called after `ratatui::try_init`, which installed that hook, so it is the one run next.
+fn release_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        release(&mut io::stdout());
+        previous(info);
+    }));
+}
+
 /// Restores the terminal however the TUI loop ends.
 struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
+        release(&mut io::stdout());
         ratatui::restore();
     }
 }
 
-fn interactive(pipeline: Pipeline) -> Result<Report, Box<dyn Error>> {
+fn interactive(pipeline: Pipeline, mouse: bool) -> Result<Report, Box<dyn Error>> {
     let controls = pipeline.controls();
     let mut session = pipeline.hub().watch();
     let worker = spawn(pipeline, Quiet, true);
     let ui = (|| -> Result<(), Box<dyn Error>> {
         let mut terminal = ratatui::try_init()?;
         let _restore = Restore;
-        ui_loop(&mut terminal, &mut session, &controls)
+        if mouse {
+            release_on_panic();
+        }
+        capture_if(mouse, &mut io::stdout())?;
+        ui_loop(&mut terminal, &mut session, &controls, mouse)
     })();
     // However the UI ended, stop the pipeline so the session is closed and stored.
     controls.quit();
@@ -343,6 +424,7 @@ fn ui_loop(
     terminal: &mut ratatui::DefaultTerminal,
     session: &mut watch::Receiver<Session>,
     controls: &Controls,
+    mouse_on: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut dirty = true;
     loop {
@@ -366,6 +448,19 @@ fn ui_loop(
                     if press(k, controls, Rect::new(0, 0, pane.width, pane.height)) {
                         return Ok(());
                     }
+                    dirty = true;
+                }
+            }
+            // With `[ui].mouse = false` capture is never enabled, so none arrive; this guards a
+            // terminal that sends them anyway.
+            Event::Mouse(ev) => {
+                let pane = terminal.size()?;
+                if mouse_if(
+                    mouse_on,
+                    ev,
+                    controls,
+                    Rect::new(0, 0, pane.width, pane.height),
+                ) {
                     dirty = true;
                 }
             }
@@ -1269,5 +1364,206 @@ mod tests {
         let err = live_input(&no_system, &args(None, None)).unwrap_err();
         assert!(err.contains("--app"), "{err}");
         assert!(live_input(&no_system, &args(None, Some("chrome"))).is_ok());
+    }
+
+    fn at(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn click_at(at_: (u16, u16)) -> MouseEvent {
+        at(MouseEventKind::Down(MouseButton::Left), at_)
+    }
+
+    /// Where `needle` is on the drawn screen: what a user would point at.
+    fn point(session: &Session, needle: &str) -> (u16, u16) {
+        let s = screen(session);
+        s.lines()
+            .enumerate()
+            .find_map(|(y, row)| {
+                let x = row.find(needle).map(|b| row[..b].chars().count())?;
+                Some((u16::try_from(x).ok()?, u16::try_from(y).ok()?))
+            })
+            .unwrap_or_else(|| panic!("{needle} is not on screen:\n{s}"))
+    }
+
+    fn mouse(ev: MouseEvent, controls: &Controls) -> bool {
+        super::mouse(ev, controls, PANE)
+    }
+
+    #[test]
+    fn a_left_click_on_a_row_does_what_its_number_key_does_and_nothing_else_does_anything() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        solution(hub, 30);
+        let row = point(&hub.snapshot(), "1 ▸ Deeper Answer");
+
+        // The click and the key end on the same screen.
+        let (keyed, _c) = Controls::for_test();
+        solution(keyed.hub(), 30);
+        press(key(press_key('1')).unwrap(), &keyed);
+        mouse(click_at(row), &controls);
+        let open = screen(&hub.snapshot());
+        assert!(open.contains("1 ▾ Deeper Answer"), "{open}");
+        assert_eq!(open, screen(&keyed.hub().snapshot()));
+
+        // Clicked again (the grid moved down as the body opened, so point at the new frame), it
+        // closes, as its key does.
+        mouse(
+            click_at(point(&hub.snapshot(), "1 ▾ Deeper Answer")),
+            &controls,
+        );
+        assert!(screen(&hub.snapshot()).contains("1 ▸ Deeper Answer"));
+
+        // Elsewhere, or with another button, drag, hover or release: nothing is dispatched.
+        let row = point(&hub.snapshot(), "1 ▸ Deeper Answer");
+        let mut actions = hub.subscribe();
+        for ev in [
+            click_at((2, 2)),
+            click_at((2, PANE.height - 1)),
+            click_at((PANE.width + 5, row.1)),
+            at(MouseEventKind::Down(MouseButton::Right), row),
+            at(MouseEventKind::Down(MouseButton::Middle), row),
+            at(MouseEventKind::Up(MouseButton::Left), row),
+            at(MouseEventKind::Drag(MouseButton::Left), row),
+            at(MouseEventKind::Moved, row),
+        ] {
+            mouse(ev, &controls);
+            assert!(actions.try_recv().is_err(), "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_an_open_section_three_rows_a_notch_and_stops_at_both_ends() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        solution(hub, 30);
+        let row = point(&hub.snapshot(), "1 ▸ Deeper Answer");
+        let wheel = |kind| at(kind, (10, 6));
+
+        // No section open: nothing moves and nothing is dispatched.
+        let mut actions = hub.subscribe();
+        mouse(wheel(MouseEventKind::ScrollDown), &controls);
+        assert!(actions.try_recv().is_err());
+
+        mouse(click_at(row), &controls);
+        let top = screen(&hub.snapshot());
+        assert!(top.contains("↓ 16 more"), "{top}");
+        mouse(wheel(MouseEventKind::ScrollUp), &controls);
+        assert_eq!(hub.snapshot().scroll, 0, "already at the top");
+        mouse(wheel(MouseEventKind::ScrollDown), &controls);
+        assert_eq!(hub.snapshot().scroll, 3);
+        let three = screen(&hub.snapshot());
+        assert!(three.contains("↑ 3 · ↓ 13 more"), "{three}");
+        for _ in 0..10 {
+            mouse(wheel(MouseEventKind::ScrollDown), &controls);
+        }
+        assert_eq!(hub.snapshot().scroll, 16, "the last row, not past it");
+        let mut actions = hub.subscribe();
+        mouse(wheel(MouseEventKind::ScrollDown), &controls);
+        assert!(actions.try_recv().is_err(), "nothing moves at the end");
+        mouse(wheel(MouseEventKind::ScrollUp), &controls);
+        assert_eq!(hub.snapshot().scroll, 13);
+        for _ in 0..10 {
+            mouse(wheel(MouseEventKind::ScrollUp), &controls);
+        }
+        assert_eq!(screen(&hub.snapshot()), top);
+
+        // The pointer on the transcript or the status line: not the left column.
+        let mut actions = hub.subscribe();
+        for y in [PANE.height - 3, PANE.height - 1] {
+            mouse(at(MouseEventKind::ScrollDown, (10, y)), &controls);
+        }
+        assert!(actions.try_recv().is_err());
+        assert_eq!(hub.snapshot().scroll, 0);
+    }
+
+    #[test]
+    fn behind_an_earlier_question_the_wheel_and_a_click_act_on_the_question_on_screen() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        solution(hub, 30);
+        for a in question(2, "Design a job queue") {
+            hub.dispatch(a);
+        }
+        press(named(KeyCode::Left), &controls);
+        let earlier = screen(&hub.snapshot());
+        assert!(earlier.contains("QUESTION 1 of 2"), "{earlier}");
+
+        mouse(
+            click_at(point(&hub.snapshot(), "1 ▸ Deeper Answer")),
+            &controls,
+        );
+        let open = screen(&hub.snapshot());
+        assert!(open.contains("1 ▾ Deeper Answer"), "{open}");
+        assert!(open.contains("QUESTION 1 of 2"), "still browsing:\n{open}");
+        mouse(at(MouseEventKind::ScrollDown, (10, 6)), &controls);
+        assert_eq!(hub.snapshot().scroll, 3);
+        // The live question is as it was: no section open on it.
+        press(named(KeyCode::Right), &controls);
+        let live = screen(&hub.snapshot());
+        assert!(live.contains("Design a job queue"), "{live}");
+        assert!(!live.contains('▾'), "{live}");
+    }
+
+    #[test]
+    fn mouse_capture_is_enabled_once_and_released_by_the_one_function_every_exit_calls() {
+        // Nothing is written to release a capture that was never enabled (`mouse = false`).
+        let mut out = Vec::new();
+        release(&mut out);
+        assert!(out.is_empty());
+
+        capture(&mut out).unwrap();
+        let on = String::from_utf8(out.clone()).unwrap();
+        assert!(
+            on.contains("\x1b[?1000h") && on.contains("\x1b[?1006h"),
+            "{on:?}"
+        );
+        out.clear();
+        release(&mut out);
+        let off = String::from_utf8(out.clone()).unwrap();
+        assert!(
+            off.contains("\x1b[?1000l") && off.contains("\x1b[?1006l"),
+            "{off:?}"
+        );
+        // A second release (the panic hook after `Restore`, say) writes nothing.
+        out.clear();
+        release(&mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn with_mouse_off_nothing_is_captured_and_a_wheel_or_click_changes_nothing() {
+        let (controls, _commands) = Controls::for_test();
+        let hub = controls.hub();
+        solution(hub, 30);
+        let row = point(&hub.snapshot(), "1 ▸ Deeper Answer");
+        let before = hub.snapshot();
+        let mut actions = hub.subscribe();
+
+        // `[ui].mouse = false`: no capture sequence is written, and events are not acted on.
+        let mut out = Vec::new();
+        capture_if(false, &mut out).unwrap();
+        assert!(out.is_empty());
+        for ev in [click_at(row), at(MouseEventKind::ScrollDown, (10, 6))] {
+            assert!(!mouse_if(false, ev, &controls, PANE));
+        }
+        assert!(actions.try_recv().is_err());
+        assert_eq!(screen(&hub.snapshot()), screen(&before));
+
+        // On, the same events act.
+        assert!(mouse_if(true, click_at(row), &controls, PANE));
+        assert!(screen(&hub.snapshot()).contains("1 ▾ Deeper Answer"));
+        assert!(mouse_if(
+            true,
+            at(MouseEventKind::ScrollDown, (10, 6)),
+            &controls,
+            PANE
+        ));
+        assert_eq!(hub.snapshot().scroll, 3);
     }
 }

@@ -84,6 +84,8 @@ Keys in `dmn run`:
 | Enter | Ask about what the asking lane last said (the interviewer, by default), when the detector missed the question |
 | `1`–`6` | Open or close one of the six sections under the Approach |
 | `↑` `↓`, PgUp, PgDn | Scroll the open section when it is taller than the screen: a row, or the rows on screen |
+| Mouse wheel | Scroll the open section, three rows a notch, with the pointer on the left column (`[ui].mouse`, on by default) |
+| Left click on a section row | The same as its number key. `mouse = false` gives the mouse back to the terminal (text selection) |
 | `←` `→` | Show the question before the one on screen, or the one after; `→` from the newest earlier one returns to the live question |
 | `w` | Swap the STAR story of a behavioral question |
 | `s` | Coding solutions: hints ↔ full |

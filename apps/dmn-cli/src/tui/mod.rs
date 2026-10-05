@@ -33,6 +33,10 @@
 //! question, the Approach and the sections keep the left in the same order, and the status line
 //! stays full-width. Narrower panes (the 100 × 30 and 80 × 24 above) are stacked as listed.
 //!
+//! The mouse (#95) reads the same layout: [`section_at`] finds the section row under a click from
+//! the row rectangles `sections::Plan::row_cells` gives the renderer, and the wheel is
+//! [`scroll_to`] with [`Scroll::WheelUp`] / `WheelDown` while [`on_left_column`] holds.
+//!
 //! Density rules: every field is cut to its area with `…` instead of growing it (an open
 //! section's body with the scroll hint), and nothing expands on its own: a section opens only on
 //! its key, one at a time (`Question::open`).
@@ -49,10 +53,10 @@ mod status;
 mod tests;
 mod text;
 
-use dmn_session::{Progress, Question, Session};
+use dmn_session::{Progress, Question, Section, Session};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use status::TranscriptArea;
 
 /// Rows the question block takes: four content lines inside a border.
@@ -91,7 +95,13 @@ pub enum Scroll {
     Down,
     PageUp,
     PageDown,
+    /// One notch of the mouse wheel (#95): [`WHEEL_ROWS`] rows.
+    WheelUp,
+    WheelDown,
 }
+
+/// Rows one notch of the wheel scrolls (#95).
+const WHEEL_ROWS: u16 = 3;
 
 /// Everything the widgets read, worked out once per frame.
 struct View<'a> {
@@ -192,9 +202,35 @@ pub fn scroll_to(session: &Session, area: Rect, by: Scroll) -> Option<u16> {
         Scroll::Down => at.saturating_add(1),
         Scroll::PageUp => at.saturating_sub(page),
         Scroll::PageDown => at.saturating_add(page),
+        Scroll::WheelUp => at.saturating_sub(WHEEL_ROWS),
+        Scroll::WheelDown => at.saturating_add(WHEEL_ROWS),
     }
     .min(extent.max);
     (to != session.scroll).then_some(to)
+}
+
+/// Whether the pointer at (`x`, `y`) is on the left column of a pane of `area` (#95): the question,
+/// the Approach and the sections, which are everything above the transcript strip when the pane
+/// is stacked.
+pub fn on_left_column(session: &Session, area: Rect, x: u16, y: u16) -> bool {
+    !session.assist_off && frame(area).0.contains(Position::new(x, y))
+}
+
+/// The section whose row the pointer at (`x`, `y`) is on, in the grid the frame for `session` on
+/// a pane of `area` draws (#95): the same layout and the same row rectangles the renderer uses.
+/// `None` anywhere else.
+pub fn section_at(session: &Session, area: Rect, x: u16, y: u16) -> Option<Section> {
+    if session.assist_off {
+        return None;
+    }
+    let view = View::new(session);
+    let (left, ..) = frame(area);
+    let m = middle(&view, left);
+    let (plan, grid, _) = m.sections.as_ref()?;
+    plan.row_cells(*grid)
+        .into_iter()
+        .find(|(_, cell)| cell.contains(Position::new(x, y)))
+        .map(|(section, _)| section)
 }
 
 /// The three-area screen: the question and Approach (left on a wide pane), the transcript with

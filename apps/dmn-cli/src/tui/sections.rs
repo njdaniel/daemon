@@ -63,6 +63,35 @@ impl Plan {
         u16::try_from(self.rows.len().div_ceil(self.columns)).unwrap_or(u16::MAX)
     }
 
+    /// Where each row on screen sits in `grid`, in the fixed order: the one place the grid's
+    /// arithmetic lives, so the click that hit-tests (#95) lands on what [`render`] drew.
+    pub(super) fn row_cells(&self, grid: Rect) -> Vec<(Section, Rect)> {
+        let inner = Rect {
+            x: grid.x.saturating_add(MARGIN),
+            width: grid.width.saturating_sub(2 * MARGIN),
+            ..grid
+        };
+        let per_column = self.rows.len().div_ceil(self.columns);
+        let column_width = inner.width / u16::try_from(self.columns).unwrap_or(1).max(1);
+        let mut cells = Vec::new();
+        for (i, section) in self.rows.iter().enumerate() {
+            // Column-major, so the rows read top to bottom in the fixed order.
+            let (column, row) = (i / per_column, i % per_column);
+            let Ok(row) = u16::try_from(row) else { break };
+            if row >= inner.height {
+                continue;
+            }
+            let x = inner.x + column_width * u16::try_from(column).unwrap_or(0);
+            let w = if column + 1 == self.columns {
+                inner.right().saturating_sub(x)
+            } else {
+                column_width
+            };
+            cells.push((*section, Rect::new(x, inner.y + row, w, 1)));
+        }
+        cells
+    }
+
     /// Lines the open section's body would like.
     pub(super) fn body_rows(&self) -> u16 {
         u16::try_from(self.body.len()).unwrap_or(u16::MAX)
@@ -129,30 +158,14 @@ pub(super) fn render(plan: &Plan, grid: Rect, body_area: Rect, buf: &mut Buffer)
     } else {
         Style::new()
     };
-    let inner = Rect {
-        x: grid.x.saturating_add(MARGIN),
-        width: grid.width.saturating_sub(2 * MARGIN),
-        ..grid
-    };
-    let per_column = plan.rows.len().div_ceil(plan.columns);
-    let column_width = inner.width / u16::try_from(plan.columns).unwrap_or(1).max(1);
-    for (i, section) in plan.rows.iter().enumerate() {
-        // Column-major, so the rows read top to bottom in the fixed order.
-        let (column, row) = (i / per_column, i % per_column);
-        let Ok(row) = u16::try_from(row) else { break };
-        if row >= inner.height {
-            continue;
-        }
-        let x = inner.x + column_width * u16::try_from(column).unwrap_or(0);
-        let w = if column + 1 == plan.columns {
-            inner.right().saturating_sub(x)
-        } else {
-            column_width
-        };
-        let cell = Rect::new(x, inner.y + row, w, 1);
-        Paragraph::new(row_line(*section, plan, usize::from(w).saturating_sub(1)))
-            .style(base)
-            .render(cell, buf);
+    for (section, cell) in plan.row_cells(grid) {
+        Paragraph::new(row_line(
+            section,
+            plan,
+            usize::from(cell.width).saturating_sub(1),
+        ))
+        .style(base)
+        .render(cell, buf);
     }
 
     if plan.body.is_empty() || body_area.height == 0 {
