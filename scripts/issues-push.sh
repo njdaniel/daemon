@@ -10,9 +10,11 @@ mk model:sonnet c5def5 "implemented by Sonnet"; mk model:opus 5319e7 "implemente
 for m in m0 m1 m2 m3 m4; do mk "$m" bfd4f2 "milestone $m"; done
 for l in audio stt llm ui infra; do mk "lane:$l" e4e669 "lane $l"; done
 
-for f in "$ROOT"/docs/issues/[0-9][0-9]-*.md; do
+existing=$(gh issue list --state all --limit 500 --json title -q '.[].title')
+
+for f in "$ROOT"/docs/issues/[0-9]*-*.md; do
   title=$(head -1 "$f" | sed -E 's/^# #[0-9]+ — //')
-  if gh issue list --state all --search "in:title \"$title\"" --json title -q '.[].title' | grep -qxF "$title"; then
+  if printf '%s\n' "$existing" | grep -qxF "$title"; then
     echo "exists: $title"; continue
   fi
   labels=$(grep -m1 '^Labels:' "$f" | sed -E 's/^Labels: `//; s/`$//; s/, /,/g')
