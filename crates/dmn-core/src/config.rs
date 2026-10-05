@@ -32,6 +32,9 @@ pub enum ConfigError {
     Serialise(#[from] toml::ser::Error),
     #[error("{0} already exists; pass --force to overwrite")]
     Exists(String),
+    /// An in-place edit of the config file (`dmn speak enroll`) that could not be made safely.
+    #[error("{0}")]
+    Edit(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -468,9 +471,10 @@ impl Default for Assist {
     }
 }
 
-/// Speak (#107): synthesize text in the enrolled voice clone through a local TTS server
-/// (Chatterbox-TTS-Server, OpenAI-compatible). Off by default; `dmn speak` refuses to run
-/// while `enabled` is false. The translation language is **not** here — it lands with #109.
+/// Speak (#107): synthesize text in the enrolled voice clone through a TTS server on this
+/// machine (chatterbox-tts-api, OpenAI-compatible). Off by default; `dmn speak` refuses to run
+/// while `enabled` is false or `tts_url` is another host. The translation language is **not**
+/// here: it lands with #109.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Speak {
@@ -483,6 +487,15 @@ pub struct Speak {
     /// dmn never reads it. The 35B Ollama model takes 22 of the 4090's 24 GB, so GPU TTS is
     /// opt-in: check `nvidia-smi` first.
     pub device: String,
+}
+
+impl Speak {
+    /// `tts_url` is on this machine (a loopback name or address). `dmn speak` refuses to run
+    /// otherwise: the text, and at enrollment the voice clip, would leave the machine, and
+    /// SPEC § Privacy promises they do not.
+    pub fn is_local(&self) -> bool {
+        is_loopback_url(self.tts_url.trim())
+    }
 }
 
 impl Default for Speak {
@@ -617,7 +630,7 @@ enabled = true                       # false = transcribe / translate only: no d
 
 [speak]
 enabled = false                      # speak text in your cloned voice via a local TTS server (`dmn speak`, #107)
-tts_url = "http://localhost:4123"    # Chatterbox-TTS-Server; see README § Speak for setup
+tts_url = "http://localhost:4123"    # chatterbox-tts-api on this machine (no other host); README § Speak
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
 
@@ -709,33 +722,51 @@ impl Config {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    /// Set `[speak].voice_ref` in the config file at `path`, keeping every other key and every
-    /// comment (#107: `dmn speak enroll` records the enrolled clip here). A missing file is
-    /// created from the template first. The write goes through a sibling temp file and a rename
-    /// so an interrupted enroll never leaves a truncated config, and the result is re-parsed
-    /// before returning.
+    /// Set `[speak].voice_ref` in the config file at `path`, keeping every other line, comment
+    /// and section as it is (#107: `dmn speak enroll` records the enrolled clip here): the one
+    /// `voice_ref` line is replaced in place, or added to `[speak]`, or a `[speak]` section is
+    /// appended. A missing file is created from the template first. The edited text is parsed
+    /// before anything is written, so a file this edit cannot handle is left untouched and the
+    /// error says so. A symlinked config (a dotfiles repo) is edited where it points, and the
+    /// write goes through a sibling temp file and a rename, keeping the file's permissions, so
+    /// an interrupted enroll never leaves a truncated config.
     pub fn write_voice_ref(path: &Path, voice_ref: &str) -> Result<(), ConfigError> {
         let shown = path.display().to_string();
         if !path.exists() {
             Self::write_template(path, false)?;
         }
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        let target = std::fs::canonicalize(path).map_err(|source| ConfigError::Read {
+            path: shown.clone(),
+            source,
+        })?;
+        let text = std::fs::read_to_string(&target).map_err(|source| ConfigError::Read {
             path: shown.clone(),
             source,
         })?;
         let edited = set_voice_ref(&text, voice_ref);
-        let tmp = path.with_extension("toml.tmp");
-        let tmp_shown = tmp.display().to_string();
-        std::fs::write(&tmp, &edited).map_err(|source| ConfigError::Write {
-            path: tmp_shown.clone(),
-            source,
-        })?;
-        std::fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
+        let parsed = Self::from_toml(&edited, &shown)?;
+        if parsed.speak.voice_ref != voice_ref {
+            return Err(ConfigError::Edit(format!(
+                "{shown}: cannot set [speak].voice_ref in place (is it a dotted key or an inline \
+                 table?); write voice_ref = {} under [speak] by hand",
+                toml::Value::String(voice_ref.to_owned())
+            )));
+        }
+        let write_err = |source| ConfigError::Write {
             path: shown.clone(),
             source,
-        })?;
-        let parsed = Self::load(path)?;
-        debug_assert_eq!(parsed.speak.voice_ref, voice_ref);
+        };
+        let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+        tmp_name.push(".dmn-tmp");
+        let tmp = target.with_file_name(tmp_name);
+        std::fs::write(&tmp, &edited).map_err(write_err)?;
+        let renamed = std::fs::metadata(&target)
+            .and_then(|m| std::fs::set_permissions(&tmp, m.permissions()))
+            .and_then(|()| std::fs::rename(&tmp, &target));
+        if let Err(e) = renamed {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(write_err(e));
+        }
         Ok(())
     }
 
@@ -834,7 +865,7 @@ fn set_voice_ref(text: &str, value: &str) -> String {
                 written = true;
             }
             out.append(&mut blanks);
-            in_speak = trimmed.trim_end() == "[speak]";
+            in_speak = split_comment(trimmed).0.trim_end() == "[speak]";
             section_seen |= in_speak;
             out.push(line.to_owned());
             continue;
@@ -851,6 +882,8 @@ fn set_voice_ref(text: &str, value: &str) -> String {
             let (_, comment) = split_comment(line);
             let mut new_line = format!("voice_ref = {quoted}");
             if !comment.is_empty() {
+                // The template's comment column, and at least one space before the `#`.
+                new_line.push(' ');
                 while new_line.len() < 39 {
                     new_line.push(' ');
                 }
@@ -879,24 +912,20 @@ fn set_voice_ref(text: &str, value: &str) -> String {
 }
 
 /// Split a TOML line into (code, comment) at the first `#` outside a quoted string; the
-/// returned comment includes its `#`. Handles `\"` escapes inside basic strings.
+/// returned comment includes its `#`. Knows basic strings (`"..."`, with `\"` escapes) and
+/// literal strings (`'...'`, no escapes).
 fn split_comment(line: &str) -> (&str, &str) {
-    let bytes = line.as_bytes();
-    let mut in_string = false;
+    let mut quote: Option<u8> = None;
     let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-        } else if b == b'"' {
-            in_string = true;
-        } else if b == b'#' {
-            return (&line[..i], &line[i..]);
+    for (i, &b) in line.as_bytes().iter().enumerate() {
+        match quote {
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if b == b'\\' => escaped = true,
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'#' => return (&line[..i], &line[i..]),
+            None => {}
         }
     }
     (line, "")
@@ -950,7 +979,7 @@ enabled = true                       # false = transcribe / translate only (Ctrl
 
 [speak]
 enabled = false                      # `dmn speak` (#107): clone-voice TTS through a local server
-tts_url = "http://localhost:4123"    # Chatterbox-TTS-Server (OpenAI-compatible API)
+tts_url = "http://localhost:4123"    # chatterbox-tts-api (OpenAI-compatible); this machine only
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
 
@@ -1140,9 +1169,7 @@ keep_transcripts = true
         Config::write_voice_ref(&path, "/data/voice.wav").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
-            text.contains(
-                "voice_ref = \"/data/voice.wav\"          # enrolled reference clip"
-            ),
+            text.contains("voice_ref = \"/data/voice.wav\"          # enrolled reference clip"),
             "value replaced, comment kept:\n{text}"
         );
         assert!(text.contains("# Daemon (dmn) configuration"));
@@ -1152,8 +1179,17 @@ keep_transcripts = true
 
         // A second enroll replaces the value in place.
         Config::write_voice_ref(&path, "/data/other.wav").unwrap();
-        assert_eq!(Config::load(&path).unwrap().speak.voice_ref, "/data/other.wav");
-        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("voice_ref").count(), 1);
+        assert_eq!(
+            Config::load(&path).unwrap().speak.voice_ref,
+            "/data/other.wav"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .matches("voice_ref")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1182,6 +1218,154 @@ keep_transcripts = true
         let cfg = Config::from_toml(&edited, "edited").unwrap();
         assert!(cfg.speak.enabled);
         assert_eq!(cfg.speak.voice_ref, "/v.wav");
+    }
+
+    /// A user's own config, comments, a live `[lookup]` and odd spacing included: the edit
+    /// changes the `voice_ref` line and nothing else, byte for byte.
+    #[test]
+    fn write_voice_ref_on_a_users_file_changes_only_that_line() {
+        let user = "\
+# my dmn config; keep these notes
+[llm]
+model = \"qwen3.6:35b-a3b\"   # measured
+num_ctx = 8192
+
+[lookup]
+enabled = true                # the SearXNG container
+provider = \"searxng\"
+base_url = 'http://localhost:8888/#not-a-comment'
+
+[speak]   # added by hand
+enabled = true
+voice_ref = \"/old/voice.wav\"   # set by dmn speak enroll
+tts_url = \"http://127.0.0.1:4123\"
+
+[ui]
+mouse = false
+";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, user).unwrap();
+        Config::write_voice_ref(&path, "/home/u/.local/share/dmn/voice.wav").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let changed: Vec<(&str, &str)> = user
+            .lines()
+            .zip(after.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(
+            changed,
+            [(
+                "voice_ref = \"/old/voice.wav\"   # set by dmn speak enroll",
+                "voice_ref = \"/home/u/.local/share/dmn/voice.wav\" # set by dmn speak enroll"
+            )],
+            "{after}"
+        );
+        assert_eq!(user.lines().count(), after.lines().count());
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.speak.voice_ref, "/home/u/.local/share/dmn/voice.wav");
+        assert!(cfg.lookup.enabled);
+        assert_eq!(cfg.lookup.base_url, "http://localhost:8888/#not-a-comment");
+        assert_eq!(cfg.llm.num_ctx, 8192);
+        assert!(!cfg.ui.mouse);
+        assert!(
+            !dir.path().join("config.toml.dmn-tmp").exists(),
+            "no temp file left"
+        );
+    }
+
+    #[test]
+    fn write_voice_ref_adds_the_section_to_a_file_without_one() {
+        let user = "# notes\n[lookup]\nenabled = true # on\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, user).unwrap();
+        Config::write_voice_ref(&path, "/v.wav").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(user), "{after}");
+        assert!(
+            after.ends_with("\n[speak]\nvoice_ref = \"/v.wav\"\n"),
+            "{after}"
+        );
+        assert!(Config::load(&path).unwrap().lookup.enabled);
+    }
+
+    /// A dotfiles-managed config is a symlink: the file it points to is edited, the link stays,
+    /// and the file keeps its permissions.
+    #[test]
+    fn write_voice_ref_edits_through_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles-config.toml");
+        std::fs::write(&real, "[speak]\nenabled = true\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        Config::write_voice_ref(&link, "/v.wav").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(Config::load(&real).unwrap().speak.voice_ref, "/v.wav");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// An edit this line-based approach cannot make (a dotted key) leaves the file untouched,
+    /// and so does a file that does not parse.
+    #[test]
+    fn write_voice_ref_leaves_a_file_it_cannot_edit_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in [
+            ("dotted", "speak.voice_ref = \"/old.wav\"\n"),
+            ("broken", "[llm\nmodel = \n"),
+        ] {
+            let path = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&path, text).unwrap();
+            let err = Config::write_voice_ref(&path, "/v.wav").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Edit(_) | ConfigError::Parse { .. }),
+                "{name}: {err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{name}");
+        }
+    }
+
+    #[test]
+    fn split_comment_knows_both_string_kinds() {
+        assert_eq!(split_comment("a = \"x#y\" # c"), ("a = \"x#y\" ", "# c"));
+        assert_eq!(split_comment("a = 'x#y' # c"), ("a = 'x#y' ", "# c"));
+        assert_eq!(
+            split_comment(r##"a = "q\"#" # c"##),
+            (r##"a = "q\"#" "##, "# c")
+        );
+        assert_eq!(split_comment("a = 'it''s'"), ("a = 'it''s'", ""));
+        assert_eq!(split_comment("[speak] # hi"), ("[speak] ", "# hi"));
+    }
+
+    #[test]
+    fn speak_tts_url_must_be_on_this_machine() {
+        assert!(Speak::default().is_local());
+        for url in [
+            "http://127.0.0.1:4123",
+            "http://[::1]:4123/",
+            " http://LOCALHOST:4123 ",
+        ] {
+            let s = Speak {
+                tts_url: url.into(),
+                ..Speak::default()
+            };
+            assert!(s.is_local(), "{url}");
+        }
+        for url in ["http://gpu-box.lan:4123", "https://tts.example.com"] {
+            let s = Speak {
+                tts_url: url.into(),
+                ..Speak::default()
+            };
+            assert!(!s.is_local(), "{url}");
+        }
     }
 
     #[test]
