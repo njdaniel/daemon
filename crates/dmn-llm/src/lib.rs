@@ -60,7 +60,8 @@ pub use fast::{FastEvent, FastOutcome, IgnoreReason, run_fast_phase};
 pub use futures_util::future::BoxFuture;
 pub use futures_util::stream::BoxStream;
 pub use lookup::{
-    FreshFact, FreshFacts, LookupError, OllamaSearch, OllamaSearchSettings, SearchResult, WebSearch,
+    FreshFact, FreshFacts, LookupError, OllamaSearch, OllamaSearchSettings, SearchResult,
+    SearxngSearch, SearxngSettings, WebSearch,
 };
 pub use mock::MockProvider;
 pub use ollama::{OllamaProvider, OllamaSettings};

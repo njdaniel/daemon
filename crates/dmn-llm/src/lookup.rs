@@ -4,11 +4,14 @@
 //! [`FreshFact`]s in `limits.rs` and go into the fast phase's second request under
 //! `## Fresh facts` ([`crate::FastRequest::facts`]).
 //!
-//! [`WebSearch`] is the seam: [`OllamaSearch`] is Ollama's hosted web search, `POST
-//! <base_url>/api/web_search` with `{"query", "max_results"}` and a bearer key
-//! (<https://docs.ollama.com/capabilities/web-search>), and another provider is one more
-//! implementation. The reply is read tolerantly: a `results` array whose items carry `title`,
-//! `url` and `content`; an item missing any of them is skipped, unknown fields are ignored.
+//! [`WebSearch`] is the seam, with two implementations. [`OllamaSearch`] is Ollama's hosted web
+//! search, `POST <base_url>/api/web_search` with `{"query", "max_results"}` and a bearer key
+//! (<https://docs.ollama.com/capabilities/web-search>). [`SearxngSearch`] is the user's own
+//! SearXNG instance, `GET <base_url>/search?q=<query>&format=json` with no key and no account
+//! (<https://docs.searxng.org/dev/search_api.html>); it forwards the query to the engines it is
+//! set up with. Both replies are read the same tolerant way: a `results` array whose items carry
+//! `title`, `url` and `content`; an item missing any of them is skipped, unknown fields (and
+//! SearXNG's `answers` and `infoboxes`) are ignored.
 //!
 //! Every failure is a [`LookupError`] and none is retried: the caller keeps the first answer.
 //! The key goes into the `Authorization` header and nowhere else: [`OllamaSearch`] has no
@@ -23,6 +26,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const NAME: &str = "ollama";
+const SEARXNG: &str = "searxng";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most results Ollama's web search returns for one query.
 pub const MAX_RESULTS: usize = 10;
@@ -60,6 +64,12 @@ pub enum LookupError {
     Cancelled,
     #[error("web search found nothing usable")]
     NoResults,
+    /// A stock SearXNG answers `format=json` with 403 until its settings allow JSON.
+    #[error(
+        "SearXNG at {0} refused format=json (403 Forbidden): its JSON format is disabled; add \
+         `json` to `search.formats` in its settings.yml and restart it"
+    )]
+    JsonDisabled(String),
 }
 
 /// One search result as the provider returned it: untrusted text from the web, not yet cut.
@@ -204,62 +214,73 @@ impl OllamaSearch {
         let Some(key) = self.api_key.as_deref() else {
             return Err(LookupError::NoKey(self.key_env.clone()));
         };
-        let deadline = Instant::now() + self.timeout;
-        let send = self
+        let request = self
             .client
             .post(&self.url)
             .bearer_auth(key)
-            .json(&self.body(query))
-            .send();
-        let resp = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(LookupError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => return Err(LookupError::Timeout(self.timeout)),
-            r = send => r.map_err(|e| LookupError::Unreachable {
-                provider: NAME,
-                url: self.url.clone(),
-                detail: e.to_string(),
-            })?,
-        };
-        let status = resp.status();
-        let mut body: Vec<u8> = Vec::new();
-        let mut bytes = resp.bytes_stream();
-        let read = async {
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| LookupError::Malformed {
-                    provider: NAME,
-                    detail: format!("body read failed: {e}"),
-                })?;
-                body.extend_from_slice(&chunk);
-                if body.len() > BODY_CAP {
-                    return Err(LookupError::Malformed {
-                        provider: NAME,
-                        detail: format!("reply over {BODY_CAP} bytes"),
-                    });
-                }
-            }
-            Ok(())
-        };
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(LookupError::Cancelled),
-            () = tokio::time::sleep_until(deadline) => return Err(LookupError::Timeout(self.timeout)),
-            r = read => r?,
-        }
-        let text = String::from_utf8_lossy(&body);
-        if !status.is_success() {
+            .json(&self.body(query));
+        let (status, text) = fetch(NAME, &self.url, request, cancel, self.timeout).await?;
+        if !(200..300).contains(&status) {
             return Err(LookupError::HttpStatus {
                 provider: NAME,
-                status: status.as_u16(),
+                status,
                 body: text.chars().take(ERROR_BODY_CHARS).collect(),
             });
         }
-        let results = parse_results(&text)?;
+        let results = parse_results(NAME, &text)?;
         if results.is_empty() {
             return Err(LookupError::NoResults);
         }
         Ok(results)
     }
+}
+
+/// Send `request` and read its reply, all of it within `timeout` and until `cancel` fires: the
+/// status and the body as text (at most [`BODY_CAP`] bytes).
+async fn fetch(
+    provider: &'static str,
+    url: &str,
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<(u16, String), LookupError> {
+    let deadline = Instant::now() + timeout;
+    let resp = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(LookupError::Cancelled),
+        () = tokio::time::sleep_until(deadline) => return Err(LookupError::Timeout(timeout)),
+        r = request.send() => r.map_err(|e| LookupError::Unreachable {
+            provider,
+            url: url.to_owned(),
+            detail: e.to_string(),
+        })?,
+    };
+    let status = resp.status().as_u16();
+    let mut body: Vec<u8> = Vec::new();
+    let mut bytes = resp.bytes_stream();
+    let read = async {
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk.map_err(|e| LookupError::Malformed {
+                provider,
+                detail: format!("body read failed: {e}"),
+            })?;
+            body.extend_from_slice(&chunk);
+            if body.len() > BODY_CAP {
+                return Err(LookupError::Malformed {
+                    provider,
+                    detail: format!("reply over {BODY_CAP} bytes"),
+                });
+            }
+        }
+        Ok(())
+    };
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(LookupError::Cancelled),
+        () = tokio::time::sleep_until(deadline) => return Err(LookupError::Timeout(timeout)),
+        r = read => r?,
+    }
+    Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
 impl WebSearch for OllamaSearch {
@@ -279,18 +300,126 @@ impl WebSearch for OllamaSearch {
     }
 }
 
+/// Everything [`SearxngSearch`] needs from `[lookup]`. No key: SearXNG has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearxngSettings {
+    /// The instance, like `http://localhost:8888`.
+    pub base_url: String,
+    /// The first this many results are kept, 1 to [`MAX_RESULTS`].
+    pub max_results: usize,
+    /// For the whole search: connect, headers and body.
+    pub timeout: Duration,
+}
+
+impl Default for SearxngSettings {
+    fn default() -> Self {
+        Self {
+            base_url: SearxngSearch::DEFAULT_BASE_URL.to_owned(),
+            max_results: 3,
+            timeout: Duration::from_millis(3000),
+        }
+    }
+}
+
+/// The user's own SearXNG (#102, on PR #104): a metasearch engine that runs on their machine
+/// and needs no account or key. It forwards the query to the engines it is configured with.
+#[derive(Debug)]
+pub struct SearxngSearch {
+    client: reqwest::Client,
+    base_url: String,
+    max_results: usize,
+    timeout: Duration,
+}
+
+impl SearxngSearch {
+    /// SearXNG's port in its own Docker setup.
+    pub const DEFAULT_BASE_URL: &'static str = "http://localhost:8888";
+
+    pub fn new(settings: &SearxngSettings) -> Result<Self, LookupError> {
+        let base_url = settings.base_url.trim_end_matches('/').to_owned();
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT.min(settings.timeout))
+            .build()
+            .map_err(|e| LookupError::Unreachable {
+                provider: SEARXNG,
+                url: base_url.clone(),
+                detail: format!("cannot build HTTP client: {e}"),
+            })?;
+        Ok(Self {
+            client,
+            base_url,
+            max_results: settings.max_results.clamp(1, MAX_RESULTS),
+            timeout: settings.timeout,
+        })
+    }
+
+    /// The whole request: `<base_url>/search?q=<query, encoded>&format=json`. Public so tests
+    /// can assert it.
+    pub fn url(&self, query: &str) -> Result<reqwest::Url, LookupError> {
+        reqwest::Url::parse_with_params(
+            &format!("{}/search", self.base_url),
+            &[("q", query), ("format", "json")],
+        )
+        .map_err(|e| LookupError::Unreachable {
+            provider: SEARXNG,
+            url: self.base_url.clone(),
+            detail: format!("not a URL: {e}"),
+        })
+    }
+
+    async fn run(
+        &self,
+        query: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<SearchResult>, LookupError> {
+        let url = self.url(query)?;
+        let request = self.client.get(url);
+        let (status, text) = fetch(SEARXNG, &self.base_url, request, cancel, self.timeout).await?;
+        if status == 403 {
+            return Err(LookupError::JsonDisabled(self.base_url.clone()));
+        }
+        if !(200..300).contains(&status) {
+            return Err(LookupError::HttpStatus {
+                provider: SEARXNG,
+                status,
+                body: text.chars().take(ERROR_BODY_CHARS).collect(),
+            });
+        }
+        let mut results = parse_results(SEARXNG, &text)?;
+        results.truncate(self.max_results);
+        if results.is_empty() {
+            return Err(LookupError::NoResults);
+        }
+        Ok(results)
+    }
+}
+
+impl WebSearch for SearxngSearch {
+    fn name(&self) -> &'static str {
+        SEARXNG
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<Vec<SearchResult>, LookupError>> {
+        Box::pin(async move { self.run(query, &cancel).await })
+    }
+}
+
 /// `{"results": [{"title", "url", "content"}, …]}`, read tolerantly: an item missing a field, or
 /// with one that is not a string, is skipped; unknown fields are ignored. A body that is not JSON,
 /// or has no `results` array, is [`LookupError::Malformed`].
-pub fn parse_results(body: &str) -> Result<Vec<SearchResult>, LookupError> {
+pub fn parse_results(provider: &'static str, body: &str) -> Result<Vec<SearchResult>, LookupError> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| LookupError::Malformed {
-            provider: NAME,
+            provider,
             detail: e.to_string(),
         })?;
     let Some(items) = value.get("results").and_then(serde_json::Value::as_array) else {
         return Err(LookupError::Malformed {
-            provider: NAME,
+            provider,
             detail: "no `results` array".to_owned(),
         });
     };
@@ -342,6 +471,7 @@ fn redact(err: LookupError, secret: Option<&str>) -> LookupError {
             detail: scrub(detail),
         },
         e @ (LookupError::NoKey(_)
+        | LookupError::JsonDisabled(_)
         | LookupError::Timeout(_)
         | LookupError::Cancelled
         | LookupError::NoResults) => e,
@@ -438,13 +568,13 @@ mod tests {
             {"url": "https://c.example/", "content": "no title"},
             {"title": "D", "url": "https://d.example/", "content": "delta"}
         ], "extra": true}"#;
-        let r = parse_results(body).unwrap();
+        let r = parse_results(NAME, body).unwrap();
         let titles: Vec<&str> = r.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, ["A", "D"]);
-        assert_eq!(parse_results(r#"{"results": []}"#).unwrap(), []);
+        assert_eq!(parse_results(NAME, r#"{"results": []}"#).unwrap(), []);
         for bad in ["", "not json", "{}", r#"{"results": {}}"#, "[1, 2]"] {
             assert!(
-                matches!(parse_results(bad), Err(LookupError::Malformed { .. })),
+                matches!(parse_results(NAME, bad), Err(LookupError::Malformed { .. })),
                 "{bad:?}"
             );
         }
@@ -514,6 +644,107 @@ mod tests {
         let err = search.search("q", cancel).await.unwrap_err();
         assert!(matches!(err, LookupError::Cancelled), "{err}");
         let _ = hold.join();
+    }
+
+    /// A SearXNG reply as an instance gives it: more fields than three, `answers` and
+    /// `infoboxes` beside the results, and one result with no `content`.
+    const SEARXNG_REPLY: &str = r#"{"query": "latest stable Go release", "number_of_results": 0,
+        "results": [
+            {"url": "https://go.dev/doc/devel/release", "title": "Release History - The Go Programming Language", "content": "go1.25.1 (released 2025-09-03) includes security fixes.", "engine": "duckduckgo", "engines": ["duckduckgo", "brave"], "score": 4.0, "category": "general"},
+            {"url": "https://github.com/golang/go/releases", "title": "Releases · golang/go", "engine": "brave"},
+            {"url": "https://en.wikipedia.org/wiki/Go_(programming_language)", "title": "Go (programming language)", "content": "Go is a statically typed language.", "engine": "wikipedia"},
+            {"url": "https://www.go.dev/blog/go1.25", "title": "Go 1.25 is released", "content": "Today the Go team is happy to release Go 1.25.", "engine": "brave"},
+            {"url": "https://example.com/x", "title": "fourth usable", "content": "dropped past max_results"}
+        ],
+        "answers": [{"answer": "ignore me"}], "infoboxes": [{"infobox": "Go"}], "suggestions": [], "unresponsive_engines": []}"#;
+
+    fn searxng(base_url: &str) -> SearxngSettings {
+        SearxngSettings {
+            base_url: base_url.to_owned(),
+            ..SearxngSettings::default()
+        }
+    }
+
+    async fn search_searxng(
+        s: &SearxngSettings,
+        query: &str,
+    ) -> Result<Vec<SearchResult>, LookupError> {
+        SearxngSearch::new(s)
+            .unwrap()
+            .search(query, CancellationToken::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn lookup_searxng_gets_the_encoded_query_with_no_key_and_keeps_the_first_results() {
+        let server = serve_once("200 OK", "application/json", SEARXNG_REPLY.to_owned(), 3);
+        let results = search_searxng(&searxng(&server.url), "latest stable Go release & co")
+            .await
+            .unwrap();
+        let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://go.dev/doc/devel/release",
+                "https://en.wikipedia.org/wiki/Go_(programming_language)",
+                "https://www.go.dev/blog/go1.25"
+            ],
+            "the result without content skipped, then the first three"
+        );
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let (head, body) = MockServer::head_and_body(&requests[0]);
+        let line = head.lines().next().unwrap();
+        assert_eq!(
+            line,
+            "GET /search?q=latest+stable+Go+release+%26+co&format=json HTTP/1.1"
+        );
+        assert!(!head.to_lowercase().contains("authorization"), "{head}");
+        assert!(body.is_empty(), "a GET carries nothing else: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn lookup_searxng_403_says_the_json_format_is_disabled() {
+        let server = serve_once("403 Forbidden", "text/html", "<h1>Forbidden</h1>".into(), 1);
+        let err = search_searxng(&searxng(&server.url), "q")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LookupError::JsonDisabled(_)), "{err}");
+        let said = err.to_string();
+        assert!(said.contains("403 Forbidden"), "{said}");
+        assert!(
+            said.contains("`json` to `search.formats` in its settings.yml"),
+            "{said}"
+        );
+
+        let server = serve_once(
+            "200 OK",
+            "application/json",
+            r#"{"results": [], "answers": [{"answer": "1.25"}]}"#.into(),
+            1,
+        );
+        let err = search_searxng(&searxng(&server.url), "q")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LookupError::NoResults),
+            "answers alone are not results: {err}"
+        );
+
+        let err = search_searxng(&searxng("http://127.0.0.1:9"), "q")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LookupError::Unreachable {
+                    provider: "searxng",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[test]

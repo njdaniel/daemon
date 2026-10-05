@@ -321,9 +321,11 @@ pub enum AnswerLength {
 pub struct Lookup {
     pub enabled: bool,
     pub provider: LookupProvider,
-    /// Where the search goes; Ollama's own service unless pointed elsewhere (tests use loopback).
+    /// Where the search goes ([`Lookup::endpoint`]): Ollama's own service by default; for
+    /// `searxng`, left at that default (or empty), `http://localhost:8888`. Tests use loopback.
     pub base_url: String,
-    /// Name of an environment variable holding the search key. Never the key itself.
+    /// Name of an environment variable holding the search key. Never the key itself. Ollama's
+    /// search needs one; SearXNG has none, and this is ignored for it.
     pub api_key_env: String,
     /// The whole search: past it the first answer stays and the status line says `lookup
     /// failed`.
@@ -338,7 +340,7 @@ impl Default for Lookup {
         Self {
             enabled: false,
             provider: LookupProvider::Ollama,
-            base_url: "https://ollama.com".into(),
+            base_url: OLLAMA_SEARCH_URL.into(),
             api_key_env: "OLLAMA_API_KEY".into(),
             timeout_ms: 3000,
             max_results: 3,
@@ -346,24 +348,51 @@ impl Default for Lookup {
     }
 }
 
-/// `[lookup].provider`: whose web search answers (#102). One for now; another is one more
-/// `dmn_llm::WebSearch` implementation.
+/// `[lookup].provider`: whose web search answers (#102). Each is one `dmn_llm::WebSearch`
+/// implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LookupProvider {
+    /// Ollama's hosted web search, with a key from an ollama.com account.
     #[default]
     Ollama,
+    /// The user's own SearXNG instance (on PR #104): no account, no key.
+    Searxng,
 }
 
 impl LookupProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             LookupProvider::Ollama => "ollama",
+            LookupProvider::Searxng => "searxng",
         }
+    }
+
+    /// True when the provider needs `api_key_env` to name a key.
+    pub fn needs_key(self) -> bool {
+        matches!(self, LookupProvider::Ollama)
     }
 }
 
+/// `[lookup].base_url`'s default: Ollama's web search.
+const OLLAMA_SEARCH_URL: &str = "https://ollama.com";
+/// Where a SearXNG is unless `base_url` says otherwise: its Docker image's port, on this machine.
+pub const SEARXNG_URL: &str = "http://localhost:8888";
+
 impl Lookup {
+    /// Where the search goes, without a trailing slash: `base_url`, or for `searxng` while
+    /// `base_url` is empty or still Ollama's default, [`SEARXNG_URL`] (an `[lookup]` that only
+    /// says `provider = "searxng"` means a SearXNG on this machine, not ollama.com).
+    pub fn endpoint(&self) -> String {
+        let url = self.base_url.trim().trim_end_matches('/');
+        match self.provider {
+            LookupProvider::Searxng if url.is_empty() || url == OLLAMA_SEARCH_URL => {
+                SEARXNG_URL.to_owned()
+            }
+            _ => url.to_owned(),
+        }
+    }
+
     /// The search key from the variable `api_key_env` names. `None` when unset or empty.
     pub fn api_key(&self) -> Option<ApiKey> {
         self.api_key_from(|name| std::env::var(name).ok())
@@ -383,10 +412,16 @@ impl Lookup {
     /// (SPEC § Privacy rules): what leaves, where to, and when.
     pub fn privacy_notice(&self) -> Option<String> {
         self.enabled.then(|| {
+            let to = match self.provider {
+                LookupProvider::Ollama => format!("Ollama's web search at {}", self.endpoint()),
+                LookupProvider::Searxng => format!(
+                    "your SearXNG at {}, which forwards it to the search engines it is set up with",
+                    self.endpoint()
+                ),
+            };
             format!(
                 "web lookup on: when an answer depends on what is current, its search query (a \
-                 few words the model writes, no transcript) goes to {} ([lookup].enabled = true)",
-                self.base_url.trim_end_matches('/')
+                 few words the model writes, no transcript) goes to {to} ([lookup].enabled = true)"
             )
         })
     }
@@ -518,9 +553,9 @@ num_ctx = 0                          # Ollama context window to ask for; 0 = the
 
 [lookup]
 enabled = false                      # true = a question whose answer depends on what is current is searched on the web
-provider = "ollama"                  # Ollama's hosted web search (needs a free ollama.com key)
-base_url = "https://ollama.com"
-api_key_env = "OLLAMA_API_KEY"       # NAME of an env var holding the key; never the key itself
+provider = "ollama"                  # ollama (hosted, needs an ollama.com key) | searxng (your own instance, no key)
+base_url = "https://ollama.com"      # with provider = "searxng", left as is: http://localhost:8888
+api_key_env = "OLLAMA_API_KEY"       # NAME of an env var holding the key; never the key itself; unused by searxng
 timeout_ms = 3000                    # past this the first answer stays; nothing is retried
 max_results = 3                      # 1-10 results, each a title, a 300-character snippet and its domain
 
@@ -916,8 +951,54 @@ keep_transcripts = true
         assert!(notice.contains("no transcript"), "{notice}");
         assert!(
             Config::from_toml("[lookup]\nprovider = \"bing\"\n", "bad").is_err(),
-            "one provider for now; anything else is a config error"
+            "ollama or searxng; anything else is a config error"
         );
+    }
+
+    #[test]
+    fn config_lookup_searxng_defaults_its_base_url_to_this_machine() {
+        let only = Config::from_toml("[lookup]\nenabled = true\nprovider = \"searxng\"\n", "s")
+            .unwrap()
+            .lookup;
+        assert_eq!(only.provider, LookupProvider::Searxng);
+        assert!(!only.provider.needs_key());
+        assert_eq!(
+            only.endpoint(),
+            "http://localhost:8888",
+            "unset: this machine"
+        );
+        let shown = Config {
+            lookup: only.clone(),
+            ..Config::default()
+        }
+        .to_toml()
+        .unwrap();
+        assert!(shown.contains("provider = \"searxng\""), "{shown}");
+        for (url, want) in [
+            ("https://ollama.com/", "http://localhost:8888"),
+            ("", "http://localhost:8888"),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080"),
+            ("http://searx.lan", "http://searx.lan"),
+        ] {
+            let l = Lookup {
+                base_url: url.into(),
+                ..only.clone()
+            };
+            assert_eq!(l.endpoint(), want, "{url:?}");
+        }
+        let notice = only.privacy_notice().unwrap();
+        assert!(
+            notice.contains("your SearXNG at http://localhost:8888"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("forwards it to the search engines"),
+            "{notice}"
+        );
+        // Ollama keeps its own URL, and stays the default provider.
+        assert_eq!(Lookup::default().provider, LookupProvider::Ollama);
+        assert!(LookupProvider::Ollama.needs_key());
+        assert_eq!(Lookup::default().endpoint(), "https://ollama.com");
     }
 
     #[test]

@@ -990,6 +990,15 @@ fn joined(
     })
 }
 
+/// The warning a failed lookup leaves in the log (stderr under `dmn replay`): the error says
+/// what to change, e.g. a SearXNG whose JSON format is off.
+fn lookup_failed(query: &str, took: Duration, e: &LookupError) -> String {
+    format!(
+        "web lookup for {query:?} failed after {}: {e}; the first answer stays",
+        secs(took)
+    )
+}
+
 /// How a web lookup ended, for `dmn replay` (#102).
 enum LookupEnd<'a> {
     Found(&'a FreshFacts),
@@ -1147,7 +1156,7 @@ fn web_search(
     if let Some(notice) = lookup.privacy_notice() {
         output.note(&notice);
     }
-    if lookup.api_key().is_none() {
+    if lookup.provider.needs_key() && lookup.api_key().is_none() {
         output.warn(&format!(
             "web lookup on but ${} is unset or empty: every lookup will fail (fix: export {}=<your key>)",
             lookup.api_key_env, lookup.api_key_env
@@ -1730,10 +1739,7 @@ impl Answerer<'_> {
             },
             Err(e) => {
                 tally.lookups_failed += 1;
-                self.output.warn(&format!(
-                    "web lookup for {query:?} failed after {}: {e}; the first answer stays",
-                    secs(took)
-                ));
+                self.output.warn(&lookup_failed(&query, took, &e));
                 print_lookup(id, &query, LookupEnd::Failed(&e), took, self.output);
                 self.hub.dispatch(Action::LookupFailed { candidate: id });
                 return Some(slow);
@@ -3685,6 +3691,26 @@ mod tests {
         )
     }
 
+    /// The user's own SearXNG (on PR #104) at `url`.
+    fn searxng_on(url: &str, timeout: Duration) -> Arc<dyn WebSearch> {
+        Arc::new(
+            dmn_llm::SearxngSearch::new(&dmn_llm::SearxngSettings {
+                base_url: url.to_owned(),
+                timeout,
+                ..dmn_llm::SearxngSettings::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    /// What a SearXNG returns for the query: extra fields, `answers` and `infoboxes`, a result
+    /// with no content (skipped), and more results than kept.
+    const SEARXNG_RESULTS: &str = r#"{"query": "latest stable Go release", "results": [
+        {"url": "https://www.go.dev/doc/devel/release", "title": "Release History - The Go Programming Language", "content": "go1.25.1 (released 2025-09-03) includes security fixes.", "engine": "duckduckgo", "score": 3.5},
+        {"url": "https://github.com/golang/go/releases", "title": "Releases", "engine": "brave"},
+        {"url": "https://en.wikipedia.org/wiki/Go_(programming_language)", "title": "Go (programming language)", "content": "Stable release 1.25.1 / 3 September 2025.", "engine": "wikipedia"}
+    ], "answers": [{"answer": "Go 1.0"}], "infoboxes": [{"infobox": "Go"}], "suggestions": []}"#;
+
     /// The first reply: flagged, with the remembered version hedged.
     fn flagged_reply() -> serde_json::Value {
         let mut v = fast_json_reply(GO, "knowledge");
@@ -3945,6 +3971,145 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LookupError::NoKey(_)), "{err}");
         assert!(unused.requests().is_empty());
+    }
+
+    #[test]
+    fn lookup_searxng_gets_the_query_alone_and_its_results_rebuild_the_answer() {
+        let server = SearchServer::start("200 OK", SEARXNG_RESULTS, Duration::from_millis(50));
+        let provider = dmn_llm::MockProvider::json(&flagged_reply())
+            .then_json(&checked_reply())
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            Some(searxng_on(&server.url, Duration::from_secs(3))),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        ask_go(&s, &hub, 1);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.sections.started)));
+        let tally = s.finish();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let (head, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "GET /search?q=latest+stable+Go+release&format=json HTTP/1.1"
+        );
+        assert!(
+            !head.to_lowercase().contains("authorization"),
+            "no key: {head}"
+        );
+        assert!(body.is_empty(), "{body:?}");
+        for said in ["Bluebird", "Java", "major version"] {
+            assert!(!requests[0].contains(said), "{said} left the machine");
+        }
+
+        let second = &provider.requests()[1].messages[1].content;
+        assert!(
+            second.contains("[1] Release History - The Go Programming Language (go.dev): go1.25.1"),
+            "{second}"
+        );
+        assert!(
+            second.contains("[2] Go (programming language) (en.wikipedia.org): Stable release"),
+            "the result without content skipped: {second}"
+        );
+        assert!(!second.contains("Go 1.0"), "answers are ignored: {second}");
+        let snap = hub.snapshot();
+        let live = snap.live.as_ref().unwrap();
+        assert_eq!(
+            live.checked, "go.dev",
+            "the first result's host, without www."
+        );
+        assert!(screen(&snap).contains("checked · go.dev"));
+        assert_eq!((tally.lookups, tally.checked), (1, 1));
+    }
+
+    #[test]
+    fn lookup_searxng_failures_keep_the_first_answer_and_a_403_says_what_to_change() {
+        let forbidden = SearchServer::start("403 Forbidden", "<h1>Forbidden</h1>", Duration::ZERO);
+        let slow = SearchServer::start("200 OK", SEARXNG_RESULTS, Duration::from_secs(2));
+        let empty = SearchServer::start(
+            "200 OK",
+            r#"{"results": [], "answers": [{"answer": "x"}]}"#,
+            Duration::ZERO,
+        );
+        for (case, server) in [
+            ("403", &forbidden),
+            ("timeout", &slow),
+            ("no results", &empty),
+        ] {
+            let provider =
+                dmn_llm::MockProvider::json(&flagged_reply()).then_json(&slow_json_reply());
+            let hub = Arc::new(SessionHub::default());
+            let s = Suggester::start_with_search(
+                provider.clone(),
+                Some(searxng_on(&server.url, Duration::from_millis(300))),
+                Policy::Supersede,
+                Arc::clone(&hub),
+                Context::empty(),
+                Some(Duration::from_secs(20)),
+            );
+            ask_go(&s, &hub, 1);
+            assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+                .live
+                .as_ref()
+                .is_some_and(|q| q.sections.started)));
+            let tally = s.finish();
+            assert_eq!(server.requests().len(), 1, "{case}");
+            assert_eq!(provider.requests().len(), 2, "{case}: no second request");
+            let snap = hub.snapshot();
+            assert_eq!(snap.lookup_failed, Some(1), "{case}");
+            let shown = screen(&snap);
+            assert!(shown.contains("may be out of date") && shown.contains("lookup failed"));
+            assert_eq!((tally.lookups_failed, tally.checked), (1, 0), "{case}");
+        }
+        // What the log says for the 403: what to change, where.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let e = rt
+            .block_on(
+                searxng_on(&forbidden.url, Duration::from_secs(1))
+                    .search("latest stable Go release", CancellationToken::new()),
+            )
+            .unwrap_err();
+        let said = lookup_failed("latest stable Go release", Duration::from_millis(12), &e);
+        assert!(
+            said.contains(&format!(
+                "SearXNG at {} refused format=json (403 Forbidden)",
+                forbidden.url
+            )),
+            "{said}"
+        );
+        assert!(
+            said.contains("add `json` to `search.formats` in its settings.yml"),
+            "{said}"
+        );
+        assert!(said.ends_with("the first answer stays"), "{said}");
+
+        // From `[lookup]`: no key is read for searxng, so an unset variable changes nothing.
+        let cfg = config::Lookup {
+            enabled: true,
+            provider: config::LookupProvider::Searxng,
+            base_url: empty.url.clone(),
+            api_key_env: "DMN_TEST_LOOKUP_KEY_NEVER_SET".into(),
+            ..config::Lookup::default()
+        };
+        let search = wire::web_search(&cfg).unwrap().unwrap();
+        assert_eq!(search.name(), "searxng");
+        let e = rt
+            .block_on(search.search("q", CancellationToken::new()))
+            .unwrap_err();
+        assert!(matches!(e, LookupError::NoResults), "it asked: {e}");
+        assert_eq!(empty.requests().len(), 2);
     }
 
     #[test]

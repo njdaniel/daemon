@@ -7,7 +7,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use dmn_detect::Candidate;
 use dmn_llm::{
     AnthropicProvider, FastEvent, FastOutcome, LlmError, LookupError, OllamaProvider, OllamaSearch,
-    OllamaSearchSettings, OllamaSettings, OpenAiProvider, Provider, WebSearch,
+    OllamaSearchSettings, OllamaSettings, OpenAiProvider, Provider, SearxngSearch, SearxngSettings,
+    WebSearch,
 };
 use dmn_session::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, IgnoreReason, ProviderLabel, SlowEnd,
@@ -359,18 +360,26 @@ pub fn provider(llm: &Llm) -> Result<Arc<dyn Provider>, LlmError> {
 /// The web search `[lookup]` names (#102), or `None` while it is off. The key is read now from
 /// the variable `api_key_env` names and goes into the client and nowhere else; unset, the client
 /// is still built, and every lookup fails at once with [`LookupError::NoKey`] without sending
-/// anything, which the status line reports as `lookup failed`.
+/// anything, which the status line reports as `lookup failed`. `searxng` needs no key.
 pub fn web_search(lookup: &Lookup) -> Result<Option<Arc<dyn WebSearch>>, LookupError> {
     if !lookup.enabled {
         return Ok(None);
     }
+    let max_results = usize::from(lookup.max_results);
+    let timeout = std::time::Duration::from_millis(lookup.timeout_ms);
     let search: Arc<dyn WebSearch> = match lookup.provider {
         config::LookupProvider::Ollama => Arc::new(OllamaSearch::new(&OllamaSearchSettings {
-            base_url: lookup.base_url.clone(),
+            base_url: lookup.endpoint(),
             api_key: lookup.api_key().map(|k| k.expose().to_owned()),
             key_env: lookup.api_key_env.clone(),
-            max_results: usize::from(lookup.max_results),
-            timeout: std::time::Duration::from_millis(lookup.timeout_ms),
+            max_results,
+            timeout,
+        })?),
+        // On PR #104: the user's own instance; no key, so `api_key_env` is not read.
+        config::LookupProvider::Searxng => Arc::new(SearxngSearch::new(&SearxngSettings {
+            base_url: lookup.endpoint(),
+            max_results,
+            timeout,
         })?),
     };
     Ok(Some(search))

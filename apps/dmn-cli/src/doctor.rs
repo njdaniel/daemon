@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use dmn_core::config::Provider;
+use dmn_core::config::{LookupProvider, Provider};
 use dmn_core::{Config, Paths};
 
 /// Result of one check.
@@ -422,7 +422,12 @@ pub fn remote_api_key(cfg: &Config, lookup: impl Fn(&str) -> Option<String>) -> 
 /// #102: the web lookup, informational either way: off (nothing is searched), ready (on, with
 /// its key), or on with the key variable unset (every lookup fails and the first answer stays;
 /// nothing else breaks, so this warns rather than fails the run).
-pub fn web_lookup(cfg: &Config, lookup: impl Fn(&str) -> Option<String>) -> Check {
+///
+/// For `searxng` (on PR #104) there is no key: with the lookup on, doctor asks the instance one
+/// search (`dmn`) with the 2 s timeout every doctor request has, and reports it unreachable, or
+/// its JSON format disabled (403), as a warning. Doctor's client speaks plain `http://`, so an
+/// `https://` instance is reported by its URL, unprobed.
+pub fn web_lookup(cfg: &Config, h: &dyn Http, lookup: impl Fn(&str) -> Option<String>) -> Check {
     let l = &cfg.lookup;
     if !l.enabled {
         return Check::pass(
@@ -431,8 +436,11 @@ pub fn web_lookup(cfg: &Config, lookup: impl Fn(&str) -> Option<String>) -> Chec
         )
         .optional();
     }
+    let at = l.endpoint();
+    if l.provider == LookupProvider::Searxng {
+        return searxng(&at, h);
+    }
     let var = &l.api_key_env;
-    let at = l.base_url.trim_end_matches('/');
     match l.api_key_from(lookup) {
         Some(_) => Check::pass(
             "web lookup",
@@ -460,6 +468,45 @@ pub fn web_lookup(cfg: &Config, lookup: impl Fn(&str) -> Option<String>) -> Chec
             )
             .optional()
         }
+    }
+}
+
+/// The `searxng` half of [`web_lookup`].
+fn searxng(at: &str, h: &dyn Http) -> Check {
+    let ready = |how: String| {
+        Check::pass(
+            "web lookup",
+            format!(
+                "ready: SearXNG at {at} ({how}); a search query goes there and on to the engines it is set up with"
+            ),
+        )
+        .optional()
+    };
+    if !at.starts_with("http://") {
+        return ready("not probed: doctor checks http:// instances only".to_owned());
+    }
+    let warn =
+        |detail: String, fix: &str| Check::fail("web lookup", detail, fix.to_owned()).optional();
+    match h.get(&format!("{at}/search?q=dmn&format=json")) {
+        Ok(body) => match dmn_llm::lookup::parse_results("searxng", &body) {
+            Ok(results) => ready(format!("answered with {} result(s)", results.len())),
+            Err(e) => warn(
+                format!("SearXNG at {at} answered, but not with search results: {e}"),
+                "check [lookup].base_url points at a SearXNG instance",
+            ),
+        },
+        Err(e) if e == "HTTP 403" => warn(
+            format!(
+                "SearXNG at {at}: JSON format disabled (403): every lookup fails and the first answer stays"
+            ),
+            "add `json` to `search.formats` in the instance's settings.yml and restart it",
+        ),
+        Err(e) => warn(
+            format!(
+                "SearXNG unreachable at {at}: {e}: every lookup fails and the first answer stays"
+            ),
+            "start the instance, or set [lookup].base_url to where it runs",
+        ),
     }
 }
 
@@ -590,7 +637,15 @@ fn privacy_line(cfg: &Config, locality: &Locality) -> String {
     let host = host_of(&cfg.llm.base_url);
     let line = llm_privacy(host, locality);
     // #102: what the web lookup sends, while it is on.
-    let search = host_of(&cfg.lookup.base_url);
+    let endpoint = cfg.lookup.endpoint();
+    let host = host_of(&endpoint);
+    // On PR #104: a SearXNG is the user's own, and it forwards the query to its engines.
+    let search = match cfg.lookup.provider {
+        LookupProvider::Ollama => host.to_owned(),
+        LookupProvider::Searxng => {
+            format!("your SearXNG at {host}, which forwards it to its search engines")
+        }
+    };
     match (cfg.lookup.enabled, locality) {
         (false, _) => line,
         (true, Locality::Local) => format!(
@@ -682,7 +737,7 @@ pub fn run_all(
             checks.push(remote_api_key(cfg, |name| std::env::var(name).ok()));
         }
     }
-    checks.push(web_lookup(cfg, |name| std::env::var(name).ok()));
+    checks.push(web_lookup(cfg, h, |name| std::env::var(name).ok()));
     checks.push(gpu_backend(r));
     checks.push(whisper_device(cfg.stt.device, &dmn_stt::gpu_devices()));
     Report { header, checks }
@@ -949,12 +1004,13 @@ mod tests {
     #[test]
     fn doctor_reports_the_three_web_lookup_states() {
         let mut cfg = Config::default();
-        let off = web_lookup(&cfg, |_| Some("ol-secret".into()));
+        let h = FakeHttp(Err("never asked".into()));
+        let off = web_lookup(&cfg, &h, |_| Some("ol-secret".into()));
         assert!(off.ok && !off.required, "{off:?}");
         assert!(off.detail.starts_with("off"), "{}", off.detail);
 
         cfg.lookup.enabled = true;
-        let ready = web_lookup(&cfg, |name| {
+        let ready = web_lookup(&cfg, &h, |name| {
             (name == "OLLAMA_API_KEY").then(|| "ol-secret".to_owned())
         });
         assert!(ready.ok && !ready.required, "{ready:?}");
@@ -967,7 +1023,7 @@ mod tests {
         assert!(ready.detail.contains("$OLLAMA_API_KEY"), "{}", ready.detail);
         assert!(!ready.detail.contains("ol-secret"));
 
-        let unset = web_lookup(&cfg, |_| None);
+        let unset = web_lookup(&cfg, &h, |_| None);
         assert!(
             !unset.ok && !unset.required,
             "a warning, not a failure: {unset:?}"
@@ -997,6 +1053,76 @@ mod tests {
         assert_eq!(
             privacy_line(&cfg, &endpoint_locality(&cfg, &res)),
             "nothing leaves this machine"
+        );
+    }
+
+    #[test]
+    fn doctor_reports_searxng_off_ready_unreachable_and_json_disabled() {
+        let mut cfg = Config::default();
+        cfg.lookup.provider = LookupProvider::Searxng;
+        let never = FakeHttp(Err("never asked".into()));
+        // Off: nothing probed (the fake would say "never asked").
+        let off = web_lookup(&cfg, &never, |_| None);
+        assert!(off.ok && off.detail.starts_with("off"), "{off:?}");
+
+        cfg.lookup.enabled = true;
+        let ok = FakeHttp(Ok(r#"{"results": [{"title": "t", "url": "https://go.dev/", "content": "c"}], "answers": []}"#.into()));
+        let ready = web_lookup(&cfg, &ok, |_| None);
+        assert!(ready.ok && !ready.required, "no key needed: {ready:?}");
+        assert!(
+            ready
+                .detail
+                .contains("SearXNG at http://localhost:8888 (answered with 1 result(s))"),
+            "{}",
+            ready.detail
+        );
+
+        let forbidden = web_lookup(&cfg, &FakeHttp(Err("HTTP 403".into())), |_| None);
+        assert!(
+            !forbidden.ok && !forbidden.required,
+            "a warning: {forbidden:?}"
+        );
+        assert!(
+            forbidden.detail.contains("JSON format disabled (403)"),
+            "{}",
+            forbidden.detail
+        );
+        assert!(
+            forbidden
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("`json` to `search.formats`")
+        );
+
+        let down = web_lookup(
+            &cfg,
+            &FakeHttp(Err("cannot connect to 127.0.0.1:8888: refused".into())),
+            |_| None,
+        );
+        assert!(!down.ok && !down.required, "{down:?}");
+        assert!(
+            down.detail
+                .starts_with("SearXNG unreachable at http://localhost:8888")
+        );
+
+        let html = web_lookup(&cfg, &FakeHttp(Ok("<html>".into())), |_| None);
+        assert!(
+            !html.ok && html.detail.contains("not with search results"),
+            "{html:?}"
+        );
+
+        cfg.lookup.base_url = "https://searx.example".into();
+        let tls = web_lookup(&cfg, &never, |_| None);
+        assert!(tls.ok && tls.detail.contains("not probed"), "{tls:?}");
+
+        // The header names the instance's host, not ollama.com.
+        cfg.lookup.base_url = "https://ollama.com".into();
+        let res = FakeResolver::local();
+        let line = privacy_line(&cfg, &endpoint_locality(&cfg, &res));
+        assert!(
+            line.contains("go to your SearXNG at localhost, which forwards it"),
+            "{line}"
         );
     }
 
