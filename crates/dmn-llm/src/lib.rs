@@ -18,7 +18,13 @@
 //! completions — OpenAI, OpenRouter, vLLM, LM Studio) and [`anthropic`] (tool use with the
 //! schema), both streaming SSE ([`sse`]) into the same incremental parser, and both taking the
 //! API key only as a header from the env var `[llm].api_key_env` names — never logged, never in
-//! a `Debug` impl.
+//! a `Debug` impl. #101: every request opens with `## Today`, the date the caller passes in
+//! [`FastRequest::today`] (this crate reads no clock), and the fast phase's `lookup` names the web
+//! search that would settle an answer depending on what is current ([`FastEvent::Lookup`]). #102
+//! adds [`lookup`]: the [`WebSearch`] seam and [`OllamaSearch`] that run that query (and nothing
+//! else) against Ollama's hosted web search, whose results the second fast request carries under
+//! `## Fresh facts` ([`FastRequest::facts`]), cut in [`limits::fresh_facts`]. Like the remote
+//! providers, it takes its key only as a header and never logs it.
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:
@@ -34,6 +40,7 @@
 pub mod anthropic;
 pub mod fast;
 pub mod limits;
+pub mod lookup;
 pub mod mock;
 pub mod ndjson;
 pub mod ollama;
@@ -52,6 +59,10 @@ pub use anthropic::AnthropicProvider;
 pub use fast::{FastEvent, FastOutcome, IgnoreReason, run_fast_phase};
 pub use futures_util::future::BoxFuture;
 pub use futures_util::stream::BoxStream;
+pub use lookup::{
+    FreshFact, FreshFacts, LookupError, OllamaSearch, OllamaSearchSettings, SearchResult,
+    SearxngSearch, SearxngSettings, WebSearch,
+};
 pub use mock::MockProvider;
 pub use ollama::{OllamaProvider, OllamaSettings};
 pub use openai::OpenAiProvider;

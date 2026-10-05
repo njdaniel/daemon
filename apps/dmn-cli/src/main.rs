@@ -21,6 +21,7 @@ mod run;
 mod sources;
 mod speak;
 mod suggest;
+mod today;
 mod tui;
 
 use std::process::ExitCode;
@@ -559,7 +560,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
             if let Some(notice) = cfg.llm.privacy_notice() {
                 println!("# NOTE: {notice}");
             }
-            print!("{}", cfg.to_toml()?);
+            // #102: and what the web lookup sends, while it is on.
+            if let Some(notice) = cfg.lookup.privacy_notice() {
+                println!("# NOTE: {notice}");
+            }
+            // #102: values that depend on another (the lookup's timeout) as they take effect.
+            print!("{}", cfg.effective().to_toml()?);
             Ok(())
         }
         Some(Command::Bench {

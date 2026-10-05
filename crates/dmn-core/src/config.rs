@@ -41,6 +41,7 @@ pub struct Config {
     pub stt: Stt,
     pub detect: Detect,
     pub llm: Llm,
+    pub lookup: Lookup,
     pub assist: Assist,
     pub speak: Speak,
     pub ui: Ui,
@@ -312,6 +313,145 @@ pub enum AnswerLength {
     Minimal,
 }
 
+/// The web lookup (#102): when the fast phase says an answer depends on what is current and names
+/// a search query (#101), send that query, and nothing else, to a web search and answer once more
+/// from the results. Off by default: with it on, a search query leaves the machine even with a
+/// local model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Lookup {
+    pub enabled: bool,
+    pub provider: LookupProvider,
+    /// Where the search goes ([`Lookup::endpoint`]): Ollama's own service by default; for
+    /// `searxng`, left at that default (or empty), `http://localhost:8888`. Tests use loopback.
+    pub base_url: String,
+    /// Name of an environment variable holding the search key. Never the key itself. Ollama's
+    /// search needs one; SearXNG has none, and this is ignored for it.
+    pub api_key_env: String,
+    /// The whole search: past it the first answer stays and the status line says `lookup
+    /// failed`. Left out of the file, it depends on the provider ([`Lookup::timeout`]): 3000 for
+    /// `ollama`, 6000 for `searxng`, because a stock SearXNG waits up to its own 3 s
+    /// `request_timeout` on slow engines and 3000 would lose exactly those searches. Written in
+    /// the file, it is used as written. `dmn config show` prints the value in effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Results asked for, 1–10; each goes into the prompt as a title, a 300-character snippet
+    /// and its domain. 5 since PR #104's measurement: with 3, the page that named the newest
+    /// release was often not among them.
+    pub max_results: u8,
+}
+
+impl Default for Lookup {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: LookupProvider::Ollama,
+            base_url: OLLAMA_SEARCH_URL.into(),
+            api_key_env: "OLLAMA_API_KEY".into(),
+            timeout_ms: None,
+            max_results: 5,
+        }
+    }
+}
+
+/// `[lookup].provider`: whose web search answers (#102). Each is one `dmn_llm::WebSearch`
+/// implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LookupProvider {
+    /// Ollama's hosted web search, with a key from an ollama.com account.
+    #[default]
+    Ollama,
+    /// The user's own SearXNG instance (on PR #104): no account, no key.
+    Searxng,
+}
+
+impl LookupProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LookupProvider::Ollama => "ollama",
+            LookupProvider::Searxng => "searxng",
+        }
+    }
+
+    /// True when the provider needs `api_key_env` to name a key.
+    pub fn needs_key(self) -> bool {
+        matches!(self, LookupProvider::Ollama)
+    }
+}
+
+/// `[lookup].timeout_ms` left out, for `ollama`.
+pub const LOOKUP_TIMEOUT_MS: u64 = 3000;
+/// `[lookup].timeout_ms` left out, for `searxng` (see [`Lookup::timeout_ms`]).
+pub const SEARXNG_TIMEOUT_MS: u64 = 6000;
+
+/// `[lookup].base_url`'s default: Ollama's web search.
+const OLLAMA_SEARCH_URL: &str = "https://ollama.com";
+/// Where a SearXNG is unless `base_url` says otherwise: its Docker image's port, on this machine.
+pub const SEARXNG_URL: &str = "http://localhost:8888";
+
+impl Lookup {
+    /// Where the search goes, without a trailing slash: `base_url`, or for `searxng` while
+    /// `base_url` is empty or still Ollama's default, [`SEARXNG_URL`] (an `[lookup]` that only
+    /// says `provider = "searxng"` means a SearXNG on this machine, not ollama.com).
+    pub fn endpoint(&self) -> String {
+        let url = self.base_url.trim().trim_end_matches('/');
+        match self.provider {
+            LookupProvider::Searxng if url.is_empty() || url == OLLAMA_SEARCH_URL => {
+                SEARXNG_URL.to_owned()
+            }
+            _ => url.to_owned(),
+        }
+    }
+
+    /// The search key from the variable `api_key_env` names. `None` when unset or empty.
+    pub fn api_key(&self) -> Option<ApiKey> {
+        self.api_key_from(|name| std::env::var(name).ok())
+    }
+
+    /// The search's deadline: `timeout_ms` as written, or when it is left out
+    /// [`LOOKUP_TIMEOUT_MS`] for `ollama` and [`SEARXNG_TIMEOUT_MS`] for `searxng`.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms())
+    }
+
+    /// [`Lookup::timeout`] in milliseconds.
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms.unwrap_or(match self.provider {
+            LookupProvider::Ollama => LOOKUP_TIMEOUT_MS,
+            LookupProvider::Searxng => SEARXNG_TIMEOUT_MS,
+        })
+    }
+
+    /// Same as [`Lookup::api_key`] with the environment lookup injected (tests use a closure).
+    pub fn api_key_from(&self, lookup: impl Fn(&str) -> Option<String>) -> Option<ApiKey> {
+        if self.api_key_env.is_empty() {
+            return None;
+        }
+        lookup(&self.api_key_env)
+            .filter(|v| !v.is_empty())
+            .map(ApiKey::new)
+    }
+
+    /// The sentence `dmn run`, `dmn replay` and `dmn config show` print while the lookup is on
+    /// (SPEC § Privacy rules): what leaves, where to, and when.
+    pub fn privacy_notice(&self) -> Option<String> {
+        self.enabled.then(|| {
+            let to = match self.provider {
+                LookupProvider::Ollama => format!("Ollama's web search at {}", self.endpoint()),
+                LookupProvider::Searxng => format!(
+                    "your SearXNG at {}, which forwards it to the search engines it is set up with",
+                    self.endpoint()
+                ),
+            };
+            format!(
+                "web lookup on: when an answer depends on what is current, its search query (a \
+                 few words the model writes, no transcript) goes to {to} ([lookup].enabled = true)"
+            )
+        })
+    }
+}
+
 /// Interview assistance (#79): the layer over transcription that detects questions and asks the
 /// LLM for an Approach. Off, Daemon is a live transcriber / translator only: no detector, no
 /// context, no LLM request, and the transcript takes the screen. `dmn run --no-assist` starts a
@@ -464,6 +604,14 @@ fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # the six expandable sections; 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
+[lookup]
+enabled = false                      # true = a question whose answer depends on what is current is searched on the web
+provider = "ollama"                  # ollama (hosted, needs an ollama.com key) | searxng (your own instance, no key)
+base_url = "https://ollama.com"      # with provider = "searxng", left as is: http://localhost:8888
+api_key_env = "OLLAMA_API_KEY"       # NAME of an env var holding the key; never the key itself; unused by searxng
+# timeout_ms = 3000                  # past this the first answer stays, nothing retried; left out: 3000 for ollama, 6000 for searxng
+max_results = 5                      # 1-10 results, each a title, a 300-character snippet and its domain
+
 [assist]
 enabled = true                       # false = transcribe / translate only: no detector, no LLM (Ctrl+Shift+A toggles)
 
@@ -547,7 +695,16 @@ impl Config {
         })
     }
 
-    /// The effective config as TOML (no comments).
+    /// This config with every value that depends on another written out as it takes effect
+    /// (#102: `[lookup].timeout_ms` left out is the provider's own): what `dmn config show`
+    /// prints, so it shows what runs.
+    pub fn effective(&self) -> Self {
+        let mut cfg = self.clone();
+        cfg.lookup.timeout_ms = Some(self.lookup.timeout_ms());
+        cfg
+    }
+
+    /// The config as TOML (no comments).
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(self)?)
     }
@@ -780,6 +937,14 @@ fast_timeout_ms = 4000
 slow_timeout_ms = 20000              # 0 turns the slow phase off
 num_ctx = 0                          # Ollama context window to ask for; 0 = the server default
 
+[lookup]
+enabled = false                      # true = search the web when an answer depends on what is current
+provider = "ollama"                  # ollama (hosted, key) | searxng (your own instance, no key)
+base_url = "https://ollama.com"      # searxng: left as is, http://localhost:8888
+api_key_env = "OLLAMA_API_KEY"       # name of an env var; never the key itself
+# timeout_ms = 3000                  # left out: 3000 for ollama, 6000 for searxng
+max_results = 5
+
 [assist]
 enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
 
@@ -889,7 +1054,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 34, "spec example has 34 keys: {keys:?}");
+        assert_eq!(keys.len(), 39, "spec example has 39 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -1017,6 +1182,143 @@ keep_transcripts = true
         let cfg = Config::from_toml(&edited, "edited").unwrap();
         assert!(cfg.speak.enabled);
         assert_eq!(cfg.speak.voice_ref, "/v.wav");
+    }
+
+    #[test]
+    fn config_lookup_is_off_by_default_and_show_prints_its_keys() {
+        let lookup = Config::default().lookup;
+        assert!(!lookup.enabled);
+        assert!(lookup.privacy_notice().is_none(), "off says nothing leaves");
+        assert_eq!(
+            (
+                lookup.provider.as_str(),
+                lookup.base_url.as_str(),
+                lookup.api_key_env.as_str(),
+                lookup.timeout_ms(),
+                lookup.max_results
+            ),
+            ("ollama", "https://ollama.com", "OLLAMA_API_KEY", 3000, 5)
+        );
+        // `dmn config show` prints the effective config: every `[lookup]` key, the timeout as
+        // it takes effect.
+        let shown = Config::default().effective().to_toml().unwrap();
+        let section = &shown[shown.find("[lookup]").expect(&shown)..];
+        for key in [
+            "enabled = false",
+            "provider = \"ollama\"",
+            "base_url = \"https://ollama.com\"",
+            "api_key_env = \"OLLAMA_API_KEY\"",
+            "timeout_ms = 3000",
+            "max_results = 5",
+        ] {
+            assert!(section.contains(key), "{key}: {shown}");
+        }
+
+        let on = Config::from_toml(
+            "[lookup]\nenabled = true\nbase_url = \"http://127.0.0.1:9/\"\n",
+            "on",
+        )
+        .unwrap();
+        assert!(on.lookup.enabled);
+        let notice = on.lookup.privacy_notice().unwrap();
+        assert!(notice.contains("http://127.0.0.1:9 "), "{notice}");
+        assert!(notice.contains("no transcript"), "{notice}");
+        assert!(
+            Config::from_toml("[lookup]\nprovider = \"bing\"\n", "bad").is_err(),
+            "ollama or searxng; anything else is a config error"
+        );
+    }
+
+    #[test]
+    fn config_lookup_searxng_defaults_its_base_url_to_this_machine() {
+        let only = Config::from_toml("[lookup]\nenabled = true\nprovider = \"searxng\"\n", "s")
+            .unwrap()
+            .lookup;
+        assert_eq!(only.provider, LookupProvider::Searxng);
+        assert!(!only.provider.needs_key());
+        assert_eq!(
+            only.endpoint(),
+            "http://localhost:8888",
+            "unset: this machine"
+        );
+        let shown = Config {
+            lookup: only.clone(),
+            ..Config::default()
+        }
+        .to_toml()
+        .unwrap();
+        assert!(shown.contains("provider = \"searxng\""), "{shown}");
+        for (url, want) in [
+            ("https://ollama.com/", "http://localhost:8888"),
+            ("", "http://localhost:8888"),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080"),
+            ("http://searx.lan", "http://searx.lan"),
+        ] {
+            let l = Lookup {
+                base_url: url.into(),
+                ..only.clone()
+            };
+            assert_eq!(l.endpoint(), want, "{url:?}");
+        }
+        let notice = only.privacy_notice().unwrap();
+        assert!(
+            notice.contains("your SearXNG at http://localhost:8888"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("forwards it to the search engines"),
+            "{notice}"
+        );
+        // Ollama keeps its own URL, and stays the default provider.
+        assert_eq!(Lookup::default().provider, LookupProvider::Ollama);
+        assert!(LookupProvider::Ollama.needs_key());
+        assert_eq!(Lookup::default().endpoint(), "https://ollama.com");
+        // A stock SearXNG waits up to 3 s on slow engines itself: its default deadline is longer.
+        assert_eq!(only.timeout(), std::time::Duration::from_millis(6000));
+        let effective = Config {
+            lookup: only.clone(),
+            ..Config::default()
+        }
+        .effective()
+        .to_toml()
+        .unwrap();
+        assert!(effective.contains("timeout_ms = 6000"), "{effective}");
+        // Written in the file, even 3000, it is used as written.
+        let written =
+            Config::from_toml("[lookup]\nprovider = \"searxng\"\ntimeout_ms = 3000\n", "w")
+                .unwrap()
+                .lookup;
+        assert_eq!(written.timeout(), std::time::Duration::from_millis(3000));
+        let set = Lookup {
+            timeout_ms: Some(4500),
+            ..only.clone()
+        };
+        assert_eq!(
+            set.timeout(),
+            std::time::Duration::from_millis(4500),
+            "a value set wins"
+        );
+        assert_eq!(
+            Lookup::default().timeout(),
+            std::time::Duration::from_millis(3000)
+        );
+    }
+
+    #[test]
+    fn config_lookup_key_is_read_from_the_named_variable_and_never_printed() {
+        let env = |name: &str| (name == "OLLAMA_API_KEY").then(|| "ol-secret-value".to_owned());
+        let mut c = Config::default();
+        assert_eq!(
+            c.lookup.api_key_from(env).unwrap().expose(),
+            "ol-secret-value"
+        );
+        assert!(c.lookup.api_key_from(|_| Some(String::new())).is_none());
+        assert!(c.lookup.api_key_from(|_| None).is_none());
+        c.lookup.api_key_env = String::new();
+        assert!(c.lookup.api_key_from(env).is_none());
+        c.lookup.enabled = true;
+        assert!(!c.to_toml().unwrap().contains("secret"));
+        assert!(!format!("{c:?}").contains("secret"));
     }
 
     #[test]

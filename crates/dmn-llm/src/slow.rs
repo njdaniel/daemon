@@ -27,6 +27,11 @@
 //! fast phase's does; only the instructions after it differ. Ollama keeps the last prompt's KV
 //! cache, so a slow request between two questions leaves the next fast request's shared prefix
 //! cached instead of making it re-read the whole system prompt.
+//!
+//! #101: so the slow phase gets the fast phase's date (`## Today`) and its rule for answers that
+//! depend on what is current; `slow.md` repeats that rule for the sections, and a question the
+//! fast phase flagged (`lookup` not empty) says so under the Approach, so no section builds on a
+//! remembered version.
 
 use std::time::Duration;
 
@@ -78,6 +83,9 @@ pub struct SlowRequest {
     /// The Approach already on screen, so the sections add to it instead of repeating it.
     pub approach: Vec<String>,
     pub star: Option<Star>,
+    /// #101: the fast phase's `lookup` for this question; not empty when it flagged the answer as
+    /// depending on what is current, and then the sections must not build on a remembered version.
+    pub lookup: String,
     pub coding: CodingMode,
     /// The file of each chunk in `context.chunks`, in order: the only sources `resume_context`
     /// may cite.
@@ -96,6 +104,7 @@ impl SlowRequest {
             focus: String::new(),
             approach: Vec::new(),
             star: None,
+            lookup: String::new(),
             coding: CodingMode::Hints,
             chunk_files: Vec::new(),
             previous: None,
@@ -176,6 +185,23 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
         user.push_str(&format!(
             "STAR already shown: situation: {}; task: {}; action: {}; result: {}\n",
             star.situation, star.task, star.action, star.result
+        ));
+    }
+    if let Some(facts) = req.context.facts.as_ref().filter(|f| !f.facts.is_empty()) {
+        // #102: the Approach above was rebuilt on the search results, which this request
+        // carries too.
+        user.push_str(&format!(
+            "Checked on the web (search: {}): the Approach was built on the Fresh facts above. \
+             Build every section on them too, not on what you remember; where they say nothing, \
+             say so.\n",
+            facts.query.trim()
+        ));
+    } else if !req.lookup.trim().is_empty() {
+        user.push_str(&format!(
+            "Flagged as depending on what is current (to look up: {}): the Approach may be out \
+             of date. No section names a version, release or date as the current one or builds \
+             on one.\n",
+            req.lookup.trim()
         ));
     }
     if let Some(prev) = req.previous.as_ref().filter(|_| req.wants_summary()) {
@@ -712,6 +738,59 @@ mod tests {
         ] {
             assert!(user.contains(want), "missing {want:?}:\n{user}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_slow_request_carries_the_date_the_rule_and_a_flag_from_the_fast_phase() {
+        let mock = MockProvider::json(&reply());
+        let mut req = request(Kind::Knowledge);
+        req.context.today = "2026-10-05".into();
+        let _ = run(&mock, &req).await;
+        let plain = mock.requests()[0].messages[1].content.clone();
+        assert!(plain.starts_with("## Today\n2026-10-05\n\n"), "{plain}");
+        assert!(plain.contains("- Current facts hold here too"), "{plain}");
+        assert!(!plain.contains("Flagged as depending"), "{plain}");
+        assert!(
+            mock.requests()[0].messages[0]
+                .content
+                .contains("- Current facts:"),
+            "the fast phase's rule rides in the shared system prompt"
+        );
+
+        let mock = MockProvider::json(&reply());
+        req.lookup = "latest stable Go release".into();
+        let _ = run(&mock, &req).await;
+        let flagged = &mock.requests()[0].messages[1].content;
+        let note = flagged
+            .find("Flagged as depending on what is current (to look up: latest stable Go release)")
+            .expect(flagged);
+        assert!(note > flagged.find("Approach already shown:").unwrap());
+        assert!(note < flagged.find("## Now fill").unwrap(), "{flagged}");
+    }
+
+    #[tokio::test]
+    async fn lookup_results_reach_the_slow_phase_and_replace_the_out_of_date_note() {
+        use crate::lookup::{FreshFact, FreshFacts};
+        let mock = MockProvider::json(&reply());
+        let mut req = request(Kind::Knowledge);
+        req.lookup = "latest stable Go release".into();
+        req.context.facts = Some(FreshFacts {
+            query: "latest stable Go release".into(),
+            facts: vec![FreshFact {
+                title: "All releases".into(),
+                snippet: "go1.25.1 (released 2025-09-03)".into(),
+                domain: "go.dev".into(),
+            }],
+        });
+        let _ = run(&mock, &req).await;
+        let user = &mock.requests()[0].messages[1].content;
+        assert!(user.contains("## Fresh facts\n"), "{user}");
+        assert!(user.contains("[1] All releases (go.dev)"), "{user}");
+        assert!(
+            user.contains("Checked on the web (search: latest stable Go release)"),
+            "{user}"
+        );
+        assert!(!user.contains("Flagged as depending"), "{user}");
     }
 
     #[tokio::test]

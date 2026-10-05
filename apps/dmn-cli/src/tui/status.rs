@@ -179,6 +179,11 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         spans.push(Span::styled(dot, style));
         spans.push(Span::raw(format!(" {name}{suffix} ")));
     }
+    // #102: beside the model dot, while the web lookup is on: a search query may leave the
+    // machine. Nothing is asked while assistance is off, so nothing is said then.
+    if st.web && !view.session.assist_off {
+        spans.push(Span::styled(" web ", Style::new().fg(Color::DarkGray)));
+    }
     // #16: ring-buffer overruns (audio dropped because a consumer stalled) show beside the dots,
     // and only once there are any.
     if st.overruns > 0 {
@@ -269,7 +274,8 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     Paragraph::new(Line::from(spans)).render(left, buf);
     // #79: the right-hand area is never cut (the left one is, on a narrow pane), so the one
     // state that changes what the screen is for leads it, in amber.
-    // #96: the answer to an Enter the model declined leads it the same way, for its 5 s.
+    // #96: the answer to an Enter the model declined leads it the same way, for its 5 s, and so
+    // does a web lookup that came to nothing (#102).
     // #94: and so does the count of questions that arrived behind an earlier one.
     let rest = keys.strip_prefix(lead.as_str()).unwrap_or(&keys).to_owned();
     let right_spans = vec![
@@ -314,6 +320,10 @@ const ASSIST_OFF: &str = "assist off";
 /// #96: what the status line says when the model declined what Enter sent (`is_question: false`
 /// or small talk); it leads the keys while [`dmn_session::Session::not_a_question`] is set.
 const NOT_A_QUESTION: &str = "not a question";
+
+/// #102: what the status line says for 5 s after a web lookup came to nothing; it leads the keys
+/// while [`dmn_session::Session::lookup_failed`] is set.
+const LOOKUP_FAILED: &str = "lookup failed";
 
 /// #96: Enter asks about what the asking lane last said (the interviewer, by default; the hint
 /// names no lane, so it reads the same under `asks: you` and `asks: both`). Offered whenever
@@ -377,6 +387,9 @@ fn shortcuts(view: &View<'_>) -> Keys {
     let mut lead = Vec::new();
     if view.session.not_a_question.is_some() {
         lead.push(NOT_A_QUESTION.to_owned());
+    }
+    if view.session.lookup_failed.is_some() {
+        lead.push(LOOKUP_FAILED.to_owned());
     }
     if let Some((at, of)) = view.session.place() {
         if view.session.unseen > 0 {
