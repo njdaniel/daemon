@@ -1,34 +1,105 @@
-//! A one-shot HTTP server on a raw `TcpListener` for provider tests, the same pattern as
-//! `dmn-llm`'s testserver but with byte bodies: the WAV answer and the multipart enrollment
-//! are binary. Reads one request, replies with `status` and `body` (in `pieces` chunks so the
-//! stream lands in pieces), and keeps the request bytes for assertions. Loopback only, so
-//! tests never touch the network.
+//! A scripted HTTP server on a raw `TcpListener` for tests, the same pattern as `dmn-llm`'s
+//! testserver but with byte bodies (the WAV answer and the multipart enrollment are binary) and
+//! a list of replies, one per connection, since one synthesis is two requests (the voice check,
+//! then the speech) and a re-enrollment three. Each reply's body goes out in pieces of a given
+//! size with a pause between them, with a `Content-Length` or chunked like the server's
+//! streaming route, so consumers see real streaming and pieces that split the WAV header and
+//! samples at odd offsets. Loopback only, so tests never touch the network.
+//!
+//! Compiled for this crate's tests and, with the `test-server` feature, for `dmn-cli`'s.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// How long a partial read waits before giving up (a hung test fails instead of hanging).
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-/// Pause between body pieces, so consumers see real streaming.
-const PIECE_DELAY: Duration = Duration::from_millis(5);
+/// Pause between body pieces, so consumers see real streaming: the WAV header and the first
+/// samples arrive in separate reads. Only the first [`PAUSED_PIECES`] pieces pause, so a body
+/// sent in 7-byte pieces does not take seconds.
+const PIECE_DELAY: Duration = Duration::from_millis(2);
+const PAUSED_PIECES: usize = 32;
 
-pub(crate) struct MockServer {
+/// One scripted answer.
+#[derive(Debug, Clone)]
+pub struct Reply {
+    status: String,
+    content_type: String,
+    body: Vec<u8>,
+    piece: usize,
+    chunked: bool,
+}
+
+impl Reply {
+    /// `status` like `"200 OK"`, sent whole with a `Content-Length`.
+    pub fn new(status: &str, content_type: &str, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status: status.to_owned(),
+            content_type: content_type.to_owned(),
+            body: body.into(),
+            piece: usize::MAX,
+            chunked: false,
+        }
+    }
+
+    /// `200 OK` with a JSON body.
+    pub fn json(body: &str) -> Self {
+        Self::new("200 OK", "application/json", body)
+    }
+
+    /// `200 OK` with a WAV body.
+    pub fn wav(body: Vec<u8>) -> Self {
+        Self::new("200 OK", "audio/wav", body)
+    }
+
+    /// The voice library listing chatterbox-tts-api answers `GET /v1/voices` with.
+    pub fn voices(names: &[&str]) -> Self {
+        let voices: Vec<String> = names
+            .iter()
+            .map(|n| format!(r#"{{"name":"{n}","language":"en","aliases":[],"exists":true}}"#))
+            .collect();
+        Self::json(&format!(
+            r#"{{"voices":[{}],"count":{}}}"#,
+            voices.join(","),
+            names.len()
+        ))
+    }
+
+    /// Send the body in pieces of `bytes` bytes.
+    pub fn in_pieces_of(mut self, bytes: usize) -> Self {
+        self.piece = bytes.max(1);
+        self
+    }
+
+    /// `Transfer-Encoding: chunked` instead of a `Content-Length`, one HTTP chunk per piece.
+    pub fn chunked(mut self) -> Self {
+        self.chunked = true;
+        self
+    }
+}
+
+/// The running server: its URL, and every request it has received.
+pub struct MockServer {
     pub url: String,
     requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl MockServer {
     /// Every request received so far, oldest first, as raw bytes (head + body).
-    pub(crate) fn requests(&self) -> Vec<Vec<u8>> {
-        self.requests.lock().map(|r| r.clone()).unwrap_or_default()
+    pub fn requests(&self) -> Vec<Vec<u8>> {
+        self.requests
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_else(|p| p.into_inner().clone())
     }
 
     /// The captured request's head and body, split at the blank line.
-    pub(crate) fn head_and_body<'a>(request: &'a [u8]) -> (&'a str, &'a [u8]) {
+    pub fn head_and_body(request: &[u8]) -> (&str, &[u8]) {
         match request
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
@@ -38,76 +109,117 @@ impl MockServer {
                 std::str::from_utf8(&request[..split]).unwrap_or("<non-utf8 head>"),
                 &request[split..],
             ),
-            None => (std::str::from_utf8(request).unwrap_or("<non-utf8 head>"), &[]),
+            None => (
+                std::str::from_utf8(request).unwrap_or("<non-utf8 head>"),
+                &[],
+            ),
         }
+    }
+
+    /// The request line of every request so far: `["GET /v1/voices", "POST /v1/audio/speech"]`.
+    pub fn request_lines(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .map(|r| {
+                let (head, _) = Self::head_and_body(r);
+                let line = head.lines().next().unwrap_or("");
+                line.rsplit_once(' ')
+                    .map_or(line, |(l, _version)| l)
+                    .to_owned()
+            })
+            .collect()
     }
 }
 
 impl Drop for MockServer {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
-            // A test that failed before connecting leaves the thread waiting in `accept`, and
-            // joining it would hang the suite on the unwind. Connect once so `accept` returns;
-            // the thread reads an empty request, fails to write to the closed socket, and ends.
+            // A test that failed (or made fewer requests than scripted) leaves the thread in
+            // `accept`; one connection wakes it, it sees `stop`, and it ends.
             if !h.is_finished()
                 && let Some(addr) = self.url.strip_prefix("http://")
             {
-                let _ = std::net::TcpStream::connect(addr);
+                let _ = TcpStream::connect(addr);
             }
             let _ = h.join();
         }
     }
 }
 
-/// Accept one connection and answer it with `status` and `body` (in `pieces` chunks), then exit.
-pub(crate) fn serve_once(
-    status: &str,
-    content_type: &str,
-    body: Vec<u8>,
-    pieces: usize,
-) -> MockServer {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+/// Answer one connection per reply, in order, then exit.
+pub fn serve(replies: Vec<Reply>) -> std::io::Result<MockServer> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let captured = Arc::clone(&requests);
-    let status = status.to_owned();
-    let content_type = content_type.to_owned();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (captured, stopped) = (Arc::clone(&requests), Arc::clone(&stop));
     let handle = std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-        let request = read_request(&mut stream);
-        captured
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(request);
-        let head = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        if stream.write_all(head.as_bytes()).is_err() {
-            return;
-        }
-        let piece = body.len().div_ceil(pieces.max(1));
-        for chunk in body.chunks(piece.max(1)) {
-            if stream.write_all(chunk).is_err() {
+        for reply in replies {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            if stopped.load(Ordering::SeqCst) {
                 return;
             }
-            let _ = stream.flush();
-            std::thread::sleep(PIECE_DELAY);
+            let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+            let request = read_request(&mut stream);
+            captured
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request);
+            let _ = answer(&mut stream, &reply);
         }
     });
-    MockServer {
+    Ok(MockServer {
         url: format!("http://127.0.0.1:{port}"),
         requests,
+        stop,
         handle: Some(handle),
+    })
+}
+
+/// A port nothing listens on: bound, then released.
+pub fn closed_port_url() -> std::io::Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+fn answer(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
+    let length = if reply.chunked {
+        "Transfer-Encoding: chunked".to_owned()
+    } else {
+        format!("Content-Length: {}", reply.body.len())
+    };
+    let head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\n{length}\r\nConnection: close\r\n\r\n",
+        reply.status, reply.content_type
+    );
+    stream.write_all(head.as_bytes())?;
+    for (i, piece) in reply.body.chunks(reply.piece).enumerate() {
+        if reply.chunked {
+            stream.write_all(format!("{:x}\r\n", piece.len()).as_bytes())?;
+            stream.write_all(piece)?;
+            stream.write_all(b"\r\n")?;
+        } else {
+            stream.write_all(piece)?;
+        }
+        stream.flush()?;
+        if reply.piece != usize::MAX && i < PAUSED_PIECES {
+            std::thread::sleep(PIECE_DELAY);
+        }
     }
+    if reply.chunked {
+        stream.write_all(b"0\r\n\r\n")?;
+    }
+    stream.flush()
 }
 
 /// Read one request: headers up to the blank line, then as many body bytes as Content-Length
 /// says (0 when absent).
-fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -138,11 +250,16 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// A test that fails before connecting drops its server with the thread still in `accept`;
-    /// the drop must return, not hang the suite.
+    /// A test that fails before connecting, or makes fewer requests than scripted, drops its
+    /// server with the thread still in `accept`; the drop must return, not hang the suite.
     #[test]
-    fn dropping_a_server_nobody_connected_to_returns_promptly() {
-        let server = serve_once("200 OK", "text/plain", b"never sent".to_vec(), 1);
+    fn dropping_a_server_with_unused_replies_returns_promptly() {
+        let server = serve(vec![
+            Reply::json("{}"),
+            Reply::json("{}"),
+            Reply::json("{}"),
+        ])
+        .unwrap();
         let started = Instant::now();
         drop(server);
         assert!(started.elapsed() < READ_TIMEOUT, "{:?}", started.elapsed());
