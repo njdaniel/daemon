@@ -8,6 +8,8 @@
 //! 240 characters, headings and tradeoff parts one short line, code a line count (an example is a
 //! sketch, a worked solution about 40 lines), and `resume_context` keeps only items that cite a
 //! file the request actually carried.
+//!
+//! #101 adds `lookup`: one line of at most 80 characters, cut at a word.
 
 use crate::schema::{Deeper, Example, Kind, ResumeContext, Star, Suggestion, Tradeoff};
 
@@ -42,6 +44,9 @@ pub const CODE_LINE_CHARS: usize = 120;
 pub const SUMMARY_CHARS: usize = 160;
 /// #57: a "promised to return to" topic is a few words.
 pub const PROMISE_CHARS: usize = 80;
+/// #101: the fast phase's `lookup`, a web search query that would settle an answer depending on
+/// what is current. A query is a few words; #102 sends it as it is.
+pub const LOOKUP_CHARS: usize = 80;
 
 /// One limit that model output broke. `field` names the place, like `approach[2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +340,41 @@ pub fn summary_line(
     format!("{head}{body}{tail}").trim().to_owned()
 }
 
+/// The fast phase's `lookup` (#101) as a search query: its first line only, whitespace
+/// collapsed, the quotes a model may wrap it in removed, and at most [`LOOKUP_CHARS`], cut at the
+/// last word that fits. A query is sent to a search engine, never read on screen, so a cut adds
+/// no `…`. Dropping a line or characters is flagged, as every cut is; an empty result means the
+/// answer depends on nothing current.
+pub fn limit_lookup(raw: &str, flags: &mut Vec<Flag>) -> String {
+    let mut lines = raw.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or_default();
+    let one_line = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut query = one_line
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '“' | '”'))
+        .trim()
+        .to_owned();
+    let mut cut = lines.next().is_some();
+    if query.chars().count() > LOOKUP_CHARS {
+        cut = true;
+        let chars: Vec<char> = query.chars().collect();
+        let end = (1..=LOOKUP_CHARS)
+            .rev()
+            .find(|&i| chars[i].is_whitespace())
+            .unwrap_or(LOOKUP_CHARS);
+        query = chars[..end]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+    }
+    if cut {
+        let from = raw.trim().chars().count();
+        let to = query.chars().count();
+        flags.push(Flag::new("lookup", FlagKind::Truncated { from, to }));
+    }
+    query
+}
+
 /// One approach line as the UI shows it: trimmed, the model's own numbering or bullet removed
 /// (the UI numbers lines itself), and cut to [`APPROACH_LINE_CHARS`].
 pub fn approach_line(index: usize, raw: &str, flags: &mut Vec<Flag>) -> String {
@@ -382,6 +422,7 @@ pub fn enforce(s: &mut Suggestion) -> Vec<Flag> {
     let focus = s.focus.trim().to_owned();
     s.focus = focus;
     limit_text("focus", &mut s.focus, FOCUS_CHARS, &mut flags);
+    s.lookup = limit_lookup(&s.lookup, &mut flags);
 
     s.approach.retain(|l| !strip_marker(l.trim()).is_empty());
     limit_list("approach", &mut s.approach, APPROACH_MAX, &mut flags);
@@ -755,6 +796,71 @@ mod tests {
             "0:05 two sum — hash map",
             "a blank promise is no promise"
         );
+    }
+
+    #[test]
+    fn a_lookup_query_is_one_line_of_at_most_80_characters_and_every_cut_is_flagged() {
+        let mut flags = Vec::new();
+        assert_eq!(
+            limit_lookup("  \"latest stable Go release\" ", &mut flags),
+            "latest stable Go release"
+        );
+        assert_eq!(limit_lookup("", &mut flags), "");
+        assert_eq!(limit_lookup(" \n ", &mut flags), "");
+        assert!(
+            flags.is_empty(),
+            "quotes and blanks are not cuts: {flags:?}"
+        );
+
+        let long = "current long term support release of Node.js and its end of life date \
+                    according to the official release schedule";
+        let q = limit_lookup(long, &mut flags);
+        assert!(q.chars().count() <= LOOKUP_CHARS, "{q}");
+        assert!(long.starts_with(&q), "cut at a word, nothing added: {q}");
+        assert!(!q.ends_with(' ') && !q.contains('…'), "{q:?}");
+        assert_eq!(
+            flags,
+            [Flag {
+                field: "lookup".into(),
+                kind: FlagKind::Truncated {
+                    from: long.chars().count(),
+                    to: q.chars().count()
+                }
+            }]
+        );
+
+        let mut flags = Vec::new();
+        assert_eq!(
+            limit_lookup(
+                "latest Kubernetes   release\nKubernetes 1.31 changelog",
+                &mut flags
+            ),
+            "latest Kubernetes release",
+            "the first line, whitespace collapsed"
+        );
+        assert_eq!(flags.len(), 1, "a second line dropped is a cut: {flags:?}");
+        assert_eq!(flags[0].field, "lookup");
+
+        let mut flags = Vec::new();
+        let word = "x".repeat(100);
+        assert_eq!(
+            limit_lookup(&word, &mut flags).chars().count(),
+            LOOKUP_CHARS
+        );
+        assert_eq!(flags.len(), 1);
+    }
+
+    #[test]
+    fn enforce_cuts_the_lookup_too() {
+        let mut s = Suggestion {
+            kind: Some(Kind::Knowledge),
+            approach: vec!["a".into(), "b".into(), "c".into()],
+            lookup: "latest Go release\nand its date".into(),
+            ..Suggestion::default()
+        };
+        let flags = enforce(&mut s);
+        assert_eq!(s.lookup, "latest Go release");
+        assert!(flags.iter().any(|f| f.field == "lookup"), "{flags:?}");
     }
 
     #[test]

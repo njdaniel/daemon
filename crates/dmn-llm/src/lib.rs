@@ -18,7 +18,9 @@
 //! completions — OpenAI, OpenRouter, vLLM, LM Studio) and [`anthropic`] (tool use with the
 //! schema), both streaming SSE ([`sse`]) into the same incremental parser, and both taking the
 //! API key only as a header from the env var `[llm].api_key_env` names — never logged, never in
-//! a `Debug` impl.
+//! a `Debug` impl. #101: every request opens with `## Today`, the date the caller passes in
+//! [`FastRequest::today`] (this crate reads no clock), and the fast phase's `lookup` names the web
+//! search that would settle an answer depending on what is current ([`FastEvent::Lookup`]).
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:

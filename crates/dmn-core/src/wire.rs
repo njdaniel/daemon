@@ -187,6 +187,10 @@ pub fn fast_event(id: u64, ev: &FastEvent) -> Action {
             candidate: id,
             text: text.clone(),
         },
+        FastEvent::Lookup { query } => Action::Lookup {
+            candidate: id,
+            query: query.clone(),
+        },
         FastEvent::ApproachLine { index, text } => Action::ApproachLine {
             candidate: id,
             index: *index,

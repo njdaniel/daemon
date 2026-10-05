@@ -592,6 +592,94 @@ fn a_regenerate_that_fails_after_its_new_reply_started_is_marked_failed() {
     assert_eq!(live.progress, Progress::Failed("timeout".into()));
 }
 
+fn lookup(candidate: u64, query: &str) -> Action {
+    Action::Lookup {
+        candidate,
+        query: query.into(),
+    }
+}
+
+#[test]
+fn a_lookup_marks_its_question_and_follows_the_newest_reply() {
+    let go = "What is the latest stable major version of Go?";
+    let mut log = vec![candidate(1, 20.0, go)];
+    let mut first = shown(
+        1,
+        go,
+        &[
+            "Say 1.24 is the newest you know of.",
+            "Say it may be out of date.",
+        ],
+    );
+    // As the fast phase sends it: after the focus, before the Approach lines.
+    first.insert(2, lookup(1, "latest stable Go release"));
+    log.extend(first);
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().lookup, "latest stable Go release");
+
+    // `r`: until the new reply starts, the question on screen (and its tag) is the old one.
+    log.push(Action::Regenerate { candidate: 1 });
+    assert_eq!(
+        Session::replay(&log).live.unwrap().lookup,
+        "latest stable Go release"
+    );
+    // The new reply names nothing to look up: the tag goes with the old reply.
+    log.extend(shown(1, go, &["a", "b", "c"]));
+    assert_eq!(Session::replay(&log).live.unwrap().lookup, "");
+    // And a later one that does brings it back.
+    log.push(Action::Regenerate { candidate: 1 });
+    let mut again = shown(1, go, &["a", "b", "c"]);
+    again.insert(2, lookup(1, "Go release history"));
+    log.extend(again);
+    assert_eq!(
+        Session::replay(&log).live.unwrap().lookup,
+        "Go release history"
+    );
+
+    // A declined retry leaves the question, tag and all, as it was.
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::Ignored {
+        candidate: 1,
+        reason: IgnoreReason::NotAQuestion,
+        score: 3,
+    });
+    assert_eq!(
+        Session::replay(&log).live.unwrap().lookup,
+        "Go release history"
+    );
+
+    // The next question starts without one; the earlier one keeps its tag in the history.
+    log.push(candidate(2, 60.0, "How does a B-tree split a full node?"));
+    log.extend(shown(
+        2,
+        "How does a B-tree split a full node?",
+        &["a", "b", "c"],
+    ));
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().lookup, "");
+    assert_eq!(s.history[0].lookup, "Go release history");
+}
+
+#[test]
+fn a_lookup_reaches_a_queued_question_and_a_session_without_one_serialises_as_before() {
+    let mut log = vec![candidate(1, 20.0, "q1")];
+    log.extend(shown(1, "First", &["a"]));
+    log.push(Action::Pin);
+    log.push(candidate(2, 60.0, "Which Kubernetes version is current?"));
+    log.extend(shown(2, "Which Kubernetes version is current?", &["b"]));
+    log.push(lookup(2, "current Kubernetes release"));
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().lookup, "");
+    assert_eq!(s.queued[0].lookup, "current Kubernetes release");
+
+    let plain = Session::replay(&interview());
+    let json = serde_json::to_string(&plain).unwrap();
+    assert!(!json.contains("lookup"), "{json}");
+    let text = serde_json::to_string(&s).unwrap();
+    assert!(text.contains(r#""lookup":"current Kubernetes release""#));
+    assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);
+}
+
 /// A behavioral question with STAR cards built from `story`.
 fn behavioral(id: u64, story: &str) -> Vec<Action> {
     vec![

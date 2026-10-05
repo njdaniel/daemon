@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 30] = [
+const STATES: [&str; 31] = [
     "listening",
     "live",
     "pinned",
@@ -64,6 +64,8 @@ const STATES: [&str; 30] = [
     // #94: a Deeper Answer of four items at the 240-character limit, each wrapped in full and
     // scrolled to the last word of the last: at 80 × 24 that is twelve rows down.
     "long-items",
+    // #101: an answer that depends on what is current, tagged `may be out of date`.
+    "lookup",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -425,6 +427,31 @@ fn median_question() -> Vec<Action> {
     a
 }
 
+/// #101: the live session's question, answered without stating a remembered version as current,
+/// with what to look up.
+fn go_version() -> Vec<Action> {
+    let mut a = answered(
+        1,
+        "What is the latest stable major version of Go?",
+        "knowledge",
+        "Go release cadence, keeping current",
+        &[
+            "Say the newest you know of is Go 1.24, from early 2025.",
+            "Say a newer one may be out: Go ships a release every six months.",
+            "Offer to check go.dev before relying on the number.",
+        ],
+    );
+    // As the fast phase sends it: after the focus, before the first Approach line.
+    a.insert(
+        3,
+        Action::Lookup {
+            candidate: 1,
+            query: "latest stable Go release".into(),
+        },
+    );
+    a
+}
+
 fn actions(state: &str) -> Vec<Action> {
     let mut a = opening();
     // #56: every section filled, then the key for section N pressed.
@@ -779,6 +806,7 @@ fn actions(state: &str) -> Vec<Action> {
         }
         // #94: the issue's own case, a Deeper Answer of four 240-character items. None is cut
         // inside: each wraps onto the rows it needs and the body scrolls to the end of the last.
+        "lookup" => a.extend(go_version()),
         "long-items" => {
             a.extend(long_items());
             a.push(Action::ToggleSection {
@@ -1169,6 +1197,60 @@ fn tui_loading_dims_the_previous_approach_instead_of_clearing_it() {
         );
     }
     assert!(text(&buf).contains("thinking…"));
+}
+
+#[test]
+fn tui_an_answer_that_depends_on_what_is_current_is_tagged_dim_on_the_approach_border() {
+    for size in SIZES {
+        let buf = render(&load("lookup"), size);
+        let (x, y) = row_containing(&buf, "may be out of date");
+        let screen = text(&buf);
+        let row = screen.lines().nth(usize::from(y)).unwrap_or_default();
+        assert!(
+            row.contains("APPROACH"),
+            "on the Approach border:\n{screen}"
+        );
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "{screen}");
+    }
+    // No query, no tag: the other fixtures are the snapshots above, unchanged.
+    for state in ["live", "pinned", "behavioral", "sections", "earlier"] {
+        let screen = text(&render(&load(state), (100, 30)));
+        assert!(!screen.contains("may be out of date"), "{state}:\n{screen}");
+    }
+}
+
+#[test]
+fn tui_the_out_of_date_tag_follows_the_newest_reply() {
+    let mut log = actions("lookup");
+    // Streaming: the query came before the lines, so the tag is up while they arrive.
+    let streaming: Vec<Action> = log
+        .iter()
+        .take_while(|a| !matches!(a, Action::Answered { .. }))
+        .cloned()
+        .collect();
+    let screen = text(&render(&Session::replay(&streaming), (100, 30)));
+    assert!(screen.contains("may be out of date"), "{screen}");
+
+    // `r`: the old Approach dims and says `thinking…` until the new reply starts.
+    log.push(Action::Regenerate { candidate: 1 });
+    let screen = text(&render(&Session::replay(&log), (100, 30)));
+    assert!(screen.contains("thinking…"), "{screen}");
+    assert!(!screen.contains("may be out of date"), "{screen}");
+
+    // The new reply names nothing to look up: no tag.
+    log.extend(
+        answered(
+            1,
+            "What is the latest stable major version of Go?",
+            "knowledge",
+            "Go release cadence",
+            &["a", "b", "c"],
+        )
+        .into_iter()
+        .skip(1),
+    );
+    let screen = text(&render(&Session::replay(&log), (100, 30)));
+    assert!(!screen.contains("may be out of date"), "{screen}");
 }
 
 #[test]

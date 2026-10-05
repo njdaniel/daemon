@@ -68,6 +68,7 @@ use dmn_llm::{
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
 use crate::context::{Context, ContextInfo, ContextSource, Retrieval, StoryPick};
+use crate::today;
 
 /// Where the fast phase's results go besides the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +304,8 @@ struct SlowJob {
     focus: String,
     approach: Vec<String>,
     star: Option<Star>,
+    /// #101: what its fast phase said to look up, if anything; the slow phase is told.
+    lookup: String,
     /// When its fast phase finished.
     ready: Instant,
     /// Attempts cut short by a newer job.
@@ -408,6 +411,7 @@ impl Suggester {
                 cancel: ch.cancel,
                 latest: ch.latest,
                 reload: Some(Reload::watch(config_file, &llm, build)),
+                today: test_today,
             };
             ch.hub.dispatch(Action::Provider {
                 label: wire::provider_label(&llm),
@@ -444,6 +448,7 @@ impl Suggester {
                 cancel: ch.cancel,
                 latest: ch.latest,
                 reload: None,
+                today: test_today,
             };
             let mut tally = Tally {
                 context: context.info(),
@@ -639,6 +644,8 @@ fn worker(
             return tally;
         }
     };
+    // #101: the UTC offset is read here, once, so no question waits on it.
+    tracing::info!(today = %today::local(), "the prompts carry today's date");
     // #59: whichever provider `[llm]` names; the API key is read from its env var here.
     let provider = match wire::provider(llm) {
         Ok(p) => p,
@@ -706,6 +713,7 @@ fn worker(
         cancel,
         latest: ch.latest,
         reload,
+        today: today::local,
     };
     // `[llm].slow_timeout_ms = 0` turns the slow phase off.
     let slow = (llm.slow_timeout_ms > 0).then(|| Duration::from_millis(llm.slow_timeout_ms));
@@ -839,6 +847,18 @@ struct Answerer<'a> {
     /// #59: the config file to watch for a provider change; `None` in `dmn replay` without a
     /// config file and in most tests.
     reload: Option<Reload>,
+    /// #101: today's date for every fast and slow request ([`today::local`]; a fixed date in
+    /// tests).
+    today: fn() -> String,
+}
+
+/// The date every test request carries (#101), so no test depends on the clock.
+#[cfg(test)]
+const TEST_TODAY: &str = "2026-10-05";
+
+#[cfg(test)]
+fn test_today() -> String {
+    TEST_TODAY.to_owned()
 }
 
 /// Builds the provider `[llm]` names: [`wire::provider`] in `dmn`, mocks in tests.
@@ -1056,6 +1076,7 @@ impl Answerer<'_> {
         let retrieval = context.retrieve_for(query, pick);
         tally.retrieved(retrieval.took);
         let mut req = request(&job, current.as_ref());
+        req.today = (self.today)();
         req.job_requirements = context.requirements().to_vec();
         req.chunks = retrieval.chunks.clone();
         req.story = retrieval.story.clone();
@@ -1091,7 +1112,7 @@ impl Answerer<'_> {
                         approach_marked = true;
                         first.then(|| mark(Stage::Approach))
                     }
-                    FastEvent::Focus { .. } => None,
+                    FastEvent::Focus { .. } | FastEvent::Lookup { .. } => None,
                 };
                 hub.dispatch(wire::fast_event(job.id, &e));
                 if let Some(t) = timing {
@@ -1187,6 +1208,7 @@ impl Answerer<'_> {
                             focus: suggestion.focus.clone(),
                             approach: suggestion.approach.clone(),
                             star: suggestion.star.clone(),
+                            lookup: suggestion.lookup.clone(),
                             ready: Instant::now(),
                             restarts: 0,
                             // A regenerate re-asks the same question: nothing new was answered.
@@ -1310,6 +1332,7 @@ impl Answerer<'_> {
         tally.retrieved(retrieval.took);
         let mut req = SlowRequest::new(job.question.clone(), job.kind);
         req.context = FastRequest {
+            today: (self.today)(),
             transcript: job.transcript.clone(),
             job_requirements: context.requirements().to_vec(),
             chunks: retrieval.chunks.clone(),
@@ -1320,6 +1343,7 @@ impl Answerer<'_> {
         req.focus = job.focus.clone();
         req.approach = job.approach.clone();
         req.star = job.star.clone();
+        req.lookup = job.lookup.clone();
         req.coding = wire::coding_mode(hub.snapshot().coding_solutions);
         req.chunk_files = retrieval.refs.iter().map(|r| r.file.clone()).collect();
         req.timeout = timeout;
@@ -1645,8 +1669,14 @@ fn fast_json(s: &Suggestion) -> serde_json::Value {
         "focus": s.focus,
         "approach": s.approach,
     });
-    if let (Some(star), Some(obj)) = (&s.star, v.as_object_mut()) {
-        obj.insert("star".into(), serde_json::json!(star));
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(star) = &s.star {
+            obj.insert("star".into(), serde_json::json!(star));
+        }
+        // #101: only when the answer depends on what is current.
+        if !s.lookup.is_empty() {
+            obj.insert("lookup".into(), serde_json::json!(s.lookup));
+        }
     }
     v
 }
@@ -1909,6 +1939,7 @@ mod tests {
             cancel: &cancel,
             latest: None,
             reload: None,
+            today: test_today,
         };
         // Candidate 1 is on screen, answered once already.
         hub.dispatch(wire::candidate(1, &candidate()));
@@ -2264,6 +2295,83 @@ mod tests {
     }
 
     #[test]
+    fn every_request_opens_with_today_and_a_flagged_answer_reaches_the_screen_store_and_slow_phase()
+    {
+        // #101. Request 1: fast, flagged; 2: its slow phase; 3: `r`, whose reply is not flagged.
+        let mut flagged = fast_json_reply("What is the latest stable Go?", "knowledge");
+        flagged["lookup"] = serde_json::json!("latest stable Go release");
+        let provider = dmn_llm::MockProvider::json(&flagged)
+            .then_json(&slow_json_reply())
+            .then_json(&fast_json_reply(
+                "What is the latest stable Go?",
+                "knowledge",
+            ));
+        let hub = Arc::new(SessionHub::default());
+        let mut log = hub.subscribe();
+        let s = Suggester::start_with_context(
+            provider.clone(),
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        submit_with_candidate(&s, &hub, 1);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| {
+            s.live.as_ref().is_some_and(|q| q.sections.started) && provider.requests().len() == 2
+        }));
+        assert_eq!(
+            hub.snapshot().live.unwrap().lookup,
+            "latest stable Go release",
+            "the tag's state"
+        );
+        s.regenerate(
+            1,
+            &candidate(),
+            String::new(),
+            CurrentQuestion {
+                question: "What is the latest stable Go?".into(),
+                kind: Kind::Knowledge,
+            },
+        );
+        s.finish();
+        assert_eq!(
+            hub.snapshot().live.unwrap().lookup,
+            "",
+            "follows the newest reply"
+        );
+
+        let sent = provider.requests();
+        assert!(sent.len() >= 3, "fast, slow, fast again: {}", sent.len());
+        for (i, req) in sent.iter().enumerate() {
+            let user = &req.messages[1].content;
+            assert!(
+                user.starts_with(&format!("## Today\n{TEST_TODAY}\n\n")),
+                "request {i}: {user}"
+            );
+        }
+        assert!(
+            sent[1].messages[1]
+                .content
+                .contains("(to look up: latest stable Go release)"),
+            "the slow phase knows the fast phase flagged it: {}",
+            sent[1].messages[1].content
+        );
+
+        // The store keeps the query with the suggestion: in the `Answered` payload it writes.
+        let mut payloads = Vec::new();
+        while let Ok(action) = log.try_recv() {
+            if let Action::Answered { payload, .. } = action {
+                payloads.push(payload);
+            }
+        }
+        assert!(
+            payloads[0].contains(r#""lookup":"latest stable Go release""#),
+            "{payloads:?}"
+        );
+        assert!(!payloads[1].contains("lookup"), "{payloads:?}");
+    }
+
+    #[test]
     fn a_running_slow_phase_never_delays_the_next_fast_phase() {
         // Request 1: fast for candidate 1. Request 2: its slow phase, which stalls for 10 s.
         // Request 3: fast for candidate 2. Then every slow phase answers at once.
@@ -2524,7 +2632,11 @@ mod tests {
         assert_eq!(sent.len(), 3);
         for req in &sent {
             let user = &req.messages.last().unwrap().content;
-            assert!(user.starts_with("## Job requirements\n"), "{user}");
+            // Right after today's date (#101).
+            assert!(
+                user.starts_with(&format!("## Today\n{TEST_TODAY}\n\n## Job requirements\n")),
+                "{user}"
+            );
             for b in bullets {
                 assert!(user.contains(&format!("- {b}\n")), "{b} missing: {user}");
             }
@@ -2674,7 +2786,9 @@ mod tests {
         hub.dispatch(wire::candidate(1, &candidate()));
         s.submit(1, &candidate(), "Interviewer: So.".into());
         assert_eq!(s.finish().shown, 1);
+        // The M1 prompt, plus today's date (#101).
         let m1 = dmn_llm::fast::fast_chat_request(&FastRequest {
+            today: TEST_TODAY.into(),
             transcript: "Interviewer: So.".into(),
             ..FastRequest::new(candidate().text, candidate().score)
         });
@@ -2740,6 +2854,12 @@ mod tests {
             v,
             serde_json::json!({"question": "q", "kind": "coding", "focus": "f", "approach": ["a"]})
         );
+        // #101: `dmn replay` prints the query only when there is one.
+        let dated = Suggestion {
+            lookup: "latest stable Go release".into(),
+            ..s
+        };
+        assert_eq!(fast_json(&dated)["lookup"], "latest stable Go release");
     }
 
     // --- Session memory (#57) ----------------------------------------------------------------

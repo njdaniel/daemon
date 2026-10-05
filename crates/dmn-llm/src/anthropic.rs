@@ -560,6 +560,7 @@ mod tests {
                 FastEvent::Question { .. } => "question",
                 FastEvent::Clarification { .. } => "clarification",
                 FastEvent::Focus { .. } => "focus",
+                FastEvent::Lookup { .. } => "lookup",
                 FastEvent::ApproachLine { .. } => "line",
                 FastEvent::Star(_) => "star",
             })

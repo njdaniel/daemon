@@ -337,6 +337,10 @@ pub enum Action {
     Clarification { candidate: u64, text: String },
     /// Fast phase: the focus line.
     Focus { candidate: u64, text: String },
+    /// Fast phase (#101): the answer depends on what is current, so it may be out of date;
+    /// `query` is the web search that would settle it. Sent only when the model named one, so
+    /// the Approach block shows a `may be out of date` tag only then.
+    Lookup { candidate: u64, query: String },
     /// Fast phase: approach line `index` (0-based, contiguous), already length-limited.
     ApproachLine {
         candidate: u64,

@@ -20,6 +20,7 @@ mod replay;
 mod run;
 mod sources;
 mod suggest;
+mod today;
 mod tui;
 
 use std::process::ExitCode;

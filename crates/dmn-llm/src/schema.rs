@@ -6,6 +6,12 @@
 //! whether anything is shown), then `question`, then `focus`, then `approach`. That order is what
 //! lets the question reach the session before the approach has finished streaming. serde_json's
 //! `preserve_order` feature keeps it through serialisation.
+//!
+//! #101: `lookup` sits between `focus` and `approach`. Empty, as it is for nearly every question,
+//! it costs the first Approach line a handful of tokens (`"lookup":""`). Before the Approach, the
+//! model decides whether the answer depends on what is current before it writes the lines, which
+//! is what keeps a remembered version out of them; and #102 can start its search while the
+//! Approach is still streaming.
 
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +108,11 @@ pub struct Suggestion {
     pub question: String,
     pub kind: Option<Kind>,
     pub focus: String,
+    /// #101: a web search query that would settle an answer depending on what is current (the
+    /// latest version of something, who maintains it now); empty for every other question, and
+    /// then left out of the JSON, so a payload without one reads as it did before #101.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lookup: String,
     pub approach: Vec<String>,
     pub deeper: Vec<Deeper>,
     pub followups: Vec<String>,
@@ -124,6 +135,8 @@ pub struct FastReply {
     pub kind: Option<Kind>,
     pub question: String,
     pub focus: String,
+    /// Absent from a reply that ignored the schema (an older model, a remote provider): empty.
+    pub lookup: String,
     pub approach: Vec<String>,
     pub star: Option<Star>,
 }
@@ -134,6 +147,7 @@ impl FastReply {
             question: self.question,
             kind: self.kind,
             focus: self.focus,
+            lookup: self.lookup,
             approach: self.approach,
             star: self.star,
             ..Suggestion::default()
@@ -167,6 +181,7 @@ fn fast_schema_base() -> serde_json::Value {
             "kind": { "type": "string", "enum": kinds },
             "question": { "type": "string" },
             "focus": { "type": "string" },
+            "lookup": { "type": "string" },
             "approach": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -184,7 +199,7 @@ fn fast_schema_base() -> serde_json::Value {
                 "required": ["situation", "task", "action", "result"]
             }
         },
-        "required": ["is_question", "kind", "question", "focus", "approach"]
+        "required": ["is_question", "kind", "question", "focus", "lookup", "approach"]
     })
 }
 
@@ -346,6 +361,7 @@ mod tests {
                 "kind",
                 "question",
                 "focus",
+                "lookup",
                 "approach",
                 "star"
             ]
@@ -353,8 +369,38 @@ mod tests {
         // And the order survives serialisation, which is what the provider actually receives.
         let text = schema.to_string();
         let q = text.find("\"question\"").unwrap();
+        let l = text.find("\"lookup\"").unwrap();
         let a = text.find("\"approach\"").unwrap();
-        assert!(q < a, "{text}");
+        assert!(q < l && l < a, "{text}");
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&"lookup".into()),
+            "#101: the model always decides"
+        );
+    }
+
+    #[test]
+    fn a_suggestion_without_a_lookup_serialises_as_before_and_one_with_keeps_it() {
+        let plain = Suggestion {
+            question: "q".into(),
+            focus: "f".into(),
+            approach: vec!["a".into()],
+            ..Suggestion::default()
+        };
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(!text.contains("lookup"), "{text}");
+        let with = Suggestion {
+            lookup: "latest stable Go release".into(),
+            ..plain
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(
+            text.contains(r#""focus":"f","lookup":"latest stable Go release","approach""#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Suggestion>(&text).unwrap(), with);
     }
 
     #[test]

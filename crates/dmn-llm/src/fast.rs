@@ -10,6 +10,10 @@
 //! under the current question instead of replacing it. Every published field has already been
 //! through `limits.rs`.
 //!
+//! #101: a non-empty `lookup` (the answer depends on what is current) is published as
+//! [`FastEvent::Lookup`] before the Approach lines and kept on the [`Suggestion`]; an empty or
+//! missing one publishes nothing.
+//!
 //! On timeout or cancellation the events already published stand (the UI keeps them and shows
 //! a "slow" tag); the error is returned.
 
@@ -51,6 +55,11 @@ pub enum FastEvent {
     Clarification { text: String },
     /// The focus line; not sent when the model returned none.
     Focus { text: String },
+    /// #101: the answer depends on what is current (the latest version of something, who runs
+    /// it now), so it may be out of date; `query` is the web search that would settle it, already
+    /// within limits. Not sent when the model left `lookup` empty, which is the usual case, nor
+    /// when the reply had no `lookup` at all.
+    Lookup { query: String },
     /// Approach line `index` (0-based, contiguous), already cut to 90 characters.
     ApproachLine { index: usize, text: String },
     /// STAR cards for a behavioral question.
@@ -89,6 +98,8 @@ pub struct FastAssembler {
     held: Vec<FastEvent>,
     ignored: Option<IgnoreReason>,
     focus: String,
+    /// #101: the search query, empty when the answer depends on nothing current.
+    lookup: String,
     approach: Vec<String>,
     /// Approach items the model sent, including any past the limit.
     approach_items: usize,
@@ -113,6 +124,7 @@ impl FastAssembler {
             held: Vec::new(),
             ignored: None,
             focus: String::new(),
+            lookup: String::new(),
             approach: Vec::new(),
             approach_items: 0,
             star: None,
@@ -173,6 +185,14 @@ impl FastAssembler {
                     if !focus.is_empty() {
                         self.focus = focus.clone();
                         released.push(FastEvent::Focus { text: focus });
+                    }
+                }
+                "lookup" => {
+                    let query =
+                        limits::limit_lookup(value.as_str().unwrap_or_default(), &mut self.flags);
+                    if !query.is_empty() {
+                        self.lookup = query.clone();
+                        released.push(FastEvent::Lookup { query });
                     }
                 }
                 "star" => {
@@ -273,6 +293,7 @@ impl FastAssembler {
                 question: self.question.unwrap_or_default(),
                 kind: self.kind,
                 focus: self.focus,
+                lookup: self.lookup,
                 approach: self.approach,
                 star: self.star,
                 ..Suggestion::default()
@@ -449,6 +470,7 @@ mod tests {
                 FastEvent::Question { .. } => "question",
                 FastEvent::Clarification { .. } => "clarification",
                 FastEvent::Focus { .. } => "focus",
+                FastEvent::Lookup { .. } => "lookup",
                 FastEvent::ApproachLine { .. } => "line",
                 FastEvent::Star(_) => "star",
             })
@@ -494,6 +516,106 @@ mod tests {
             mock.requests()[0].schema,
             Some(crate::schema::fast_schema())
         );
+    }
+
+    fn go_version_reply(lookup: serde_json::Value) -> serde_json::Value {
+        let mut reply = json!({
+            "is_question": true,
+            "kind": "knowledge",
+            "question": "What is the latest stable major version of Go?",
+            "focus": "Go releases, staying current",
+            "lookup": lookup,
+            "approach": [
+                "Say Go 1.24 is the newest release you know of, from early 2025.",
+                "Say it may be out of date: Go ships a release every six months.",
+                "Offer to check go.dev before relying on the number."
+            ]
+        });
+        if reply["lookup"].is_null() {
+            reply.as_object_mut().unwrap().remove("lookup");
+        }
+        reply
+    }
+
+    #[tokio::test]
+    async fn a_lookup_is_published_before_the_approach_and_kept_with_the_suggestion() {
+        let mock = MockProvider::json(&go_version_reply(json!("latest stable Go release")));
+        let req = FastRequest::new("What is the latest stable major version of Go?", 6);
+        let (events, outcome, _) = run(&mock, &req).await;
+        let at = |want: &str| {
+            events
+                .iter()
+                .position(|(_, e)| match e {
+                    FastEvent::Lookup { .. } => want == "lookup",
+                    FastEvent::ApproachLine { index: 0, .. } => want == "line",
+                    _ => false,
+                })
+                .unwrap()
+        };
+        assert!(at("lookup") < at("line"), "{events:?}");
+        assert!(events.iter().any(|(_, e)| *e
+            == FastEvent::Lookup {
+                query: "latest stable Go release".into()
+            }));
+        let Ok(FastOutcome::Shown {
+            suggestion, flags, ..
+        }) = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(suggestion.lookup, "latest stable Go release");
+        assert!(flags.is_empty(), "{flags:?}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_missing_lookup_publishes_nothing_and_the_reply_still_shows() {
+        // Missing: an older model or a provider that ignored the schema.
+        for lookup in [json!(""), json!("  "), serde_json::Value::Null] {
+            let mock = MockProvider::json(&go_version_reply(lookup.clone()));
+            let (events, outcome, _) = run(&mock, &FastRequest::new("Which Go?", 5)).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|(_, e)| matches!(e, FastEvent::Lookup { .. })),
+                "{lookup}: {events:?}"
+            );
+            let Ok(FastOutcome::Shown { suggestion, .. }) = outcome else {
+                panic!("{lookup}: {outcome:?}");
+            };
+            assert_eq!(suggestion.lookup, "");
+            assert_eq!(suggestion.approach.len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_over_long_lookup_spanning_lines_is_cut_and_flagged() {
+        let long = format!(
+            "{}\nGo release history",
+            "latest stable Go programming language release version number and its release date \
+             from the official Go website"
+        );
+        let mock = MockProvider::json(&go_version_reply(json!(long)));
+        let (events, outcome, _) = run(&mock, &FastRequest::new("Which Go?", 5)).await;
+        let query = events
+            .iter()
+            .find_map(|(_, e)| match e {
+                FastEvent::Lookup { query } => Some(query.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(query.chars().count() <= limits::LOOKUP_CHARS, "{query}");
+        assert!(
+            !query.contains('\n') && !query.contains("history"),
+            "{query}"
+        );
+        let Ok(FastOutcome::Shown {
+            suggestion, flags, ..
+        }) = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(suggestion.lookup, query);
+        assert!(flags.iter().any(|f| f.field == "lookup"), "{flags:?}");
     }
 
     #[tokio::test]
