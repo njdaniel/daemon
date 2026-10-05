@@ -106,6 +106,14 @@ const RHETORICAL_TAGS: [&str; 6] = [
 /// rest is the same register: the call itself, the calendar, the room, the pleasantries at each
 /// end. It is a vocabulary test, not a topic model; the LLM fast phase is what finally decides a
 /// candidate is small talk (SPEC § Extraction).
+///
+/// A single word stays here only when it has no technical sense (`weather`, `coffee`). Words that
+/// are also system-design vocabulary ("traffic", "connection", "audio", "calendar") are matched
+/// by phrase ("my audio", "calendar invite", "at my door") so that "How would you handle a traffic
+/// spike?" is not vetoed, and a phrase stays only when an interviewer would not plausibly say it
+/// inside a technical question ("your connection", "the invite", "double-booked", "one second" and
+/// "reschedule" are not here). Chatter no phrase covers reaches the fast phase, which answers
+/// `small_talk` and shows nothing (#93).
 const SMALL_TALK: [&str; 34] = [
     "weather",
     "weekend",
@@ -113,34 +121,34 @@ const SMALL_TALK: [&str; 34] = [
     "hear me",
     "hear you",
     "you there",
-    "audio",
-    "mic",
-    "microphone",
+    "my audio",
+    "my mic",
+    "your mic",
+    "my microphone",
+    "your microphone",
     "headset",
-    "connection",
-    "cutting out",
-    "frozen",
-    "calendar",
-    "invite",
+    "my connection",
+    "you're frozen",
+    "you are frozen",
+    "you froze",
+    "my calendar",
+    "calendar invite",
     "meeting link",
-    "reschedule",
-    "running late",
-    "double-booked",
-    "double booked",
-    "traffic",
     "raining",
     "pouring",
-    "snow",
+    "snowing",
     "sunny",
-    "holiday",
-    "vacation",
-    "lunch",
-    "door",
-    "one second",
-    "hold on",
+    "your holiday",
+    "your vacation",
+    "for lunch",
+    "grab lunch",
+    "had lunch",
+    "at my door",
+    "was at the door",
     "nice to meet",
     "good to meet",
-    "how are you",
+    "how are you doing",
+    "how are you today",
 ];
 
 /// Ends with `?` (whisper's own punctuation).
@@ -223,20 +231,32 @@ pub fn is_rhetorical(sentence: &str) -> bool {
     })
 }
 
-/// Mostly small-talk vocabulary: a small-talk phrase appears and the sentence is not carrying a
-/// technical question around it. Matching is on phrases, so "link" in "the link changed at the
-/// last minute" counts while "linked list" does not.
+/// True when any entry of `SMALL_TALK` appears in the sentence as whole words: the characters
+/// on both sides of the match, if any, are not letters or digits, so "my mic" does not match
+/// "my microservices" and "meeting link" does not match "meeting linked". The sentence is not
+/// checked for a technical question around the match, so the list holds only words and phrases
+/// that mean chatter on their own: "traffic", "connection" and "calendar" are not on it alone (see
+/// `SMALL_TALK`).
 pub fn is_small_talk(sentence: &str) -> bool {
-    let lowered = format!(" {} ", sentence.to_ascii_lowercase());
+    let lowered = sentence.to_ascii_lowercase();
     SMALL_TALK.iter().any(|phrase| {
-        if phrase.contains(' ') {
-            lowered.contains(phrase)
-        } else {
-            lowered.contains(&format!(" {phrase} "))
-                || lowered.contains(&format!(" {phrase},"))
-                || lowered.contains(&format!(" {phrase}?"))
-                || lowered.contains(&format!(" {phrase}."))
-        }
+        lowered.match_indices(phrase).any(|(start, m)| {
+            let before = lowered[..start].chars().next_back();
+            let after = lowered[start + m.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    }) || ends_with_how_are_you(&lowered)
+}
+
+/// "Hi, how are you?" is a greeting only when it ends the sentence; "how are you handling
+/// backpressure?" is a question about the system.
+fn ends_with_how_are_you(lowered: &str) -> bool {
+    let trimmed = lowered.trim_end_matches(|c: char| !c.is_alphanumeric());
+    trimmed.strip_suffix("how are you").is_some_and(|before| {
+        !before
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
     })
 }
 
@@ -351,6 +371,45 @@ mod tests {
         ));
         assert!(!is_small_talk("How would you design a rate limiter?"));
         assert!(!is_small_talk("Walk me through a linked list deletion."));
+    }
+
+    #[test]
+    fn technical_words_that_also_appear_in_chatter_are_not_small_talk_alone() {
+        for q in [
+            "How would you reserve and then reconcile usage correctly under heavy concurrent traffic across regions?",
+            "How do you handle connection pooling?",
+            "How would you handle a traffic spike?",
+            "Design a calendar app.",
+            "How would you stream audio to a thousand listeners?",
+            "How would you send an invite to a million users?",
+            "How would you scale your microservices?",
+            "How do you size your connection pool?",
+            "What happens when the connection is lost mid-stream?",
+            "How would you design the invite flow?",
+            "How do you handle traffic on the read path?",
+            "How do you keep video in sync when the audio is delayed?",
+            "How would you reschedule failed jobs?",
+            "How do you prevent double-booked seats?",
+            "How would you return results within one second?",
+            "How are you handling backpressure?",
+            "How are you going to scale this to ten regions?",
+        ] {
+            assert!(!is_small_talk(q), "{q}");
+        }
+        for q in [
+            "Can you hear me okay?",
+            "Did you find the calendar invite okay, the link changed at the last minute?",
+            "Okay, hold on one second, someone's at my door.",
+            "Sorry, my calendar double-booked me and the other call ran over.",
+            "I think my audio is cutting out.",
+            "Sorry, my connection is bad.",
+            "Is your mic on?",
+            "Hi, how are you?",
+            "So how are you?",
+            "How are you doing today?",
+        ] {
+            assert!(is_small_talk(q), "{q}");
+        }
     }
 
     #[test]
