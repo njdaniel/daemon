@@ -2,10 +2,10 @@
 
 Labels: `size:M, model:opus, m2, lane:llm`
 
-Proposed 2026-10-05, from the same live test as #101: asked for the latest Go version, Daemon said 1.24. #101 makes that answer honest ("may be out of date") and has the model name what to look up; this issue looks it up. The user chose a live web lookup during the call over a facts file refreshed beforehand or kept by hand.
+Proposed 2026-10-05, from the same live test as #101: asked for the latest Go version, Daemon said 1.24. #101 makes that answer honest ("may be out of date") and has the model name what to look up; this issue looks it up. The user chose a live web lookup during the call over a facts file refreshed beforehand or kept by hand, and put it this way: "I want to use local first but to search with web when necessary". That is the shape here: the local model answers every question first, and a search runs only for a question the model itself flags as depending on what is current.
 
 What that choice costs, so the issue states it once:
-- The search query leaves the machine. SPEC § Privacy rules says "with `provider=ollama` nothing leaves the machine"; with the lookup on that is no longer true, so it is off by default and the status line says when it is on.
+- The search query leaves the machine. SPEC's promise is conditional, not absolute: "Transcript text leaves only when the user explicitly selects a remote model" (Principles) and "With `provider=ollama` nothing leaves the machine" (§ Privacy rules). With the lookup on and the local model, the second sentence is no longer true, so the lookup is a second explicit choice: off until `[lookup].enabled = true`, and the status line says when it is on.
 - A search does not fit the 2 s budget for the first Approach line. The first answer still arrives on budget from the model alone, flagged by #101; the corrected one replaces it when the search returns.
 
 ## Goal
@@ -21,7 +21,7 @@ M | Opus | 60
 - When the fast phase returns a non-empty `lookup` (#101) and the lookup is on, the suggester sends the query while the first answer is on screen. Only that query is sent: no transcript, no candidate material.
 - **Decided**: when results arrive, the fast phase runs once more for the same question with a `## Fresh facts` section (each result's title, a snippet cut to 300 characters, and its domain) and the rule "prefer these to what you remember; if they do not answer the question, say so". Its reply replaces the question's Approach in place, as a regenerate does, and the `may be out of date` tag becomes `checked · <domain>`. The slow phase for that question starts after it and gets the same section.
 - **Decided**: the search and the second request obey the existing rules: a newer unpinned question cancels both; a pin does not. On a timeout, an error, no results or an unset key, the first answer and its tag stay and the status line says `lookup failed` for 5 s; nothing is retried.
-- While the lookup is on, the status line carries `web` next to the model dot, and SPEC § Privacy rules says what leaves the machine and when.
+- While the lookup is on, the status line carries `web` next to the model dot. SPEC's Principles line and § Privacy rules are reworded to say what leaves the machine and when: audio never; transcript text only with a remote model; a search query only with the lookup on.
 
 Out of scope: fetching and reading result pages (`web_fetch`), lookups for questions the model did not flag, a lookup key, caching results between sessions, other search providers, the M3 window.
 
