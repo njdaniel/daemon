@@ -1,7 +1,8 @@
 //! Area 2: the numbered Approach, or the STAR cards for a behavioral question. Its border's right
 //! end carries one dim hint: `thinking…` while the next reply is on its way, `…` while this one
-//! streams, `no other story` after a Swap with none (#58), and `may be out of date` while the
-//! question's answer depends on what is current (#101).
+//! streams, `no other story` after a Swap with none (#58), `may be out of date` while the
+//! question's answer depends on what is current (#101), and `checked · <domain>` once the web
+//! lookup's results rebuilt it (#102).
 
 use dmn_session::{Question, QuestionSource, StarCards};
 use ratatui::buffer::Buffer;
@@ -35,6 +36,8 @@ fn star<'a>(view: &View<'a>) -> Option<&'a StarCards> {
 
 /// The tag on the Approach block's border while the question on screen has a `lookup` (#101).
 const OUT_OF_DATE: &str = "may be out of date";
+/// The tag once the Approach was rebuilt on web search results (#102), before the domain.
+const CHECKED: &str = "checked";
 
 /// The fast phase's `kind` for a behavioral question.
 const BEHAVIORAL: &str = "behavioral";
@@ -90,23 +93,31 @@ pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     // #101: the fast phase said the answer depends on what is current. Shown as soon as the
     // query arrives (before the Approach lines), in the place the streaming "…" would take.
     let dated = view.shown().is_some_and(|q| !q.lookup.is_empty());
+    // #102: rebuilt on web search results; the tag names where the first one came from.
+    let checked = view
+        .shown()
+        .map(|q| q.checked.as_str())
+        .filter(|d| !d.is_empty());
     let hint = if view.loading {
-        Some("thinking…")
+        Some("thinking…".to_owned())
     } else if view.streaming && !dated {
-        Some("…")
+        Some("…".to_owned())
     } else if cards.is_some() && view.shown().is_some_and(|q| q.no_other_story) {
         // Swap pressed with no other matched story (#58).
-        Some("no other story")
+        Some("no other story".to_owned())
+    } else if let Some(domain) = checked {
+        Some(format!("{CHECKED} · {domain}"))
     } else if dated {
-        Some(OUT_OF_DATE)
+        Some(OUT_OF_DATE.to_owned())
     } else {
         None
     };
     // SPEC § AI Assistance: the STAR block names the matched story in its header (#58).
     let title = match cards.and_then(|c| story_title(view.shown(), c)) {
         Some(story) => {
-            let room = usize::from(area.width)
-                .saturating_sub(usize::from(FRAME_CELLS) + hint.map_or(0, |h| width(h) + 2));
+            let room = usize::from(area.width).saturating_sub(
+                usize::from(FRAME_CELLS) + hint.as_ref().map_or(0, |h| width(h) + 2),
+            );
             truncate(&format!(" STAR · {story} "), room)
         }
         None if cards.is_some() => " STAR ".to_owned(),

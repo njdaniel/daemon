@@ -187,7 +187,16 @@ pub fn slow_messages(req: &SlowRequest) -> Vec<Message> {
             star.situation, star.task, star.action, star.result
         ));
     }
-    if !req.lookup.trim().is_empty() {
+    if let Some(facts) = req.context.facts.as_ref().filter(|f| !f.facts.is_empty()) {
+        // #102: the Approach above was rebuilt on the search results, which this request
+        // carries too.
+        user.push_str(&format!(
+            "Checked on the web (search: {}): the Approach was built on the Fresh facts above. \
+             Build every section on them too, not on what you remember; where they say nothing, \
+             say so.\n",
+            facts.query.trim()
+        ));
+    } else if !req.lookup.trim().is_empty() {
         user.push_str(&format!(
             "Flagged as depending on what is current (to look up: {}): the Approach may be out \
              of date. No section names a version, release or date as the current one or builds \
@@ -757,6 +766,31 @@ mod tests {
             .expect(flagged);
         assert!(note > flagged.find("Approach already shown:").unwrap());
         assert!(note < flagged.find("## Now fill").unwrap(), "{flagged}");
+    }
+
+    #[tokio::test]
+    async fn lookup_results_reach_the_slow_phase_and_replace_the_out_of_date_note() {
+        use crate::lookup::{FreshFact, FreshFacts};
+        let mock = MockProvider::json(&reply());
+        let mut req = request(Kind::Knowledge);
+        req.lookup = "latest stable Go release".into();
+        req.context.facts = Some(FreshFacts {
+            query: "latest stable Go release".into(),
+            facts: vec![FreshFact {
+                title: "All releases".into(),
+                snippet: "go1.25.1 (released 2025-09-03)".into(),
+                domain: "go.dev".into(),
+            }],
+        });
+        let _ = run(&mock, &req).await;
+        let user = &mock.requests()[0].messages[1].content;
+        assert!(user.contains("## Fresh facts\n"), "{user}");
+        assert!(user.contains("[1] All releases (go.dev)"), "{user}");
+        assert!(
+            user.contains("Checked on the web (search: latest stable Go release)"),
+            "{user}"
+        );
+        assert!(!user.contains("Flagged as depending"), "{user}");
     }
 
     #[tokio::test]

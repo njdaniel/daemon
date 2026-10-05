@@ -272,6 +272,11 @@ pub struct Question {
     /// the newest reply.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lookup: String,
+    /// #102: the Approach on screen was rebuilt on web search results; the first result's host
+    /// (`go.dev`). The Approach block then says `checked · <domain>`. Empty otherwise, and left
+    /// out of the JSON, so every saved session loads and serialises unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub checked: String,
     pub approach: Vec<String>,
     pub star: Option<StarCards>,
     pub clarifications: Vec<Clarification>,
@@ -317,6 +322,7 @@ impl Question {
             kind,
             focus: String::new(),
             lookup: String::new(),
+            checked: String::new(),
             approach: Vec::new(),
             star: None,
             clarifications: Vec::new(),
@@ -383,6 +389,10 @@ pub struct Status {
     /// fits, or before it is loaded.
     #[serde(default, skip_serializing_if = "no_offload")]
     pub llm_cpu_percent: u8,
+    /// #102: the web lookup is on; the status line says `web` beside the model dot. Off in every
+    /// log from before it, and left out of the JSON while off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub web: bool,
 }
 
 fn no_offload(cpu_percent: &u8) -> bool {
@@ -461,6 +471,11 @@ pub struct Session {
     /// pipeline reads this to let Enter send the same turn again; the next Enter clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_failed: Option<u64>,
+    /// #102: the web lookup for this question failed (a timeout, an error, no results, no key).
+    /// The status line says `lookup failed` while it is set: 5 s, until
+    /// [`Action::NoticeExpired`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookup_failed: Option<u64>,
     /// #94: every question shown before the live one, oldest first, each as it stood when the
     /// next one took the screen from it (its focus, Approach, STAR cards, clarifications and
     /// sections). In memory only: the store has its own rows and does not read these.
@@ -711,6 +726,9 @@ fn apply(s: &mut Session, action: &Action) {
             if s.not_a_question == Some(*candidate) {
                 s.not_a_question = None;
             }
+            if s.lookup_failed == Some(*candidate) {
+                s.lookup_failed = None;
+            }
         }
         Action::Question {
             candidate,
@@ -779,6 +797,12 @@ fn apply(s: &mut Session, action: &Action) {
                 q.lookup.clone_from(query);
             }
         }
+        Action::Checked { candidate, domain } => {
+            if let Some(q) = s.question_mut(*candidate) {
+                q.checked.clone_from(domain);
+            }
+        }
+        Action::LookupFailed { candidate } => s.lookup_failed = Some(*candidate),
         Action::ApproachLine {
             candidate,
             index,
@@ -972,6 +996,7 @@ fn apply(s: &mut Session, action: &Action) {
         Action::Assist { enabled } => s.assist_off = !enabled,
         Action::QuestionSource { source } => s.question_source = *source,
         Action::LlmOffload { cpu_percent } => s.status.llm_cpu_percent = *cpu_percent,
+        Action::WebLookup { enabled } => s.status.web = *enabled,
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}
     }

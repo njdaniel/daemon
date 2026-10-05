@@ -210,6 +210,49 @@ whole card (`--model medium` runs at about 0.14 s per utterance on a 4090). Pres
 Ctrl+Shift+A later loads the LLM into what is left; if a tenth or more of it lands in system
 memory the status line says `llm partly on cpu`.
 
+#### Checking answers that depend on what is current (web lookup, off by default)
+
+A local model only knows what it was trained on. Asked for "the latest stable version of Go",
+it hedges and tags the Approach `may be out of date` (#101). With the web lookup on, Daemon
+then searches the web for that one question and answers again from what it finds (#102): the
+first Approach still arrives from the local model alone, and a few seconds later it is replaced
+in place by one built on the results, tagged `checked · go.dev`. If the search times out, fails,
+finds nothing or has no key, the first answer stays and the status line says `lookup failed`.
+
+It can search through your own [SearXNG](https://docs.searxng.org/) instance (no account, no
+key; the query goes to your instance, which forwards it to the engines it is set up with) or
+through [Ollama's web search](https://docs.ollama.com/capabilities/web-search) (a key from your
+ollama.com account).
+
+With SearXNG on this machine (its Docker image listens on port 8888), allow its JSON output by
+adding `json` to `search.formats` in its `settings.yml` (a stock instance answers 403 until you
+do), then:
+
+```toml
+[lookup]
+enabled = true
+provider = "searxng"
+# base_url = "http://localhost:8888"   # the default for searxng
+# timeout_ms = 6000                    # the default for searxng when left out
+```
+
+With Ollama's search instead, export the key, then turn the lookup on:
+
+```bash
+export OLLAMA_API_KEY=...        # the key stays in the environment; dmn never writes or logs it
+```
+
+```toml
+[lookup]
+enabled = true
+# provider = "ollama"; base_url = "https://ollama.com"; api_key_env = "OLLAMA_API_KEY"
+# timeout_ms = 3000; max_results = 5
+```
+
+`dmn doctor` says whether it is off, ready, or on with the variable unset (for SearXNG: whether
+the instance answers, and whether its JSON format is off), and the status line
+says `web` beside the model dot while it is on. What it sends, and to whom, is under Privacy.
+
 ### Initialize and inspect your system
 
 ```bash
@@ -338,6 +381,21 @@ Daemon is being designed with privacy as a core constraint:
 - Ollama is the default LLM provider
 - remote providers are opt-in
 - no accounts, telemetry, or cloud sync are required for v1
+
+What leaves the machine, and when:
+
+- **Audio:** never.
+- **Transcript text** (with the retrieved notes and the session summary): only when you choose a
+  remote model (`[llm].provider` other than `ollama`, or an Ollama on another host).
+- **A web search query:** only with the web lookup on (`[lookup].enabled = true`; off by
+  default). For a question whose answer depends on what is current, the few words the model
+  writes as a search query (at most 80 characters, such as `latest stable Go release`) goes to
+  the search you chose. With `provider = "searxng"`: to your own SearXNG instance
+  (`http://localhost:8888` by default), with no account or key; your instance then forwards it
+  to the search engines it is configured with. With `provider = "ollama"`: with the number of
+  results wanted, to Ollama's web search at `https://ollama.com/api/web_search`, with your key
+  from `OLLAMA_API_KEY`. No transcript, no resume or notes, nothing from the session goes with
+  it.
 
 ## Roadmap
 

@@ -47,6 +47,20 @@
 //! comes that way (the slow phase is off, cut, or the session ended first) gets a fallback line
 //! from its own text ([`dmn_context::memory::fallback`]). Every fast and slow request carries the
 //! session's last 8 lines.
+//!
+//! #102, the web lookup (`[lookup].enabled`, off by default): when a fast reply names a `lookup`
+//! query (#101), the search starts the moment that field closes, as a task on this thread's
+//! runtime, so it runs while the Approach lines stream and while any later request does; it never
+//! holds up a fast phase, which only ever waits on the model. The query is all it sends. When it
+//! comes back with results, the fast phase runs once more for that question with them under
+//! `## Fresh facts` ([`Answerer::finish_lookup`]), as a regenerate does: the reply replaces the
+//! question in place and the Approach says `checked · <domain>`. That question's slow phase waits
+//! for it and carries the same results. Any failure (a timeout, an error, no results, no key)
+//! leaves the first answer and says `lookup failed`; nothing is retried. Waiting for a search
+//! comes after a waiting job and before any slow phase, so the model is never idle behind one for
+//! longer than `[lookup].timeout_ms`. A newer unpinned question cancels the search
+//! ([`Latest::searches`]) and the second request (the request in flight) as it cancels any
+//! request; while pinned both complete.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -61,9 +75,9 @@ use dmn_detect::Candidate;
 use dmn_llm::fast::FAST_PHASE_TIMEOUT;
 use dmn_llm::schema::Star;
 use dmn_llm::{
-    Asker, CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, IgnoreReason,
-    Kind, LlmError, PreviousAnswer, Provider, SlowFields, SlowOutcome, SlowRequest, Suggestion,
-    run_fast_phase, run_slow_phase,
+    Asker, CancellationToken, CurrentQuestion, FastEvent, FastOutcome, FastRequest, FreshFacts,
+    IgnoreReason, Kind, LlmError, LookupError, PreviousAnswer, Provider, SearchResult, SlowFields,
+    SlowOutcome, SlowRequest, Suggestion, WebSearch, run_fast_phase, run_slow_phase,
 };
 use dmn_session::{Action, Dot, Health, SessionHub, Stage};
 
@@ -106,6 +120,7 @@ impl Output {
 const SUPERSEDED: &str = "superseded by a newer question";
 
 /// One candidate and the last 60 s of transcript at the moment it was found.
+#[derive(Clone)]
 struct Job {
     /// The session's candidate id, which tags every action for this candidate.
     id: u64,
@@ -206,6 +221,11 @@ pub struct Tally {
     pub slow_restarts: usize,
     /// Shown questions whose slow phase never ran: superseded, or the run was stopped.
     pub slow_dropped: usize,
+    /// #102: web lookups started, those that failed (a timeout, an error, no results, no key),
+    /// and the answers rebuilt on what they found.
+    pub lookups: usize,
+    pub lookups_failed: usize,
+    pub checked: usize,
     /// Longest completed slow phase, request start to close.
     pub slow_slowest: Duration,
     /// #57: summary lines written, and how many of them were fallbacks (no model line).
@@ -247,11 +267,18 @@ struct Latest {
     newest: AtomicU64,
     /// The request in flight, if any.
     inflight: Mutex<Option<CancellationToken>>,
+    /// #102: the web searches started since the last unpinned question, each for an older
+    /// question than any submitted after it; the next unpinned question cancels them all.
+    searches: Mutex<Vec<CancellationToken>>,
 }
 
 impl Latest {
     fn inflight(&self) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
         self.inflight.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn searches(&self) -> std::sync::MutexGuard<'_, Vec<CancellationToken>> {
+        self.searches.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -265,6 +292,9 @@ impl Latest {
 struct SlowGate {
     waiting: AtomicU64,
     inflight: Mutex<Option<CancellationToken>>,
+    /// #102: wakes the thread while it waits on a web search, so a job handed over meanwhile is
+    /// taken at once. A notification with nobody waiting is kept for the next wait.
+    arrived: tokio::sync::Notify,
 }
 
 impl SlowGate {
@@ -278,6 +308,7 @@ impl SlowGate {
         if let Some(token) = self.inflight().as_ref() {
             token.cancel();
         }
+        self.arrived.notify_one();
     }
 
     /// The thread took a job.
@@ -306,6 +337,8 @@ struct SlowJob {
     star: Option<Star>,
     /// #101: what its fast phase said to look up, if anything; the slow phase is told.
     lookup: String,
+    /// #102: the web search results its Approach was rebuilt on; the slow phase carries them too.
+    facts: Option<FreshFacts>,
     /// When its fast phase finished.
     ready: Instant,
     /// Attempts cut short by a newer job.
@@ -354,9 +387,12 @@ impl Suggester {
     /// `context` is where the sources and job requirements are read from (#54). `config_file`,
     /// when given, is watched between requests: a change to `[llm]`'s provider, endpoint, model
     /// or key variable swaps the provider for the next request, without a restart (#59).
+    /// `lookup` is `[lookup]` (#102): the web search for answers that depend on what is current,
+    /// when it is on.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         llm: &config::Llm,
+        lookup: &config::Lookup,
         output: Output,
         policy: Policy,
         hub: Arc<SessionHub>,
@@ -365,11 +401,11 @@ impl Suggester {
         context: ContextSource,
         config_file: Option<PathBuf>,
     ) -> Self {
-        let llm = llm.clone();
+        let (llm, lookup) = (llm.clone(), lookup.clone());
         Self::spawn(policy, hub, move |ch| {
             let reload =
                 config_file.map(|path| Reload::watch(path, &llm, Box::new(wire::provider)));
-            worker(&llm, output, clock, audio, &ch, &context, reload)
+            worker(&llm, &lookup, output, clock, audio, &ch, &context, reload)
         })
     }
 
@@ -412,6 +448,7 @@ impl Suggester {
                 latest: ch.latest,
                 reload: Some(Reload::watch(config_file, &llm, build)),
                 today: test_today,
+                search: None,
             };
             ch.hub.dispatch(Action::Provider {
                 label: wire::provider_label(&llm),
@@ -430,10 +467,27 @@ impl Suggester {
         provider: P,
         policy: Policy,
         hub: Arc<SessionHub>,
+        context: Context,
+        slow: Option<Duration>,
+    ) -> Self {
+        Self::start_with_search(provider, None, policy, hub, context, slow)
+    }
+
+    /// [`Suggester::start_with_context`] with the web lookup on `search` (#102), as `worker`
+    /// sets it up when `[lookup]` is on.
+    #[cfg(test)]
+    fn start_with_search<P: Provider + Send + 'static>(
+        provider: P,
+        search: Option<Arc<dyn WebSearch>>,
+        policy: Policy,
+        hub: Arc<SessionHub>,
         mut context: Context,
         slow: Option<Duration>,
     ) -> Self {
         Self::spawn(policy, hub, move |ch| {
+            if search.is_some() {
+                ch.hub.dispatch(Action::WebLookup { enabled: true });
+            }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -449,6 +503,7 @@ impl Suggester {
                 latest: ch.latest,
                 reload: None,
                 today: test_today,
+                search,
             };
             let mut tally = Tally {
                 context: context.info(),
@@ -513,10 +568,14 @@ impl Suggester {
     ) {
         if let Some(latest) = &self.latest {
             latest.newest.fetch_max(id, Ordering::AcqRel);
-            if !self.hub.snapshot().pinned
-                && let Some(inflight) = latest.inflight().as_ref()
-            {
-                inflight.cancel();
+            if !self.hub.snapshot().pinned {
+                if let Some(inflight) = latest.inflight().as_ref() {
+                    inflight.cancel();
+                }
+                // #102: every search still running is for a question this one replaces.
+                for search in latest.searches().drain(..) {
+                    search.cancel();
+                }
             }
         }
         self.send(Job {
@@ -601,8 +660,10 @@ struct Channels<'a> {
     gate: &'a SlowGate,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     llm: &config::Llm,
+    lookup: &config::Lookup,
     output: Output,
     clock: wire::SessionClock,
     audio: wire::AudioClock,
@@ -688,6 +749,7 @@ fn worker(
     });
     report_offload(&rt, &*provider, hub);
     announce(llm, hub, output);
+    let search = web_search(lookup, hub, output);
 
     // #54: the sources and job requirements, loaded once before the first question. A new job
     // description is summarised here, off every question's path; candidates queue meanwhile.
@@ -714,6 +776,7 @@ fn worker(
         latest: ch.latest,
         reload,
         today: today::local,
+        search,
     };
     // `[llm].slow_timeout_ms = 0` turns the slow phase off.
     let slow = (llm.slow_timeout_ms > 0).then(|| Duration::from_millis(llm.slow_timeout_ms));
@@ -728,8 +791,9 @@ fn worker(
 }
 
 /// Serve jobs until the sender drops (or the run is stopped). A job waiting always goes first;
-/// the slow phase (when `slow` gives its deadline) runs only while none is. `Err` only for an
-/// unreachable provider, after which nothing more is sent.
+/// then a web search's second request (#102), waiting for a search still running unless a job
+/// arrives; the slow phase (when `slow` gives its deadline) runs only while none of those is
+/// waiting. `Err` only for an unreachable provider, after which nothing more is sent.
 fn serve(
     answerer: &mut Answerer<'_>,
     ch: &Channels<'_>,
@@ -739,6 +803,7 @@ fn serve(
 ) -> Result<(), LlmError> {
     let mut current: Option<CurrentQuestion> = None;
     let mut pending: VecDeque<SlowJob> = VecDeque::new();
+    let mut looking: VecDeque<Looking> = VecDeque::new();
     let mut memory = Memory::default();
     let mut closed = false;
     loop {
@@ -753,6 +818,17 @@ fn serve(
         let job = match job {
             Some(job) => job,
             None => {
+                match answerer.next_lookup(&mut looking, ch.gate) {
+                    LookupWait::Nothing => {}
+                    LookupWait::JobWaiting => continue,
+                    LookupWait::Done(l, found) => {
+                        // #59: between requests, never mid-request.
+                        answerer.reload();
+                        let next = answerer.finish_lookup(*l, found, &mut current, tally);
+                        queue_slow(answerer, next, slow, &mut pending, &mut memory, tally);
+                        continue;
+                    }
+                }
                 if let (Some(timeout), Some(mut next)) =
                     (slow, answerer.next_slow(&mut pending, &mut memory, tally))
                 {
@@ -789,10 +865,25 @@ fn serve(
             }
         };
         ch.gate.taken();
+        // #102: `r` or Swap starts the question afresh, so a search for its earlier reply is
+        // moot; that reply's slow job goes back in line for the new one to replace.
+        while let Some(at) = looking.iter().position(|l| l.id == job.id) {
+            if let Some(stale) = looking.remove(at) {
+                stale.token.cancel();
+                queue_slow(
+                    answerer,
+                    Some(stale.slow),
+                    slow,
+                    &mut pending,
+                    &mut memory,
+                    tally,
+                );
+            }
+        }
         // #59: a provider change in the config file takes effect here, before this request.
         answerer.reload();
         let carried = job.answered.clone();
-        let Some(mut next) = answerer.answer(job, &mut current, context, tally)? else {
+        let Some(answer) = answerer.answer(job, &mut current, context, tally)? else {
             // No slow phase from this job (ignored, a clarification, superseded, failed). While
             // its previous question is still on screen the next job carries it again. If the
             // screen moved on (a question that showed, then failed), nothing will: write that
@@ -804,22 +895,161 @@ fn serve(
             }
             continue;
         };
-        memory.shown(&next);
-        if slow.is_some() {
-            // A regeneration replaces its question's earlier slow job, and takes over the
-            // summary that job still owed.
-            if let Some(at) = pending.iter().position(|p| p.id == next.id)
-                && let Some(old) = pending.remove(at)
-                && next.answered.is_none()
-            {
-                next.answered = old.answered;
+        match answer {
+            Answer::Shown(next) => {
+                queue_slow(
+                    answerer,
+                    Some(*next),
+                    slow,
+                    &mut pending,
+                    &mut memory,
+                    tally,
+                );
             }
-            pending.push_back(next);
-        } else if let Some(prev) = next.answered.take() {
-            // No slow phase to write it: the previous question's fallback line, now.
-            answerer.summarise(&Asked::from(&prev), None, &mut memory, tally);
+            // #102: its slow phase waits for the search and the request built on it.
+            Answer::Looking(mut l) => {
+                memory.shown(&l.slow);
+                if slow.is_none()
+                    && let Some(prev) = l.slow.answered.take()
+                {
+                    answerer.summarise(&Asked::from(&prev), None, &mut memory, tally);
+                }
+                looking.push_back(*l);
+            }
         }
     }
+}
+
+/// A shown question's slow phase goes in line (#55), or, with the slow phase off, the question
+/// before it gets its fallback summary line now (#57).
+fn queue_slow(
+    answerer: &Answerer<'_>,
+    next: Option<SlowJob>,
+    slow: Option<Duration>,
+    pending: &mut VecDeque<SlowJob>,
+    memory: &mut Memory,
+    tally: &mut Tally,
+) {
+    let Some(mut next) = next else {
+        return;
+    };
+    memory.shown(&next);
+    if slow.is_some() {
+        // A regeneration replaces its question's earlier slow job, and takes over the
+        // summary that job still owed.
+        if let Some(at) = pending.iter().position(|p| p.id == next.id)
+            && let Some(old) = pending.remove(at)
+            && next.answered.is_none()
+        {
+            next.answered = old.answered;
+        }
+        pending.push_back(next);
+    } else if let Some(prev) = next.answered.take() {
+        // No slow phase to write it: the previous question's fallback line, now.
+        answerer.summarise(&Asked::from(&prev), None, memory, tally);
+    }
+}
+
+/// What [`Answerer::answer`] put on screen.
+enum Answer {
+    /// A question; its slow phase is next.
+    Shown(Box<SlowJob>),
+    /// #102: a question whose answer depends on what is current, with its web search running.
+    Looking(Box<Looking>),
+}
+
+/// #102: a question whose web search is running, or done and not yet acted on.
+struct Looking {
+    id: u64,
+    query: String,
+    /// The job and the request its first answer came from: asked again, with the results.
+    job: Job,
+    request: FastRequest,
+    retrieval: Retrieval,
+    /// Its slow phase, held until the second answer (or until the lookup came to nothing).
+    slow: SlowJob,
+    token: CancellationToken,
+    search: SearchTask,
+    /// When the first request and the search started, for the log and `dmn replay`.
+    asked: Instant,
+    searched: Instant,
+}
+
+/// A web search running on the suggester's runtime (#102).
+type SearchTask = tokio::task::JoinHandle<Result<Vec<SearchResult>, LookupError>>;
+
+/// A search task's result; a task that panicked or was dropped with the runtime is a failure.
+fn joined(
+    r: Result<Result<Vec<SearchResult>, LookupError>, tokio::task::JoinError>,
+) -> Result<Vec<SearchResult>, LookupError> {
+    r.unwrap_or_else(|e| {
+        Err(LookupError::Malformed {
+            provider: "lookup",
+            detail: format!("search task ended: {e}"),
+        })
+    })
+}
+
+/// The warning a failed lookup leaves in the log (stderr under `dmn replay`): the error says
+/// what to change, e.g. a SearXNG whose JSON format is off.
+fn lookup_failed(query: &str, took: Duration, e: &LookupError) -> String {
+    format!(
+        "web lookup for {query:?} failed after {}: {e}; the first answer stays",
+        secs(took)
+    )
+}
+
+/// How a web lookup ended, for `dmn replay` (#102).
+enum LookupEnd<'a> {
+    Found(&'a FreshFacts),
+    Failed(&'a LookupError),
+    /// The question it was for is gone (a newer one, or the run stopped).
+    Dropped,
+}
+
+/// A web lookup as `dmn replay` prints it (#102): the query, how long the search took, and
+/// what came of it.
+fn print_lookup(id: u64, query: &str, end: LookupEnd<'_>, took: Duration, output: Output) {
+    let Output::Print { json } = output else {
+        return;
+    };
+    let (outcome, results, domain, error) = match &end {
+        LookupEnd::Found(f) => ("found", f.facts.len(), f.domain(), None),
+        LookupEnd::Failed(e) => ("failed", 0, None, Some(e.to_string())),
+        LookupEnd::Dropped => ("dropped", 0, None, None),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "lookup",
+                "candidate": id,
+                "query": query,
+                "outcome": outcome,
+                "results": results,
+                "domain": domain,
+                "error": error,
+                "search_ms": ms(took),
+            })
+        );
+        return;
+    }
+    let what = match (&end, domain) {
+        (LookupEnd::Found(_), Some(d)) => format!("{results} result(s), first from {d}"),
+        (LookupEnd::Failed(_), _) => format!("failed: {}", error.unwrap_or_default()),
+        _ => outcome.to_owned(),
+    };
+    println!("  ?? web lookup {query:?} after {}: {what}", secs(took));
+}
+
+/// What [`Answerer::next_lookup`] found.
+enum LookupWait {
+    /// No search to act on: on to the slow phase.
+    Nothing,
+    /// A job arrived while waiting: it goes first.
+    JobWaiting,
+    /// A search ended, with what it found.
+    Done(Box<Looking>, Result<Vec<SearchResult>, LookupError>),
 }
 
 /// How one slow-phase attempt went, for [`serve`].
@@ -850,6 +1080,9 @@ struct Answerer<'a> {
     /// #101: today's date for every fast and slow request ([`today::local`]; a fixed date in
     /// tests).
     today: fn() -> String,
+    /// #102: the web search `[lookup]` names; `None` while it is off, and then no query ever
+    /// leaves.
+    search: Option<Arc<dyn WebSearch>>,
 }
 
 /// The date every test request carries (#101), so no test depends on the clock.
@@ -902,6 +1135,34 @@ fn announce(llm: &config::Llm, hub: &SessionHub, output: Output) {
         )),
         None => tracing::info!(provider = llm.provider.as_str(), model = %llm.model, "model"),
     }
+}
+
+/// #102: the web search `[lookup]` names, said on the status line (`web`) and, like a remote
+/// model, in words. A key variable that is unset is said now: every lookup will fail until it is
+/// set, and the status line says so each time.
+fn web_search(
+    lookup: &config::Lookup,
+    hub: &SessionHub,
+    output: Output,
+) -> Option<Arc<dyn WebSearch>> {
+    let search = match wire::web_search(lookup) {
+        Ok(search) => search?,
+        Err(e) => {
+            output.warn(&format!("web lookup off: {e}"));
+            return None;
+        }
+    };
+    hub.dispatch(Action::WebLookup { enabled: true });
+    if let Some(notice) = lookup.privacy_notice() {
+        output.note(&notice);
+    }
+    if lookup.provider.needs_key() && lookup.api_key().is_none() {
+        output.warn(&format!(
+            "web lookup on but ${} is unset or empty: every lookup will fail (fix: export {}=<your key>)",
+            lookup.api_key_env, lookup.api_key_env
+        ));
+    }
+    Some(search)
 }
 
 /// The request for `job`: a new candidate (answered with the question on screen as context, so
@@ -1000,16 +1261,16 @@ impl Answerer<'_> {
         announce(&r.llm, self.hub, self.output);
     }
 
-    /// Answer one job and dispatch everything it produced. Returns the slow phase to run for a
-    /// question it put on screen (#55). `Err` only for an unreachable provider, after which
-    /// nothing more is sent.
+    /// Answer one job and dispatch everything it produced. Returns what it put on screen: the
+    /// question, whose slow phase is next (#55), or the question with its web search running
+    /// (#102). `Err` only for an unreachable provider, after which nothing more is sent.
     fn answer(
         &self,
         job: Job,
         current: &mut Option<CurrentQuestion>,
         context: &mut Context,
         tally: &mut Tally,
-    ) -> Result<Option<SlowJob>, LlmError> {
+    ) -> Result<Option<Answer>, LlmError> {
         let hub = self.hub;
         if self.cancel.is_cancelled() {
             hub.dispatch(Action::Failed {
@@ -1020,29 +1281,17 @@ impl Answerer<'_> {
             return Ok(None);
         }
         let regenerating = job.regenerate.is_some();
-        // Publish this request's token before looking at `newest`: `submit` bumps `newest`
-        // before it looks at the token, so a newer question either sees this token and cancels
-        // it, or this check sees the newer question.
-        let token = self.cancel.child_token();
-        if let Some(latest) = self.latest {
-            *latest.inflight() = Some(token.clone());
-        }
         // A question still queued behind a newer one is never sent, unless pinned (then both
         // are on screen). A regeneration is the user asking about the question on screen, so
         // it is always sent.
-        if let Some(latest) = self.latest
-            && !regenerating
-            && latest.newest.load(Ordering::Acquire) > job.id
-            && !hub.snapshot().pinned
-        {
-            *latest.inflight() = None;
+        let Some(token) = self.claim(job.id, regenerating) else {
             hub.dispatch(Action::Failed {
                 candidate: job.id,
                 error: SUPERSEDED.into(),
             });
             tally.superseded += 1;
             return Ok(None);
-        }
+        };
         // #54: the requirements every prompt carries, and the chunks for this question (the
         // question on screen when regenerating). Timed from here, so its cost is visible in the
         // run summary against the 50 ms the issue allows it.
@@ -1082,10 +1331,61 @@ impl Answerer<'_> {
         req.story = retrieval.story.clone();
         // #57: the session's last 8 summary lines.
         req.summary = hub.snapshot().summary_for_prompt();
+        self.ask(job, req, retrieval, token, current, tally)
+    }
+
+    /// Publish a request's token, then look at `newest`: `submit` bumps `newest` before it looks
+    /// at the token, so a newer question either sees this token and cancels it, or this check
+    /// sees the newer question. `None`: candidate `id` is queued behind a newer, unpinned question
+    /// and is not to be sent (`exempt`: a regeneration, which the user asked for, always is).
+    fn claim(&self, id: u64, exempt: bool) -> Option<CancellationToken> {
+        let token = self.cancel.child_token();
+        if let Some(latest) = self.latest {
+            *latest.inflight() = Some(token.clone());
+        }
+        if !exempt && self.superseded(id) {
+            if let Some(latest) = self.latest {
+                *latest.inflight() = None;
+            }
+            return None;
+        }
+        Some(token)
+    }
+
+    /// A newer question has replaced candidate `id` on screen (`dmn run`, unpinned).
+    fn superseded(&self, id: u64) -> bool {
+        self.latest
+            .is_some_and(|l| l.newest.load(Ordering::Acquire) > id && !self.hub.snapshot().pinned)
+    }
+
+    /// Run the fast phase for `req` and dispatch everything it produced. With `req.facts` set it
+    /// is a web lookup's second request (#102): the reply replaces the question as a regenerate's
+    /// does, it starts no search of its own, and once shown the Approach is tagged with the
+    /// first result's domain.
+    fn ask(
+        &self,
+        job: Job,
+        req: FastRequest,
+        retrieval: Retrieval,
+        token: CancellationToken,
+        current: &mut Option<CurrentQuestion>,
+        tally: &mut Tally,
+    ) -> Result<Option<Answer>, LlmError> {
+        let hub = self.hub;
+        let regenerating = job.regenerate.is_some();
+        let checking = req
+            .facts
+            .as_ref()
+            .and_then(|f| f.domain().map(str::to_owned));
         let started = Instant::now();
         let mut question_at = None;
         let mut first_line_at = None;
         let mut approach_marked = false;
+        // #102: a question (not a clarification) the reply put on screen, and the search its
+        // `lookup` started.
+        let mut is_question = false;
+        let mut off_course = false;
+        let mut searching: Option<(String, CancellationToken, SearchTask, Instant)> = None;
         let audio = &self.audio;
         // #16: when the question line and the first Approach line (or the STAR cards) were
         // produced, in audio time, for the session log. The store keeps the first showing, so a
@@ -1098,6 +1398,21 @@ impl Answerer<'_> {
         let result = self
             .rt
             .block_on(run_fast_phase(&*self.provider, &req, token.clone(), |e| {
+                match &e {
+                    FastEvent::Question { .. } => is_question = true,
+                    // #102: a lookup's second request is for a question already on screen; a
+                    // reply that takes it for a clarification of itself is not an answer, and
+                    // none of it is shown.
+                    FastEvent::Clarification { .. } if checking.is_some() => off_course = true,
+                    FastEvent::Lookup { query } if is_question && checking.is_none() => {
+                        searching = self.start_search(job.id, query);
+                    }
+                    _ => {}
+                }
+                // #102: the answer built on the results is checked, not out of date.
+                if off_course || (checking.is_some() && matches!(e, FastEvent::Lookup { .. })) {
+                    return;
+                }
                 let timing = match e {
                     FastEvent::Question { .. } | FastEvent::Clarification { .. } => {
                         let first = question_at.is_none();
@@ -1122,6 +1437,17 @@ impl Answerer<'_> {
         if let Some(latest) = self.latest {
             *latest.inflight() = None;
         }
+        // Whatever happens next, a search goes on only for a question that is now on screen.
+        let shown = matches!(
+            &result,
+            Ok(FastOutcome::Shown {
+                clarification: false,
+                ..
+            })
+        );
+        if !shown && let Some((_, search, _, _)) = searching.take() {
+            search.cancel();
+        }
         // Cancelled by a newer question, not by `q`: say so in the session and the tally.
         let superseded = matches!(result, Err(LlmError::Cancelled))
             && token.is_cancelled()
@@ -1132,6 +1458,15 @@ impl Answerer<'_> {
                 error: SUPERSEDED.into(),
             });
             tally.superseded += 1;
+            return Ok(None);
+        }
+        if off_course {
+            // #102: the question on screen stays as it was, as after a failed `r`.
+            hub.dispatch(Action::Failed {
+                candidate: job.id,
+                error: "the answer to the lookup was not an answer".into(),
+            });
+            tally.failed += 1;
             return Ok(None);
         }
         hub.dispatch(wire::outcome(job.id, &result, self.clock.now()));
@@ -1172,16 +1507,27 @@ impl Answerer<'_> {
                     &retrieval,
                     self.output,
                 );
-                if clarification {
+                if let (Some(domain), false) = (&checking, clarification) {
+                    // #102: after `Answered`, so the tag sits on the reply that earned it.
+                    hub.dispatch(Action::Checked {
+                        candidate: job.id,
+                        domain: domain.clone(),
+                    });
+                    tally.checked += 1;
+                } else if clarification {
                     tally.clarifications += 1;
                 } else {
                     tally.shown += 1;
                     if regenerating {
                         tally.regenerated += 1;
                     }
+                }
+                if !clarification {
                     // #58: a new behavioral question built from a matched story records the
-                    // ranking, so Swap can walk it. A regenerate or swap keeps what it has.
+                    // ranking, so Swap can walk it. A regenerate or swap keeps what it has, and
+                    // so does a lookup's second answer (#102).
                     if suggestion.kind == Some(Kind::Behavioral)
+                        && checking.is_none()
                         && retrieval.story.is_some()
                         && !retrieval.stories.is_empty()
                     {
@@ -1209,6 +1555,7 @@ impl Answerer<'_> {
                             approach: suggestion.approach.clone(),
                             star: suggestion.star.clone(),
                             lookup: suggestion.lookup.clone(),
+                            facts: req.facts.clone(),
                             ready: Instant::now(),
                             restarts: 0,
                             // A regenerate re-asks the same question: nothing new was answered.
@@ -1226,7 +1573,9 @@ impl Answerer<'_> {
                     &retrieval,
                     self.output,
                 );
-                tally.ignored += 1;
+                if checking.is_none() {
+                    tally.ignored += 1;
+                }
             }
             Err(e @ LlmError::Unreachable { .. }) => {
                 tally.failed += 1;
@@ -1258,7 +1607,172 @@ impl Answerer<'_> {
                 tally.failed += 1;
             }
         }
-        Ok(slow)
+        let Some(slow) = slow else {
+            if let Some((_, search, _, _)) = searching {
+                search.cancel();
+            }
+            return Ok(None);
+        };
+        Ok(Some(match searching {
+            Some((query, token, search, searched)) => Answer::Looking(Box::new(Looking {
+                id: job.id,
+                query,
+                job,
+                request: req,
+                retrieval,
+                slow,
+                token,
+                search,
+                asked: started,
+                searched,
+            })),
+            None => Answer::Shown(Box::new(slow)),
+        }))
+    }
+
+    /// #102: start the web search for candidate `id`'s `query` on this thread's runtime, so it
+    /// runs while the reply streams and while later requests do. `None` while the lookup is off.
+    fn start_search(
+        &self,
+        id: u64,
+        query: &str,
+    ) -> Option<(String, CancellationToken, SearchTask, Instant)> {
+        let search = Arc::clone(self.search.as_ref()?);
+        let token = self.cancel.child_token();
+        if let Some(latest) = self.latest {
+            latest.searches().push(token.clone());
+        }
+        let (q, t) = (query.to_owned(), token.clone());
+        let task = self.rt.spawn(async move { search.search(&q, t).await });
+        tracing::info!(candidate = id, query, "web lookup started");
+        Some((query.to_owned(), token, task, Instant::now()))
+    }
+
+    /// #102: the oldest search that has ended, or, while one is still running and no job is
+    /// waiting, wait for it. A search for a question a newer one has replaced is cancelled first,
+    /// so nothing waits on it.
+    fn next_lookup(&self, looking: &mut VecDeque<Looking>, gate: &SlowGate) -> LookupWait {
+        for l in looking.iter().filter(|l| self.superseded(l.id)) {
+            l.token.cancel();
+        }
+        if let Some(at) = looking.iter().position(|l| l.search.is_finished())
+            && let Some(mut l) = looking.remove(at)
+        {
+            let found = self.rt.block_on(&mut l.search);
+            return LookupWait::Done(Box::new(l), joined(found));
+        }
+        let Some(front) = looking.front_mut() else {
+            return LookupWait::Nothing;
+        };
+        let found = self.rt.block_on(async {
+            loop {
+                if gate.job_waiting() {
+                    return None;
+                }
+                tokio::select! {
+                    biased;
+                    found = &mut front.search => return Some(found),
+                    () = gate.arrived.notified() => {}
+                }
+            }
+        });
+        let Some(found) = found else {
+            return LookupWait::JobWaiting;
+        };
+        match looking.pop_front() {
+            Some(l) => LookupWait::Done(Box::new(l), joined(found)),
+            None => LookupWait::Nothing,
+        }
+    }
+
+    /// #102: act on a search that ended. With results, ask the fast phase once more with them
+    /// under `## Fresh facts`; its reply replaces the question in place (as `r`'s does) and is
+    /// tagged with the first result's domain, and its slow phase carries the same results.
+    /// Otherwise the first answer stays: `lookup failed` on the status line, nothing retried.
+    /// Returns the question's slow phase.
+    fn finish_lookup(
+        &self,
+        l: Looking,
+        found: Result<Vec<SearchResult>, LookupError>,
+        current: &mut Option<CurrentQuestion>,
+        tally: &mut Tally,
+    ) -> Option<SlowJob> {
+        let Looking {
+            id,
+            query,
+            job,
+            mut request,
+            retrieval,
+            mut slow,
+            asked,
+            searched,
+            ..
+        } = l;
+        tally.lookups += 1;
+        let took = searched.elapsed();
+        // Stopped, or the question is no longer on screen: nothing to correct, nothing to say.
+        let on_screen = {
+            let s = self.hub.snapshot();
+            s.live
+                .iter()
+                .chain(s.queued.iter())
+                .any(|q| q.candidate == id)
+        };
+        if self.cancel.is_cancelled() || self.superseded(id) || !on_screen {
+            print_lookup(id, &query, LookupEnd::Dropped, took, self.output);
+            return Some(slow);
+        }
+        let facts = found.and_then(|results| {
+            let mut flags = Vec::new();
+            let facts =
+                dmn_llm::limits::fresh_facts(&results, dmn_llm::limits::FACTS_MAX, &mut flags);
+            if facts.is_empty() {
+                Err(LookupError::NoResults)
+            } else {
+                Ok(facts)
+            }
+        });
+        let facts = match facts {
+            Ok(facts) => FreshFacts {
+                query: query.clone(),
+                facts,
+            },
+            Err(e) => {
+                tally.lookups_failed += 1;
+                self.output.warn(&lookup_failed(&query, took, &e));
+                print_lookup(id, &query, LookupEnd::Failed(&e), took, self.output);
+                self.hub.dispatch(Action::LookupFailed { candidate: id });
+                return Some(slow);
+            }
+        };
+        print_lookup(id, &query, LookupEnd::Found(&facts), took, self.output);
+        // The second request is a fast phase like any: a newer unpinned question cancels it.
+        let Some(token) = self.claim(id, false) else {
+            return Some(slow);
+        };
+        // As `r` does: the Approach on screen dims until the new reply starts.
+        self.hub.dispatch(Action::Regenerate { candidate: id });
+        request.facts = Some(facts);
+        let held = slow.answered.take();
+        match self.ask(job, request, retrieval, token, current, tally) {
+            Ok(Some(Answer::Shown(mut next))) => {
+                tracing::info!(
+                    candidate = id,
+                    query,
+                    search_ms = ms(took),
+                    total_ms = ms(asked.elapsed()),
+                    "web lookup: the answer was rebuilt on its results"
+                );
+                next.answered = held;
+                Some(*next)
+            }
+            // Superseded, declined or failed: the first answer stays, and so does its slow
+            // phase (a search the second answer started is not possible: it starts none).
+            Ok(_) | Err(_) => {
+                slow.answered = held;
+                Some(slow)
+            }
+        }
     }
 
     /// The next slow phase to run, or `None` when there is none (or the run was stopped). Under
@@ -1338,6 +1852,8 @@ impl Answerer<'_> {
             chunks: retrieval.chunks.clone(),
             story: retrieval.story.clone(),
             asker: job.asker,
+            // #102: the results its Approach was rebuilt on.
+            facts: job.facts.clone(),
             ..FastRequest::new(job.said.clone(), 0)
         };
         req.focus = job.focus.clone();
@@ -1802,6 +2318,7 @@ mod tests {
         let hub = Arc::new(SessionHub::default());
         let s = Suggester::start(
             &llm,
+            &config::Lookup::default(),
             Output::Print { json: true },
             Policy::AnswerAll,
             Arc::clone(&hub),
@@ -1861,6 +2378,7 @@ mod tests {
         let hub = Arc::new(SessionHub::default());
         let s = Suggester::start(
             &llm,
+            &config::Lookup::default(),
             Output::Quiet,
             Policy::AnswerAll,
             Arc::clone(&hub),
@@ -1895,6 +2413,7 @@ mod tests {
         let hub = Arc::new(SessionHub::default());
         let s = Suggester::start(
             &llm,
+            &config::Lookup::default(),
             Output::Quiet,
             Policy::Supersede,
             Arc::clone(&hub),
@@ -1940,6 +2459,7 @@ mod tests {
             latest: None,
             reload: None,
             today: test_today,
+            search: None,
         };
         // Candidate 1 is on screen, answered once already.
         hub.dispatch(wire::candidate(1, &candidate()));
@@ -3085,5 +3605,650 @@ mod tests {
         assert_eq!(hub.snapshot().live.unwrap().candidate, 2, "Q2 showed");
         let tally = s.finish();
         assert_eq!(tally.failed, 1, "{tally:?}");
+    }
+
+    // --- Web lookup (#102) --------------------------------------------------------------------
+
+    /// A loopback web search: every request is kept (head and body) and answered with `status`
+    /// and `body` after `delay`. Tests never touch the network.
+    struct SearchServer {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SearchServer {
+        fn start(status: &'static str, body: &str, delay: Duration) -> Self {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let kept = Arc::clone(&requests);
+            let body = body.to_owned();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let (kept, body) = (Arc::clone(&kept), body.clone());
+                    std::thread::spawn(move || {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let request = loop {
+                            let text = String::from_utf8_lossy(&buf).into_owned();
+                            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                                let len = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        k.eq_ignore_ascii_case("content-length")
+                                            .then(|| v.trim().parse::<usize>().ok())?
+                                    })
+                                    .unwrap_or(0);
+                                if rest.len() >= len {
+                                    break text;
+                                }
+                            }
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break String::from_utf8_lossy(&buf).into(),
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        kept.lock().unwrap().push(request);
+                        std::thread::sleep(delay);
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    });
+                }
+            });
+            Self { url, requests }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// What go.dev's release page says, as Ollama's web search returns it.
+    const GO_RESULTS: &str = r#"{"results": [
+        {"title": "All releases - The Go Programming Language", "url": "https://go.dev/doc/devel/release", "content": "go1.25.1 (released 2025-09-03) includes security fixes. go1.25.0 (released 2025-08-12) is a major release of Go."},
+        {"title": "Go 1.25 Release Notes", "url": "https://www.go.dev/doc/go1.25", "content": "The latest Go release, version 1.25, arrives six months after Go 1.24."}
+    ]}"#;
+    const GO: &str = "What is the latest stable major version of Go?";
+    /// Said before the question: it must never reach the search.
+    const SAID_BEFORE: &str = "Interviewer: We moved project Bluebird off Java last spring.";
+
+    fn search_on(url: &str, key: Option<&str>, timeout: Duration) -> Arc<dyn WebSearch> {
+        Arc::new(
+            dmn_llm::OllamaSearch::new(&dmn_llm::OllamaSearchSettings {
+                base_url: url.to_owned(),
+                api_key: key.map(str::to_owned),
+                timeout,
+                ..dmn_llm::OllamaSearchSettings::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    /// The user's own SearXNG (on PR #104) at `url`.
+    fn searxng_on(url: &str, timeout: Duration) -> Arc<dyn WebSearch> {
+        Arc::new(
+            dmn_llm::SearxngSearch::new(&dmn_llm::SearxngSettings {
+                base_url: url.to_owned(),
+                timeout,
+                ..dmn_llm::SearxngSettings::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    /// What a SearXNG returns for the query: extra fields, `answers` and `infoboxes`, a result
+    /// with no content (skipped), and more results than kept.
+    const SEARXNG_RESULTS: &str = r#"{"query": "latest stable Go release", "results": [
+        {"url": "https://www.go.dev/doc/devel/release", "title": "Release History - The Go Programming Language", "content": "go1.25.1 (released 2025-09-03) includes security fixes.", "engine": "duckduckgo", "score": 3.5},
+        {"url": "https://github.com/golang/go/releases", "title": "Releases", "engine": "brave"},
+        {"url": "https://en.wikipedia.org/wiki/Go_(programming_language)", "title": "Go (programming language)", "content": "Stable release 1.25.1 / 3 September 2025.", "engine": "wikipedia"}
+    ], "answers": [{"answer": "Go 1.0"}], "infoboxes": [{"infobox": "Go"}], "suggestions": []}"#;
+
+    /// The first reply: flagged, with the remembered version hedged.
+    fn flagged_reply() -> serde_json::Value {
+        let mut v = fast_json_reply(GO, "knowledge");
+        v["lookup"] = serde_json::json!("latest stable Go release");
+        v["approach"] = serde_json::json!([
+            "Say the newest you know of is Go 1.24.",
+            "Say a newer one may be out."
+        ]);
+        v
+    }
+
+    /// The reply built on the results.
+    fn checked_reply() -> serde_json::Value {
+        let mut v = fast_json_reply(GO, "knowledge");
+        v["approach"] = serde_json::json!([
+            "Say the latest stable major release is Go 1.25.",
+            "Mention Go 1.25.1 is its newest patch."
+        ]);
+        v
+    }
+
+    fn go_candidate() -> Candidate {
+        Candidate {
+            text: GO.into(),
+            line: GO.into(),
+            ..candidate()
+        }
+    }
+
+    fn ask_go(s: &Suggester, hub: &SessionHub, id: u64) {
+        hub.dispatch(wire::candidate(id, &go_candidate()));
+        s.submit(
+            id,
+            &go_candidate(),
+            format!("{SAID_BEFORE}\nInterviewer: {GO}"),
+        );
+    }
+
+    fn fresh(req: &dmn_llm::ChatRequest) -> bool {
+        req.messages[1].content.contains("## Fresh facts")
+    }
+
+    fn screen(session: &dmn_session::Session) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| crate::tui::draw(f, session)).unwrap();
+        let buf = t.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn lookup_off_sends_no_search_for_a_flagged_question() {
+        let server = SearchServer::start("200 OK", GO_RESULTS, Duration::ZERO);
+        let off = config::Lookup {
+            base_url: server.url.clone(),
+            ..config::Lookup::default()
+        };
+        // The default: `[lookup]` off builds no search at all.
+        let search = wire::web_search(&off).unwrap();
+        assert!(search.is_none());
+        let provider = dmn_llm::MockProvider::json(&flagged_reply()).then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            search,
+            Policy::AnswerAll,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        ask_go(&s, &hub, 1);
+        let tally = s.finish();
+        assert!(server.requests().is_empty(), "nothing left for the search");
+        let sent = provider.requests();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the fast phase and its slow phase, as before"
+        );
+        assert!(!sent.iter().any(fresh));
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.live.as_ref().unwrap().lookup,
+            "latest stable Go release"
+        );
+        assert!(!snap.status.web && snap.lookup_failed.is_none());
+        assert_eq!((tally.lookups, tally.checked), (0, 0));
+    }
+
+    #[test]
+    fn lookup_on_sends_the_query_alone_and_the_answer_built_on_it_replaces_the_first() {
+        let server = SearchServer::start("200 OK", GO_RESULTS, Duration::from_millis(50));
+        let provider = dmn_llm::MockProvider::json(&flagged_reply())
+            .then_json(&checked_reply())
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            Some(search_on(
+                &server.url,
+                Some("test-key"),
+                Duration::from_secs(3),
+            )),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        ask_go(&s, &hub, 1);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.sections.started)));
+        let tally = s.finish();
+
+        // Exactly one search, carrying the query and nothing said in the call.
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let (head, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("POST /api/web_search "), "{head}");
+        assert!(
+            head.to_lowercase()
+                .contains("authorization: bearer test-key")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"query": "latest stable Go release", "max_results": 5})
+        );
+        for said in ["Bluebird", "Java", GO] {
+            assert!(!requests[0].contains(said), "{said} left the machine");
+        }
+
+        // Fast, then fast again with the results, then the slow phase with them too.
+        let sent = provider.requests();
+        assert_eq!(sent.len(), 3);
+        assert!(!fresh(&sent[0]));
+        let second = &sent[1].messages[1].content;
+        assert!(fresh(&sent[1]), "{second}");
+        assert!(
+            second.contains("[1] All releases - The Go Programming Language (go.dev): go1.25.1"),
+            "{second}"
+        );
+        assert!(
+            second.contains("(go.dev): The latest Go release"),
+            "www. dropped: {second}"
+        );
+        assert!(
+            sent[1].temperature.abs() < f32::EPSILON,
+            "asked as the first was"
+        );
+        assert!(fresh(&sent[2]) && sent[2].messages[1].content.contains("Checked on the web"));
+
+        // Replaced in place, tagged with the first result's domain.
+        let snap = hub.snapshot();
+        let live = snap.live.as_ref().unwrap();
+        assert_eq!(live.candidate, 1);
+        assert!(
+            snap.history.is_empty(),
+            "the same question, not a second one"
+        );
+        assert_eq!(
+            live.approach[0],
+            "Say the latest stable major release is Go 1.25."
+        );
+        assert_eq!(live.checked, "go.dev");
+        assert!(snap.status.web);
+        let shown = screen(&snap);
+        assert!(shown.contains("checked · go.dev"), "{shown}");
+        assert!(!shown.contains("may be out of date"), "{shown}");
+        assert!(shown.contains("● model  web "), "{shown}");
+        assert_eq!((tally.lookups, tally.checked, tally.shown), (1, 1, 1));
+    }
+
+    /// The four ways a lookup comes to nothing. Each leaves the first answer and its tag, says
+    /// `lookup failed`, and asks the model nothing more than the slow phase.
+    #[test]
+    fn lookup_failures_keep_the_first_answer_and_send_no_second_request() {
+        let timeout = SearchServer::start("200 OK", GO_RESULTS, Duration::from_secs(2));
+        let error = SearchServer::start("500 Internal Server Error", "{}", Duration::ZERO);
+        let empty = SearchServer::start("200 OK", r#"{"results": []}"#, Duration::ZERO);
+        let unused = SearchServer::start("200 OK", GO_RESULTS, Duration::ZERO);
+        let cases = [
+            ("timeout", &timeout, Some("k"), 1),
+            ("error", &error, Some("k"), 1),
+            ("no results", &empty, Some("k"), 1),
+            ("no key", &unused, None, 0),
+        ];
+        for (case, server, key, searches) in cases {
+            let provider =
+                dmn_llm::MockProvider::json(&flagged_reply()).then_json(&slow_json_reply());
+            let hub = Arc::new(SessionHub::default());
+            let started = Instant::now();
+            let s = Suggester::start_with_search(
+                provider.clone(),
+                Some(search_on(&server.url, key, Duration::from_millis(300))),
+                Policy::Supersede,
+                Arc::clone(&hub),
+                Context::empty(),
+                Some(Duration::from_secs(20)),
+            );
+            ask_go(&s, &hub, 1);
+            assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+                .live
+                .as_ref()
+                .is_some_and(|q| q.sections.started)));
+            let tally = s.finish();
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{case}: within the timeout"
+            );
+            assert_eq!(server.requests().len(), searches, "{case}");
+            let sent = provider.requests();
+            assert_eq!(sent.len(), 2, "{case}: fast and slow only");
+            assert!(!sent.iter().any(fresh), "{case}");
+            assert!(
+                sent[1].messages[1].content.contains("Flagged as depending"),
+                "{case}: the slow phase is told it may be out of date"
+            );
+            let snap = hub.snapshot();
+            let live = snap.live.as_ref().unwrap();
+            assert_eq!(
+                live.approach[0], "Say the newest you know of is Go 1.24.",
+                "{case}"
+            );
+            assert_eq!(live.lookup, "latest stable Go release", "{case}");
+            assert_eq!(live.checked, "", "{case}");
+            assert_eq!(snap.lookup_failed, Some(1), "{case}");
+            let shown = screen(&snap);
+            assert!(shown.contains("may be out of date"), "{case}: {shown}");
+            assert!(shown.contains("lookup failed"), "{case}: {shown}");
+            assert_eq!(
+                (tally.lookups, tally.lookups_failed, tally.checked),
+                (1, 1, 0)
+            );
+        }
+        // `[lookup]` on with its variable unset builds a client that sends nothing.
+        let no_key = config::Lookup {
+            enabled: true,
+            base_url: unused.url.clone(),
+            api_key_env: "DMN_TEST_LOOKUP_KEY_NEVER_SET".into(),
+            ..config::Lookup::default()
+        };
+        let search = wire::web_search(&no_key).unwrap().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(search.search("q", CancellationToken::new()))
+            .unwrap_err();
+        assert!(matches!(err, LookupError::NoKey(_)), "{err}");
+        assert!(unused.requests().is_empty());
+    }
+
+    #[test]
+    fn lookup_searxng_gets_the_query_alone_and_its_results_rebuild_the_answer() {
+        let server = SearchServer::start("200 OK", SEARXNG_RESULTS, Duration::from_millis(50));
+        let provider = dmn_llm::MockProvider::json(&flagged_reply())
+            .then_json(&checked_reply())
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            Some(searxng_on(&server.url, Duration::from_secs(3))),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        ask_go(&s, &hub, 1);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.sections.started)));
+        let tally = s.finish();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let (head, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "GET /search?q=latest+stable+Go+release&format=json HTTP/1.1"
+        );
+        assert!(
+            !head.to_lowercase().contains("authorization"),
+            "no key: {head}"
+        );
+        assert!(body.is_empty(), "{body:?}");
+        for said in ["Bluebird", "Java", "major version"] {
+            assert!(!requests[0].contains(said), "{said} left the machine");
+        }
+
+        let second = &provider.requests()[1].messages[1].content;
+        assert!(
+            second.contains("[1] Release History - The Go Programming Language (go.dev): go1.25.1"),
+            "{second}"
+        );
+        assert!(
+            second.contains("[2] Go (programming language) (en.wikipedia.org): Stable release"),
+            "the result without content skipped: {second}"
+        );
+        assert!(!second.contains("Go 1.0"), "answers are ignored: {second}");
+        let snap = hub.snapshot();
+        let live = snap.live.as_ref().unwrap();
+        assert_eq!(
+            live.checked, "go.dev",
+            "the first result's host, without www."
+        );
+        assert!(screen(&snap).contains("checked · go.dev"));
+        assert_eq!((tally.lookups, tally.checked), (1, 1));
+    }
+
+    #[test]
+    fn lookup_searxng_failures_keep_the_first_answer_and_a_403_says_what_to_change() {
+        let forbidden = SearchServer::start("403 Forbidden", "<h1>Forbidden</h1>", Duration::ZERO);
+        let slow = SearchServer::start("200 OK", SEARXNG_RESULTS, Duration::from_secs(2));
+        let empty = SearchServer::start(
+            "200 OK",
+            r#"{"results": [], "answers": [{"answer": "x"}]}"#,
+            Duration::ZERO,
+        );
+        for (case, server) in [
+            ("403", &forbidden),
+            ("timeout", &slow),
+            ("no results", &empty),
+        ] {
+            let provider =
+                dmn_llm::MockProvider::json(&flagged_reply()).then_json(&slow_json_reply());
+            let hub = Arc::new(SessionHub::default());
+            let s = Suggester::start_with_search(
+                provider.clone(),
+                Some(searxng_on(&server.url, Duration::from_millis(300))),
+                Policy::Supersede,
+                Arc::clone(&hub),
+                Context::empty(),
+                Some(Duration::from_secs(20)),
+            );
+            ask_go(&s, &hub, 1);
+            assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+                .live
+                .as_ref()
+                .is_some_and(|q| q.sections.started)));
+            let tally = s.finish();
+            assert_eq!(server.requests().len(), 1, "{case}");
+            assert_eq!(provider.requests().len(), 2, "{case}: no second request");
+            let snap = hub.snapshot();
+            assert_eq!(snap.lookup_failed, Some(1), "{case}");
+            let shown = screen(&snap);
+            assert!(shown.contains("may be out of date") && shown.contains("lookup failed"));
+            assert_eq!((tally.lookups_failed, tally.checked), (1, 0), "{case}");
+        }
+        // What the log says for the 403: what to change, where.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let e = rt
+            .block_on(
+                searxng_on(&forbidden.url, Duration::from_secs(1))
+                    .search("latest stable Go release", CancellationToken::new()),
+            )
+            .unwrap_err();
+        let said = lookup_failed("latest stable Go release", Duration::from_millis(12), &e);
+        assert!(
+            said.contains(&format!(
+                "SearXNG at {} refused format=json (403 Forbidden)",
+                forbidden.url
+            )),
+            "{said}"
+        );
+        assert!(
+            said.contains("add `json` to `search.formats` in its settings.yml"),
+            "{said}"
+        );
+        assert!(said.ends_with("the first answer stays"), "{said}");
+
+        // From `[lookup]`: no key is read for searxng, so an unset variable changes nothing.
+        let cfg = config::Lookup {
+            enabled: true,
+            provider: config::LookupProvider::Searxng,
+            base_url: empty.url.clone(),
+            api_key_env: "DMN_TEST_LOOKUP_KEY_NEVER_SET".into(),
+            ..config::Lookup::default()
+        };
+        let search = wire::web_search(&cfg).unwrap().unwrap();
+        assert_eq!(search.name(), "searxng");
+        let e = rt
+            .block_on(search.search("q", CancellationToken::new()))
+            .unwrap_err();
+        assert!(matches!(e, LookupError::NoResults), "it asked: {e}");
+        assert_eq!(empty.requests().len(), 2);
+    }
+
+    #[test]
+    fn lookup_a_newer_question_cancels_the_search() {
+        let server = SearchServer::start("200 OK", GO_RESULTS, Duration::from_secs(3));
+        let provider = dmn_llm::MockProvider::json(&flagged_reply())
+            .then_json(&fast_json_reply("How would you shard it?", "system_design"))
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            Some(search_on(&server.url, Some("k"), Duration::from_secs(5))),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        let started = Instant::now();
+        ask_go(&s, &hub, 1);
+        let until = Instant::now() + Duration::from_secs(5);
+        while server.requests().is_empty() {
+            assert!(Instant::now() < until, "the search never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        submit_with_candidate(&s, &hub, 2);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.candidate == 2 && q.sections.started)));
+        let tally = s.finish();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "nothing waited on the cancelled search: {:?}",
+            started.elapsed()
+        );
+        let sent = provider.requests();
+        assert_eq!(sent.len(), 3, "Q1 fast, Q2 fast, Q2 slow");
+        assert!(!sent.iter().any(fresh));
+        let snap = hub.snapshot();
+        assert_eq!(snap.lookup_failed, None, "cancelled is not failed");
+        assert_eq!(snap.history[0].checked, "");
+        assert_eq!((tally.lookups_failed, tally.checked), (0, 0));
+    }
+
+    #[test]
+    fn lookup_a_newer_question_cancels_the_second_request() {
+        // The second request stalls: Q2 arrives while it is in flight.
+        let mut stalled = vec![dmn_llm::mock::Step::Pause(Duration::from_secs(5))];
+        stalled.extend(dmn_llm::mock::json_script(&checked_reply()));
+        let server = SearchServer::start("200 OK", GO_RESULTS, Duration::ZERO);
+        let provider = dmn_llm::MockProvider::json(&flagged_reply())
+            .then(stalled)
+            .then_json(&fast_json_reply("How would you shard it?", "system_design"))
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            Some(search_on(&server.url, Some("k"), Duration::from_secs(3))),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        ask_go(&s, &hub, 1);
+        let until = Instant::now() + Duration::from_secs(5);
+        while provider.requests().len() < 2 {
+            assert!(Instant::now() < until, "the second request never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        submit_with_candidate(&s, &hub, 2);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.candidate == 2 && q.sections.started)));
+        s.finish();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "not after the stall"
+        );
+        let sent = provider.requests();
+        assert_eq!(
+            sent.len(),
+            4,
+            "Q1, Q1 with results (cut short), Q2, Q2's slow phase"
+        );
+        assert!(fresh(&sent[1]) && !fresh(&sent[2]));
+        let snap = hub.snapshot();
+        let q1 = &snap.history[0];
+        assert_eq!(q1.approach[0], "Say the newest you know of is Go 1.24.");
+        assert_eq!(q1.checked, "", "the cut-short answer never showed");
+    }
+
+    #[test]
+    fn lookup_while_pinned_the_search_and_the_second_request_complete() {
+        let server = SearchServer::start("200 OK", GO_RESULTS, Duration::from_millis(500));
+        let provider = dmn_llm::MockProvider::json(&flagged_reply())
+            .then_json(&fast_json_reply("How would you shard it?", "system_design"))
+            .then_json(&checked_reply())
+            .then_json(&slow_json_reply());
+        let hub = Arc::new(SessionHub::default());
+        let s = Suggester::start_with_search(
+            provider.clone(),
+            Some(search_on(&server.url, Some("k"), Duration::from_secs(3))),
+            Policy::Supersede,
+            Arc::clone(&hub),
+            Context::empty(),
+            Some(Duration::from_secs(20)),
+        );
+        ask_go(&s, &hub, 1);
+        assert!(wait_for(&hub, Duration::from_secs(5), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.progress == dmn_session::Progress::Done)));
+        hub.dispatch(Action::Pin);
+        assert_eq!(server.requests().len(), 1, "the search is running");
+        submit_with_candidate(&s, &hub, 2);
+        assert!(wait_for(&hub, Duration::from_secs(10), |s| s
+            .live
+            .as_ref()
+            .is_some_and(|q| q.checked == "go.dev" && q.sections.started)));
+        let tally = s.finish();
+        let sent = provider.requests();
+        assert!(
+            !fresh(&sent[1]),
+            "Q2's fast phase went first: the model is never idle"
+        );
+        assert!(fresh(&sent[2]), "then Q1 once more, with the results");
+        let snap = hub.snapshot();
+        let live = snap.live.as_ref().unwrap();
+        assert_eq!(live.candidate, 1);
+        assert_eq!(
+            live.approach[0],
+            "Say the latest stable major release is Go 1.25."
+        );
+        assert_eq!(
+            snap.queued[0].candidate, 2,
+            "Q2 still queued behind the pin"
+        );
+        assert_eq!((tally.lookups, tally.checked), (1, 1));
     }
 }

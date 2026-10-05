@@ -230,6 +230,12 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     {
         eprintln!("run: {notice}");
     }
+    // #102: likewise the web lookup's query; the TUI says `web` on the status line.
+    if args.headless
+        && let Some(notice) = cfg.lookup.privacy_notice()
+    {
+        eprintln!("run: {notice}");
+    }
     let (input, questions) = match args.replay.clone() {
         Some((interviewer, candidate)) => {
             let questions = interviewer.parent().map(|d| d.join("questions.json"));

@@ -1,0 +1,30 @@
+┌ LIVE QUESTION ──────────────────────────────────────────────────────────────────────── knowledge ┐
+│ What is the latest stable major version of Go?                                                   │
+│ Focus: Go release cadence, keeping current                                                       │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ──────────────────────────────────────────────────────────────────── may be out of date ┐
+│ 1  Say the newest you know of is Go 1.24, from early 2025.                                       │
+│ 2  Say a newer one may be out: Go ships a release every six months.                              │
+│ 3  Offer to check go.dev before relying on the number.                                           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+Interviewer Hi, thanks for making the time today. This session is about an hour of system design.
+You         Sounds great.
+ ● mic  ● system  ● model  web                               lookup failed · p pin · r redo · ⏎ ask

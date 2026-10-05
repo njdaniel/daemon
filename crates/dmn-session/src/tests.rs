@@ -680,6 +680,145 @@ fn a_lookup_reaches_a_queued_question_and_a_session_without_one_serialises_as_be
     assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);
 }
 
+#[test]
+fn a_lookup_that_came_back_tags_the_reply_built_on_it_until_the_question_starts_afresh() {
+    // #102: the first reply flagged, then the second request's reply, in place, then `checked`.
+    let go = "What is the latest stable major version of Go?";
+    let mut log = vec![Action::WebLookup { enabled: true }, candidate(1, 20.0, go)];
+    let mut first = shown(1, go, &["Say 1.24 is the newest you know of."]);
+    first.insert(2, lookup(1, "latest stable Go release"));
+    log.extend(first);
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(1, go, &["Say Go 1.25 is the latest, per go.dev."]));
+    log.push(Action::Checked {
+        candidate: 1,
+        domain: "go.dev".into(),
+    });
+    let s = Session::replay(&log);
+    assert!(s.status.web);
+    let live = s.live.as_ref().unwrap();
+    assert_eq!(live.candidate, 1);
+    assert_eq!(live.checked, "go.dev");
+    assert_eq!(live.approach, ["Say Go 1.25 is the latest, per go.dev."]);
+    assert_eq!(s.counts.shown, 2, "one question, answered twice");
+    assert!(
+        s.history.is_empty(),
+        "replaced in place, not a second question"
+    );
+    let text = serde_json::to_string(&s).unwrap();
+    assert!(text.contains(r#""checked":"go.dev""#) && text.contains(r#""web":true"#));
+    assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), s);
+
+    // `r` starts the question afresh: the new reply was not checked.
+    log.push(Action::Regenerate { candidate: 1 });
+    log.extend(shown(1, go, &["a", "b", "c"]));
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "");
+}
+
+fn checked(candidate: u64) -> Action {
+    Action::Checked {
+        candidate,
+        domain: "go.dev".into(),
+    }
+}
+
+/// Review on PR #104: every path that puts a new Approach in place of a checked one leaves it
+/// untagged, because the new reply's `Question` rebuilds the question; only a reply that never
+/// started (or was declined) leaves the checked Approach, and its tag, on screen.
+#[test]
+fn checked_never_outlives_the_approach_it_was_earned_by() {
+    // Swap (#58): a behavioral question, checked, then built from the next story.
+    let mut log = vec![candidate(1, 20.0, "Tell me about a time you disagreed")];
+    log.extend(behavioral(1, "stories/a.md"));
+    log.push(Action::Stories {
+        candidate: 1,
+        ranked: vec!["stories/a.md".into(), "stories/b.md".into()],
+    });
+    log.push(checked(1));
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "go.dev");
+    log.push(Action::SwapStory { candidate: 1 });
+    assert_eq!(
+        Session::replay(&log).live.unwrap().checked,
+        "go.dev",
+        "until the new cards start, the checked ones are on screen"
+    );
+    log.extend(behavioral(1, "stories/b.md"));
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "");
+
+    // A continuation (#63) replaces its checked first half.
+    let mut log = split_question(false);
+    log.insert(log.len() - 6, checked(1));
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().candidate, 2);
+    assert_eq!(s.live.unwrap().checked, "");
+    let mut pinned = split_question(true);
+    pinned.insert(pinned.len() - 7, checked(1));
+    assert_eq!(Session::replay(&pinned).live.unwrap().checked, "");
+
+    // `r` on a checked answer whose reply starts and then fails: the half-built Approach is
+    // not the checked one, and carries no tag.
+    let go = "What is the latest stable major version of Go?";
+    let mut log = vec![candidate(1, 20.0, go)];
+    log.extend(shown(1, go, &["Say Go 1.25 is the latest."]));
+    log.push(checked(1));
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::Question {
+        candidate: 1,
+        text: go.into(),
+        kind: "knowledge".into(),
+    });
+    log.push(Action::Failed {
+        candidate: 1,
+        error: "timeout".into(),
+    });
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "");
+
+    // The lookup's own second request failing midway: `Checked` is sent only after its
+    // `Answered`, so the partial reply is untagged too.
+    let mut log = vec![candidate(1, 20.0, go)];
+    let mut first = shown(1, go, &["Say 1.24 is the newest you know of."]);
+    first.insert(2, lookup(1, "latest stable Go release"));
+    log.extend(first);
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::Question {
+        candidate: 1,
+        text: go.into(),
+        kind: "knowledge".into(),
+    });
+    log.push(Action::Failed {
+        candidate: 1,
+        error: "superseded by a newer question".into(),
+    });
+    let live = Session::replay(&log).live.unwrap();
+    assert_eq!((live.checked.as_str(), live.lookup.as_str()), ("", ""));
+}
+
+#[test]
+fn a_failed_lookup_says_so_until_its_notice_expires_and_changes_nothing_else() {
+    let go = "What is the latest stable major version of Go?";
+    let mut log = vec![candidate(1, 20.0, go)];
+    let mut first = shown(1, go, &["Say 1.24 is the newest you know of."]);
+    first.insert(2, lookup(1, "latest stable Go release"));
+    log.extend(first);
+    let before = Session::replay(&log);
+    log.push(Action::LookupFailed { candidate: 1 });
+    let s = Session::replay(&log);
+    assert_eq!(s.lookup_failed, Some(1));
+    assert_eq!(s.live, before.live, "the first answer and its tag stay");
+    // Another candidate's notice ending leaves this one up.
+    log.push(Action::NoticeExpired { candidate: 7 });
+    assert_eq!(Session::replay(&log).lookup_failed, Some(1));
+    log.push(Action::NoticeExpired { candidate: 1 });
+    let s = Session::replay(&log);
+    assert_eq!(s.lookup_failed, None);
+    assert_eq!(s, before, "nothing else moved");
+    // A session that never looked anything up serialises as before.
+    let plain = serde_json::to_string(&Session::replay(&interview())).unwrap();
+    for key in ["checked", "lookup_failed", "\"web\""] {
+        assert!(!plain.contains(key), "{key}: {plain}");
+    }
+}
+
 /// A behavioral question with STAR cards built from `story`.
 fn behavioral(id: u64, story: &str) -> Vec<Action> {
     vec![
