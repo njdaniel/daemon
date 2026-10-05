@@ -263,11 +263,13 @@ enum Command {
         #[command(subcommand)]
         action: SessionsAction,
     },
-    /// Synthesize text in your enrolled voice clone through the local TTS server (#107)
+    /// Synthesize text in your enrolled voice clone through the local TTS server (#107):
+    /// `dmn speak "text" --out file.wav`, or `dmn speak enroll --wav <clip>` first
+    #[command(args_conflicts_with_subcommands = true)]
     Speak {
         #[command(subcommand)]
         action: Option<SpeakAction>,
-        /// The text to synthesize (omit for `enroll`)
+        /// The text to synthesize
         text: Option<String>,
         /// Write the synthesized speech to this WAV file. Nothing plays audio yet:
         /// playback lands in #108
@@ -337,15 +339,20 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum SpeakAction {
-    /// Enroll a reference clip: validate it, store it under the data dir, register it with the
-    /// TTS server and record it as [speak].voice_ref
+    /// Enroll a reference clip: validate it, register it with the TTS server, store a copy
+    /// under the data dir and record it as [speak].voice_ref
     Enroll {
         /// The reference clip: a WAV of your voice, at least 6 s, mono 16 kHz+ preferred
         #[arg(long)]
         wav: std::path::PathBuf,
-        /// Voice name on the server and for the stored clip; default "voice"
+        /// Voice name on the server and for the stored clip (letters, digits, - and _);
+        /// default "voice". Enrolling a name again replaces that voice
         #[arg(long)]
         name: Option<String>,
+        /// The language this voice will speak (en, es, fr, ...); default: the server's (en).
+        /// chatterbox-tts-api speaks each voice in the language it was enrolled with
+        #[arg(long)]
+        language: Option<String>,
     },
 }
 
@@ -535,18 +542,28 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Some(Command::Sources { action }) => Ok(sources::run(&paths, action)?),
         Some(Command::Speak { action, text, out }) => {
             let cfg = Config::load(&paths.config_file)?;
+            let provider = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url);
             match action {
-                Some(SpeakAction::Enroll { wav, name }) => {
-                    let provider = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url);
-                    let args = speak::EnrollArgs { wav, name };
+                Some(SpeakAction::Enroll {
+                    wav,
+                    name,
+                    language,
+                }) => {
+                    let args = speak::EnrollArgs {
+                        wav,
+                        name,
+                        language,
+                    };
                     print!("{}", speak::enroll(&cfg, &paths, &args, &provider)?);
                 }
                 None => {
                     let text = text.ok_or(CliError::Usage(
                         "speak needs the text to synthesize: dmn speak \"text\" --out <file.wav> (or `dmn speak enroll --wav <clip>`)".into(),
                     ))?;
-                    let provider = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url);
-                    print!("{}", speak::speak(&cfg, &paths, &text, out.as_deref(), &provider)?);
+                    print!(
+                        "{}",
+                        speak::speak(&cfg, &paths, &text, out.as_deref(), &provider)?
+                    );
                 }
             }
             Ok(())
