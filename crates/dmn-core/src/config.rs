@@ -42,6 +42,7 @@ pub struct Config {
     pub detect: Detect,
     pub llm: Llm,
     pub assist: Assist,
+    pub speak: Speak,
     pub ui: Ui,
     pub privacy: Privacy,
 }
@@ -327,6 +328,34 @@ impl Default for Assist {
     }
 }
 
+/// Speak (#107): synthesize text in the enrolled voice clone through a local TTS server
+/// (Chatterbox-TTS-Server, OpenAI-compatible). Off by default; `dmn speak` refuses to run
+/// while `enabled` is false. The translation language is **not** here — it lands with #109.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Speak {
+    pub enabled: bool,
+    /// Base URL of the TTS server, like `http://localhost:4123`.
+    pub tts_url: String,
+    /// Path to the enrolled reference clip (`dmn speak enroll` writes it); "" = not enrolled.
+    pub voice_ref: String,
+    /// Where the server should run (`cpu` | `cuda`), a hint for the server setup doc only —
+    /// dmn never reads it. The 35B Ollama model takes 22 of the 4090's 24 GB, so GPU TTS is
+    /// opt-in: check `nvidia-smi` first.
+    pub device: String,
+}
+
+impl Default for Speak {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tts_url: "http://localhost:4123".into(),
+            voice_ref: String::new(),
+            device: "cpu".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ui {
@@ -438,6 +467,12 @@ num_ctx = 0                          # Ollama context window to ask for; 0 = the
 [assist]
 enabled = true                       # false = transcribe / translate only: no detector, no LLM (Ctrl+Shift+A toggles)
 
+[speak]
+enabled = false                      # speak text in your cloned voice via a local TTS server (`dmn speak`, #107)
+tts_url = "http://localhost:4123"    # Chatterbox-TTS-Server; see README § Speak for setup
+voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
+device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
+
 [ui]
 always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above on GNOME Wayland
@@ -517,6 +552,36 @@ impl Config {
         Ok(toml::to_string_pretty(self)?)
     }
 
+    /// Set `[speak].voice_ref` in the config file at `path`, keeping every other key and every
+    /// comment (#107: `dmn speak enroll` records the enrolled clip here). A missing file is
+    /// created from the template first. The write goes through a sibling temp file and a rename
+    /// so an interrupted enroll never leaves a truncated config, and the result is re-parsed
+    /// before returning.
+    pub fn write_voice_ref(path: &Path, voice_ref: &str) -> Result<(), ConfigError> {
+        let shown = path.display().to_string();
+        if !path.exists() {
+            Self::write_template(path, false)?;
+        }
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: shown.clone(),
+            source,
+        })?;
+        let edited = set_voice_ref(&text, voice_ref);
+        let tmp = path.with_extension("toml.tmp");
+        let tmp_shown = tmp.display().to_string();
+        std::fs::write(&tmp, &edited).map_err(|source| ConfigError::Write {
+            path: tmp_shown.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
+            path: shown.clone(),
+            source,
+        })?;
+        let parsed = Self::load(path)?;
+        debug_assert_eq!(parsed.speak.voice_ref, voice_ref);
+        Ok(())
+    }
+
     /// Read the API key from the env var named in `[llm].api_key_env`. `None` when unset or empty.
     pub fn api_key(&self) -> Option<ApiKey> {
         self.llm.api_key()
@@ -593,6 +658,93 @@ fn is_loopback_url(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// `text` with `[speak].voice_ref` set to `value`: replace the key where it stands (keeping an
+/// inline comment), insert it under an existing `[speak]` header, or append a new section.
+/// The value is quoted through `toml::Value` so any path characters are escaped correctly.
+fn set_voice_ref(text: &str, value: &str) -> String {
+    let quoted = toml::Value::String(value.to_owned()).to_string();
+    let mut out: Vec<String> = Vec::new();
+    let mut in_speak = false;
+    let mut section_seen = false;
+    let mut written = false;
+    // Blank lines trailing a section are held back so the key lands before them, not after.
+    let mut blanks: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            if in_speak && !written {
+                out.push(format!("voice_ref = {quoted}"));
+                written = true;
+            }
+            out.append(&mut blanks);
+            in_speak = trimmed.trim_end() == "[speak]";
+            section_seen |= in_speak;
+            out.push(line.to_owned());
+            continue;
+        }
+        if trimmed.is_empty() {
+            blanks.push(line.to_owned());
+            continue;
+        }
+        out.append(&mut blanks);
+        let is_voice_ref = trimmed
+            .strip_prefix("voice_ref")
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if in_speak && is_voice_ref {
+            let (_, comment) = split_comment(line);
+            let mut new_line = format!("voice_ref = {quoted}");
+            if !comment.is_empty() {
+                while new_line.len() < 39 {
+                    new_line.push(' ');
+                }
+                new_line.push_str(comment);
+            }
+            out.push(new_line);
+            written = true;
+            continue;
+        }
+        out.push(line.to_owned());
+    }
+    if in_speak && !written {
+        out.push(format!("voice_ref = {quoted}"));
+    }
+    out.append(&mut blanks);
+    if !section_seen {
+        out.push(String::new());
+        out.push("[speak]".to_owned());
+        out.push(format!("voice_ref = {quoted}"));
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Split a TOML line into (code, comment) at the first `#` outside a quoted string; the
+/// returned comment includes its `#`. Handles `\"` escapes inside basic strings.
+fn split_comment(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b'#' {
+            return (&line[..i], &line[i..]);
+        }
+    }
+    (line, "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +782,12 @@ num_ctx = 0                          # Ollama context window to ask for; 0 = the
 
 [assist]
 enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
+
+[speak]
+enabled = false                      # `dmn speak` (#107): clone-voice TTS through a local server
+tts_url = "http://localhost:4123"    # Chatterbox-TTS-Server (OpenAI-compatible API)
+voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
+device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
 
 [ui]
 always_on_top = true
@@ -731,7 +889,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 30, "spec example has 30 keys: {keys:?}");
+        assert_eq!(keys.len(), 34, "spec example has 34 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -777,6 +935,88 @@ keep_transcripts = true
                 .unwrap()
                 .contains("mouse = true")
         );
+    }
+
+    #[test]
+    fn speak_defaults_off_and_round_trips() {
+        let s = &Config::default().speak;
+        assert!(!s.enabled);
+        assert_eq!(s.tts_url, "http://localhost:4123");
+        assert!(s.voice_ref.is_empty());
+        assert_eq!(s.device, "cpu");
+
+        let c = Config::from_toml(
+            "[speak]\nenabled = true\nvoice_ref = \"/home/u/.local/share/dmn/voice.wav\"\n",
+            "speak",
+        )
+        .unwrap();
+        assert!(c.speak.enabled);
+        assert_eq!(c.speak.voice_ref, "/home/u/.local/share/dmn/voice.wav");
+        assert_eq!(c.speak.tts_url, "http://localhost:4123", "default fills in");
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("[speak]"), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+    }
+
+    #[test]
+    fn speak_unknown_keys_are_errors_and_target_is_not_here_yet() {
+        let err = Config::from_toml("[speak]\ntts_ur = \"x\"\n", "typo").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        // The translation language lands with #109; until then it must be refused, not ignored.
+        let err = Config::from_toml("[speak]\ntarget = \"es\"\n", "early").unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+    }
+
+    #[test]
+    fn write_voice_ref_updates_the_key_and_keeps_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::write_template(&path, false).unwrap();
+        Config::write_voice_ref(&path, "/data/voice.wav").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(
+                "voice_ref = \"/data/voice.wav\"          # enrolled reference clip"
+            ),
+            "value replaced, comment kept:\n{text}"
+        );
+        assert!(text.contains("# Daemon (dmn) configuration"));
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.speak.voice_ref, "/data/voice.wav");
+        assert_eq!(cfg.llm, Config::default().llm, "other keys untouched");
+
+        // A second enroll replaces the value in place.
+        Config::write_voice_ref(&path, "/data/other.wav").unwrap();
+        assert_eq!(Config::load(&path).unwrap().speak.voice_ref, "/data/other.wav");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().matches("voice_ref").count(), 1);
+    }
+
+    #[test]
+    fn write_voice_ref_creates_a_missing_config_from_the_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg/config.toml");
+        Config::write_voice_ref(&path, "/data/voice.wav").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.speak.voice_ref, "/data/voice.wav");
+        assert_eq!(cfg.audio, Config::default().audio);
+    }
+
+    #[test]
+    fn set_voice_ref_appends_a_section_when_there_is_none_and_escapes_values() {
+        let edited = set_voice_ref("[llm]\nmodel = \"m\"\n", "/tmp/we\"ird.wav");
+        let cfg = Config::from_toml(&edited, "edited").unwrap();
+        assert_eq!(cfg.speak.voice_ref, "/tmp/we\"ird.wav");
+        assert_eq!(cfg.llm.model, "m");
+
+        // A [speak] section without the key gains it at the end of the section body.
+        let edited = set_voice_ref("[speak]\nenabled = true\n\n[ui]\n", "/v.wav");
+        assert!(
+            edited.contains("enabled = true\nvoice_ref = \"/v.wav\"\n\n[ui]"),
+            "{edited}"
+        );
+        let cfg = Config::from_toml(&edited, "edited").unwrap();
+        assert!(cfg.speak.enabled);
+        assert_eq!(cfg.speak.voice_ref, "/v.wav");
     }
 
     #[test]
