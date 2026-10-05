@@ -3,7 +3,7 @@
 //! Subcommands arrive with their issues. Now: `doctor` (#2, #6), `doctor --probe` (#5),
 //! `doctor --fetch` and `bench` (#8), `config show` (#2), `devices` (#4), `replay` (#9),
 //! `sessions list|export|purge` (#13), `run --replay` (#15), live `run` (#16),
-//! `sources add|list|rm` (#53).
+//! `sources add|list|rm` (#53), `speak` (#107).
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -19,6 +19,7 @@ mod probe;
 mod replay;
 mod run;
 mod sources;
+mod speak;
 mod suggest;
 mod tui;
 
@@ -59,6 +60,8 @@ enum CliError {
     Sessions(#[from] dmn_core::recorder::RecorderError),
     #[error(transparent)]
     Sources(#[from] sources::SourcesError),
+    #[error(transparent)]
+    Speak(#[from] speak::SpeakError),
     /// A command-line value clap could not check on its own.
     #[error("{0}")]
     Usage(String),
@@ -259,6 +262,17 @@ enum Command {
         #[command(subcommand)]
         action: SessionsAction,
     },
+    /// Synthesize text in your enrolled voice clone through the local TTS server (#107)
+    Speak {
+        #[command(subcommand)]
+        action: Option<SpeakAction>,
+        /// The text to synthesize (omit for `enroll`)
+        text: Option<String>,
+        /// Write the synthesized speech to this WAV file. Nothing plays audio yet:
+        /// playback lands in #108
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
     /// Add, list or remove context sources: resume, job description, notes, stories
     Sources {
         #[command(subcommand)]
@@ -317,6 +331,20 @@ enum Command {
         /// default a replay writes the same session log a live call would
         #[arg(long)]
         no_store: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SpeakAction {
+    /// Enroll a reference clip: validate it, store it under the data dir, register it with the
+    /// TTS server and record it as [speak].voice_ref
+    Enroll {
+        /// The reference clip: a WAV of your voice, at least 6 s, mono 16 kHz+ preferred
+        #[arg(long)]
+        wav: std::path::PathBuf,
+        /// Voice name on the server and for the stored clip; default "voice"
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -504,6 +532,24 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Some(Command::Sessions { action }) => sessions(&paths, action),
         Some(Command::Sources { action }) => Ok(sources::run(&paths, action)?),
+        Some(Command::Speak { action, text, out }) => {
+            let cfg = Config::load(&paths.config_file)?;
+            match action {
+                Some(SpeakAction::Enroll { wav, name }) => {
+                    let provider = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url);
+                    let args = speak::EnrollArgs { wav, name };
+                    print!("{}", speak::enroll(&cfg, &paths, &args, &provider)?);
+                }
+                None => {
+                    let text = text.ok_or(CliError::Usage(
+                        "speak needs the text to synthesize: dmn speak \"text\" --out <file.wav> (or `dmn speak enroll --wav <clip>`)".into(),
+                    ))?;
+                    let provider = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url);
+                    print!("{}", speak::speak(&cfg, &paths, &text, out.as_deref(), &provider)?);
+                }
+            }
+            Ok(())
+        }
         Some(Command::Config {
             action: ConfigAction::Show,
         }) => {

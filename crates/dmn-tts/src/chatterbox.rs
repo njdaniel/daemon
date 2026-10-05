@@ -44,7 +44,7 @@ fn blocking_client(url: &str) -> Result<reqwest::blocking::Client, TtsError> {
 }
 
 /// A non-2xx answer's body, capped, for the error message.
-fn error_body(mut resp: reqwest::blocking::Response) -> String {
+fn error_body(resp: reqwest::blocking::Response) -> String {
     let mut bytes = Vec::new();
     let _ = resp.take(ERROR_BODY_CAP as u64).read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).chars().take(300).collect()
