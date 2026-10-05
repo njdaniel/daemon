@@ -1,0 +1,30 @@
+┌ LIVE QUESTION ─────────────────────────────────────────────────────────────────────────── coding ┐
+│ Implement an LRU cache with O(1) get and put.                                                    │
+│ Focus: hash map, doubly linked list, eviction order                                              │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1  Keep a hash map from key to node, and the nodes in a doubly linked list.                      │
+│ 2  Move a node to the front on every get and put.                                                │
+│ 3  On overflow, drop the node at the back and its key.                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+  1 ▾ Deeper Answer
+          def __init__(self, capacity):
+              self.capacity = capacity
+              self.items = {}
+              self.head, self.tail = Node(None, None), Node(None, None)
+              self.head.next, self.tail.prev = self.tail, self.head
+
+          def _unlink(self, node):
+              node.prev.next, node.next.prev = node.next, node.prev
+
+          def _push_front(self, node):
+              node.prev, node.next = self.head, self.head.next
+              self.head.next.prev = node
+              self.head.next = node
+      ↑ 9 · ↓ 19 more
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+You         Sounds great.
+You         I'd pair a dictionary with a doubly linked list.
+ ● mic  ● system  ● model                                               ↑↓ scroll · s: full · ⏎ ask

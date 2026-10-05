@@ -674,9 +674,14 @@ pub struct Controls {
 }
 
 impl Controls {
-    /// `p`: pin the live question, or unpin it (which shows the newest queued question).
+    /// `p`: pin the live question, or unpin it (which shows the newest queued question). Nothing
+    /// while an earlier question is on screen (#94): the key acts on the live one, which the
+    /// user is not looking at.
     pub fn toggle_pin(&self) {
         let snap = self.hub.snapshot();
+        if snap.earlier().is_some() {
+            return;
+        }
         if snap.pinned {
             self.hub.dispatch(Action::Unpin);
         } else if snap.live.is_some() {
@@ -684,8 +689,12 @@ impl Controls {
         }
     }
 
-    /// `r`: regenerate the live question (temperature 0.7, "a different angle").
+    /// `r`: regenerate the live question (temperature 0.7, "a different angle"). An earlier
+    /// question (#94) is read-only, so while one is on screen the key asks nothing.
     pub fn regenerate(&self) {
+        if self.hub.snapshot().earlier().is_some() {
+            return;
+        }
         let _ = self.commands.send(Command::Regenerate);
     }
 
@@ -723,8 +732,13 @@ impl Controls {
     /// wrapping round to the first. The session moves on at once (the header names the new
     /// story, the old cards dim); the pipeline then asks the model for cards from that story.
     /// With one story or none, the session notes there is no other and nothing is asked.
+    /// Nothing while an earlier question is on screen (#94): it is read-only.
     pub fn swap_story(&self) {
-        let Some(live) = self.hub.snapshot().live else {
+        let snap = self.hub.snapshot();
+        if snap.earlier().is_some() {
+            return;
+        }
+        let Some(live) = snap.live else {
             return;
         };
         let candidate = live.candidate;
@@ -743,11 +757,32 @@ impl Controls {
         let _ = self.commands.send(Command::Assist { on });
     }
 
-    /// `1`–`6`: open `section` under the live question's Approach (closing the open one), or
-    /// close it (#56). The reducer ignores a row that is not on screen; one action per press,
-    /// so the session log replays to the same screen.
+    /// `1`–`6`: open `section` under the Approach of the question on screen (closing the open
+    /// one), or close it (#56). The reducer ignores a row that is not on screen; one action per
+    /// press, so the session log replays to the same screen.
     pub fn toggle_section(&self, section: Section) {
         self.hub.dispatch(Action::ToggleSection { section });
+    }
+
+    /// `←` (#94): show the question before the one on screen. It holds the screen as a pin
+    /// does: the pipeline goes on answering behind it, and the status line counts what arrives.
+    pub fn earlier(&self) {
+        self.hub.dispatch(Action::Earlier);
+    }
+
+    /// `→` (#94): show the question after the earlier one on screen, which from the newest of
+    /// them is the live question again.
+    pub fn later(&self) {
+        self.hub.dispatch(Action::Later);
+    }
+
+    /// `↑ ↓ PgUp PgDn` (#94): scroll the open section to the offset `to` works out from the
+    /// session; the caller knows the pane, which decides how many rows the section has. `None`
+    /// means the key moves nothing, and then nothing is dispatched.
+    pub fn scroll(&self, to: impl FnOnce(&Session) -> Option<u16>) {
+        if let Some(offset) = to(&self.hub.snapshot()) {
+            self.hub.dispatch(Action::Scroll { offset });
+        }
     }
 
     #[cfg(test)]

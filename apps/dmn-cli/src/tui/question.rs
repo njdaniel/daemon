@@ -1,4 +1,5 @@
-//! Area 1: the question, its focus line and the latest clarification.
+//! Area 1: the question, its focus line and the latest clarification: the live question's, or
+//! those of the earlier question `←` stepped back to (#94).
 
 use dmn_session::QuestionSource;
 use ratatui::buffer::Buffer;
@@ -13,6 +14,8 @@ use super::{Mode, View};
 /// The label colours the SPEC gives the states: teal for live, amber for pinned.
 const LIVE: Color = Color::Cyan;
 const PINNED: Color = Color::Yellow;
+/// An earlier question (#94) is labelled like `LISTENING`: neither is the live question.
+const EARLIER: Color = Color::Gray;
 
 /// Content lines inside the block (SPEC: the question block holds 2–4 lines).
 const LINES: usize = 4;
@@ -21,9 +24,14 @@ const QUESTION_LINES: usize = 3;
 
 pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     let (label, colour) = match view.mode {
-        Mode::Listening => ("LISTENING", Color::Gray),
-        Mode::Live => ("LIVE QUESTION", LIVE),
-        Mode::Pinned => ("PINNED QUESTION", PINNED),
+        Mode::Listening => ("LISTENING".to_owned(), Color::Gray),
+        Mode::Live => ("LIVE QUESTION".to_owned(), LIVE),
+        Mode::Pinned => ("PINNED QUESTION".to_owned(), PINNED),
+        // #94: where the user is among the questions shown so far.
+        Mode::Earlier => {
+            let (at, of) = view.session.place().unwrap_or_default();
+            (format!("QUESTION {at} of {of}"), EARLIER)
+        }
     };
     let mut block = Block::bordered()
         .padding(Padding::horizontal(1))
@@ -39,10 +47,11 @@ pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines(view, usize::from(inner.width))).render(inner, buf);
 }
 
-/// The kind of question, and the "N new" badge while pinned questions queue.
+/// The kind of question, and the "N new" badge while pinned questions queue. Behind an earlier
+/// question (#94) the status line counts what arrived instead.
 fn right_title(view: &View<'_>) -> Option<Line<'static>> {
     let mut spans = Vec::new();
-    if let Some(q) = view.live() {
+    if let Some(q) = view.shown() {
         if !q.kind.is_empty() {
             spans.push(Span::styled(
                 format!(" {} ", q.kind.replace('_', " ")),
@@ -75,7 +84,7 @@ fn waiting(source: QuestionSource) -> &'static str {
 
 fn lines(view: &View<'_>, width_cells: usize) -> Vec<Line<'static>> {
     let muted = Style::new().fg(Color::DarkGray);
-    let Some(q) = view.live() else {
+    let Some(q) = view.shown() else {
         // LISTENING: the last sentence from a lane that can ask, in muted text, so the user sees
         // the app hears. The placeholder names that lane (#90).
         let heard = view.session.last_heard.as_deref();

@@ -19,11 +19,11 @@ const FRAME_CELLS: u16 = 4;
 /// The top and bottom border.
 const FRAME_ROWS: u16 = 2;
 
-/// The STAR cards when the live question has them in place of an Approach: SPEC § AI Assistance,
+/// The STAR cards when the question on screen has them in place of an Approach: SPEC § AI Assistance,
 /// "Behavioral questions replace the Approach block with the STAR block" (the fast phase also
 /// returns an Approach for them, which the cards stand in for).
 fn star<'a>(view: &View<'a>) -> Option<&'a StarCards> {
-    view.live().and_then(|q| {
+    view.shown().and_then(|q| {
         q.star
             .as_ref()
             .filter(|_| q.kind == BEHAVIORAL || q.approach.is_empty())
@@ -54,7 +54,7 @@ pub(super) fn rows_needed(view: &View<'_>, area_width: u16) -> u16 {
 
 /// The numbered Approach, the STAR cards, or a note while there is nothing to show yet.
 fn content(view: &View<'_>, cells: usize) -> Vec<Line<'static>> {
-    let mut lines = match (view.live(), star(view)) {
+    let mut lines = match (view.shown(), star(view)) {
         (Some(_), Some(cards)) => star_lines(cards, cells),
         (Some(q), None) => approach_lines(q, cells),
         (None, _) => Vec::new(),
@@ -69,7 +69,7 @@ fn content(view: &View<'_>, cells: usize) -> Vec<Line<'static>> {
                 QuestionSource::You => "The Approach appears here when you ask a question.",
                 QuestionSource::Both => "The Approach appears here when a question is asked.",
             },
-            Mode::Live | Mode::Pinned => "…",
+            Mode::Live | Mode::Pinned | Mode::Earlier => "…",
         };
         lines.push(Line::from(Span::styled(
             truncate(note, cells),
@@ -85,14 +85,14 @@ pub(super) fn render(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         Some("thinking…")
     } else if view.streaming {
         Some("…")
-    } else if cards.is_some() && view.live().is_some_and(|q| q.no_other_story) {
+    } else if cards.is_some() && view.shown().is_some_and(|q| q.no_other_story) {
         // Swap pressed with no other matched story (#58).
         Some("no other story")
     } else {
         None
     };
     // SPEC § AI Assistance: the STAR block names the matched story in its header (#58).
-    let title = match cards.and_then(|c| story_title(view.live(), c)) {
+    let title = match cards.and_then(|c| story_title(view.shown(), c)) {
         Some(story) => {
             let room = usize::from(area.width)
                 .saturating_sub(usize::from(FRAME_CELLS) + hint.map_or(0, |h| width(h) + 2));

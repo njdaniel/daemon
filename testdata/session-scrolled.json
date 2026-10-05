@@ -1,0 +1,109 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    },
+    {
+      "speaker": "you",
+      "start": 31.0,
+      "end": 36.0,
+      "text": "I'd pair a dictionary with a doubly linked list."
+    }
+  ],
+  "partials": [],
+  "last_interviewer": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "live": {
+    "candidate": 1,
+    "text": "Implement an LRU cache with O(1) get and put.",
+    "kind": "coding",
+    "focus": "hash map, doubly linked list, eviction order",
+    "approach": [
+      "Keep a hash map from key to node, and the nodes in a doubly linked list.",
+      "Move a node to the front on every get and put.",
+      "On overflow, drop the node at the back and its key."
+    ],
+    "star": null,
+    "clarifications": [],
+    "progress": {
+      "state": "done"
+    },
+    "sections": {
+      "deeper": [
+        {
+          "label": "Insight",
+          "text": "The list holds the order and the map finds a node in O(1); two sentinel nodes mean no insert or unlink ever checks for an empty list."
+        }
+      ],
+      "solution": {
+        "language": "python",
+        "code": "class Node:\n    def __init__(self, key, value):\n        self.key, self.value = key, value\n        self.prev = self.next = None\n\nclass LRUCache:\n    def __init__(self, capacity):\n        self.capacity = capacity\n        self.items = {}\n        self.head, self.tail = Node(None, None), Node(None, None)\n        self.head.next, self.tail.prev = self.tail, self.head\n\n    def _unlink(self, node):\n        node.prev.next, node.next.prev = node.next, node.prev\n\n    def _push_front(self, node):\n        node.prev, node.next = self.head, self.head.next\n        self.head.next.prev = node\n        self.head.next = node\n\n    def get(self, key):\n        node = self.items.get(key)\n        if node is None:\n            return -1\n        self._unlink(node)\n        self._push_front(node)\n        return node.value\n\n    def put(self, key, value):\n        if key in self.items:\n            self._unlink(self.items[key])\n        node = Node(key, value)\n        self.items[key] = node\n        self._push_front(node)\n        if len(self.items) > self.capacity:\n            oldest = self.tail.prev\n            self._unlink(oldest)\n            del self.items[oldest.key]\n"
+      },
+      "followups": [],
+      "tradeoffs": [],
+      "example": null,
+      "mention": [],
+      "resume_context": [],
+      "states": {
+        "deeper": {
+          "state": "done"
+        },
+        "followups": {
+          "state": "empty"
+        },
+        "tradeoffs": {
+          "state": "empty"
+        },
+        "example": {
+          "state": "empty"
+        },
+        "mention": {
+          "state": "empty"
+        },
+        "resume_context": {
+          "state": "empty"
+        }
+      },
+      "started": true
+    },
+    "open": "deeper"
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 1,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "full",
+  "scroll": 9
+}

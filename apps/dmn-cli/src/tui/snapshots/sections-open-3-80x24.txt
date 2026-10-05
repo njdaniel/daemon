@@ -17,8 +17,8 @@
   3 ▾ Tradeoffs                         6 ▸ Resume Context
       Central Redis: + exact counts − a network hop per request and a single
       point of failure
-      …
+      ↓ 2 more
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
 You         Sounds great.
 You         Okay, so first I'd want to know what we're limiting on.
- ● mic  ● system  ● model                               3 close · p pin · ⏎ ask
+ ● mic  ● system  ● model                             ↑↓ scroll · p pin · ⏎ ask
