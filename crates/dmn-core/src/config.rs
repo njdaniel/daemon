@@ -328,7 +328,9 @@ pub struct Lookup {
     /// search needs one; SearXNG has none, and this is ignored for it.
     pub api_key_env: String,
     /// The whole search: past it the first answer stays and the status line says `lookup
-    /// failed`.
+    /// failed`. For `searxng` left at the default 3000, [`Lookup::timeout`] gives 6000: a stock
+    /// SearXNG waits up to its own 3 s `request_timeout` on slow engines, so 3000 would lose
+    /// exactly those searches.
     pub timeout_ms: u64,
     /// Results asked for, 1–10; each goes into the prompt as a title, a 300-character snippet
     /// and its domain.
@@ -342,7 +344,7 @@ impl Default for Lookup {
             provider: LookupProvider::Ollama,
             base_url: OLLAMA_SEARCH_URL.into(),
             api_key_env: "OLLAMA_API_KEY".into(),
-            timeout_ms: 3000,
+            timeout_ms: LOOKUP_TIMEOUT_MS,
             max_results: 3,
         }
     }
@@ -374,6 +376,11 @@ impl LookupProvider {
     }
 }
 
+/// `[lookup].timeout_ms`'s default.
+const LOOKUP_TIMEOUT_MS: u64 = 3000;
+/// What `timeout_ms` left at its default means for SearXNG (see [`Lookup::timeout_ms`]).
+pub const SEARXNG_TIMEOUT_MS: u64 = 6000;
+
 /// `[lookup].base_url`'s default: Ollama's web search.
 const OLLAMA_SEARCH_URL: &str = "https://ollama.com";
 /// Where a SearXNG is unless `base_url` says otherwise: its Docker image's port, on this machine.
@@ -396,6 +403,16 @@ impl Lookup {
     /// The search key from the variable `api_key_env` names. `None` when unset or empty.
     pub fn api_key(&self) -> Option<ApiKey> {
         self.api_key_from(|name| std::env::var(name).ok())
+    }
+
+    /// The search's deadline: `timeout_ms`, except that for `searxng` the default 3000 means
+    /// [`SEARXNG_TIMEOUT_MS`]. Any other value is used as written.
+    pub fn timeout(&self) -> std::time::Duration {
+        let ms = match self.provider {
+            LookupProvider::Searxng if self.timeout_ms == LOOKUP_TIMEOUT_MS => SEARXNG_TIMEOUT_MS,
+            _ => self.timeout_ms,
+        };
+        std::time::Duration::from_millis(ms)
     }
 
     /// Same as [`Lookup::api_key`] with the environment lookup injected (tests use a closure).
@@ -556,7 +573,7 @@ enabled = false                      # true = a question whose answer depends on
 provider = "ollama"                  # ollama (hosted, needs an ollama.com key) | searxng (your own instance, no key)
 base_url = "https://ollama.com"      # with provider = "searxng", left as is: http://localhost:8888
 api_key_env = "OLLAMA_API_KEY"       # NAME of an env var holding the key; never the key itself; unused by searxng
-timeout_ms = 3000                    # past this the first answer stays; nothing is retried
+timeout_ms = 3000                    # past this the first answer stays; nothing is retried; with searxng, 3000 means 6000
 max_results = 3                      # 1-10 results, each a title, a 300-character snippet and its domain
 
 [assist]
@@ -754,8 +771,8 @@ num_ctx = 0                          # Ollama context window to ask for; 0 = the
 
 [lookup]
 enabled = false                      # true = search the web when an answer depends on what is current
-provider = "ollama"                  # Ollama's hosted web search
-base_url = "https://ollama.com"
+provider = "ollama"                  # ollama (hosted, key) | searxng (your own instance, no key)
+base_url = "https://ollama.com"      # searxng: left as is, http://localhost:8888
 api_key_env = "OLLAMA_API_KEY"       # name of an env var; never the key itself
 timeout_ms = 3000
 max_results = 3
@@ -999,6 +1016,21 @@ keep_transcripts = true
         assert_eq!(Lookup::default().provider, LookupProvider::Ollama);
         assert!(LookupProvider::Ollama.needs_key());
         assert_eq!(Lookup::default().endpoint(), "https://ollama.com");
+        // A stock SearXNG waits up to 3 s on slow engines itself: its default deadline is longer.
+        assert_eq!(only.timeout(), std::time::Duration::from_millis(6000));
+        let set = Lookup {
+            timeout_ms: 4500,
+            ..only.clone()
+        };
+        assert_eq!(
+            set.timeout(),
+            std::time::Duration::from_millis(4500),
+            "a value set wins"
+        );
+        assert_eq!(
+            Lookup::default().timeout(),
+            std::time::Duration::from_millis(3000)
+        );
     }
 
     #[test]

@@ -219,8 +219,24 @@ first Approach still arrives from the local model alone, and a few seconds later
 in place by one built on the results, tagged `checked · go.dev`. If the search times out, fails,
 finds nothing or has no key, the first answer stays and the status line says `lookup failed`.
 
-It uses [Ollama's web search](https://docs.ollama.com/capabilities/web-search), which needs a
-key from your ollama.com account. Export it, then turn the lookup on:
+It can search through your own [SearXNG](https://docs.searxng.org/) instance (no account, no
+key; the query goes to your instance, which forwards it to the engines it is set up with) or
+through [Ollama's web search](https://docs.ollama.com/capabilities/web-search) (a key from your
+ollama.com account).
+
+With SearXNG on this machine (its Docker image listens on port 8888), allow its JSON output by
+adding `json` to `search.formats` in its `settings.yml` (a stock instance answers 403 until you
+do), then:
+
+```toml
+[lookup]
+enabled = true
+provider = "searxng"
+# base_url = "http://localhost:8888"   # the default for searxng
+# timeout_ms = 6000                    # what the default 3000 means for searxng
+```
+
+With Ollama's search instead, export the key, then turn the lookup on:
 
 ```bash
 export OLLAMA_API_KEY=...        # the key stays in the environment; dmn never writes or logs it
@@ -233,7 +249,8 @@ enabled = true
 # timeout_ms = 3000; max_results = 3
 ```
 
-`dmn doctor` says whether it is off, ready, or on with the variable unset, and the status line
+`dmn doctor` says whether it is off, ready, or on with the variable unset (for SearXNG: whether
+the instance answers, and whether its JSON format is off), and the status line
 says `web` beside the model dot while it is on. What it sends, and to whom, is under Privacy.
 
 ### Initialize and inspect your system
@@ -372,10 +389,13 @@ What leaves the machine, and when:
   remote model (`[llm].provider` other than `ollama`, or an Ollama on another host).
 - **A web search query:** only with the web lookup on (`[lookup].enabled = true`; off by
   default). For a question whose answer depends on what is current, the few words the model
-  writes as a search query (at most 80 characters, such as `latest stable Go release`) and the
-  number of results wanted go to Ollama's web search at `https://ollama.com/api/web_search`,
-  with your key from `OLLAMA_API_KEY`. No transcript, no resume or notes, nothing from the
-  session goes with it.
+  writes as a search query (at most 80 characters, such as `latest stable Go release`) goes to
+  the search you chose. With `provider = "searxng"`: to your own SearXNG instance
+  (`http://localhost:8888` by default), with no account or key; your instance then forwards it
+  to the search engines it is configured with. With `provider = "ollama"`: with the number of
+  results wanted, to Ollama's web search at `https://ollama.com/api/web_search`, with your key
+  from `OLLAMA_API_KEY`. No transcript, no resume or notes, nothing from the session goes with
+  it.
 
 ## Roadmap
 

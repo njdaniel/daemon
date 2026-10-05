@@ -5,6 +5,9 @@
 //!   `dmn` asks it, its `lookup` sent to Ollama's web search, and the fast phase asked again with
 //!   what came back. It needs a key in `OLLAMA_API_KEY` and does nothing without one:
 //!   `OLLAMA_API_KEY=… cargo test -p dmn-llm --test live_lookup -- --ignored --nocapture end_to_end`
+//! - `lookup_live_go_version_searxng` is the same against a SearXNG on this machine (no key;
+//!   `DMN_SEARXNG_URL`, default `http://localhost:8888`); it says so and stops when none answers:
+//!   `cargo test -p dmn-llm --test live_lookup -- --ignored --nocapture searxng`
 //! - `lookup_live_the_model_answers_from_the_results` needs no key: it hands the second request
 //!   a result set written for the test, with a version no model has seen, and checks the Approach
 //!   says that one.
@@ -15,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use dmn_llm::{
     CancellationToken, FastOutcome, FastRequest, FreshFact, FreshFacts, OllamaProvider,
-    OllamaSearch, OllamaSearchSettings, OllamaSettings, Provider, Suggestion, WebSearch,
-    run_fast_phase,
+    OllamaSearch, OllamaSearchSettings, OllamaSettings, Provider, SearxngSearch, SearxngSettings,
+    Suggestion, WebSearch, run_fast_phase,
 };
 
 const TODAY: &str = "2026-10-05";
@@ -81,12 +84,35 @@ async fn lookup_live_go_version_end_to_end() {
         eprintln!("OLLAMA_API_KEY is unset: nothing searched");
         return;
     };
-    let p = provider().await;
     let search = OllamaSearch::new(&OllamaSearchSettings {
         api_key: Some(key),
         ..OllamaSearchSettings::default()
     })
     .unwrap();
+    end_to_end(&search).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn lookup_live_go_version_searxng() {
+    let base_url = std::env::var("DMN_SEARXNG_URL")
+        .unwrap_or_else(|_| SearxngSearch::DEFAULT_BASE_URL.to_owned());
+    let search = SearxngSearch::new(&SearxngSettings {
+        base_url: base_url.clone(),
+        ..SearxngSettings::default()
+    })
+    .unwrap();
+    if let Err(e) = search.search("go", CancellationToken::new()).await {
+        eprintln!("no SearXNG answering at {base_url}: {e}; nothing searched");
+        return;
+    }
+    end_to_end(&search).await;
+}
+
+/// The Go question, its `lookup` sent to `search`, and the fast phase asked again with the
+/// results; prints both Approaches and the times.
+async fn end_to_end(search: &dyn WebSearch) {
+    let p = provider().await;
     let asked = Instant::now();
     let (first, at) = ask(&p, &request(None)).await;
     show("first answer", &first, at);

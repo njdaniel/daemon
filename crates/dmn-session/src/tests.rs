@@ -715,6 +715,84 @@ fn a_lookup_that_came_back_tags_the_reply_built_on_it_until_the_question_starts_
     assert_eq!(Session::replay(&log).live.unwrap().checked, "");
 }
 
+fn checked(candidate: u64) -> Action {
+    Action::Checked {
+        candidate,
+        domain: "go.dev".into(),
+    }
+}
+
+/// Review on PR #104: every path that puts a new Approach in place of a checked one leaves it
+/// untagged, because the new reply's `Question` rebuilds the question; only a reply that never
+/// started (or was declined) leaves the checked Approach, and its tag, on screen.
+#[test]
+fn checked_never_outlives_the_approach_it_was_earned_by() {
+    // Swap (#58): a behavioral question, checked, then built from the next story.
+    let mut log = vec![candidate(1, 20.0, "Tell me about a time you disagreed")];
+    log.extend(behavioral(1, "stories/a.md"));
+    log.push(Action::Stories {
+        candidate: 1,
+        ranked: vec!["stories/a.md".into(), "stories/b.md".into()],
+    });
+    log.push(checked(1));
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "go.dev");
+    log.push(Action::SwapStory { candidate: 1 });
+    assert_eq!(
+        Session::replay(&log).live.unwrap().checked,
+        "go.dev",
+        "until the new cards start, the checked ones are on screen"
+    );
+    log.extend(behavioral(1, "stories/b.md"));
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "");
+
+    // A continuation (#63) replaces its checked first half.
+    let mut log = split_question(false);
+    log.insert(log.len() - 6, checked(1));
+    let s = Session::replay(&log);
+    assert_eq!(s.live.as_ref().unwrap().candidate, 2);
+    assert_eq!(s.live.unwrap().checked, "");
+    let mut pinned = split_question(true);
+    pinned.insert(pinned.len() - 7, checked(1));
+    assert_eq!(Session::replay(&pinned).live.unwrap().checked, "");
+
+    // `r` on a checked answer whose reply starts and then fails: the half-built Approach is
+    // not the checked one, and carries no tag.
+    let go = "What is the latest stable major version of Go?";
+    let mut log = vec![candidate(1, 20.0, go)];
+    log.extend(shown(1, go, &["Say Go 1.25 is the latest."]));
+    log.push(checked(1));
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::Question {
+        candidate: 1,
+        text: go.into(),
+        kind: "knowledge".into(),
+    });
+    log.push(Action::Failed {
+        candidate: 1,
+        error: "timeout".into(),
+    });
+    assert_eq!(Session::replay(&log).live.unwrap().checked, "");
+
+    // The lookup's own second request failing midway: `Checked` is sent only after its
+    // `Answered`, so the partial reply is untagged too.
+    let mut log = vec![candidate(1, 20.0, go)];
+    let mut first = shown(1, go, &["Say 1.24 is the newest you know of."]);
+    first.insert(2, lookup(1, "latest stable Go release"));
+    log.extend(first);
+    log.push(Action::Regenerate { candidate: 1 });
+    log.push(Action::Question {
+        candidate: 1,
+        text: go.into(),
+        kind: "knowledge".into(),
+    });
+    log.push(Action::Failed {
+        candidate: 1,
+        error: "superseded by a newer question".into(),
+    });
+    let live = Session::replay(&log).live.unwrap();
+    assert_eq!((live.checked.as_str(), live.lookup.as_str()), ("", ""));
+}
+
 #[test]
 fn a_failed_lookup_says_so_until_its_notice_expires_and_changes_nothing_else() {
     let go = "What is the latest stable major version of Go?";

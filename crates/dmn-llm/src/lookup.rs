@@ -316,7 +316,8 @@ impl Default for SearxngSettings {
         Self {
             base_url: SearxngSearch::DEFAULT_BASE_URL.to_owned(),
             max_results: 3,
-            timeout: Duration::from_millis(3000),
+            // A stock SearXNG waits up to 3 s on slow engines itself.
+            timeout: Duration::from_millis(6000),
         }
     }
 }

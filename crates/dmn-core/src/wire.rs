@@ -366,7 +366,7 @@ pub fn web_search(lookup: &Lookup) -> Result<Option<Arc<dyn WebSearch>>, LookupE
         return Ok(None);
     }
     let max_results = usize::from(lookup.max_results);
-    let timeout = std::time::Duration::from_millis(lookup.timeout_ms);
+    let timeout = lookup.timeout();
     let search: Arc<dyn WebSearch> = match lookup.provider {
         config::LookupProvider::Ollama => Arc::new(OllamaSearch::new(&OllamaSearchSettings {
             base_url: lookup.endpoint(),
