@@ -108,6 +108,8 @@ dmn run --replay INTERVIEWER.wav CANDIDATE.wav [--headless]
 dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
 dmn sessions list | export ID | purge ID|all
+dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server
+dmn speak "TEXT" --out FILE.wav           # synthesize TEXT in your cloned voice (playback: #108)
 ```
 
 `dmn sources` (context documents) arrives with M2.
@@ -253,6 +255,67 @@ enabled = true
 the instance answers, and whether its JSON format is off), and the status line
 says `web` beside the model dot while it is on. What it sends, and to whom, is under Privacy.
 
+#### Speak in your cloned voice (`dmn speak`, off by default)
+
+`dmn speak` synthesizes text in a clone of your own voice, from a 10–30 s recording of you, through
+a text-to-speech server on this machine (#107). It writes the speech to a WAV file; playing it into
+the call through a virtual microphone is #108, and translating what you just said before speaking
+it is #109.
+
+The server is [chatterbox-tts-api](https://github.com/travisvn/chatterbox-tts-api), an
+OpenAI-compatible server around Resemble AI's [Chatterbox](https://github.com/resemble-ai/chatterbox)
+model (zero-shot voice cloning, 22 languages in its multilingual model). You run it yourself, like
+Ollama; Daemon only talks to it over HTTP. With Docker, on the CPU:
+
+```bash
+git clone https://github.com/travisvn/chatterbox-tts-api && cd chatterbox-tts-api
+cp .env.example.docker .env            # then set DEVICE=cpu in .env
+# The stock compose file publishes port 4123 on every interface; keep it on this machine:
+cat > docker/docker-compose.dmn.yml <<'EOF'
+services:
+  chatterbox-tts:
+    ports: !override
+      - '127.0.0.1:4123:4123'
+    environment:
+      - USE_MULTILINGUAL_MODEL=true
+EOF
+docker compose -f docker/docker-compose.cpu.yml -f docker/docker-compose.dmn.yml up -d --build
+curl -s http://localhost:4123/health    # "status": "healthy" once the model has downloaded and loaded
+```
+
+The first start downloads the model, which takes a while. On the dev box's CPU (Ryzen 7700X) one
+sentence (about 4 s of speech) takes 11–14 s to render, roughly 3× slower than real time.
+
+**GPU: check your VRAM first.** The default LLM (`qwen3.6:35b-a3b`) takes about 22 of an RTX
+4090's 24 GB, so the TTS server on the same GPU will not fit beside it. Run `nvidia-smi` before
+choosing `docker/docker-compose.gpu.yml` (or `DEVICE=cuda`), and expect to need a smaller LLM, a
+remote one, or assistance off. `[speak].device` records your choice for this setup; dmn does not
+read it.
+
+Then turn speak on, enroll a clip of your voice, and speak:
+
+```toml
+[speak]
+enabled = true
+# tts_url = "http://localhost:4123"   # the default; it must be on this machine
+```
+
+```bash
+# A WAV of you speaking for at least 6 s (10-30 s is better), mono 16 kHz or more preferred.
+# --language is the language the voice will speak (the server ties it to the voice); default en.
+dmn speak enroll --wav ~/my-voice.wav --language es
+dmn speak "Buenas tardes, gracias por la oportunidad." --out /tmp/dmn-speak.wav
+pw-play /tmp/dmn-speak.wav
+```
+
+`enroll` checks the clip (a WAV, at least 6 s, at most 10 MB; a stereo or sub-16 kHz clip works,
+with a note), registers it with the server under its name (`voice` unless `--name` says otherwise;
+enrolling a name again replaces that voice), keeps a copy at `~/.local/share/dmn/<name>.wav`, and
+sets `[speak].voice_ref` to that copy in your config, editing that one line and leaving the rest
+of the file as it was. `dmn speak` checks the voice is still in the server's library before asking
+for speech (the server would otherwise answer in its default voice) and says how to enroll it again
+if not. Without `--out` it says playback lands in #108.
+
 ### Initialize and inspect your system
 
 ```bash
@@ -339,6 +402,7 @@ crates/
   dmn-detect/       question detection
   dmn-context/      resume / job / notes retrieval
   dmn-llm/          Ollama and remote LLM providers
+  dmn-tts/          text-to-speech in your cloned voice via a local TTS server
   dmn-session/      live session state
   dmn-store/        persistence
   dmn-core/         pipeline orchestration
@@ -396,6 +460,15 @@ What leaves the machine, and when:
   results wanted, to Ollama's web search at `https://ollama.com/api/web_search`, with your key
   from `OLLAMA_API_KEY`. No transcript, no resume or notes, nothing from the session goes with
   it.
+- **Text to speak, and your voice clip:** only to the TTS server at `[speak].tts_url`, which
+  `dmn speak` requires to be on this machine (it refuses any other host). `dmn speak "text"` sends
+  the text; `dmn speak enroll` uploads your clip once, and the server keeps it in its voice
+  library (delete it there with `curl -X DELETE http://localhost:4123/v1/voices/<name>`).
+
+Audio on disk: the call is never recorded unless `[privacy].record_audio = true`. `dmn speak`
+writes audio only where its own command line names: `--out FILE.wav` writes the synthesized
+speech there, and `enroll --wav CLIP` keeps a copy of your clip at
+`~/.local/share/dmn/<name>.wav`.
 
 ## Roadmap
 
