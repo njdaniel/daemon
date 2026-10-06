@@ -2,7 +2,9 @@
 //!
 //! Input: text plus the name of a voice enrolled with the server ([`SpeakRequest`];
 //! [`TtsProvider::enroll`] registers a reference clip under a name).
-//! Output: a [`PcmStream`] of mono f32 [`PcmChunk`]s, each carrying the server's sample rate.
+//! Output: a [`PcmStream`] of mono f32 [`PcmChunk`]s, each carrying the server's sample rate;
+//! and the server's voice library ([`TtsProvider::voices`], #109), each [`Voice`] with the
+//! language it was enrolled with.
 //! Owns: one bounded crossbeam channel per synthesis (the [`PcmStream`]'s receiver), fed by a
 //! decoder thread that reads the HTTP body as it arrives: backpressure is the channel bound,
 //! and dropping the [`PcmStream`] stops the download. Playback (the virtual microphone) is
@@ -33,4 +35,4 @@ pub mod testserver;
 pub use chatterbox::ChatterboxProvider;
 pub use futures_util::future::BoxFuture;
 pub use mock::{MockEnrollment, MockTtsProvider};
-pub use provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider};
+pub use provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};

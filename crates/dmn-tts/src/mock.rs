@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use futures_util::future::BoxFuture;
 
 use crate::decode::decode_reader;
-use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider};
+use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
 
 /// One enrollment the mock received.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,12 +18,15 @@ pub struct MockEnrollment {
     pub bytes: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MockTtsProvider {
     /// The WAV synthesized on every request; a sine by default.
     wav: Vec<u8>,
     requests: Arc<Mutex<Vec<SpeakRequest>>>,
     enrollments: Arc<Mutex<Vec<MockEnrollment>>>,
+    /// The library [`TtsProvider::voices`] lists before any enrollment; `None` for a server
+    /// without one.
+    library: Option<Vec<Voice>>,
 }
 
 impl Default for MockTtsProvider {
@@ -45,7 +48,23 @@ impl MockTtsProvider {
             wav,
             requests: Arc::new(Mutex::new(Vec::new())),
             enrollments: Arc::new(Mutex::new(Vec::new())),
+            library: Some(Vec::new()),
         }
+    }
+
+    /// List `voices` as the server's library, each `(name, enrolled language)`; enrollments
+    /// are listed after them. `None` stands for a server with no library to list.
+    pub fn with_voices(mut self, voices: Option<&[(&str, Option<&str>)]>) -> Self {
+        self.library = voices.map(|v| {
+            v.iter()
+                .map(|(name, language)| Voice {
+                    name: (*name).to_owned(),
+                    aliases: Vec::new(),
+                    language: language.map(str::to_owned),
+                })
+                .collect()
+        });
+        self
     }
 
     /// Every synthesis request received so far, oldest first.
@@ -126,6 +145,23 @@ impl TtsProvider for MockTtsProvider {
             })
         })
     }
+
+    fn voices<'a>(&'a self) -> BoxFuture<'a, Result<Option<Vec<Voice>>, TtsError>> {
+        Box::pin(async move {
+            let Some(mut voices) = self.library.clone() else {
+                return Ok(None);
+            };
+            for e in self.enrollments() {
+                voices.retain(|v| v.name != e.name);
+                voices.push(Voice {
+                    name: e.name,
+                    aliases: Vec::new(),
+                    language: e.language,
+                });
+            }
+            Ok(Some(voices))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +177,23 @@ mod tests {
         let samples: usize = stream.map(|c| c.unwrap().samples.len()).sum();
         assert_eq!(samples, 12_000, "0.5 s at 24 kHz");
         assert_eq!(mock.requests(), vec![req]);
+    }
+
+    #[tokio::test]
+    async fn voices_lists_the_library_then_what_was_enrolled() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("v.wav");
+        std::fs::write(&clip, crate::decode::sine_wav(16_000, &[0.5], 300.0, 0.25)).unwrap();
+        let mock = MockTtsProvider::new().with_voices(Some(&[("old", Some("en"))]));
+        mock.enroll("me", &clip, Some("es")).await.unwrap();
+        let voices = mock.voices().await.unwrap().unwrap();
+        let listed: Vec<(&str, Option<&str>)> = voices
+            .iter()
+            .map(|v| (v.name.as_str(), v.language.as_deref()))
+            .collect();
+        assert_eq!(listed, [("old", Some("en")), ("me", Some("es"))]);
+        let none = MockTtsProvider::new().with_voices(None);
+        assert_eq!(none.voices().await.unwrap(), None);
     }
 
     #[tokio::test]

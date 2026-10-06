@@ -68,6 +68,24 @@ pub struct Enrolled {
     pub replaced: bool,
 }
 
+/// One voice in the server's library (#109), as [`TtsProvider::voices`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Voice {
+    pub name: String,
+    /// Other names the server answers to for this voice.
+    pub aliases: Vec<String>,
+    /// The language it was enrolled with, and so the only one it speaks; `None` when the
+    /// listing does not say.
+    pub language: Option<String>,
+}
+
+impl Voice {
+    /// Whether `name` is this voice's name or one of its aliases.
+    pub fn answers_to(&self, name: &str) -> bool {
+        self.name == name || self.aliases.iter().any(|a| a == name)
+    }
+}
+
 /// One decoded piece of the synthesized audio: mono f32 samples at `sample_rate`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PcmChunk {
@@ -132,4 +150,8 @@ pub trait TtsProvider: Send + Sync {
         wav: &'a Path,
         language: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Enrolled, TtsError>>;
+
+    /// The server's voice library (#109: `dmn run` checks at start that the enrolled voice
+    /// speaks `[speak].target`). `None` when the server has no library to list.
+    fn voices<'a>(&'a self) -> BoxFuture<'a, Result<Option<Vec<Voice>>, TtsError>>;
 }
