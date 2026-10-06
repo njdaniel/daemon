@@ -5,7 +5,7 @@ Labels: `size:M, model:opus, m4, lane:llm`
 Written 2026-10-05. Third and final issue of the translate-and-speak feature (planned 2026-10-05 with #107 and #108). #107 speaks text in your cloned voice; #108 routes it to a virtual microphone the interviewer hears. This issue is the feature the user asked for: press a key, and what you just said in your own language is spoken in the interview's language, in your voice.
 
 ## Goal
-With `[speak].enabled = true` and `target = "es"` (any whisper language code), pressing `s` in the TUI takes your last finalized `You` utterance, translates it to the target language with the configured LLM (default Ollama, `think: false`), synthesizes it in your enrolled voice and plays it into `dmn-voice`. The status line shows `translating…` / `speaking…` while it happens.
+With `[speak].enabled = true` and `target = "es"` (any whisper language code), pressing `t` in the TUI takes your last finalized `You` utterance, translates it to the target language with the configured LLM (default Ollama, `think: false`), synthesizes it in your enrolled voice and plays it into `dmn-voice`. The status line shows `translating…` / `speaking…` while it happens.
 
 ## Size / Model / Turns
 M | Opus | 45
@@ -22,16 +22,22 @@ M | Opus | 45
 - TEMPLATE + key-count test updated.
 
 ### Pipeline + TUI (`apps/dmn-cli`)
-- Key `s` → `Command::Speak` (same path as the existing pin/regenerate/ask keys): the pipeline pulls the last finalized `You` segment from its TranscriptLog, runs translate → synthesize → play (#108's vmic). No `You` final yet: status shows `nothing to speak`.
+- Key `t` → `Command::Speak` (same path as the existing pin/regenerate/ask keys): the pipeline pulls the last finalized `You` segment from its TranscriptLog, runs translate → synthesize → play (#108's vmic). No `You` final yet: status shows `nothing to speak`.
 - New actions `Action::SpeakStarted` / `SpeakDone` (with the translated text, shown under the question area as one dim line, capped by the limit) so the session reducer owns the state and snapshots can pin it.
 - Status line tag `speaking` / `translating…` beside the existing `es→en` and `asks:` tags.
 - While a speak is in flight, the pipeline's EchoGuard ignores anything on either lane for the playback window. In practice a virtual source does not appear on the loopback, so this is a belt-and-braces time-window guard, not new echo logic.
-- Assist on/off is independent: `s` works with assistance off (it is a speech feature, not an answer feature). The key does nothing when `[speak].enabled = false`.
+- Assist on/off is independent: `t` works with assistance off (it is a speech feature, not an answer feature). The key does nothing when `[speak].enabled = false`.
 
 ### Docs
-- README: the `s` key, `target`, a note that translation runs on the same Ollama model so it adds ~1 s.
+- README: the `t` key, `target`, a note that translation runs on the same Ollama model so it adds ~1 s.
 - docs/SPEC.md: a Speak subsection (key, flow, limits, privacy: text goes to localhost Ollama and the localhost TTS server only).
 - docs/issues/README.md paragraph (the three issues) if not already written.
+
+## Found while building #107 (added 2026-10-06, before this issue starts)
+- **The key is not `s`.** `s` already toggles coding-solution hints ↔ full (#50), and `p r m w a q`, `1`–`6`, Enter (#96), `←`/`→`, `↑`/`↓`, PgUp/PgDn (#94) are taken too. **Decided: `t`** (talk/translate); the rest of this issue says `t`, and the status line's key hints gain `t speak` while `[speak].enabled`.
+- **The voice's language is fixed at enrollment.** The server ignores `language` on a speech request; a voice speaks the language it was enrolled with, so `dmn speak enroll` has `--language` (#107). `[speak].target` must therefore match the enrolled voice's language: on start-up, with `[speak].enabled`, dmn reads `GET /v1/voices`, and if the enrolled voice's `language` differs from `target` it is a config error naming both (`target = "es" but the enrolled voice speaks "en"; re-enroll with --language es`). One enrolled voice per language; switching languages means re-enrolling.
+- **Latency budget.** Translation on the local LLM adds about 1 s; the CPU TTS adds 11–14 s to first audio (#108 measures it). So after `t` the interviewer hears the sentence 12–16 s later on today's box. The status line must make the wait legible (`translating…` then `speaking…` with elapsed seconds), and the PR reports the measured key-to-first-audio time. Not this issue's job to make it fast.
+- **Ollama and the TTS server both run on this machine; neither call leaves it.** The translation goes through the configured `[llm]` provider, so with a remote provider the utterance text leaves the machine exactly as the transcript window already does; SPEC § Privacy says so in one sentence.
 
 ## Out of scope
 - Automatic per-utterance speaking, queueing, barge-in, speaking the LLM's *suggested* answer instead of your own words (all later, if wanted).
@@ -42,11 +48,11 @@ M | Opus | 45
 #107, #108 (both merged)
 
 ## Acceptance
-- [ ] Replay an English candidate fixture with `[speak].enabled`, `target = "es"`, mock LLM + mock TTS: pressing `s` after a `You` final produces exactly one translate request whose body is that utterance, then one synthesize request whose text is the (mock) translation, then playback starts
-- [ ] With no `You` final yet, `s` shows `nothing to speak` and makes no LLM or TTS request
+- [ ] Replay an English candidate fixture with `[speak].enabled`, `target = "es"`, mock LLM + mock TTS: pressing `t` after a `You` final produces exactly one translate request whose body is that utterance, then one synthesize request whose text is the (mock) translation, then playback starts
+- [ ] With no `You` final yet, `t` shows `nothing to speak` and makes no LLM or TTS request
 - [ ] The translate request goes through the configured provider with `think: false`; the translation is capped by the new `limits.rs` limit
 - [ ] Status line shows `translating…` then `speaking…`, then clears; snapshots at 100 × 30 and 80 × 24
-- [ ] `s` is inert with `[speak].enabled = false`, and works with assistance off
+- [ ] `t` is inert with `[speak].enabled = false`, and works with assistance off
 - [ ] `[speak].enabled = true` with no `target` is a config error naming `target`
 - [ ] Echo guard drops segments during the playback window (unit test, no PipeWire)
 - [ ] README + SPEC updated
@@ -65,7 +71,7 @@ cargo run -p dmn-cli -- run        # [speak].enabled, target = "es", dmn-voice s
 
 ## Tests to add
 - translate.rs: prompt shape, verbatim-only instruction, limit enforcement, provider errors surface as status text
-- pipeline: `s` with a `You` final (mock LLM + mock TTS) → one translate, one synthesize, one play; `s` with none → nothing; disabled → nothing
+- pipeline: `t` with a `You` final (mock LLM + mock TTS) → one translate, one synthesize, one play; `t` with none → nothing; disabled → nothing
 - session reducer: SpeakStarted/SpeakDone transitions; status tags
 - TUI snapshots: both status tags, the dim translation line, 100 × 30 and 80 × 24
 - echo window: a segment inside the window is dropped, one outside is kept

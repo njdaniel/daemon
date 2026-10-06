@@ -27,6 +27,12 @@ L | Fable | 60, two runs planned
 - README Speak section: select `dmn-voice` as the microphone in the call; how to verify with `pw-dump` / the desktop's audio panel.
 - docs/SPEC.md § Audio: one row for the virtual source.
 
+## Found while building #107 (added 2026-10-06, before this issue starts)
+- **Speed is the problem to design around.** The real server (travisvn/chatterbox-tts-api, CPU, the only way it runs on the dev box today: Docker has no NVIDIA runtime and the LLM holds ~22 of 24 GB VRAM) produced 3.8 s of Spanish in 11.2 s, and on its streaming route the first audio arrived after 11.4 s. A sentence reaches the call 11–15 s after it is asked for. This issue should (a) play from the streaming route (`POST /v1/audio/speech/stream`, already in `dmn-tts` as `.streaming()`) so playback starts as soon as the first chunk decodes rather than after the whole WAV, (b) report in the PR the time from `speak` to first audible sample, and (c) note in README how to run the server on the GPU (its `docker-compose.gpu.yml`) for anyone with VRAM to spare. Making it near real time is not this issue's job; measuring it is.
+- **The server's WAV is 32-bit float, 24 kHz, mono, with `fact` and `PEAK` chunks**, and the streaming route writes a `0xFFFFFFFF` data length. #107's decoder handles all of that; feed the vmic from `PcmChunk`s, never re-parse the WAV here.
+- **An unknown voice name is spoken in the default voice with a 200.** #107 checks `GET /v1/voices` before every synthesis; keep that path, do not bypass it.
+- **The spec principle must be reworded first.** README line 7 and the SPEC's principles say Daemon does not "type or speak on the user's behalf". This issue is the first to put Daemon's audio into a call, so the PR rewords both to what is now true: Daemon never speaks unprompted and never speaks words the user did not say or ask for; with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user presses the key. Say so in the PR.
+
 ## Out of scope
 - Translation, the `s` key, TUI (#109).
 - Playing to speakers as well (monitoring) — later if wanted.
