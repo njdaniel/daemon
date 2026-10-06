@@ -90,7 +90,7 @@ fn live_dmn_speak_plays_spanish_into_dmn_voice_and_pw_record_hears_it() {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
-        format!("[speak]\nenabled = true\ntts_url = \"{TTS_URL}\"\n"),
+        format!("[speak]\nenabled = true\ntarget = \"es\"\ntts_url = \"{TTS_URL}\"\n"),
     )
     .unwrap();
     let clip = dir.path().join("clip.wav");
