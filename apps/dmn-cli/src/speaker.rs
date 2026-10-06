@@ -1,0 +1,757 @@
+//! `t` in `dmn run` (#109): the user's last turn, translated into `[speak].target` by the
+//! configured LLM, synthesized in their enrolled voice by the TTS server on this machine, and
+//! played into the `dmn-voice` virtual microphone (#108) the call has selected.
+//!
+//! [`Speaker`] owns one worker thread with its own current-thread tokio runtime, so a press never
+//! waits on the pipeline thread or the suggester: the translation is one more request on the
+//! `[llm]` provider (the same one the fast phase uses, `think: false` included), run whether
+//! interview assistance is on or off. One press at a time: the pipeline sends a job only while
+//! the session has none in flight, and the worker does the three steps in order, dispatching
+//! [`Action::SpeakTranslated`] between them and [`Action::SpeakDone`] or
+//! [`Action::SpeakFailed`] at the end. A failure is a status notice, never a panic.
+//!
+//! **Node lifetime.** The worker opens `dmn-voice` when it starts and keeps that one node for the
+//! session, so the call can select it as its microphone before the first press and keeps it
+//! selected between presses (#108: a call can only select a node that is there; one that came
+//! and went with each press would drop out of the call's settings and fall back to the default
+//! mic). If it cannot be opened (no PipeWire), the next press tries again and says so. A
+//! playback nothing pulled is reported, and the node is closed and opened again, so speech
+//! nobody heard is not left in its ring to play at the next press.
+//!
+//! **Echo window.** When PipeWire first pulls a press's speech the worker sends
+//! [`Window::From`], and when the last sample has played [`Window::Until`]; the pipeline turns
+//! them into audio time for the echo guard, which then drops what either lane heard meanwhile.
+//!
+//! **Cancellation.** [`Speaker::stop`] (on `q`) cancels the translation and the wait for the TTS
+//! server's first bytes, stops feeding at the next chunk, and joins the thread.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use dmn_audio::{AudioError, VMIC_NODE_NAME};
+use dmn_core::config::Config;
+use dmn_core::{Paths, wire};
+use dmn_llm::{CancellationToken, LlmError, Provider};
+use dmn_session::{Action, SessionHub};
+use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider};
+
+use crate::speak::{self, DRAIN_MARGIN, SpeakError, SpeechSink};
+
+/// Opens the sink the speech plays into: `dmn-voice` for a session, a test's sink in tests.
+/// `Err` is the reason, for the status line.
+pub type OpenSink = Box<dyn FnMut() -> Result<Box<dyn SpeechSink + Send>, String> + Send>;
+
+/// How often the worker looks at the playback while it drains, and at the stop flag.
+const DRAIN_TICK: Duration = Duration::from_millis(50);
+
+/// Everything a session's speaker needs, built and checked by [`setup`] before the run starts.
+pub struct SpeakSetup {
+    pub provider: Arc<dyn Provider>,
+    pub tts: Box<dyn TtsProvider>,
+    pub open_sink: OpenSink,
+    /// `[speak].target`, sent to the TTS server with the text.
+    pub target: String,
+    /// The target as the model reads it: "Spanish (es)".
+    pub target_name: String,
+    /// The enrolled voice's name in the server's library.
+    pub voice: String,
+    /// The translation's budget: the fast phase's.
+    pub timeout: Duration,
+}
+
+/// When a press's speech played, on the wall clock, for the echo guard's window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// PipeWire pulled the first sample.
+    From(Instant),
+    /// The last sample has played (or the playback stopped).
+    Until(Instant),
+}
+
+struct Job {
+    id: u64,
+    text: String,
+    pressed: Instant,
+}
+
+/// The worker that speaks `t`'s presses. See the module doc.
+pub struct Speaker {
+    jobs: Option<crossbeam_channel::Sender<Job>>,
+    windows: crossbeam_channel::Receiver<Window>,
+    stop: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Speaker {
+    /// Start the worker: it opens the sink at once (so `dmn-voice` is there for the call to
+    /// select) and loads the model, then waits for presses.
+    pub fn start(setup: SpeakSetup, hub: Arc<SessionHub>) -> Result<Self, SpeakError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| SpeakError::Runtime(e.to_string()))?;
+        // One job waits at most: the pipeline sends only while none is in flight.
+        let (jobs, jobs_rx) = crossbeam_channel::bounded(1);
+        let (windows_tx, windows) = crossbeam_channel::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let worker = Worker {
+            setup,
+            hub,
+            rt,
+            sink: None,
+            windows: windows_tx,
+            stop: Arc::clone(&stop),
+            cancel: cancel.clone(),
+        };
+        let handle = std::thread::Builder::new()
+            .name("dmn-speak".to_owned())
+            .spawn(move || worker.run(&jobs_rx))
+            .map_err(|e| SpeakError::Runtime(format!("cannot spawn the speak thread: {e}")))?;
+        Ok(Self {
+            jobs: Some(jobs),
+            windows,
+            stop,
+            cancel,
+            handle: Some(handle),
+        })
+    }
+
+    /// Speak `text` (the user's turn) as press `id`. False when the worker cannot take it.
+    pub fn speak(&self, id: u64, text: String) -> bool {
+        self.jobs.as_ref().is_some_and(|jobs| {
+            jobs.try_send(Job {
+                id,
+                text,
+                pressed: Instant::now(),
+            })
+            .is_ok()
+        })
+    }
+
+    /// The playback windows reported since the last call.
+    pub fn windows(&self) -> Vec<Window> {
+        self.windows.try_iter().collect()
+    }
+
+    /// Cancel what is in flight and join the worker.
+    pub fn stop(mut self) {
+        self.shut_down();
+    }
+
+    fn shut_down(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.cancel.cancel();
+        self.jobs = None;
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for Speaker {
+    fn drop(&mut self) {
+        self.shut_down();
+    }
+}
+
+struct Worker {
+    setup: SpeakSetup,
+    hub: Arc<SessionHub>,
+    rt: tokio::runtime::Runtime,
+    sink: Option<Box<dyn SpeechSink + Send>>,
+    windows: crossbeam_channel::Sender<Window>,
+    stop: Arc<AtomicBool>,
+    cancel: CancellationToken,
+}
+
+impl Worker {
+    fn run(mut self, jobs: &crossbeam_channel::Receiver<Job>) {
+        self.open_sink();
+        // The model loads before the first press needs it, not during it (a cold 35B model
+        // takes longer than the translation's budget). A failure shows on that press.
+        let provider = Arc::clone(&self.setup.provider);
+        if let Err(e) = self.rt.block_on(provider.warm_up()) {
+            tracing::warn!(error = %e, "speak: the model's warm-up failed");
+        }
+        while let Ok(job) = jobs.recv() {
+            if self.stopped() {
+                break;
+            }
+            let id = job.id;
+            match self.speak(job) {
+                Ok(()) => self.hub.dispatch(Action::SpeakDone { id }),
+                Err(reason) => self.hub.dispatch(Action::SpeakFailed { id, reason }),
+            }
+        }
+        // The node goes first; a synthesis stopped while it waited for the server leaves a
+        // blocking wait on the runtime's pool, which is not waited for.
+        let Worker { sink, rt, .. } = self;
+        drop(sink);
+        rt.shutdown_background();
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    fn open_sink(&mut self) -> Option<String> {
+        match (self.setup.open_sink)() {
+            Ok(sink) => {
+                self.sink = Some(sink);
+                None
+            }
+            Err(why) => {
+                tracing::warn!(error = %why, "speak: cannot open {VMIC_NODE_NAME}");
+                Some(why)
+            }
+        }
+    }
+
+    /// One press: translate, synthesize, play. `Err` is the status line's reason.
+    fn speak(&mut self, job: Job) -> Result<(), String> {
+        let Job { id, text, pressed } = job;
+        let provider = Arc::clone(&self.setup.provider);
+        let translated = self
+            .rt
+            .block_on(dmn_llm::translate(
+                &*provider,
+                &text,
+                &self.setup.target_name,
+                self.setup.timeout,
+                self.cancel.child_token(),
+            ))
+            .map_err(|e| {
+                tracing::warn!(id, error = %e, "speak: translation failed");
+                dmn_llm::translate::failure_text(&e)
+            })?;
+        let translated_ms = pressed.elapsed().as_millis() as u64;
+        self.hub.dispatch(Action::SpeakTranslated {
+            id,
+            text: translated.text.clone(),
+        });
+        if self.stopped() {
+            return Ok(());
+        }
+        if self.sink.is_none()
+            && let Some(why) = self.open_sink()
+        {
+            return Err(format!("no {VMIC_NODE_NAME}: {why}"));
+        }
+        let req = SpeakRequest::new(translated.text, self.setup.voice.clone())
+            .with_language(self.setup.target.clone());
+        let tts = &self.setup.tts;
+        let cancel = self.cancel.clone();
+        let stream = self
+            .rt
+            .block_on(async {
+                tokio::select! {
+                    r = tts.synthesize(req) => r.map_err(Some),
+                    () = cancel.cancelled() => Err(None),
+                }
+            })
+            .map_err(|e| match e {
+                Some(e) => {
+                    tracing::warn!(id, error = %e, "speak: synthesis failed");
+                    tts_failure(&e)
+                }
+                None => "stopped".to_owned(),
+            })?;
+        let played = self.play(stream);
+        let done_ms = pressed.elapsed().as_millis() as u64;
+        match &played {
+            Ok(first) => tracing::info!(
+                id,
+                translated_ms,
+                first_audio_ms =
+                    first.map(|t| t.saturating_duration_since(pressed).as_millis() as u64),
+                done_ms,
+                "speak: spoke into {VMIC_NODE_NAME}"
+            ),
+            Err(why) => {
+                tracing::warn!(id, translated_ms, done_ms, error = %why, "speak: playback failed")
+            }
+        }
+        played.map(|_| ())
+    }
+
+    /// Feed the speech into the sink as it arrives, then wait for its last sample to play.
+    /// Returns when PipeWire pulled the first of it. Speech nobody pulled is an error, and the
+    /// node is opened afresh so it does not play at the next press.
+    fn play(&mut self, stream: PcmStream) -> Result<Option<Instant>, String> {
+        let Some(sink) = self.sink.as_mut() else {
+            return Err(format!("no {VMIC_NODE_NAME}"));
+        };
+        let windows = &self.windows;
+        let stop = &self.stop;
+        let (_, base, _, _) = sink.stats();
+        let mut first: Option<Instant> = None;
+        let mut started = |sink: &dyn SpeechSink| {
+            if first.is_none() && sink.stats().1 > base {
+                let now = Instant::now();
+                first = Some(now);
+                let _ = windows.send(Window::From(now));
+            }
+        };
+        let fed = (|| {
+            for chunk in stream {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let chunk = chunk.map_err(|e| tts_failure(&e))?;
+                sink.write(&chunk.samples, chunk.sample_rate)
+                    .map_err(|e| playback_failure(&e))?;
+                started(sink.as_ref());
+            }
+            Ok(())
+        })();
+        let drained = fed.and_then(|()| {
+            let rate = sink.rate().max(1);
+            let (written, pulled, _, _) = sink.stats();
+            let queued =
+                Duration::from_secs_f64(written.saturating_sub(pulled) as f64 / f64::from(rate));
+            let deadline = Instant::now() + queued + DRAIN_MARGIN;
+            loop {
+                let done = sink.drain(DRAIN_TICK).map_err(|e| playback_failure(&e))?;
+                started(sink.as_ref());
+                if done {
+                    return Ok(true);
+                }
+                if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return Ok(false);
+                }
+            }
+        });
+        if first.is_some() {
+            let _ = windows.send(Window::Until(Instant::now()));
+        }
+        let unheard = match drained {
+            Ok(true) => return Ok(first),
+            Ok(false) if self.stopped() => return Ok(first),
+            Ok(false) => format!("nobody hears {VMIC_NODE_NAME}: select it as the call's mic"),
+            Err(why) => why,
+        };
+        // Whatever is still queued would play at the next press: start from an empty node.
+        self.sink = None;
+        self.open_sink();
+        Err(unheard)
+    }
+}
+
+/// A TTS failure in the status line's words.
+fn tts_failure(e: &TtsError) -> String {
+    let why = match e {
+        TtsError::Unreachable { .. } => "server down".to_owned(),
+        TtsError::UnknownVoice { .. } => "voice not enrolled".to_owned(),
+        TtsError::HttpStatus { status, .. } => format!("HTTP {status}"),
+        TtsError::Decode { .. } | TtsError::BodyRead { .. } => "bad audio".to_owned(),
+        other => other.to_string().chars().take(40).collect(),
+    };
+    format!("tts failed: {why}")
+}
+
+/// A playback failure in the status line's words: nothing pulling a full ring is the one the
+/// user can fix.
+fn playback_failure(e: &AudioError) -> String {
+    let text = e.to_string();
+    if text.contains("nothing pulled") {
+        format!("nobody hears {VMIC_NODE_NAME}: select it as the call's mic")
+    } else {
+        format!(
+            "playback failed: {}",
+            text.chars().take(40).collect::<String>()
+        )
+    }
+}
+
+/// `es` as the model should read it: "Spanish (es)". `None` for a code whisper does not know.
+pub fn target_name(code: &str) -> Option<String> {
+    let name = dmn_stt::Language::name_of(code)?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    Some(format!(
+        "{}{} ({code})",
+        first.to_uppercase(),
+        chars.as_str()
+    ))
+}
+
+/// Check, before the run starts, everything a press would need and could not fix mid-call:
+/// speak is on and the TTS server is on this machine, a voice is enrolled and the server has
+/// it, and that voice speaks `[speak].target` (#109: a voice speaks only the language it was
+/// enrolled with). Returns the voice's name.
+pub fn check(cfg: &Config, paths: &Paths, tts: &dyn TtsProvider) -> Result<String, SpeakError> {
+    let config = paths.config_file.display().to_string();
+    speak::check_gates(cfg, paths)?;
+    if cfg.speak.voice_ref.is_empty() {
+        return Err(SpeakError::NotEnrolled { config });
+    }
+    let target = cfg.speak.target.clone();
+    if target_name(&target).is_none() {
+        return Err(SpeakError::UnknownTarget { target, config });
+    }
+    let voice = speak::voice_name(&cfg.speak.voice_ref);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SpeakError::Runtime(e.to_string()))?;
+    let Some(voices) = rt
+        .block_on(tts.voices())
+        .map_err(|e| speak::tts_error(e, paths))?
+    else {
+        tracing::warn!("the TTS server lists no voices; not checking the voice's language");
+        return Ok(voice);
+    };
+    let clip = cfg.speak.voice_ref.clone();
+    let Some(enrolled) = voices.iter().find(|v| v.answers_to(&voice)) else {
+        return Err(SpeakError::VoiceGone { voice, clip });
+    };
+    match enrolled.language.as_deref() {
+        Some(speaks) if speaks != target => Err(SpeakError::LanguageMismatch {
+            target,
+            speaks: speaks.to_owned(),
+            voice,
+            clip,
+            config,
+        }),
+        Some(_) => Ok(voice),
+        None => {
+            tracing::warn!(voice = %voice, "the TTS server does not say which language the voice speaks");
+            Ok(voice)
+        }
+    }
+}
+
+/// The session's speaker for `dmn run`, after [`check`]: the `[llm]` provider for the
+/// translation, the TTS server's streaming route, and `dmn-voice`.
+pub fn setup(cfg: &Config, paths: &Paths) -> Result<SpeakSetup, SpeakError> {
+    let tts = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url).streaming();
+    let voice = check(cfg, paths, &tts)?;
+    let provider =
+        wire::provider(&cfg.llm).map_err(|e: LlmError| SpeakError::Llm(e.to_string()))?;
+    let target = cfg.speak.target.clone();
+    Ok(SpeakSetup {
+        provider,
+        tts: Box::new(tts),
+        open_sink: Box::new(open_dmn_voice),
+        target_name: target_name(&target).unwrap_or_else(|| target.clone()),
+        target,
+        voice,
+        timeout: Duration::from_millis(cfg.llm.fast_timeout_ms),
+    })
+}
+
+/// `dmn-voice` on its own PipeWire connection, which lives as long as the node.
+/// `Err` is short: it follows `no dmn-voice: ` on the status line, and the full error is logged.
+fn open_dmn_voice() -> Result<Box<dyn SpeechSink + Send>, String> {
+    let (ctx, mic) = speak::open_vmic().map_err(|e| {
+        tracing::warn!(error = %e, "speak: cannot open {VMIC_NODE_NAME}");
+        match e {
+            SpeakError::NoPipeWire { .. } => "PipeWire is not running".to_owned(),
+            other => other.to_string().chars().take(40).collect(),
+        }
+    })?;
+    Ok(Box::new(SessionMic { mic, _ctx: ctx }))
+}
+
+/// The session's `dmn-voice` and the connection it lives on; the node goes before the context.
+struct SessionMic {
+    mic: dmn_audio::VirtualMic,
+    _ctx: Arc<dmn_audio::PipeWireContext>,
+}
+
+impl SpeechSink for SessionMic {
+    fn rate(&self) -> u32 {
+        self.mic.rate()
+    }
+
+    fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
+        self.mic.write(samples, sample_rate)
+    }
+
+    fn drain(&mut self, timeout: Duration) -> Result<bool, AudioError> {
+        self.mic.drain(timeout)
+    }
+
+    fn stats(&self) -> (u64, u64, u64, Option<Instant>) {
+        let s = self.mic.stats();
+        (s.written, s.pulled, s.underruns, s.first_pull)
+    }
+}
+
+/// What reached a [`MemorySink`]: each chunk's sample count and rate, in order.
+#[cfg(test)]
+pub type Fed = Arc<std::sync::Mutex<Vec<(usize, u32)>>>;
+
+/// A sink standing in for `dmn-voice` in tests: keeps every chunk, and "plays" all it has at the
+/// first `drain` (or never, for a call that has not selected it).
+#[cfg(test)]
+pub struct MemorySink {
+    pub rate: u32,
+    pub log: Fed,
+    pub plays: bool,
+    written: u64,
+    pulled: u64,
+}
+
+#[cfg(test)]
+impl MemorySink {
+    pub fn new(plays: bool) -> (Self, Fed) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Self {
+                rate: 48_000,
+                log: Arc::clone(&log),
+                plays,
+                written: 0,
+                pulled: 0,
+            },
+            log,
+        )
+    }
+}
+
+#[cfg(test)]
+impl SpeechSink for MemorySink {
+    fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((samples.len(), sample_rate));
+        self.written += samples.len() as u64 * u64::from(self.rate) / u64::from(sample_rate);
+        Ok(())
+    }
+
+    fn drain(&mut self, timeout: Duration) -> Result<bool, AudioError> {
+        if self.plays {
+            self.pulled = self.written;
+        } else {
+            // Nobody pulls: waits out the timeout, as `dmn-voice` would.
+            std::thread::sleep(timeout);
+        }
+        Ok(self.plays)
+    }
+
+    fn stats(&self) -> (u64, u64, u64, Option<Instant>) {
+        (self.written, self.pulled, 0, None)
+    }
+}
+
+/// A speaker setup over a mock model and a mock TTS server, playing into a [`MemorySink`]
+/// (the first one opened; any later one plays at once), and the log of what reached that sink.
+#[cfg(test)]
+pub fn setup_with(
+    llm: dmn_llm::MockProvider,
+    tts: dmn_tts::MockTtsProvider,
+    plays: bool,
+) -> (SpeakSetup, Fed) {
+    let (sink, log) = MemorySink::new(plays);
+    let mut sink = Some(sink);
+    let open: OpenSink = Box::new(move || match sink.take() {
+        Some(s) => Ok(Box::new(s) as Box<dyn SpeechSink + Send>),
+        None => {
+            let (s, _) = MemorySink::new(true);
+            Ok(Box::new(s))
+        }
+    });
+    (
+        SpeakSetup {
+            provider: Arc::new(llm),
+            tts: Box::new(tts),
+            open_sink: open,
+            target: "es".into(),
+            target_name: "Spanish (es)".into(),
+            voice: "me".into(),
+            timeout: Duration::from_secs(4),
+        },
+        log,
+    )
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use dmn_llm::MockProvider;
+    use dmn_llm::mock::Step;
+    use dmn_session::Session;
+    use dmn_tts::MockTtsProvider;
+
+    const SAID: &str = "I'd start with a token bucket per API key.";
+    const SPANISH: &str = "Empezaría con un token bucket por clave de API.";
+
+    fn cfg(target: &str) -> (tempfile::TempDir, Paths, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = target.into();
+        cfg.speak.voice_ref = "/data/me.wav".into();
+        (dir, paths, cfg)
+    }
+
+    /// The start-up check: the enrolled voice must speak `target`; a mismatch names both and
+    /// the command that fixes it.
+    #[test]
+    fn the_enrolled_voice_must_speak_the_target_language() {
+        let (_dir, paths, cfg) = cfg("es");
+        let ok = MockTtsProvider::new().with_voices(Some(&[("me", Some("es"))]));
+        assert_eq!(check(&cfg, &paths, &ok).unwrap(), "me");
+
+        let english = MockTtsProvider::new().with_voices(Some(&[("me", Some("en"))]));
+        let err = check(&cfg, &paths, &english).unwrap_err();
+        assert!(matches!(err, SpeakError::LanguageMismatch { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[speak].target = \"es\"")
+                && msg.contains("the enrolled voice \"me\" speaks \"en\""),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("re-enroll with --language es: dmn speak enroll --wav /data/me.wav --name me --language es"),
+            "{msg}"
+        );
+
+        let gone = MockTtsProvider::new().with_voices(Some(&[("someone", Some("es"))]));
+        let err = check(&cfg, &paths, &gone).unwrap_err();
+        assert!(matches!(err, SpeakError::VoiceGone { .. }), "{err}");
+
+        // A server with no library cannot be asked; the run goes on.
+        let no_library = MockTtsProvider::new().with_voices(None);
+        assert_eq!(check(&cfg, &paths, &no_library).unwrap(), "me");
+    }
+
+    #[test]
+    fn the_check_refuses_what_a_press_could_not_fix() {
+        let mock = MockTtsProvider::new().with_voices(Some(&[("me", Some("es"))]));
+        let (_dir, paths, mut c) = cfg("es");
+        c.speak.voice_ref.clear();
+        assert!(matches!(
+            check(&c, &paths, &mock),
+            Err(SpeakError::NotEnrolled { .. })
+        ));
+        let (_dir, paths, c) = cfg("xx");
+        let err = check(&c, &paths, &mock).unwrap_err();
+        assert!(matches!(err, SpeakError::UnknownTarget { .. }), "{err}");
+        let (_dir, paths, mut c) = cfg("es");
+        c.speak.tts_url = "http://gpu-box.lan:4123".into();
+        assert!(matches!(
+            check(&c, &paths, &mock),
+            Err(SpeakError::NotLocal { .. })
+        ));
+        let url = dmn_tts::testserver::closed_port_url().unwrap();
+        let (_dir, paths, mut c) = cfg("es");
+        c.speak.tts_url = url.clone();
+        let err = check(&c, &paths, &dmn_tts::ChatterboxProvider::new(&url)).unwrap_err();
+        assert!(matches!(err, SpeakError::ServerDown { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_target_is_named_for_the_model() {
+        assert_eq!(target_name("es").as_deref(), Some("Spanish (es)"));
+        assert_eq!(target_name("de").as_deref(), Some("German (de)"));
+        assert_eq!(target_name("xx"), None);
+    }
+
+    /// Wait until the session has no press in flight (or 5 s).
+    pub(crate) fn settled(hub: &SessionHub) -> Session {
+        let t = Instant::now();
+        loop {
+            let s = hub.snapshot();
+            if s.speech.is_none() || t.elapsed() > Duration::from_secs(5) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_press_translates_then_synthesizes_the_translation_then_plays_it() {
+        let llm = MockProvider::new(vec![Step::Text(SPANISH.into()), Step::Done]);
+        let tts = MockTtsProvider::new();
+        let (setup, played) = setup_with(llm.clone(), tts.clone(), true);
+        let hub = Arc::new(SessionHub::default());
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        hub.dispatch(Action::SpeakStarted { id: 1 });
+        assert!(speaker.speak(1, SAID.into()));
+        let s = settled(&hub);
+        assert_eq!(s.speech, None);
+        assert_eq!(s.speak_failed, None, "{:?}", s.speak_failed);
+
+        let asked = llm.requests();
+        assert_eq!(asked.len(), 1, "one translate request");
+        assert_eq!(asked[0].messages[1].content, SAID);
+        assert!(asked[0].messages[0].content.contains("into Spanish (es)"));
+        let spoken = tts.requests();
+        assert_eq!(spoken.len(), 1, "one synthesize request");
+        assert_eq!(spoken[0].text, SPANISH);
+        assert_eq!(spoken[0].voice, "me");
+        assert_eq!(spoken[0].language.as_deref(), Some("es"));
+        let fed: usize = played.lock().unwrap().iter().map(|(n, _)| n).sum();
+        assert_eq!(fed, 12_000, "the mock's 0.5 s at 24 kHz reached the sink");
+        let windows = speaker.windows();
+        assert!(
+            matches!(windows.as_slice(), [Window::From(a), Window::Until(b)] if a <= b),
+            "{windows:?}"
+        );
+        speaker.stop();
+    }
+
+    #[test]
+    fn failures_end_the_press_with_a_reason_never_a_panic() {
+        // The model fails: nothing is synthesized.
+        let llm = MockProvider::new(vec![Step::Error("model not found".into())]);
+        let tts = MockTtsProvider::new();
+        let (setup, _) = setup_with(llm, tts.clone(), true);
+        let hub = Arc::new(SessionHub::default());
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        hub.dispatch(Action::SpeakStarted { id: 1 });
+        speaker.speak(1, SAID.into());
+        let s = settled(&hub);
+        assert_eq!(
+            s.speak_failed.map(|n| n.reason).as_deref(),
+            Some("translate failed: model not found")
+        );
+        assert!(tts.requests().is_empty());
+        speaker.stop();
+
+        // The TTS server's answer is not audio.
+        let llm = MockProvider::new(vec![Step::Text(SPANISH.into()), Step::Done]);
+        let (setup, _) = setup_with(llm, MockTtsProvider::with_wav(b"nope".to_vec()), true);
+        let hub = Arc::new(SessionHub::default());
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        hub.dispatch(Action::SpeakStarted { id: 2 });
+        speaker.speak(2, SAID.into());
+        let s = settled(&hub);
+        assert_eq!(
+            s.speak_failed.map(|n| n.reason).as_deref(),
+            Some("tts failed: bad audio")
+        );
+        speaker.stop();
+
+        // Nothing pulls dmn-voice: said, and the next press plays into a fresh node.
+        let llm = MockProvider::new(vec![Step::Text(SPANISH.into()), Step::Done]);
+        let (setup, _) = setup_with(llm, MockTtsProvider::new(), false);
+        let hub = Arc::new(SessionHub::default());
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        hub.dispatch(Action::SpeakStarted { id: 3 });
+        speaker.speak(3, SAID.into());
+        let s = settled(&hub);
+        assert_eq!(
+            s.speak_failed.map(|n| n.reason).as_deref(),
+            Some("nobody hears dmn-voice: select it as the call's mic")
+        );
+        assert!(speaker.windows().is_empty(), "nothing played: no window");
+        hub.dispatch(Action::SpeakStarted { id: 4 });
+        speaker.speak(4, SAID.into());
+        let s = settled(&hub);
+        assert_eq!(s.speak_failed, None, "{:?}", s.speak_failed);
+        speaker.stop();
+    }
+}

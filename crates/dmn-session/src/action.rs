@@ -447,6 +447,27 @@ pub enum Action {
     /// rendering stays a function of session state. Labels, routing and the transcript are the
     /// same whatever it is.
     QuestionSource { source: QuestionSource },
+    /// `t` speaks (#109) in this session: `[speak].enabled` with its target, dispatched once
+    /// after `Started` by `dmn run`. The status line's keys offer `t speak` while it is on.
+    SpeakEnabled { enabled: bool },
+    /// `t` (#109): press `id` (numbered by the pipeline, from 1) took the user's last turn and
+    /// sent it to be translated. The status line says `translating…` with the seconds since.
+    SpeakStarted { id: u64 },
+    /// #109: press `id`'s translation arrived, already within `limits.rs`'s cap: it shows as one
+    /// dim line under the question, and the status line says `speaking…` while the TTS server
+    /// renders it and it plays into `dmn-voice`.
+    SpeakTranslated { id: u64, text: String },
+    /// #109: `secs` whole seconds have passed since press `id`, for the status line's count.
+    /// The pipeline, which has a clock, says when; the reducer has none.
+    SpeakElapsed { id: u64, secs: u32 },
+    /// #109: press `id`'s speech has played to its end: the tag and the translation line go.
+    SpeakDone { id: u64 },
+    /// #109: press `id` spoke nothing: there was nothing to speak, or the translation, the TTS
+    /// server or the playback failed. `reason` is the status line's words for it, shown for 5 s
+    /// until [`Action::SpeakNoticeExpired`]; a press in flight with this id ends.
+    SpeakFailed { id: u64, reason: String },
+    /// #109: press `id`'s failure notice has been up for its 5 s.
+    SpeakNoticeExpired { id: u64 },
     /// A status dot changed.
     Status { dot: Dot, health: Health },
     /// The LLM provider now answering (#59): at start and after a config reload switched it.

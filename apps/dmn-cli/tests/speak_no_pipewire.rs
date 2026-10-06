@@ -18,7 +18,7 @@ fn speak_without_pipewire_names_the_problem_and_does_not_panic() {
     // A closed port: PipeWire must be reported before the server is ever contacted.
     std::fs::write(
         config_dir.join("config.toml"),
-        "[speak]\nenabled = true\ntts_url = \"http://127.0.0.1:1\"\nvoice_ref = \"/nowhere/voice.wav\"\n",
+        "[speak]\nenabled = true\ntarget = \"es\"\ntts_url = \"http://127.0.0.1:1\"\nvoice_ref = \"/nowhere/voice.wav\"\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_dmn"))

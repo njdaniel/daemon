@@ -26,6 +26,12 @@
 //! Empty finals (dmn-stt's "this utterance produced no text" marker) and Unknown-source
 //! segments are not compared, only kept in order.
 //!
+//! #109: while `t` plays the user's translated speech into the `dmn-voice` virtual microphone,
+//! the guard also drops anything on either lane whose audio meets that playback window
+//! ([`EchoGuard::speaking_from`] / [`EchoGuard::speaking_until`], on audio time). A virtual
+//! source is neither the mic nor the call's output, so in practice nothing arrives; the window
+//! is a belt-and-braces guard against a setup that routes it back into one, not new echo logic.
+//!
 //! Based on Kimi's unpushed draft for #60 (the matcher and most tests); the wall-clock hold,
 //! the open-utterance stretch, ordered release and split-line matching are new here.
 
@@ -56,6 +62,10 @@ pub const MAX_HOLD: Duration = Duration::from_millis(4000);
 /// old ones are pruned as mic finals move past them; this caps a session in which the candidate
 /// never speaks.
 const KEEP: usize = 64;
+
+/// Playback windows ([`EchoGuard::speaking_from`]) kept, at most: only recent ones can still
+/// meet a segment on its way through whisper.
+const KEEP_WINDOWS: usize = 8;
 
 /// What the guard decided, in the order the pipeline must act on it.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,6 +241,9 @@ pub struct EchoGuard {
     /// `(start, end so far)`.
     open: Option<(Duration, Duration)>,
     dropped: u64,
+    /// #109: audio-time spans in which `t` played speech into `dmn-voice`, oldest first; the
+    /// last one's end is `None` while it plays.
+    speaking: VecDeque<(Duration, Option<Duration>)>,
 }
 
 impl EchoGuard {
@@ -243,12 +256,42 @@ impl EchoGuard {
             interviewers: VecDeque::new(),
             open: None,
             dropped: 0,
+            speaking: VecDeque::new(),
         }
     }
 
-    /// Mic finals dropped so far.
+    /// Mic finals dropped so far, as copies of the loopback or (#109) inside a playback window.
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// #109: dmn started playing speech into `dmn-voice` at audio time `at`. Until
+    /// [`EchoGuard::speaking_until`], a segment on either lane whose audio meets the window is
+    /// dropped: a virtual source is not on the loopback and not the mic, so this is a
+    /// time-window guard in case a setup routes it back into one, not new echo logic.
+    pub fn speaking_from(&mut self, at: Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.speaking.push_back((at, None));
+        while self.speaking.len() > KEEP_WINDOWS {
+            self.speaking.pop_front();
+        }
+    }
+
+    /// #109: the playback that [`EchoGuard::speaking_from`] began ended at audio time `at`.
+    /// Segments still in whisper whose audio falls inside it are dropped when they arrive.
+    pub fn speaking_until(&mut self, at: Duration) {
+        if let Some((from, end @ None)) = self.speaking.back_mut() {
+            *end = Some(at.max(*from));
+        }
+    }
+
+    /// Whether `seg`'s audio meets a playback window.
+    fn during_playback(&self, seg: &Segment) -> bool {
+        self.speaking
+            .iter()
+            .any(|(from, until)| seg.end >= *from && until.is_none_or(|u| seg.start <= u))
     }
 
     /// You segments currently held back.
@@ -260,6 +303,14 @@ impl EchoGuard {
     pub fn observe(&mut self, seg: Segment, now: Duration) -> Vec<Verdict> {
         if !self.enabled {
             return vec![Verdict::Publish(seg)];
+        }
+        // #109: nothing heard while dmn itself was speaking is taken as said, on either lane. A
+        // final counts as dropped; a partial is closed like a dropped final's, uncounted.
+        if seg.source != Source::Unknown && self.during_playback(&seg) {
+            if seg.is_final && !seg.text.trim().is_empty() {
+                self.dropped += 1;
+            }
+            return vec![Verdict::Drop(seg)];
         }
         match seg.source {
             Source::Interviewer => self.interviewer(seg, now),
@@ -439,6 +490,74 @@ mod tests {
     }
 
     const QUESTION: &str = "How would you design a rate limiter?";
+
+    /// #109: while `t` plays speech into `dmn-voice` (audio 40–46 s here), a segment on either
+    /// lane whose audio meets that window is dropped, counted when it is a final; one outside it
+    /// is kept, including one whisper delivers after the window has closed.
+    #[test]
+    fn a_segment_inside_the_playback_window_is_dropped_and_one_outside_is_kept() {
+        let mut guard = EchoGuard::new(true);
+        let mut log = TranscriptLog::new();
+        let now = ms(50_000);
+        apply(
+            &mut log,
+            &guard.observe(mic(30_000, 33_000, "I'd shard by tenant."), now),
+        );
+        guard.speaking_from(ms(40_000));
+        // While it plays: the mic, the loopback, a partial; all overlapping the open window.
+        let during = [
+            mic(41_000, 43_000, "Empezaría por clave."),
+            interviewer(42_000, 44_000, "Mm-hm, go on."),
+            seg(Source::Interviewer, 44_500, 45_000, "Sure", false),
+        ];
+        for s in during {
+            let verdicts = guard.observe(s.clone(), now);
+            assert_eq!(verdicts, [Verdict::Drop(s)]);
+            apply(&mut log, &verdicts);
+        }
+        guard.speaking_until(ms(46_000));
+        // Transcribed late, spoken inside the window: still dropped.
+        let late = interviewer(45_500, 47_000, "Sounds good.");
+        assert_eq!(guard.observe(late.clone(), now), [Verdict::Drop(late)]);
+        // After the window, on both lanes: kept.
+        let after = interviewer(46_500, 49_000, "And how would you test it?");
+        assert_eq!(
+            guard.observe(after.clone(), now),
+            [Verdict::Publish(after.clone())]
+        );
+        apply(&mut log, &[Verdict::Publish(after)]);
+        apply(
+            &mut log,
+            &guard.observe(mic(50_000, 52_000, "With a replay harness."), ms(60_000)),
+        );
+        apply(&mut log, &guard.finish());
+        assert_eq!(
+            guard.dropped(),
+            3,
+            "two finals in the window, one late; no partial"
+        );
+        assert_eq!(
+            published(&log),
+            [
+                (Source::You, "I'd shard by tenant.".to_owned()),
+                (Source::Interviewer, "And how would you test it?".to_owned()),
+                (Source::You, "With a replay harness.".to_owned()),
+            ]
+        );
+        assert!(
+            log.open_partials().is_empty(),
+            "the dropped partial is closed"
+        );
+    }
+
+    #[test]
+    fn with_the_guard_off_a_playback_window_drops_nothing() {
+        let mut guard = EchoGuard::new(false);
+        guard.speaking_from(ms(40_000));
+        let s = mic(41_000, 43_000, "Empezaría por clave.");
+        assert_eq!(guard.observe(s.clone(), ms(50_000)), [Verdict::Publish(s)]);
+        assert_eq!(guard.dropped(), 0);
+    }
 
     #[test]
     fn echo_similarity_is_exactly_as_defined() {

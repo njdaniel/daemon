@@ -24,7 +24,9 @@
 //! adds [`lookup`]: the [`WebSearch`] seam and [`OllamaSearch`] that run that query (and nothing
 //! else) against Ollama's hosted web search, whose results the second fast request carries under
 //! `## Fresh facts` ([`FastRequest::facts`]), cut in [`limits::fresh_facts`]. Like the remote
-//! providers, it takes its key only as a header and never logs it.
+//! providers, it takes its key only as a header and never logs it. #109 adds [`translate`]: the
+//! user's last turn into `[speak].target`, one plain-text request read whole and cut to one line
+//! in [`limits::limit_translation`], for `t` to speak in the user's cloned voice.
 //!
 //! **Trait shape.** [`Provider::chat`] is a plain `fn` returning a [`BoxFuture`] that resolves to a
 //! [`DeltaStream`] (a `BoxStream` of [`Delta`]s). No `async fn` in the trait and no macro crate:
@@ -54,6 +56,7 @@ pub mod sse;
 pub mod stream_json;
 #[cfg(test)]
 mod testserver;
+pub mod translate;
 
 pub use anthropic::AnthropicProvider;
 pub use fast::{FastEvent, FastOutcome, IgnoreReason, run_fast_phase};
@@ -76,3 +79,4 @@ pub use slow::{
     CodingMode, PreviousAnswer, SlowField, SlowFields, SlowOutcome, SlowRequest, run_slow_phase,
 };
 pub use tokio_util::sync::CancellationToken;
+pub use translate::{Translation, translate};

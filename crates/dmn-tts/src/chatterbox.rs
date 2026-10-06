@@ -35,7 +35,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 
 use crate::decode::decode_reader;
-use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider};
+use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
 
 const NAME: &str = "chatterbox";
 const SPEECH: &str = "/v1/audio/speech";
@@ -176,40 +176,62 @@ fn path_segment(name: &str) -> String {
         .collect()
 }
 
-/// The names (and aliases) in a `GET /v1/voices` answer; `None` when it is not that shape.
-fn voice_names(body: &[u8]) -> Option<Vec<String>> {
+/// The voices in a `GET /v1/voices` answer, with their aliases and the language each was
+/// enrolled with; `None` when it is not that shape.
+fn voice_list(body: &[u8]) -> Option<Vec<Voice>> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let voices = v.get("voices")?.as_array()?;
-    let mut names = Vec::new();
-    for voice in voices {
+    let entries = v.get("voices")?.as_array()?;
+    let mut voices = Vec::new();
+    for entry in entries {
         // Tolerant: an entry may be a bare name, or an object with a name and aliases.
-        if let Some(n) = voice.as_str() {
-            names.push(n.to_owned());
+        if let Some(n) = entry.as_str() {
+            voices.push(Voice {
+                name: n.to_owned(),
+                aliases: Vec::new(),
+                language: None,
+            });
             continue;
         }
-        if let Some(n) = voice.get("name").and_then(|n| n.as_str()) {
-            names.push(n.to_owned());
+        let aliases: Vec<String> = entry
+            .get("aliases")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|a| a.as_str())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let name = entry.get("name").and_then(|n| n.as_str());
+        if name.is_none() && aliases.is_empty() {
+            continue;
         }
-        if let Some(aliases) = voice.get("aliases").and_then(|a| a.as_array()) {
-            names.extend(aliases.iter().filter_map(|a| a.as_str()).map(str::to_owned));
-        }
+        voices.push(Voice {
+            name: name.unwrap_or_default().to_owned(),
+            aliases,
+            language: entry
+                .get("language")
+                .and_then(|l| l.as_str())
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned),
+        });
     }
-    Some(names)
+    Some(voices)
 }
 
-/// Refuse a voice the server's library does not have (it would speak in its default voice).
-fn check_voice(
+/// `GET /v1/voices`. `Ok(None)` when the server has no voice library (another
+/// OpenAI-compatible one: an error status) or answers with something that is not a listing.
+fn list_voices(
     client: &reqwest::blocking::Client,
     base: &str,
-    voice: &str,
-) -> Result<(), TtsError> {
+) -> Result<Option<Vec<Voice>>, TtsError> {
     let url = format!("{base}{VOICES}");
     let resp = client.get(&url).send().map_err(|e| unreachable(&url, &e))?;
     let status = resp.status();
     if !status.is_success() {
-        // No voice library on this server (another OpenAI-compatible one): nothing to check.
-        tracing::warn!(status = status.as_u16(), url = %url, "cannot list the TTS server's voices; not checking the voice");
-        return Ok(());
+        tracing::warn!(status = status.as_u16(), url = %url, "cannot list the TTS server's voices");
+        return Ok(None);
     }
     let mut body = Vec::new();
     resp.take(4 * 1024 * 1024)
@@ -217,13 +239,31 @@ fn check_voice(
         .map_err(|e| TtsError::BodyRead {
             detail: error_chain(&e),
         })?;
-    let Some(names) = voice_names(&body) else {
-        tracing::warn!(url = %url, "the TTS server's voice listing is not the expected shape; not checking the voice");
+    let voices = voice_list(&body);
+    if voices.is_none() {
+        tracing::warn!(url = %url, "the TTS server's voice listing is not the expected shape");
+    }
+    Ok(voices)
+}
+
+/// Refuse a voice the server's library does not have (it would speak in its default voice).
+/// A server with no library to list is trusted as is.
+fn check_voice(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    voice: &str,
+) -> Result<(), TtsError> {
+    let Some(voices) = list_voices(client, base)? else {
         return Ok(());
     };
-    if names.iter().any(|n| n == voice) {
+    if voices.iter().any(|v| v.answers_to(voice)) {
         return Ok(());
     }
+    let names: Vec<&str> = voices
+        .iter()
+        .flat_map(|v| std::iter::once(v.name.as_str()).chain(v.aliases.iter().map(String::as_str)))
+        .filter(|n| !n.is_empty())
+        .collect();
     Err(TtsError::UnknownVoice {
         voice: voice.to_owned(),
         known: if names.is_empty() {
@@ -470,6 +510,18 @@ impl TtsProvider for ChatterboxProvider {
             tokio::task::spawn_blocking(move || enroll_job(&base, &name, language.as_deref(), clip))
                 .await
                 .map_err(|e| TtsError::Worker(format!("enroll task join: {e}")))?
+        })
+    }
+
+    fn voices<'a>(&'a self) -> BoxFuture<'a, Result<Option<Vec<Voice>>, TtsError>> {
+        Box::pin(async move {
+            let base = self.base_url.clone();
+            tokio::task::spawn_blocking(move || {
+                let url = format!("{base}{VOICES}");
+                list_voices(&blocking_client(&url)?, &base)
+            })
+            .await
+            .map_err(|e| TtsError::Worker(format!("voices task join: {e}")))?
         })
     }
 }
@@ -833,6 +885,55 @@ mod tests {
             1,
             "bad names never reach the server"
         );
+    }
+
+    /// #109: the listing as chatterbox-tts-api answers it, each voice with the language it was
+    /// enrolled with; a server without the route has no library.
+    #[tokio::test]
+    async fn voices_lists_names_aliases_and_enrolled_languages() {
+        let server = serve(vec![
+            Reply::json(
+                r#"{"voices":[{"name":"me","language":"es","aliases":["voice"],"exists":true},{"name":"en-voice","language":"en"},"bare",{"aliases":["x"]},{"language":"fr"}],"count":5}"#,
+            ),
+            Reply::new("404 Not Found", "application/json", r#"{"detail":"Not Found"}"#),
+            Reply::json(r#"{"unexpected":true}"#),
+        ])
+        .unwrap();
+        let p = ChatterboxProvider::new(&server.url);
+        let voices = p.voices().await.unwrap().unwrap();
+        assert_eq!(
+            voices,
+            [
+                Voice {
+                    name: "me".into(),
+                    aliases: vec!["voice".into()],
+                    language: Some("es".into()),
+                },
+                Voice {
+                    name: "en-voice".into(),
+                    aliases: vec![],
+                    language: Some("en".into()),
+                },
+                Voice {
+                    name: "bare".into(),
+                    aliases: vec![],
+                    language: None,
+                },
+                Voice {
+                    name: String::new(),
+                    aliases: vec!["x".into()],
+                    language: None,
+                },
+            ]
+        );
+        assert!(voices[0].answers_to("voice") && voices[0].answers_to("me"));
+        assert_eq!(p.voices().await.unwrap(), None, "no library on this server");
+        assert_eq!(p.voices().await.unwrap(), None, "not a listing");
+        assert_eq!(server.request_lines(), ["GET /v1/voices"; 3]);
+
+        let p = ChatterboxProvider::new(closed_port_url().unwrap());
+        let err = p.voices().await.expect_err("nothing listening");
+        assert!(matches!(err, TtsError::Unreachable { .. }), "{err}");
     }
 
     /// The synthesize future resolves once the WAV header is read; after that the decoder

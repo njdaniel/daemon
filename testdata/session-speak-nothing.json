@@ -1,0 +1,70 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "interviewer",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    }
+  ],
+  "partials": [],
+  "last_interviewer": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "live": {
+    "candidate": 1,
+    "text": "How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",
+    "kind": "system_design",
+    "focus": "architecture, consistency tradeoffs, distributed state, failure handling",
+    "approach": [
+      "Clarify scope: per user, per API key or per IP, and the limits per tier.",
+      "Use a token bucket per key; sliding-window counters if bursts matter.",
+      "Keep counters in regional Redis with a local in-process cache in front.",
+      "Accept small over-admission across regions; reconcile quotas asynchronously.",
+      "If Redis is down, fail open to a conservative local limit and alert."
+    ],
+    "star": null,
+    "clarifications": [],
+    "progress": {
+      "state": "done"
+    }
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 1,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "hints",
+  "speak": true,
+  "speak_failed": {
+    "id": 1,
+    "reason": "nothing to speak"
+  }
+}

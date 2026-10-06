@@ -1,7 +1,8 @@
 //! Area 1: the question, its focus line and the latest clarification: the live question's, or
-//! those of the earlier question `←` stepped back to (#94).
+//! those of the earlier question `←` stepped back to (#94). While `t` speaks (#109), its
+//! translation is the block's last line, dim.
 
-use dmn_session::QuestionSource;
+use dmn_session::{QuestionSource, Session};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -83,13 +84,45 @@ fn waiting(source: QuestionSource) -> &'static str {
 }
 
 fn lines(view: &View<'_>, width_cells: usize) -> Vec<Line<'static>> {
+    let mut out = question_lines(view, width_cells);
+    // #109: what `t` is speaking, as the block's last line, dim; the question gives it a row.
+    if let Some(line) = speech_line(view.session, width_cells) {
+        out.truncate(LINES - 1);
+        out.push(line);
+    }
+    out
+}
+
+/// #109: the translation a `t` press is speaking, as one dim line cut to `width_cells`; `None`
+/// before the translation has arrived and once it has played.
+pub(super) fn speech_line(session: &Session, width_cells: usize) -> Option<Line<'static>> {
+    let text = session.speech.as_ref().map(|sp| sp.text.as_str())?;
+    if text.is_empty() {
+        return None;
+    }
+    let dim = Style::new().fg(Color::DarkGray);
+    Some(Line::from(vec![
+        Span::styled(SPEECH_MARK, Style::new().fg(Color::Magenta)),
+        Span::styled(
+            truncate(text, width_cells.saturating_sub(width(SPEECH_MARK))),
+            dim,
+        ),
+    ]))
+}
+
+/// Leads the translation's line (#109).
+const SPEECH_MARK: &str = "» ";
+
+fn question_lines(view: &View<'_>, width_cells: usize) -> Vec<Line<'static>> {
     let muted = Style::new().fg(Color::DarkGray);
+    // #109: a row for the translation `t` is speaking, while it is.
+    let speech = usize::from(speech_line(view.session, width_cells).is_some());
     let Some(q) = view.shown() else {
         // LISTENING: the last sentence from a lane that can ask, in muted text, so the user sees
         // the app hears. The placeholder names that lane (#90).
         let heard = view.session.last_heard.as_deref();
         return match heard {
-            Some(t) => wrap(t, width_cells, QUESTION_LINES)
+            Some(t) => wrap(t, width_cells, QUESTION_LINES.min(LINES - speech))
                 .into_iter()
                 .map(|l| Line::from(Span::styled(l, muted)))
                 .collect(),
@@ -102,7 +135,7 @@ fn lines(view: &View<'_>, width_cells: usize) -> Vec<Line<'static>> {
 
     let focus = (!q.focus.is_empty()).then_some(q.focus.as_str());
     let clarification = q.clarifications.last().map(|c| c.text.as_str());
-    let others = usize::from(focus.is_some()) + usize::from(clarification.is_some());
+    let others = usize::from(focus.is_some()) + usize::from(clarification.is_some()) + speech;
     let question_lines = QUESTION_LINES.min(LINES - others);
 
     let mut out: Vec<Line<'static>> = wrap(&q.text, width_cells, question_lines)

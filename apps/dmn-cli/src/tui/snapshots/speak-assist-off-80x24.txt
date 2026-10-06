@@ -1,0 +1,24 @@
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+Interviewer Let's move on. Tell me about the team you worked with on the
+            payments migration.
+You         There were five of us: two backend engineers, a data engineer, a
+            product manager and me leading the cut-over plan.
+Interviewer How long did the migration take?
+You         About four months, with the last three weeks running both systems
+            side by side and comparing every ledger entry.
+Interviewer And did anything go wrong on the day?
+You         One batch job still pointed at the old database, so we paused it and
+            replayed its writes.
+Interviewer Good. Let's talk about how you would test that.
+Interviewer And what about the▍
+You         I'd start with a token bucket per API key and keep the counters in
+            regional Redis.
+» Empezaría con un token bucket por clave de API y guardaría los contadores en…
+ ● mic  ● system  ● model  es→en  speaking… 9s  assist off · C-S-a on · t speak

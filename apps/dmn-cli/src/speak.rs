@@ -35,7 +35,7 @@ const MAX_NAME: usize = 64;
 /// How long to wait for PipeWire's registry (the graph rate comes from it).
 const PW_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 /// Margin over the queued audio's own length when waiting for the last sample to play.
-const DRAIN_MARGIN: Duration = Duration::from_secs(2);
+pub(crate) const DRAIN_MARGIN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpeakError {
@@ -91,6 +91,24 @@ pub enum SpeakError {
     WriteOut { path: String, detail: String },
     #[error("cannot start the async runtime: {0}")]
     Runtime(String),
+    /// #109: the voice speaks only the language it was enrolled with, so `t` would speak the
+    /// translation with the wrong accent, or not at all.
+    #[error(
+        "[speak].target = {target:?} in {config}, but the enrolled voice {voice:?} speaks {speaks:?}; re-enroll with --language {target}: dmn speak enroll --wav {clip} --name {voice} --language {target}"
+    )]
+    LanguageMismatch {
+        target: String,
+        speaks: String,
+        voice: String,
+        clip: String,
+        config: String,
+    },
+    #[error(
+        "[speak].target = {target:?} in {config} is not a language whisper knows; use a code such as \"es\", \"de\" or \"fr\""
+    )]
+    UnknownTarget { target: String, config: String },
+    #[error("cannot reach the [llm] provider for translation: {0}")]
+    Llm(String),
     #[error(transparent)]
     Tts(TtsError),
     #[error(transparent)]
@@ -113,7 +131,7 @@ fn rt() -> Result<tokio::runtime::Runtime, SpeakError> {
 }
 
 /// The gates both subcommands pass first: speak is on, and the server is on this machine.
-fn check_gates(cfg: &Config, paths: &Paths) -> Result<(), SpeakError> {
+pub(crate) fn check_gates(cfg: &Config, paths: &Paths) -> Result<(), SpeakError> {
     let config = paths.config_file.display().to_string();
     if !cfg.speak.enabled {
         return Err(SpeakError::Disabled { config });
@@ -130,7 +148,7 @@ fn check_gates(cfg: &Config, paths: &Paths) -> Result<(), SpeakError> {
 /// A provider error, with the unreachable case naming the config line to fix: the server's
 /// address as configured (not the route), and the root cause ("Connection refused (os error
 /// 111)") without reqwest's wrapping text.
-fn tts_error(e: TtsError, paths: &Paths) -> SpeakError {
+pub(crate) fn tts_error(e: TtsError, paths: &Paths) -> SpeakError {
     match e {
         TtsError::Unreachable { url, detail } => SpeakError::ServerDown {
             url: url.split('/').take(3).collect::<Vec<_>>().join("/"),
@@ -143,7 +161,7 @@ fn tts_error(e: TtsError, paths: &Paths) -> SpeakError {
 
 /// The voice name the server knows the clip by is the stored clip's file stem, so `dmn speak`
 /// finds it from `[speak].voice_ref` alone (the config keeps no separate name).
-fn voice_name(voice_ref: &str) -> String {
+pub(crate) fn voice_name(voice_ref: &str) -> String {
     Path::new(voice_ref)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -342,7 +360,7 @@ pub fn speak(
 }
 
 /// Connect to PipeWire and put `dmn-voice` in the graph at the graph's rate.
-fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakError> {
+pub(crate) fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakError> {
     let ctx = Arc::new(PipeWireContext::connect().map_err(|e| match e {
         PipeWireError::Init(detail) | PipeWireError::Connect(detail) => {
             SpeakError::NoPipeWire { detail }
@@ -359,7 +377,7 @@ fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakError> {
 }
 
 /// Where the speech goes when it is not a file: `VirtualMic`, or a test's sink.
-trait SpeechSink {
+pub(crate) trait SpeechSink {
     fn rate(&self) -> u32;
     fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError>;
     /// Wait for the queued audio to play; `Ok(false)` when it did not within `timeout`.
@@ -571,6 +589,7 @@ provider = \"searxng\"
 
 [speak]
 enabled = true          # turned on for #107
+target = \"es\"           # #109
 ";
 
     #[test]

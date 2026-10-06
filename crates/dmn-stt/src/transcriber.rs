@@ -60,6 +60,12 @@ pub enum Language {
     /// The audio is in this language (an ISO 639-1 code whisper knows, `es`, `de`, ...);
     /// translate its text to English with no detection.
     Fixed(String),
+    /// Detect the language of each utterance, as [`Language::Auto`] does, and keep its text in
+    /// that language: whisper's transcribe task, no translation. #109: the You lane while
+    /// `[speak]` is on, so what `t` translates and speaks is the user's own words, not
+    /// whisper's English rendering of them. Needs a multilingual model, like `Auto`, but not one
+    /// that translates (`large-v3-turbo` will do).
+    Detect,
 }
 
 impl Language {
@@ -74,23 +80,55 @@ impl Language {
         }
     }
 
-    /// The config spelling: `en`, `auto` or the code.
+    /// The English name whisper gives a language code (`es` → `spanish`), or `None` for a code
+    /// it does not know. #109 names `[speak].target` this way to the model that translates.
+    pub fn name_of(code: &str) -> Option<&'static str> {
+        whisper_rs::get_lang_id(code).and_then(whisper_rs::get_lang_str_full)
+    }
+
+    /// The config spelling: `en`, `auto` or the code; `detect` for [`Language::Detect`], which
+    /// no config names (the pipeline picks it for one lane).
     pub fn label(&self) -> &str {
         match self {
             Language::English => "en",
             Language::Auto => "auto",
             Language::Fixed(code) => code,
+            Language::Detect => "detect",
         }
     }
 
     /// Whether whisper runs its translate task, which needs a multilingual model.
     pub fn translates(&self) -> bool {
+        matches!(self, Language::Auto | Language::Fixed(_))
+    }
+
+    /// Whether whisper hears anything but English, which needs a multilingual model.
+    pub fn multilingual(&self) -> bool {
         !matches!(self, Language::English)
+    }
+
+    /// The language whisper is told and whether it translates, for one inference: `pinned` is
+    /// what this utterance's first inference detected (`None`: let whisper detect).
+    pub fn task<'a>(&'a self, pinned: Option<&'a str>) -> (Option<&'a str>, bool) {
+        match self {
+            Language::English => (Some("en"), false),
+            // A `None` language makes whisper.cpp detect it from the encoder output before
+            // decoding; the translate task then decodes English whatever it heard.
+            Language::Auto => (pinned, true),
+            Language::Fixed(code) => (Some(code), true),
+            // The same detection; the transcribe task then decodes in the language it heard.
+            Language::Detect => (pinned, false),
+        }
     }
 
     /// An English-only model cannot detect or translate, and `large-v3-turbo` cannot
     /// translate ([`Model::translates`]).
     pub fn check(&self, model: Model) -> Result<(), SttError> {
+        if *self == Language::Detect && model.is_english_only() {
+            return Err(SttError::ModelIsEnglishOnly {
+                model: model.name().to_owned(),
+            });
+        }
         if !self.translates() || model.translates() {
             return Ok(());
         }
@@ -178,7 +216,7 @@ impl Transcriber {
         }
         // The callers check `Language::check` against the registry entry with a better message;
         // this is the backstop for a file handed in by path: the `.en` files cannot translate.
-        if cfg.language.translates() {
+        if cfg.language.multilingual() {
             let name = model_file
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -186,7 +224,7 @@ impl Transcriber {
             if name.ends_with(".en.bin") {
                 return Err(SttError::ModelIsEnglishOnly { model: shown });
             }
-            if name.contains("turbo") {
+            if cfg.language.translates() && name.contains("turbo") {
                 return Err(SttError::ModelCannotTranslate { model: shown });
             }
         }
@@ -254,7 +292,8 @@ impl Transcriber {
 
     /// Transcribe one utterance (16 kHz mono f32). `prompt` is the previous utterance's text.
     /// `pinned` is the language already detected earlier in this same utterance under
-    /// [`Language::Auto`] (the worker passes it back so detection runs once per utterance);
+    /// [`Language::Auto`] or [`Language::Detect`] (the worker passes it back so detection runs
+    /// once per utterance);
     /// `None` lets whisper detect. It is ignored in the other modes.
     pub fn transcribe(
         &mut self,
@@ -292,18 +331,10 @@ impl Transcriber {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(c_int::try_from(self.cfg.threads.max(1)).unwrap_or(4));
-        match &self.cfg.language {
-            Language::English => params.set_language(Some("en")),
-            // A `None` language makes whisper.cpp detect it from the encoder output before
-            // decoding; the translate task then decodes English whatever it heard.
-            Language::Auto => {
-                params.set_translate(true);
-                params.set_language(pinned);
-            }
-            Language::Fixed(code) => {
-                params.set_translate(true);
-                params.set_language(Some(code));
-            }
+        let (language, translate) = self.cfg.language.task(pinned);
+        params.set_language(language);
+        if translate {
+            params.set_translate(true);
         }
         // The previous utterance's text goes in explicitly as `tokens` above. With no_context
         // false whisper.cpp would also prepend its own last decode, which here is usually a
@@ -516,6 +547,51 @@ mod tests {
             Err::<(), _>(load_error())
         });
         assert!(err.is_err(), "no device left to fall back to");
+    }
+
+    /// #109: what each mode tells whisper. `Detect` detects as `Auto` does (and keeps what the
+    /// utterance's first inference pinned) but never runs the translate task, so the You lane
+    /// keeps the user's own words while `[speak]` is on.
+    #[test]
+    fn each_mode_sets_the_language_and_the_translate_task() {
+        assert_eq!(Language::English.task(Some("es")), (Some("en"), false));
+        assert_eq!(Language::Auto.task(None), (None, true));
+        assert_eq!(Language::Auto.task(Some("es")), (Some("es"), true));
+        let fixed = Language::Fixed("de".into());
+        assert_eq!(fixed.task(Some("es")), (Some("de"), true));
+        assert_eq!(Language::Detect.task(None), (None, false));
+        assert_eq!(Language::Detect.task(Some("en")), (Some("en"), false));
+        assert!(!Language::Detect.translates() && Language::Detect.multilingual());
+        assert_eq!(Language::Detect.label(), "detect");
+        assert_eq!(Language::name_of("es"), Some("spanish"));
+        assert_eq!(Language::name_of("xx"), None);
+    }
+
+    #[test]
+    fn detect_needs_a_multilingual_model_but_not_one_that_translates() {
+        assert!(Language::Detect.check(Model::Small).is_ok());
+        assert!(Language::Detect.check(Model::LargeV3Turbo).is_ok());
+        assert!(matches!(
+            Language::Detect.check(Model::SmallEn),
+            Err(SttError::ModelIsEnglishOnly { .. })
+        ));
+        assert!(matches!(
+            Language::Auto.check(Model::LargeV3Turbo),
+            Err(SttError::ModelCannotTranslate { .. })
+        ));
+    }
+
+    #[test]
+    fn detect_refuses_an_english_only_file_handed_in_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ggml-small.en.bin");
+        std::fs::write(&path, b"not a model").unwrap();
+        let cfg = SttConfig {
+            language: Language::Detect,
+            ..SttConfig::default()
+        };
+        let err = Transcriber::load(&path, cfg).err().unwrap();
+        assert!(matches!(err, SttError::ModelIsEnglishOnly { .. }), "{err}");
     }
 
     #[test]

@@ -268,6 +268,63 @@ fn the_spanish_interviewer_lane_arrives_in_english_with_es_detected() {
     );
 }
 
+/// #109: `Language::Detect`, the You lane's mode while `[speak]` is on, detects the language as
+/// `auto` does but keeps the text in it: the Spanish lane arrives in Spanish, not translated,
+/// where the test above gets English from the same audio under `auto`.
+#[test]
+#[ignore = "needs the es fixture WAVs (just fixtures-fetch) and the multilingual model (dmn doctor --fetch small)"]
+fn under_detect_the_spanish_lane_keeps_its_spanish() {
+    let fixture = testdata().join("es");
+    let wav = fixture.join("interviewer.wav");
+    let model = model_path(&models_dir(), Model::Small);
+    assert!(wav.is_file() && model.is_file(), "fixture or model missing");
+    let segments = transcribe_lane_in(&wav, Source::Interviewer, &model, Language::Detect);
+    let finals: Vec<&Segment> = segments.iter().filter(|s| !s.text.is_empty()).collect();
+    assert!(!finals.is_empty(), "the lane produced no transcript");
+    // Words that run through Spanish and not English: their share of every final's words.
+    const SPANISH: [&str; 12] = [
+        "de", "que", "el", "la", "en", "los", "las", "una", "por", "cómo", "qué", "es",
+    ];
+    let words: Vec<String> = finals
+        .iter()
+        .flat_map(|s| s.text.split_whitespace())
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .collect();
+    let spanish = words
+        .iter()
+        .filter(|w| SPANISH.contains(&w.as_str()))
+        .count();
+    let english = words
+        .iter()
+        .filter(|w| ["the", "you", "how", "would", "what", "and"].contains(&w.as_str()))
+        .count();
+    for s in finals.iter().take(5) {
+        println!("{:?}: {}", s.language, s.text);
+    }
+    println!(
+        "{} finals, {spanish} Spanish and {english} English marker words of {}",
+        finals.len(),
+        words.len()
+    );
+    assert!(
+        spanish * 100 >= words.len() * 15 && english * 100 < words.len() * 2,
+        "the text is not Spanish: {spanish} Spanish and {english} English markers in {} words",
+        words.len()
+    );
+    let es = finals
+        .iter()
+        .filter(|s| s.language.as_deref() == Some("es"))
+        .count();
+    assert!(
+        es * 10 >= finals.len() * 9,
+        "detected as es: {es} of {}",
+        finals.len()
+    );
+}
+
 #[test]
 #[ignore = "needs the fixture WAVs and a whisper model"]
 fn silence_between_turns_produces_no_hallucinated_segments() {

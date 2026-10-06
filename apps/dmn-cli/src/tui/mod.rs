@@ -44,6 +44,11 @@
 //! With interview assistance off (#79, Ctrl+Shift+A or `--no-assist`) there is no question and no
 //! Approach, so the screen is the transcript alone: every line of the session's window, wrapped
 //! rather than cut, the newest just above the same status line, which says `assist off`.
+//!
+//! `t` (#109, while `[speak]` is on) is shown in three places: `t speak` among the keys, the
+//! status line's `translating…` / `speaking…` tag with the seconds since the press, and the
+//! translation being spoken as one dim line at the foot of the question block (above the status
+//! line on the transcript-first screen). Why a press spoke nothing leads the keys for 5 s.
 
 mod approach;
 mod question;
@@ -165,10 +170,19 @@ pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
     let mut view = View::new(session);
     if session.assist_off {
         // #79: transcript first. The question and Approach areas would only ever be empty (or
-        // stale), so their rows go to the transcript.
-        let [t, s] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_ROWS)]).areas(area);
+        // stale), so their rows go to the transcript. #109: what `t` is speaking takes the row
+        // above the status line while it plays, as there is no question block for it.
+        let speech = question::speech_line(session, usize::from(area.width));
+        let [t, sp, s] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(u16::from(speech.is_some())),
+            Constraint::Length(STATUS_ROWS),
+        ])
+        .areas(area);
         status::render_transcript(&view, TranscriptArea::Screen, t, buf);
+        if let Some(line) = speech {
+            ratatui::widgets::Widget::render(ratatui::widgets::Paragraph::new(line), sp, buf);
+        }
         status::render_status(&view, s, buf);
         return;
     }

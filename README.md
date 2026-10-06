@@ -4,7 +4,7 @@
 
 Daemon listens to a live interview call, transcribes the conversation, detects interviewer questions, and surfaces a short answer scaffold designed to be understood in a few seconds.
 
-The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, does not type on the user's behalf, and does not attempt to hide itself from screen sharing. It never speaks unprompted and never speaks words the user did not say or ask for: with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user asks (`dmn speak`; a key in the TUI with #109).
+The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, does not type on the user's behalf, and does not attempt to hide itself from screen sharing. It never speaks unprompted and never speaks words the user did not say or ask for: with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user asks (`dmn speak`, or `t` in `dmn run`).
 
 > **Status:** early development. The foundation CLI is working; the live TUI pipeline and desktop UI are under active development.
 
@@ -90,6 +90,7 @@ Keys in `dmn run`:
 | `w` | Swap the STAR story of a behavioral question |
 | `s` | Coding solutions: hints ↔ full |
 | `m` | Mute or unmute your microphone |
+| `t` | With `[speak]` on: translate what you last said into `[speak].target` and speak it in your cloned voice into `dmn-voice` (below, § Speak) |
 | Ctrl+Shift+A | Interview assistance on ↔ off |
 | `q`, Esc, Ctrl+C | Quit |
 
@@ -261,7 +262,8 @@ says `web` beside the model dot while it is on. What it sends, and to whom, is u
 `dmn speak` synthesizes text in a clone of your own voice, from a 10–30 s recording of you, through
 a text-to-speech server on this machine (#107), and plays it into a virtual microphone named
 `dmn-voice` that the call selects as its microphone (#108), so the interviewer hears it and your
-own speakers stay silent. Translating what you just said before speaking it is #109.
+own speakers stay silent. In `dmn run`, `t` translates what you just said into the interview's
+language and speaks that (#109, below).
 
 The server is [chatterbox-tts-api](https://github.com/travisvn/chatterbox-tts-api), an
 OpenAI-compatible server around Resemble AI's [Chatterbox](https://github.com/resemble-ai/chatterbox)
@@ -304,8 +306,11 @@ Then turn speak on, enroll a clip of your voice, and speak:
 ```toml
 [speak]
 enabled = true
+target = "es"                         # the language `t` speaks; enroll the voice with the same --language
 # tts_url = "http://localhost:4123"   # the default; it must be on this machine
 ```
+
+`target` has no default, and `enabled = true` without it is a config error naming the key.
 
 ```bash
 # A WAV of you speaking for at least 6 s (10-30 s is better), mono 16 kHz or more preferred.
@@ -346,6 +351,37 @@ pw-play /tmp/vmic.wav                            # intelligible, right speed, yo
 ```
 
 Without a running PipeWire server the command says so and suggests `--out`; nothing panics.
+
+**`t` in `dmn run`: say it in your language, the interviewer hears it in theirs (#109).** With
+`[speak].enabled` and `target`, `dmn run` opens `dmn-voice` when it starts and keeps it for the
+whole session, so select it as the call's microphone once, before you need it. Say something
+(in English, say), then press `t`: your last turn (what you said since the interviewer last spoke,
+up to 30 s) is translated into `target` by the same `[llm]` model the answers use, synthesized in
+your enrolled voice, and played into `dmn-voice`. The status line shows `translating… 0s`, then
+`speaking… 9s` with the seconds since the key, and the translation sits as one dim line (`» …`)
+at the foot of the question block until it has played. The keys end with `t speak` while it is on.
+`t` works with assistance off (Ctrl+Shift+A), does nothing while `[speak]` is off, and does
+nothing while a press is still in flight. Before you have said anything it says `nothing to
+speak`; a failed translation, a TTS server that went away, or a `dmn-voice` nothing has selected
+is said in amber for 5 s, and nothing else changes.
+
+Translation on the local model adds well under a second (0.35–0.49 s for one sentence on the dev
+box, measured 2026-10-06); the CPU TTS server is the wait. For "I would start with a token bucket
+for each API key and keep the counters in Redis." (6.5 s of Spanish), the call heard the first
+sound 18.0–18.7 s after `t` and the last 24.5–25.5 s after it. Mid-call that is a long pause; a GPU
+TTS server, where VRAM allows, is the way to shorten it.
+
+At start-up, `dmn run` checks what a press would need and could not fix mid-call: the TTS server
+answers, your voice is in its library, and the voice speaks `target` (the server speaks each voice
+only in the language it was enrolled with). A voice enrolled for another language is an error
+naming both and the fix: `dmn speak enroll --wav <clip> --language es`. One enrolled voice per
+language; switching languages means re-enrolling.
+
+With `[stt].language = "auto"` (or a code, for an interview in another language), whisper
+translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it
+detects your language and keeps your own words, so `t` translates what you said rather than
+whisper's English version of it. Use headphones: the mic lane is no longer translated, so a mic
+that hears the call would show the interviewer's own-language words as yours.
 
 ### Initialize and inspect your system
 
@@ -494,7 +530,10 @@ What leaves the machine, and when:
 - **Text to speak, and your voice clip:** only to the TTS server at `[speak].tts_url`, which
   `dmn speak` requires to be on this machine (it refuses any other host). `dmn speak "text"` sends
   the text; `dmn speak enroll` uploads your clip once, and the server keeps it in its voice
-  library (delete it there with `curl -X DELETE http://localhost:4123/v1/voices/<name>`).
+  library (delete it there with `curl -X DELETE http://localhost:4123/v1/voices/<name>`). `t` in
+  `dmn run` sends your last turn to the `[llm]` provider for translation (localhost Ollama by
+  default; with a remote provider it leaves the machine exactly as the transcript window already
+  does), then the translation to the same TTS server.
 
 Audio on disk: the call is never recorded unless `[privacy].record_audio = true`. `dmn speak`
 writes audio only where its own command line names: `--out FILE.wav` writes the synthesized

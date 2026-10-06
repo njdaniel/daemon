@@ -35,6 +35,9 @@ pub enum ConfigError {
     /// An in-place edit of the config file (`dmn speak enroll`) that could not be made safely.
     #[error("{0}")]
     Edit(String),
+    /// Keys that parse but cannot go together ([`Config::check`]).
+    #[error("{path}: {message}")]
+    Invalid { path: String, message: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -473,8 +476,8 @@ impl Default for Assist {
 
 /// Speak (#107): synthesize text in the enrolled voice clone through a TTS server on this
 /// machine (chatterbox-tts-api, OpenAI-compatible). Off by default; `dmn speak` refuses to run
-/// while `enabled` is false or `tts_url` is another host. The translation language is **not**
-/// here: it lands with #109.
+/// while `enabled` is false or `tts_url` is another host. #109: `t` in `dmn run` translates the
+/// user's last turn into `target` and speaks it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Speak {
@@ -487,6 +490,28 @@ pub struct Speak {
     /// dmn never reads it. The 35B Ollama model takes 22 of the 4090's 24 GB, so GPU TTS is
     /// opt-in: check `nvidia-smi` first.
     pub device: String,
+    /// #109: the language `t` translates into and speaks, a two- or three-letter code (`es`):
+    /// the interview's language, and the one the voice was enrolled with (`dmn speak enroll
+    /// --language`), since the server speaks each voice in its enrollment language only. No
+    /// default: "" is unset, and `enabled = true` without it is a config error naming the key.
+    #[serde(deserialize_with = "language_code")]
+    pub target: String,
+}
+
+/// `[speak].target`: "" (unset) or a code of the shape `[stt].language` takes, two or three
+/// lowercase letters. Whether whisper and the TTS server know it is checked when `dmn run`
+/// starts.
+fn language_code<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let raw = String::deserialize(d)?;
+    let code = raw.trim();
+    if code.is_empty()
+        || ((2..=3).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase()))
+    {
+        return Ok(code.to_owned());
+    }
+    Err(serde::de::Error::custom(format!(
+        "[speak].target {raw:?} is not a two- or three-letter language code such as \"es\""
+    )))
 }
 
 impl Speak {
@@ -505,6 +530,7 @@ impl Default for Speak {
             tts_url: "http://localhost:4123".into(),
             voice_ref: String::new(),
             device: "cpu".into(),
+            target: String::new(),
         }
     }
 }
@@ -633,6 +659,7 @@ enabled = false                      # speak text in your cloned voice via a loc
 tts_url = "http://localhost:4123"    # chatterbox-tts-api on this machine (no other host); README § Speak
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
+target = ""                          # dmn run: `t` speaks your last turn in this language (es, de, ...); the voice's enroll --language; needed with enabled = true
 
 [ui]
 always_on_top = true
@@ -648,12 +675,33 @@ keep_transcripts = true
 "#;
 
 impl Config {
-    /// Parse a TOML document. Missing keys take defaults; unknown keys are errors.
+    /// Parse a TOML document. Missing keys take defaults; unknown keys are errors, and so is a
+    /// combination no run can use ([`Config::check`]).
     pub fn from_toml(text: &str, path_for_errors: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(|source| ConfigError::Parse {
+        let cfg: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path_for_errors.to_owned(),
             source,
-        })
+        })?;
+        cfg.check().map_err(|message| ConfigError::Invalid {
+            path: path_for_errors.to_owned(),
+            message,
+        })?;
+        Ok(cfg)
+    }
+
+    /// Keys that are each valid but cannot go together. #109: `[speak].enabled = true` needs
+    /// `target`, the language `t` speaks; it has no default, since it must be the language the
+    /// voice was enrolled with.
+    pub fn check(&self) -> Result<(), String> {
+        if self.speak.enabled && self.speak.target.is_empty() {
+            return Err(
+                "[speak].enabled = true needs `target` under [speak]: the language `t` speaks, \
+                 a code such as \"es\", the one the voice was enrolled with \
+                 (`dmn speak enroll --language es`)"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// Load `path`. A missing file is the default config, not an error.
@@ -982,6 +1030,7 @@ enabled = false                      # `dmn speak` (#107): clone-voice TTS throu
 tts_url = "http://localhost:4123"    # chatterbox-tts-api (OpenAI-compatible); this machine only
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
+target = ""                          # `t` (#109) speaks in this language (es, de, ...): the voice's enroll --language
 
 [ui]
 always_on_top = true
@@ -1083,7 +1132,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 39, "spec example has 39 keys: {keys:?}");
+        assert_eq!(keys.len(), 40, "spec example has 40 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -1139,26 +1188,71 @@ keep_transcripts = true
         assert!(s.voice_ref.is_empty());
         assert_eq!(s.device, "cpu");
 
+        assert!(s.target.is_empty(), "no default language");
+
         let c = Config::from_toml(
-            "[speak]\nenabled = true\nvoice_ref = \"/home/u/.local/share/dmn/voice.wav\"\n",
+            "[speak]\nenabled = true\ntarget = \"es\"\nvoice_ref = \"/home/u/.local/share/dmn/voice.wav\"\n",
             "speak",
         )
         .unwrap();
         assert!(c.speak.enabled);
+        assert_eq!(c.speak.target, "es");
         assert_eq!(c.speak.voice_ref, "/home/u/.local/share/dmn/voice.wav");
         assert_eq!(c.speak.tts_url, "http://localhost:4123", "default fills in");
         let toml = c.to_toml().unwrap();
         assert!(toml.contains("[speak]"), "{toml}");
+        assert!(toml.contains("target = \"es\""), "{toml}");
         assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
     }
 
     #[test]
-    fn speak_unknown_keys_are_errors_and_target_is_not_here_yet() {
+    fn speak_unknown_keys_are_errors() {
         let err = Config::from_toml("[speak]\ntts_ur = \"x\"\n", "typo").unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
-        // The translation language lands with #109; until then it must be refused, not ignored.
-        let err = Config::from_toml("[speak]\ntarget = \"es\"\n", "early").unwrap_err();
-        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+    }
+
+    /// #109: `t` speaks in `target`, which has no default; on without it is an error that names
+    /// the key and the fix, whatever command loads the file.
+    #[test]
+    fn speak_enabled_without_a_target_is_a_config_error_naming_target() {
+        let err = Config::from_toml(
+            "[speak]\nenabled = true\n",
+            "/home/u/.config/dmn/config.toml",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("/home/u/.config/dmn/config.toml: "),
+            "{msg}"
+        );
+        assert!(msg.contains("needs `target` under [speak]"), "{msg}");
+        assert!(msg.contains("--language es"), "{msg}");
+        // Blank is unset too.
+        assert!(Config::from_toml("[speak]\nenabled = true\ntarget = \" \"\n", "t").is_err());
+        // Off, an unset target is fine (the default), and a set one is kept for later.
+        assert!(Config::from_toml("[speak]\nenabled = false\n", "t").is_ok());
+        let off = Config::from_toml("[speak]\ntarget = \"de\"\n", "t").unwrap();
+        assert_eq!(off.speak.target, "de");
+        assert!(Config::default().check().is_ok());
+    }
+
+    /// The shape `[stt].language` checks for a code: two or three lowercase letters.
+    #[test]
+    fn speak_target_takes_the_shape_of_a_language_code() {
+        for ok in ["es", "de", "yue", " fr "] {
+            let cfg = Config::from_toml(&format!("[speak]\ntarget = {ok:?}\n"), "t").unwrap();
+            assert_eq!(cfg.speak.target, ok.trim());
+        }
+        for bad in ["Spanish", "ES", "e", "auto", "es-MX", "e5"] {
+            let err =
+                Config::from_toml(&format!("[speak]\ntarget = {bad:?}\n"), "t").expect_err(bad);
+            assert!(matches!(err, ConfigError::Parse { .. }), "{bad}: {err}");
+            assert!(
+                err.to_string().contains("[speak].target"),
+                "{bad}: names the key: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1210,9 +1304,12 @@ keep_transcripts = true
         assert_eq!(cfg.llm.model, "m");
 
         // A [speak] section without the key gains it at the end of the section body.
-        let edited = set_voice_ref("[speak]\nenabled = true\n\n[ui]\n", "/v.wav");
+        let edited = set_voice_ref(
+            "[speak]\nenabled = true\ntarget = \"es\"\n\n[ui]\n",
+            "/v.wav",
+        );
         assert!(
-            edited.contains("enabled = true\nvoice_ref = \"/v.wav\"\n\n[ui]"),
+            edited.contains("target = \"es\"\nvoice_ref = \"/v.wav\"\n\n[ui]"),
             "{edited}"
         );
         let cfg = Config::from_toml(&edited, "edited").unwrap();
@@ -1237,6 +1334,7 @@ base_url = 'http://localhost:8888/#not-a-comment'
 
 [speak]   # added by hand
 enabled = true
+target = \"es\"
 voice_ref = \"/old/voice.wav\"   # set by dmn speak enroll
 tts_url = \"http://127.0.0.1:4123\"
 
@@ -1297,7 +1395,7 @@ mouse = false
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("dotfiles-config.toml");
-        std::fs::write(&real, "[speak]\nenabled = true\n").unwrap();
+        std::fs::write(&real, "[speak]\nenabled = true\ntarget = \"es\"\n").unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
         let link = dir.path().join("config.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
