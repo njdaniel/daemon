@@ -857,8 +857,10 @@ enabled = true          # turned on for #107
         );
     }
 
-    /// Nothing selected `dmn-voice`: the report says how much never played and asks the
-    /// question, instead of failing (the speech was synthesized and the node was there).
+    /// Nothing selected `dmn-voice` and the clip fit the ring, so every `write` succeeded and
+    /// only `drain` came up empty: the report says how much never played and asks the
+    /// question, instead of failing. A clip longer than the ring never gets here: `write`
+    /// itself fails after its 5 s no-listener timeout and the command exits 1.
     #[test]
     fn a_drain_that_times_out_is_reported_not_hidden() {
         let server = serve(vec![Reply::voices(&["voice"]), Reply::wav(sine_answer())]).unwrap();

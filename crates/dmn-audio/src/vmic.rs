@@ -70,9 +70,12 @@ type Cons = <HeapRb<f32> as Split>::Cons;
 /// only does relaxed atomic loads, stores and adds on these.
 #[derive(Debug)]
 pub struct RingStats {
-    /// Callbacks that had to emit some silence while `speaking` was set: a gap in the speech.
+    /// Callbacks that found the ring empty while `speaking` was set: a whole buffer of silence,
+    /// a gap in the speech. A short fill is not counted (the clip's last buffer looks the same),
+    /// so a producer only slightly slower than real time shows as fewer gaps than it made.
     underruns: AtomicU64,
-    /// Writer calls that found the ring too full to take everything (and waited).
+    /// Writer pushes that found the ring too full to take everything. The writer retries every
+    /// 5 ms, so one wait of 100 ms counts about 20; it is a count of polls, not of waits.
     stalls: AtomicU64,
     /// Samples handed to PipeWire so far (real samples, not padding).
     pulled: AtomicU64,
@@ -451,8 +454,9 @@ impl LoopVmic {
         props.insert(*pw::keys::NODE_NAME, spec.node_name.as_str());
         props.insert(*pw::keys::NODE_DESCRIPTION, spec.description.as_str());
         props.insert(*pw::keys::NODE_NICK, spec.node_name.as_str());
-        // Never let the session manager link it to a sink: it is not something to play out
-        // loud, and the user's speakers must stay silent.
+        // What keeps the node off the speakers is the missing AUTOCONNECT flag on `connect`
+        // below: the session manager never links it to a sink, only whatever selects it as a
+        // microphone links to it. This flag only stops a later move to another target.
         props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
         let stream = pw::stream::StreamRc::new(core.clone(), &spec.node_name, props)
             .map_err(|e| e.to_string())?;

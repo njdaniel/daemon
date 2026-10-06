@@ -294,9 +294,10 @@ the server's; the virtual microphone adds about 0.1 s.
 **GPU: check your VRAM first.** The default LLM (`qwen3.6:35b-a3b`) takes about 22 of an RTX
 4090's 24 GB, so the TTS server on the same GPU will not fit beside it. Run `nvidia-smi` before
 choosing `docker/docker-compose.gpu.yml` (or `DEVICE=cuda`) in place of the CPU compose file
-above, and expect to need a smaller LLM, a remote one, or assistance off. With VRAM to spare the
-GPU build renders a sentence in about a second, which makes the wait above mostly disappear.
-`[speak].device` records your choice for this setup; dmn does not read it.
+above, and expect to need a smaller LLM, a remote one, or assistance off. On the dev box the server
+runs on the CPU, and the times above are the CPU's; the GPU compose file exists for a machine with
+VRAM to spare, and its speed has not been measured here. `[speak].device` records your choice for
+this setup; dmn does not read it.
 
 Then turn speak on, enroll a clip of your voice, and speak:
 
@@ -330,9 +331,12 @@ device. The call then transmits the cloned voice; your own speakers and headphon
 your real microphone is not touched. The node exists only while the command runs, so start the
 command and then select it (the server's render time leaves several seconds for that), or select
 it in a call before a second `dmn speak`; a session that speaks repeatedly (#109) can keep one node
-open for its whole run. If nothing has selected `dmn-voice`, PipeWire does not pull from it: the
-command finishes and reports how much was never played, and asks whether the node is selected
-anywhere. To check from a terminal:
+open for its whole run. If nothing has selected `dmn-voice`, PipeWire does not pull from it. The
+speech is queued in a 2 s buffer: a phrase that fits waits its own length plus 2 s for a listener,
+then the command finishes with exit 0 and reports how much was never played; a longer one (most sentences,
+including the 2.3 s example above) fills the buffer, waits 5 s for something to pull, and the
+command exits 1 with `nothing pulled from dmn-voice for 5 s … is it selected as the microphone
+anywhere?`. To check from a terminal:
 
 ```bash
 dmn speak "Gracias por la oportunidad." &
