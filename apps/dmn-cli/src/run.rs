@@ -7,7 +7,7 @@
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
 //! what the asking lane last said (the interviewer, by default) when the detector missed the
 //! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
-//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `q` (or Ctrl-C) quit. Nothing
+//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `q` (or Ctrl-C) quit. Nothing
 //! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal, mouse capture included, is restored on the
 //! way out, on an error, and (through ratatui's panic hook and ours) on a panic.
@@ -42,6 +42,7 @@ use crate::pipeline::{
     Controls, Found, Input, Observer, Options, Partials, Pipeline, Quiet, Report,
 };
 use crate::replay;
+use crate::speaker::{self, Speaker};
 use crate::suggest::{Output, Policy};
 use crate::tui;
 
@@ -110,6 +111,10 @@ pub enum Key {
     Later,
     /// `↑ ↓ PgUp PgDn` (#94): scroll the open section, a row or the rows visible.
     Scroll(tui::Scroll),
+    /// `t` (#109): translate what you last said into `[speak].target` and speak it in your
+    /// voice into `dmn-voice`. Not `s`, which coding solutions (#50) had; `t` for talk and
+    /// translate.
+    Speak,
     Quit,
 }
 
@@ -132,6 +137,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('m' | 'M') => Some(Key::Mute),
         KeyCode::Char('s' | 'S') => Some(Key::Solutions),
         KeyCode::Char('w' | 'W') => Some(Key::Swap),
+        KeyCode::Char('t' | 'T') => Some(Key::Speak),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -164,6 +170,7 @@ pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
         Key::Earlier => controls.earlier(),
         Key::Later => controls.later(),
         Key::Scroll(by) => controls.scroll(|session| tui::scroll_to(session, pane, by)),
+        Key::Speak => controls.speak(),
         Key::Quit => {
             controls.quit();
             return true;
@@ -236,6 +243,14 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     {
         eprintln!("run: {notice}");
     }
+    // #109: everything `t` needs is checked before any audio moves, so a TTS server that is
+    // down or a voice enrolled in the wrong language fails here, with the fix, not mid-call.
+    // Only the TUI has the key.
+    let speak = if cfg.speak.enabled && !args.headless {
+        Some(speaker::setup(cfg, paths)?)
+    } else {
+        None
+    };
     let (input, questions) = match args.replay.clone() {
         Some((interviewer, candidate)) => {
             let questions = interviewer.parent().map(|d| d.join("questions.json"));
@@ -249,7 +264,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         }
         None => (live_input(cfg, args)?, None),
     };
-    let pipeline = Pipeline::start(
+    let mut pipeline = Pipeline::start(
         cfg,
         paths,
         &Options {
@@ -274,6 +289,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             coding_solutions: args.solutions,
         },
     )?;
+    if let Some(setup) = speak {
+        pipeline.attach_speaker(Speaker::start(setup, pipeline.hub())?);
+    }
     let audio = pipeline.info().audio;
     let live = pipeline.info().live;
     if args.headless {
@@ -758,6 +776,20 @@ mod tests {
             commands.try_recv(),
             Ok(crate::pipeline::Command::Regenerate)
         );
+    }
+
+    /// #109: `t` (not `s`, coding solutions' since #50) goes to the pipeline thread, which owns
+    /// the transcript the turn comes from; the session changes only when that thread acts.
+    #[test]
+    fn t_goes_to_the_pipeline_thread() {
+        assert_eq!(key(press_key('t')), Some(Key::Speak));
+        assert_eq!(key(press_key('T')), Some(Key::Speak));
+        assert_eq!(key(press_key('s')), Some(Key::Solutions), "s is still s");
+        let (controls, commands) = Controls::for_test();
+        let before = controls.hub().snapshot();
+        assert!(!press(key(press_key('t')).unwrap(), &controls));
+        assert_eq!(commands.try_recv(), Ok(crate::pipeline::Command::Speak));
+        assert_eq!(controls.hub().snapshot(), before);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! lines under the Approach on a stacked screen, a right-hand column on a wide one (#88), or the
 //! whole screen above the status line with assistance off (#79); the last two are wrapped.
 
-use dmn_session::{Health, Line as TranscriptLine, QuestionSource, Section, Speaker};
+use dmn_session::{Health, Line as TranscriptLine, QuestionSource, Section, SpeakStage, Speaker};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -227,6 +227,19 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
             Style::new().fg(Color::DarkGray),
         ));
     }
+    // #109: a `t` press in flight, in the You lane's colour (it is your voice), with the seconds
+    // since the key: the TTS server takes 10 s and more on a CPU, so the wait is made legible.
+    // Shown with assistance off too: `t` is a speech feature, not an answer feature.
+    if let Some(sp) = &view.session.speech {
+        let stage = match sp.stage {
+            SpeakStage::Translating => TRANSLATING,
+            SpeakStage::Speaking => SPEAKING,
+        };
+        spans.push(Span::styled(
+            format!(" {stage} {}s ", sp.secs),
+            Style::new().fg(Color::Magenta),
+        ));
+    }
     // #79: a local model that loaded partly into system memory (whisper took the GPU first) is
     // named in amber: answers come, but slower. (Assistance off is said on the right, with the
     // keys, where nothing cuts it.)
@@ -340,7 +353,8 @@ const ASK: &str = "⏎ ask";
 /// its body is taller than its rows (#94).
 ///
 /// While assistance is on, `⏎ ask` follows the two (#96), and `not a question` leads them for
-/// the 5 s after the model declined what Enter sent. Once the session has an earlier question,
+/// the 5 s after the model declined what Enter sent. While `[speak]` is on `t speak` comes last
+/// (#109), and for 5 s after a press spoke nothing, why leads them. Once the session has an earlier question,
 /// `← earlier` comes before `⏎ ask` (#94).
 ///
 /// On an earlier question (#94) the two are the ways out of it, `← earlier` (not on the first)
@@ -374,13 +388,24 @@ fn shortcuts(view: &View<'_>) -> Keys {
     let swap = view
         .shown()
         .is_some_and(|q| q.star.is_some() && q.stories.len() > 1);
+    // #109: why the last `t` spoke nothing leads the keys for its 5 s, assistance on or off.
+    let speak_failed = view.session.speak_failed.as_ref().map(|n| n.reason.clone());
+    let speak = view.session.speak.then(|| SPEAK.to_owned());
     if view.session.assist_off {
         // Ctrl+Shift+A in tmux's notation: short enough that an 80-column pane with every tag
-        // (`system: all audio`, `es→en`) still shows the whole state.
-        return Keys {
-            lead: ASSIST_OFF.to_owned(),
-            forms: vec![format!("{ASSIST_OFF} · C-S-a on ")],
+        // (`system: all audio`, `es→en`) still shows the whole state. #109: `t` works with
+        // assistance off, so its key follows, and goes first when the pane is narrow.
+        let lead: Vec<String> = speak_failed
+            .into_iter()
+            .chain(std::iter::once(ASSIST_OFF.to_owned()))
+            .collect();
+        let lead = lead.join(SEP);
+        let on = format!("{lead} · C-S-a on");
+        let forms = match speak {
+            Some(key) => vec![format!("{on} · {key} "), format!("{on} ")],
+            None => vec![format!("{on} ")],
         };
+        return Keys { lead, forms };
     }
     // What leads the keys is the last part to go: the answer to Enter, and on an earlier
     // question the count of those that arrived behind it.
@@ -391,6 +416,7 @@ fn shortcuts(view: &View<'_>) -> Keys {
     if view.session.lookup_failed.is_some() {
         lead.push(LOOKUP_FAILED.to_owned());
     }
+    lead.extend(speak_failed);
     if let Some((at, of)) = view.session.place() {
         if view.session.unseen > 0 {
             lead.push(format!("{} new", view.session.unseen));
@@ -406,7 +432,7 @@ fn shortcuts(view: &View<'_>) -> Keys {
         } else {
             forward.to_owned()
         };
-        let parts: Vec<String> = [Some(step), sections, Some(ASK.to_owned())]
+        let parts: Vec<String> = [Some(step), sections, Some(ASK.to_owned()), speak]
             .into_iter()
             .flatten()
             .collect();
@@ -422,12 +448,21 @@ fn shortcuts(view: &View<'_>) -> Keys {
         (_, _, false, None) => format!("{pin} · r redo"),
     };
     let earlier = (!view.session.history.is_empty()).then(|| EARLIER.to_owned());
-    let parts: Vec<String> = [Some(pair), earlier, Some(ASK.to_owned())]
+    let parts: Vec<String> = [Some(pair), earlier, Some(ASK.to_owned()), speak]
         .into_iter()
         .flatten()
         .collect();
     Keys::new(&lead, &parts)
 }
+
+/// #109: `t` translates what you last said into `[speak].target` and speaks it in your voice.
+/// Offered while `[speak]` is on, last, so it is the first key a narrow pane gives up.
+const SPEAK: &str = "t speak";
+
+/// #109: the status line's tag while the model translates a `t` press.
+pub(super) const TRANSLATING: &str = "translating…";
+/// #109: the tag while the TTS server renders the translation and it plays into `dmn-voice`.
+pub(super) const SPEAKING: &str = "speaking…";
 
 /// #94: `←` shows the question before the one on screen. Offered once there is one.
 const EARLIER: &str = "← earlier";

@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 33] = [
+const STATES: [&str; 37] = [
     "listening",
     "live",
     "pinned",
@@ -70,6 +70,12 @@ const STATES: [&str; 33] = [
     // go.dev`; and a lookup that failed, the first answer kept and `lookup failed` said.
     "checked",
     "lookup-failed",
+    // #109: `t` translating your last turn, then speaking it (the translation under the
+    // question), a press with nothing to speak, and `t` with assistance off.
+    "speak-translating",
+    "speak-speaking",
+    "speak-nothing",
+    "speak-assist-off",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -845,6 +851,45 @@ fn actions(state: &str) -> Vec<Action> {
             a.extend(go_version());
             a.push(Action::LookupFailed { candidate: 1 });
         }
+        // #109: `t` pressed after your answer: the model translating it, then the TTS server and
+        // `dmn-voice` speaking it (the translation under the question); a press before you had
+        // said anything; and `t` with assistance off, where the line sits above the status line.
+        "speak-translating" | "speak-speaking" => {
+            a.push(Action::SpeakEnabled { enabled: true });
+            a.extend(rate_limiter());
+            a.push(seg(Speaker::You, 31.0, 36.5, YOUR_ANSWER, true));
+            a.push(Action::SpeakStarted { id: 1 });
+            a.push(Action::SpeakElapsed { id: 1, secs: 1 });
+            if state == "speak-speaking" {
+                a.push(Action::SpeakTranslated {
+                    id: 1,
+                    text: YOUR_ANSWER_ES.into(),
+                });
+                a.push(Action::SpeakElapsed { id: 1, secs: 12 });
+            }
+        }
+        "speak-nothing" => {
+            a.push(Action::SpeakEnabled { enabled: true });
+            a.extend(rate_limiter());
+            a.push(Action::SpeakFailed {
+                id: 1,
+                reason: "nothing to speak".into(),
+            });
+        }
+        "speak-assist-off" => {
+            let mut a = actions("assist-off");
+            a.insert(1, Action::SpeakEnabled { enabled: true });
+            a.extend([
+                seg(Speaker::You, 92.5, 97.0, YOUR_ANSWER, true),
+                Action::SpeakStarted { id: 1 },
+                Action::SpeakTranslated {
+                    id: 1,
+                    text: YOUR_ANSWER_ES.into(),
+                },
+                Action::SpeakElapsed { id: 1, secs: 9 },
+            ]);
+            return a;
+        }
         "long-items" => {
             a.extend(long_items());
             a.push(Action::ToggleSection {
@@ -856,6 +901,12 @@ fn actions(state: &str) -> Vec<Action> {
     }
     a
 }
+
+/// #109: what you said, and the translation `t` speaks.
+const YOUR_ANSWER: &str =
+    "I'd start with a token bucket per API key and keep the counters in regional Redis.";
+const YOUR_ANSWER_ES: &str = "Empezaría con un token bucket por clave de API y guardaría los \
+                              contadores en un Redis regional.";
 
 /// #94: four Deeper Answer items, each exactly the 240 characters `dmn-llm`'s limits allow.
 const LONG_ITEMS: [(&str, &str); 4] = [
@@ -1618,15 +1669,63 @@ fn status_line(session: &Session, size: (u16, u16)) -> String {
 fn tui_the_keys_offer_ask_whenever_assistance_is_on() {
     // #96: in every state of the screen, since the detector's miss can come in any; not while
     // assistance is off, when Enter sends nothing.
+    // #109: with `[speak]` on, `t speak` follows it.
     for state in STATES {
         let session = load(state);
         let last = status_line(&session, (100, 30));
-        assert_eq!(
-            last.ends_with(" · ⏎ ask"),
-            !session.assist_off,
-            "{state}: {last}"
+        let tail = if session.speak {
+            " · ⏎ ask · t speak"
+        } else {
+            " · ⏎ ask"
+        };
+        assert_eq!(last.ends_with(tail), !session.assist_off, "{state}: {last}");
+    }
+}
+
+/// #109: `t speak` is offered while `[speak]` is on, assistance on or off, and never otherwise;
+/// the tag says where the press is, with its seconds, in the You lane's colour; the translation
+/// is one dim line; and why a press spoke nothing leads the keys in amber.
+#[test]
+fn tui_speak_shows_its_key_its_tag_its_line_and_its_notice() {
+    for state in STATES {
+        let session = load(state);
+        let last = status_line(&session, (100, 30));
+        assert_eq!(last.contains("t speak"), session.speak, "{state}: {last}");
+    }
+    let off = load("speak-assist-off");
+    assert!(
+        status_line(&off, (100, 30)).ends_with("assist off · C-S-a on · t speak"),
+        "{}",
+        status_line(&off, (100, 30))
+    );
+
+    let buf = render(&load("speak-translating"), (100, 30));
+    let (x, y) = row_containing(&buf, "translating… 1s");
+    assert_eq!(buf[(x, y)].fg, Color::Magenta);
+    assert!(!text(&buf).contains("» "), "no line before the translation");
+
+    for size in SIZES {
+        let buf = render(&load("speak-speaking"), size);
+        let screen = text(&buf);
+        assert!(screen.contains("speaking… 12s"), "{screen}");
+        let (x, y) = row_containing(&buf, "» Empezaría");
+        assert_eq!(buf[(x + 2, y)].fg, Color::DarkGray, "dim");
+        assert!(
+            screen.contains("rate limiter for a globally distributed API"),
+            "the question keeps its block:\n{screen}"
         );
     }
+    let buf = render(&load("speak-assist-off"), (100, 30));
+    let rows: Vec<String> = text(&buf).lines().map(str::to_owned).collect();
+    assert!(
+        rows[28].starts_with("» Empezaría"),
+        "above the status line: {}",
+        rows[28]
+    );
+
+    let buf = render(&load("speak-nothing"), (80, 24));
+    let (x, y) = row_containing(&buf, "nothing to speak");
+    assert_eq!(buf[(x, y)].fg, Color::Yellow);
 }
 
 #[test]

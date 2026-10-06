@@ -20,6 +20,7 @@ mod replay;
 mod run;
 mod sources;
 mod speak;
+mod speaker;
 mod suggest;
 mod today;
 mod tui;

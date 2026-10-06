@@ -29,6 +29,13 @@
 //! starts with it off never warms the LLM, and with a local Ollama asks it to unload before
 //! whisper loads, so whisper can have the GPU; the suggester then starts on the first Ctrl+Shift+A.
 //!
+//! `t` (#109) is the pipeline thread's too, and independent of assistance: [`Speaking`] takes the
+//! You lane's last turn (as [`last_turn`] builds the asking lane's for Enter) and hands it to the
+//! session's [`Speaker`], which translates it, synthesizes it in the user's voice and plays it
+//! into `dmn-voice`. The loop counts the seconds on the status line, takes its failure notice
+//! down after 5 s, and turns the speaker's playback windows into audio time for the echo guard,
+//! which drops what either lane heard while dmn was speaking.
+//!
 //! A monitor thread watches the lanes while they run (#16): it counts ring-buffer overruns into
 //! the session, turns live capture state into the mic / system dots, moves the [`AudioClock`]'s
 //! anchor as the interviewer lane consumes frames (so [`Action::Timing`] marks are on the clock
@@ -68,6 +75,7 @@ use dmn_vad::{
 use tokio::sync::watch;
 
 use crate::context::ContextSource;
+use crate::speaker::{Speaker, Window};
 use crate::suggest::{Answered, Output, Policy, Suggester, Tally};
 
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
@@ -362,22 +370,30 @@ pub const NOT_A_QUESTION_FOR: Duration = Duration::from_secs(5);
 /// #102: how long the status line says `lookup failed`.
 pub const LOOKUP_FAILED_FOR: Duration = Duration::from_secs(5);
 
-/// One status-line notice (#96, #102): `showing` is the candidate whose notice the session has up,
-/// `tracked` the one this thread has seen and since when. Once it has been up for `lasts`, the
-/// notice is taken down with [`Action::NoticeExpired`]. Returns what to track from now.
+/// #109: how long the status line says why a `t` press spoke nothing.
+pub const SPEAK_FAILED_FOR: Duration = Duration::from_secs(5);
+/// #109: how long after the last sample played the echo guard's playback window stays open:
+/// the VAD's hangover and the node's own buffer.
+const SPEAK_TAIL: Duration = Duration::from_millis(300);
+
+/// One status-line notice (#96, #102, #109): `showing` is the id whose notice the session has
+/// up, `tracked` the one this thread has seen and since when. Once it has been up for `lasts`,
+/// the notice is taken down with the action `expired` makes for it ([`Action::NoticeExpired`]
+/// for a candidate's). Returns what to track from now.
 fn expire(
     hub: &SessionHub,
     showing: Option<u64>,
     tracked: Option<(u64, Instant)>,
     now: Instant,
     lasts: Duration,
+    expired: fn(u64) -> Action,
 ) -> Option<(u64, Instant)> {
     match (showing, tracked) {
         (Some(id), Some((seen, since))) if id == seen => {
             if now.saturating_duration_since(since) < lasts {
                 return tracked;
             }
-            hub.dispatch(Action::NoticeExpired { candidate: id });
+            hub.dispatch(expired(id));
             None
         }
         (Some(id), _) => Some((id, now)),
@@ -401,7 +417,7 @@ fn expire(
 /// turn, and on the asking lane it is neither the turn's last line nor one of its lines.
 /// [`TranscriptLog`] keeps no such final (dmn-stt trims its text, and the log drops an empty
 /// one), so this holds for any slice, not only the log's.
-fn last_turn(finals: &[Segment], asks: QuestionSource) -> Option<Candidate> {
+pub(crate) fn last_turn(finals: &[Segment], asks: QuestionSource) -> Option<Candidate> {
     let finals: Vec<&Segment> = finals
         .iter()
         .filter(|s| !s.text.trim().is_empty())
@@ -687,6 +703,8 @@ pub enum Command {
     Assist { on: bool },
     /// Enter (#96): send the asking lane's last turn to the model, detector or no detector.
     Ask,
+    /// `t` (#109): speak the You lane's last turn in `[speak].target`, assistance or not.
+    Speak,
 }
 
 /// The TUI's handle on a running pipeline. Cheap to clone; safe from any thread.
@@ -730,6 +748,14 @@ impl Controls {
     /// pressed again.
     pub fn ask(&self) {
         let _ = self.commands.send(Command::Ask);
+    }
+
+    /// `t` (#109): translate what you last said into `[speak].target` and speak it into
+    /// `dmn-voice` in your voice. The pipeline thread takes the turn from its transcript log; it
+    /// does nothing while `[speak]` is off or while a press is still in flight, and says
+    /// `nothing to speak` before you have said anything. Assistance on or off does not matter.
+    pub fn speak(&self) {
+        let _ = self.commands.send(Command::Speak);
     }
 
     /// `m`: mute or unmute the mic. Muted, the mic lane's VAD hears only silence, so nothing
@@ -962,6 +988,8 @@ pub struct Pipeline {
     log: TranscriptLog,
     /// The detector and the LLM (#79): on or off, the transcript above is the same.
     assist: Assistance,
+    /// `t` (#109): off until [`Pipeline::attach_speaker`].
+    speaking: Speaking,
 }
 
 /// Starts the suggester the first time assistance is on (#79).
@@ -1082,8 +1110,11 @@ impl Pipeline {
         let assist = opts.assist.unwrap_or(cfg.assist.enabled);
         // #90: `--question-source` over `[detect].question_source`, fixed for the session.
         let asks = opts.question_source.unwrap_or(cfg.detect.question_source);
+        // #109: `t` translates on the same model whether assistance is on or not, so with
+        // `[speak]` on the model is wanted even with assistance off.
+        let llm_wanted = assist || cfg.speak.enabled;
         if !opts.no_llm {
-            if !assist {
+            if !llm_wanted {
                 unload_local_llm(&cfg.llm);
             } else if stt_cfg.device != DeviceChoice::Cpu {
                 warm_local_llm(&cfg.llm);
@@ -1128,12 +1159,16 @@ impl Pipeline {
                 Audio::Wav(w) => ring_frames(w.duration(), speed),
                 Audio::Live { .. } => DEFAULT_CAPACITY_FRAMES,
             };
+            let lane_cfg = SttConfig {
+                language: lane_language(source, &stt_cfg.language, cfg.speak.enabled),
+                ..stt_cfg.clone()
+            };
             built.push(build_lane(
                 source,
                 audio,
                 ring,
                 &model,
-                &stt_cfg,
+                &lane_cfg,
                 vad_close,
                 silero.as_deref(),
                 partials,
@@ -1247,7 +1282,9 @@ impl Pipeline {
             ),
             launch,
         );
+        let speaking = Speaking::new(Arc::clone(&hub));
         Ok(Self {
+            speaking,
             info: Info {
                 model: name,
                 threads: stt_cfg.threads,
@@ -1295,6 +1332,12 @@ impl Pipeline {
         Arc::clone(&self.hub)
     }
 
+    /// #109: `t` speaks through `speaker` from now on (`dmn run` with `[speak]` on); the
+    /// status line offers the key.
+    pub fn attach_speaker(&mut self, speaker: Speaker) {
+        self.speaking.attach(speaker);
+    }
+
     pub fn controls(&self) -> Controls {
         Controls {
             hub: Arc::clone(&self.hub),
@@ -1314,6 +1357,8 @@ impl Pipeline {
                 self.command(cmd);
             }
             self.assist.expire_notice(Instant::now());
+            self.speaking
+                .tick(Instant::now(), &mut self.echo, &self.audio);
             if self.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -1387,7 +1432,10 @@ impl Pipeline {
     }
 
     fn command(&mut self, cmd: Command) {
-        self.assist.command(cmd, &self.log);
+        match cmd {
+            Command::Speak => self.speaking.press(&self.log),
+            cmd => self.assist.command(cmd, &self.log),
+        }
     }
 
     /// Drain and join every stage, end the session, and report.
@@ -1425,6 +1473,8 @@ impl Pipeline {
             self.log.apply(seg);
         }
         let wall = self.audio_zero.elapsed();
+        // #109: a press in flight stops with the run; nothing is dispatched after `Ended`.
+        self.speaking.finish();
         // Answer whatever is still queued; the transcript is complete by now. A stopped run
         // cancels instead.
         let (detecting, tally, dropped_candidates) = self.assist.finish(stopped);
@@ -1632,13 +1682,22 @@ impl Assistance {
             let s = self.session.borrow();
             (s.not_a_question, s.lookup_failed)
         };
-        self.notice = expire(&self.hub, asked, self.notice, now, NOT_A_QUESTION_FOR);
+        let expired = |candidate| Action::NoticeExpired { candidate };
+        self.notice = expire(
+            &self.hub,
+            asked,
+            self.notice,
+            now,
+            NOT_A_QUESTION_FOR,
+            expired,
+        );
         self.lookup_notice = expire(
             &self.hub,
             lookup,
             self.lookup_notice,
             now,
             LOOKUP_FAILED_FOR,
+            expired,
         );
     }
 
@@ -1666,7 +1725,7 @@ impl Assistance {
             return;
         }
         match cmd {
-            Command::Assist { .. } => {}
+            Command::Assist { .. } | Command::Speak => {}
             Command::Ask => self.ask(log),
             Command::Regenerate => {
                 let Some(s) = &self.suggester else {
@@ -1732,6 +1791,135 @@ impl Assistance {
             .take()
             .map(|s| if stopped { s.stop() } else { s.finish() });
         (self.detecting, tally, self.dropped_candidates)
+    }
+}
+
+/// `t` (#109) on the pipeline thread: which press is which, the seconds on the status line,
+/// the failure notice's 5 s, and the echo guard's playback windows. The [`Speaker`] does the
+/// work on its own thread; the session says whether a press is in flight, so the reducer owns
+/// that state and a press while one is in flight does nothing.
+pub struct Speaking {
+    hub: Arc<SessionHub>,
+    session: watch::Receiver<Session>,
+    /// `None` while `[speak]` is off: `t` does nothing.
+    speaker: Option<Speaker>,
+    /// Presses so far, which number them.
+    presses: u64,
+    /// The press in flight and when it was made, for its seconds.
+    pressed: Option<(u64, Instant)>,
+    /// The failure notice now up, as its press and when this thread first saw it.
+    notice: Option<(u64, Instant)>,
+}
+
+impl Speaking {
+    pub fn new(hub: Arc<SessionHub>) -> Self {
+        Self {
+            session: hub.watch(),
+            hub,
+            speaker: None,
+            presses: 0,
+            pressed: None,
+            notice: None,
+        }
+    }
+
+    fn attach(&mut self, speaker: Speaker) {
+        self.speaker = Some(speaker);
+        self.hub.dispatch(Action::SpeakEnabled { enabled: true });
+    }
+
+    /// One `t`: the You lane's last turn to the speaker. Nothing while `[speak]` is off or a
+    /// press is in flight; `nothing to speak` before the user has said anything.
+    fn press(&mut self, log: &TranscriptLog) {
+        let Some(speaker) = &self.speaker else {
+            return;
+        };
+        if self.session.borrow().speech.is_some() {
+            return;
+        }
+        self.presses += 1;
+        let id = self.presses;
+        let Some(turn) = last_turn(log.finals(), QuestionSource::You) else {
+            self.hub.dispatch(Action::SpeakFailed {
+                id,
+                reason: NOTHING_TO_SPEAK.to_owned(),
+            });
+            return;
+        };
+        self.hub.dispatch(Action::SpeakStarted { id });
+        self.pressed = Some((id, Instant::now()));
+        if !speaker.speak(id, turn.text) {
+            self.hub.dispatch(Action::SpeakFailed {
+                id,
+                reason: "speak failed: the speaker stopped".to_owned(),
+            });
+        }
+    }
+
+    /// Every loop: the press's seconds, the notice's expiry, and the playback windows into
+    /// `echo` on `audio`'s clock.
+    fn tick(&mut self, now: Instant, echo: &mut EchoGuard, audio: &AudioClock) {
+        let Some(speaker) = &self.speaker else {
+            return;
+        };
+        for window in speaker.windows() {
+            let at = |t: Instant| Duration::from_secs_f64(audio.at(t).max(0.0));
+            match window {
+                Window::From(t) => echo.speaking_from(at(t)),
+                Window::Until(t) => echo.speaking_until(at(t) + SPEAK_TAIL),
+            }
+        }
+        let (speech, failed) = {
+            let s = self.session.borrow();
+            (
+                s.speech.as_ref().map(|sp| (sp.id, sp.secs)),
+                s.speak_failed.as_ref().map(|n| n.id),
+            )
+        };
+        if let (Some((id, shown)), Some((pressed, at))) = (speech, self.pressed)
+            && id == pressed
+        {
+            let secs =
+                u32::try_from(now.saturating_duration_since(at).as_secs()).unwrap_or(u32::MAX);
+            if secs > shown {
+                self.hub.dispatch(Action::SpeakElapsed { id, secs });
+            }
+        }
+        self.notice = expire(
+            &self.hub,
+            failed,
+            self.notice,
+            now,
+            SPEAK_FAILED_FOR,
+            |id| Action::SpeakNoticeExpired { id },
+        );
+    }
+
+    fn finish(&mut self) {
+        if let Some(speaker) = self.speaker.take() {
+            speaker.stop();
+        }
+    }
+}
+
+/// #109: what the status line says when `t` is pressed before you have said anything.
+pub const NOTHING_TO_SPEAK: &str = "nothing to speak";
+
+/// #109: the language whisper runs one lane in. With `[speak]` on, the You lane keeps the
+/// user's own words: under `[stt].language = "auto"` or a code (#77), whisper's translate task
+/// would turn them into English before `t` could translate them into the interview's language,
+/// so that lane detects its language and transcribes without translating
+/// ([`dmn_stt::Language::Detect`]). The Interviewer lane, and both lanes with `[speak]` off or
+/// `language = "en"`, are as configured.
+pub fn lane_language(
+    source: Source,
+    language: &dmn_stt::Language,
+    speak: bool,
+) -> dmn_stt::Language {
+    if speak && source == Source::You && language.translates() {
+        dmn_stt::Language::Detect
+    } else {
+        language.clone()
     }
 }
 
@@ -3954,5 +4142,527 @@ mod tests {
             "{}",
             asked[0]
         );
+    }
+
+    // --- #109: `t` speaks your last turn in the interview's language ---------------------------
+
+    const SAID: &str = "I'd start with a token bucket per API key.";
+    const SAID_REST: &str = "And I'd keep the counters in Redis.";
+    const SPANISH: &str = "Empezaría con un token bucket por clave de API y guardaría los \
+                           contadores en Redis.";
+
+    fn spanish() -> dmn_llm::MockProvider {
+        dmn_llm::MockProvider::new(vec![
+            dmn_llm::mock::Step::Text(SPANISH.into()),
+            dmn_llm::mock::Step::Done,
+        ])
+    }
+
+    /// `t` on `hub` with a speaker over `llm` and `tts`, and what reached its sink.
+    fn speaking(
+        hub: &Arc<SessionHub>,
+        llm: &dmn_llm::MockProvider,
+        tts: &dmn_tts::MockTtsProvider,
+    ) -> (Speaking, crate::speaker::Fed) {
+        let (setup, played) = crate::speaker::setup_with(llm.clone(), tts.clone(), true);
+        let mut s = Speaking::new(Arc::clone(hub));
+        s.attach(Speaker::start(setup, Arc::clone(hub)).unwrap());
+        (s, played)
+    }
+
+    /// The interviewer's question, then your answer in two finals.
+    fn your_answer(hub: &SessionHub) -> TranscriptLog {
+        let mut log = TranscriptLog::new();
+        for seg in [
+            final_at(Source::Interviewer, 0, 5_000, FIRST),
+            final_at(Source::You, 6_000, 9_000, SAID),
+            final_at(Source::You, 9_400, 12_000, SAID_REST),
+        ] {
+            hear(hub, &mut log, seg);
+        }
+        log
+    }
+
+    #[test]
+    fn t_after_a_you_final_translates_that_turn_then_synthesizes_the_translation_then_plays_it() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, played) = speaking(&hub, &llm, &tts);
+        let log = your_answer(&hub);
+        s.press(&log);
+        let pressed = hub.snapshot().speech.expect("a press in flight at once");
+        assert_eq!(pressed.stage, dmn_session::SpeakStage::Translating);
+        let after = wait_until(&hub, "the press played", |s| {
+            s.speech.is_none() && !tts.requests().is_empty()
+        });
+        s.finish();
+        assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+
+        let asked = llm.requests();
+        assert_eq!(asked.len(), 1, "exactly one translate request");
+        assert_eq!(
+            asked[0].messages[1].content,
+            format!("{SAID} {SAID_REST}"),
+            "its body is your last turn, nothing else"
+        );
+        let synthesized = tts.requests();
+        assert_eq!(synthesized.len(), 1, "exactly one synthesize request");
+        assert_eq!(synthesized[0].text, SPANISH, "of the translation");
+        let fed: usize = played.lock().unwrap().iter().map(|(n, _)| n).sum();
+        assert_eq!(fed, 12_000, "then playback: the speech reached dmn-voice");
+    }
+
+    #[test]
+    fn t_before_you_have_said_anything_says_nothing_to_speak_and_asks_nothing() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, played) = speaking(&hub, &llm, &tts);
+        let mut log = TranscriptLog::new();
+        hear(
+            &hub,
+            &mut log,
+            final_at(Source::Interviewer, 0, 5_000, FIRST),
+        );
+        s.press(&log);
+        let snap = hub.snapshot();
+        assert_eq!(snap.speech, None);
+        assert_eq!(
+            snap.speak_failed.as_ref().map(|n| n.reason.as_str()),
+            Some(NOTHING_TO_SPEAK)
+        );
+        assert!(screen(&snap).contains("nothing to speak"));
+        // Up for 5 s on this thread's clock, then gone.
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(Instant::now(), 1.0);
+        let seen = Instant::now();
+        s.tick(seen, &mut echo, &clock);
+        s.tick(
+            seen + SPEAK_FAILED_FOR - Duration::from_millis(1),
+            &mut echo,
+            &clock,
+        );
+        assert!(hub.snapshot().speak_failed.is_some(), "not yet");
+        s.tick(seen + SPEAK_FAILED_FOR, &mut echo, &clock);
+        assert_eq!(hub.snapshot().speak_failed, None);
+        s.finish();
+        assert!(llm.requests().is_empty(), "no LLM request");
+        assert!(tts.requests().is_empty(), "no TTS request");
+        assert!(played.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn t_does_nothing_while_speak_is_off() {
+        let hub = Arc::new(SessionHub::default());
+        let mut s = Speaking::new(Arc::clone(&hub));
+        let log = your_answer(&hub);
+        let before = hub.snapshot();
+        s.press(&log);
+        s.tick(
+            Instant::now(),
+            &mut EchoGuard::new(true),
+            &AudioClock::new(Instant::now(), 1.0),
+        );
+        let after = hub.snapshot();
+        assert_eq!(after, before, "no action at all");
+        assert!(!after.speak && after.speech.is_none() && after.speak_failed.is_none());
+        assert!(!screen(&after).contains("t speak"));
+        s.finish();
+    }
+
+    /// `t` is a speech feature, not an answer feature: with assistance off it speaks, while the
+    /// layer that answers questions ignores it and never starts its model.
+    #[test]
+    fn t_works_with_assistance_off() {
+        let (mut a, mock, launched) = assistance(false);
+        let hub = Arc::clone(&a.hub);
+        hub.dispatch(Action::Assist { enabled: false });
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, _) = speaking(&hub, &llm, &tts);
+        let log = your_answer(&hub);
+        a.command(Command::Speak, &log);
+        s.press(&log);
+        wait_until(&hub, "the press played", |s| {
+            s.speech.is_none() && !tts.requests().is_empty()
+        });
+        s.finish();
+        assert_eq!(llm.requests().len(), 1);
+        assert_eq!(tts.requests().len(), 1);
+        assert!(!launched.load(Ordering::Acquire), "no suggester");
+        assert!(
+            mock.requests().is_empty(),
+            "the answering model was not asked"
+        );
+        assert!(screen(&hub.snapshot()).contains("assist off"));
+    }
+
+    #[test]
+    fn a_second_t_while_one_is_in_flight_does_nothing() {
+        let hub = Arc::new(SessionHub::default());
+        // A slow model keeps the first press translating while the second comes.
+        let llm = spanish().with_delay(Duration::from_millis(100));
+        let tts = dmn_tts::MockTtsProvider::new();
+        let (mut s, _) = speaking(&hub, &llm, &tts);
+        let log = your_answer(&hub);
+        s.press(&log);
+        s.press(&log);
+        s.press(&log);
+        assert_eq!(s.presses, 1, "only the first press counts");
+        wait_until(&hub, "the press played", |s| {
+            s.speech.is_none() && !tts.requests().is_empty()
+        });
+        // Once it has played, the next press speaks again.
+        s.press(&log);
+        assert_eq!(s.presses, 2);
+        wait_until(&hub, "the second press played", |s| {
+            s.speech.is_none() && tts.requests().len() == 2
+        });
+        s.finish();
+        assert_eq!(llm.requests().len(), 2);
+    }
+
+    /// The status line's seconds come from this thread's clock, one action per new second; a
+    /// press that fails is said for 5 s like any notice.
+    #[test]
+    fn the_seconds_since_the_press_count_up_on_the_status_line() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, _) = speaking(&hub, &llm, &tts);
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(Instant::now(), 1.0);
+        // A press as the reducer sees it, with no job behind it.
+        let t0 = Instant::now();
+        hub.dispatch(Action::SpeakStarted { id: 9 });
+        s.pressed = Some((9, t0));
+        s.tick(t0 + Duration::from_millis(900), &mut echo, &clock);
+        assert_eq!(hub.snapshot().speech.unwrap().secs, 0);
+        s.tick(t0 + Duration::from_millis(3_200), &mut echo, &clock);
+        let snap = hub.snapshot();
+        assert_eq!(snap.speech.as_ref().unwrap().secs, 3);
+        assert!(
+            screen(&snap).contains("translating… 3s"),
+            "{}",
+            screen(&snap)
+        );
+        hub.dispatch(Action::SpeakTranslated {
+            id: 9,
+            text: SPANISH.into(),
+        });
+        s.tick(t0 + Duration::from_millis(11_000), &mut echo, &clock);
+        let snap = hub.snapshot();
+        assert!(screen(&snap).contains("speaking… 11s"), "{}", screen(&snap));
+        assert!(screen(&snap).contains("» Empezaría con un token bucket"));
+        hub.dispatch(Action::SpeakDone { id: 9 });
+        let snap = hub.snapshot();
+        assert!(!screen(&snap).contains("speaking…"), "the tag clears");
+        assert!(!screen(&snap).contains("» "), "and the line");
+        s.finish();
+    }
+
+    /// The echo window (no PipeWire): what either lane heard while the speech played is dropped
+    /// by the guard; what came after is kept.
+    #[test]
+    fn segments_heard_while_t_plays_are_dropped_and_later_ones_kept() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, _) = speaking(&hub, &llm, &tts);
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(Instant::now(), 1.0);
+        let log = your_answer(&hub);
+        let pressed_at = Duration::from_secs_f64(clock.now());
+        s.press(&log);
+        wait_until(&hub, "the press played", |s| {
+            s.speech.is_none() && !tts.requests().is_empty()
+        });
+        s.tick(Instant::now(), &mut echo, &clock);
+        let done_at = Duration::from_secs_f64(clock.now());
+        s.finish();
+        let ms = |d: Duration| d.as_millis() as u64;
+        let during = final_at(
+            Source::Interviewer,
+            ms(pressed_at),
+            ms(done_at),
+            "Empezaría con un token bucket.",
+        );
+        let verdicts = echo.observe(during.clone(), Duration::from_secs(100));
+        assert_eq!(verdicts, [Verdict::Drop(during)]);
+        let later = final_at(
+            Source::Interviewer,
+            ms(done_at) + 5_000,
+            ms(done_at) + 8_000,
+            LATER,
+        );
+        let verdicts = echo.observe(later.clone(), Duration::from_secs(100));
+        assert_eq!(verdicts, [Verdict::Publish(later)]);
+    }
+
+    /// #109 with #77: with `[speak]` on the You lane keeps your own words; the Interviewer lane
+    /// translates as configured. With `[speak]` off, or English, nothing changes.
+    #[test]
+    fn with_speak_on_the_you_lane_transcribes_without_whisper_translate() {
+        use dmn_stt::Language;
+        let auto = Language::Auto;
+        let es = Language::Fixed("es".into());
+        assert_eq!(lane_language(Source::You, &auto, true), Language::Detect);
+        assert_eq!(lane_language(Source::You, &es, true), Language::Detect);
+        assert_eq!(lane_language(Source::Interviewer, &auto, true), auto);
+        assert_eq!(lane_language(Source::Interviewer, &es, true), es);
+        for lang in [Language::English, auto.clone(), es.clone()] {
+            for source in [Source::You, Source::Interviewer] {
+                assert_eq!(lane_language(source, &lang, false), lang, "speak off");
+            }
+        }
+        assert_eq!(
+            lane_language(Source::You, &Language::English, true),
+            Language::English,
+            "English needs no translation to keep"
+        );
+    }
+
+    /// #109 live, the issue's measurement: an English You line, `t`, the real model (Ollama,
+    /// `qwen3.6:35b-a3b`, `think: false`) translating it into Spanish, the real TTS server
+    /// (chatterbox-tts-api on :4123) speaking it in a test voice, and `pw-record` on `dmn-voice`
+    /// hearing it, on a pipe. Prints key → translation, key → first audio, key → done. The test
+    /// voice `dmn-test-109` is enrolled from 15 s of the Spanish fixture with `--language es`
+    /// (so the start-up check passes) and deleted afterwards; everything else lives in a
+    /// tempdir. Skips when either server is not answering.
+    #[test]
+    #[ignore = "needs PipeWire, Ollama with qwen3.6:35b-a3b, the TTS server on :4123 and the es fixture"]
+    fn live_t_speaks_your_english_line_in_spanish_into_dmn_voice() {
+        use std::io::Read as _;
+        use std::process::{Command as Proc, Stdio};
+        const TTS: &str = "http://localhost:4123";
+        const VOICE: &str = "dmn-test-109";
+        let up = |url: &str| {
+            Proc::new("curl")
+                .args(["-sf", "-m", "2", url])
+                .stdout(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if !up(&format!("{TTS}/health")) || !up("http://localhost:11434/api/version") {
+            eprintln!("skipped: the TTS server or Ollama is not answering");
+            return;
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/es/candidate.wav");
+        if !fixture.exists() {
+            eprintln!("skipped: {} is missing", fixture.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        // Seconds 47–62 of the fixture, as #108's live check cuts it.
+        let clip = dir.path().join(format!("{VOICE}.wav"));
+        {
+            let mut r = hound::WavReader::open(&fixture).unwrap();
+            let spec = r.spec();
+            let rate = spec.sample_rate as usize;
+            let samples: Vec<i16> = r
+                .samples::<i16>()
+                .skip(47 * rate)
+                .take(15 * rate)
+                .map(|s| s.unwrap())
+                .collect();
+            let mut w = hound::WavWriter::create(&clip, spec).unwrap();
+            for s in samples {
+                w.write_sample(s).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        struct DeleteVoice;
+        impl Drop for DeleteVoice {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("curl")
+                    .args(["-s", "-X", "DELETE", &format!("{TTS}/v1/voices/{VOICE}")])
+                    .stdout(std::process::Stdio::null())
+                    .status();
+            }
+        }
+        let _cleanup = DeleteVoice;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        use dmn_tts::TtsProvider as _;
+        rt.block_on(dmn_tts::ChatterboxProvider::new(TTS).enroll(VOICE, &clip, Some("es")))
+            .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "es".into();
+        cfg.speak.tts_url = TTS.into();
+        cfg.speak.voice_ref = clip.display().to_string();
+        cfg.llm.num_ctx = 8192;
+        let setup = crate::speaker::setup(&cfg, &paths).unwrap();
+        let hub = Arc::new(SessionHub::default());
+        let mut s = Speaking::new(Arc::clone(&hub));
+        s.attach(Speaker::start(setup, Arc::clone(&hub)).unwrap());
+
+        // The node is there before any press, for the call (here pw-record) to select.
+        let node = Instant::now();
+        while !String::from_utf8_lossy(&Proc::new("pw-dump").output().unwrap().stdout)
+            .contains("\"node.name\": \"dmn-voice\"")
+        {
+            assert!(node.elapsed() < Duration::from_secs(5), "no dmn-voice");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut rec = Proc::new("pw-record")
+            .args(["--target", "dmn-voice", "--raw", "--rate", "48000"])
+            .args(["--channels", "1", "--format", "f32", "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut out = rec.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut first, mut loud, mut buf) = (None, 0usize, [0u8; 4096]);
+            while let Ok(n) = out.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let hits = buf[..n]
+                    .chunks_exact(4)
+                    .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() > 0.005)
+                    .count();
+                if hits > 0 {
+                    first.get_or_insert_with(Instant::now);
+                    loud += hits;
+                }
+            }
+            (first, loud)
+        });
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut log = TranscriptLog::new();
+        hear(
+            &hub,
+            &mut log,
+            final_at(
+                Source::You,
+                6_000,
+                11_000,
+                "I would start with a token bucket for each API key and keep the counters in Redis.",
+            ),
+        );
+        let pressed = Instant::now();
+        s.press(&log);
+        let mut translated = None;
+        let done = loop {
+            let snap = hub.snapshot();
+            match &snap.speech {
+                Some(sp) if sp.stage == dmn_session::SpeakStage::Speaking => {
+                    translated.get_or_insert_with(|| (pressed.elapsed(), sp.text.clone()));
+                }
+                Some(_) => {}
+                None => break (pressed.elapsed(), snap),
+            }
+            assert!(pressed.elapsed() < Duration::from_secs(120), "never done");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = rec.kill();
+        let _ = rec.wait();
+        let (first, loud) = reader.join().unwrap();
+        s.finish();
+        let (done_after, snap) = done;
+        assert_eq!(snap.speak_failed, None, "{:?}", snap.speak_failed);
+        let (translated_after, text) = translated.expect("a translation");
+        let first_after = first.map(|t| t.saturating_duration_since(pressed));
+        eprintln!("translation: {text}");
+        eprintln!(
+            "key → translation {:.2} s, key → first audio {}, key → done {:.2} s, {:.1} s of speech heard by pw-record",
+            translated_after.as_secs_f64(),
+            first_after.map_or("never".into(), |d| format!("{:.2} s", d.as_secs_f64())),
+            done_after.as_secs_f64(),
+            loud as f64 / 48_000.0
+        );
+        assert!(
+            first_after.is_some(),
+            "pw-record heard nothing from dmn-voice"
+        );
+    }
+
+    /// The issue's first criterion end to end on a fixture: the real pipeline replays the
+    /// English sysdesign interview (whisper and all), `t` is pressed once a You final is in the
+    /// transcript, and the mock model and mock TTS server see exactly one request each. Run
+    /// with `just probe` on a dev machine.
+    #[test]
+    #[ignore = "needs the fixture WAVs (just fixtures-fetch) and the whisper model (dmn doctor --fetch small.en)"]
+    fn replaying_an_english_fixture_t_speaks_the_candidates_last_turn() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/sysdesign");
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            models_dir: Paths::from_xdg().unwrap().models_dir,
+            ..Paths::under(dir.path())
+        };
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "es".into();
+        // Nothing listens here: a request that slipped past the mocks would fail loudly.
+        cfg.llm.base_url = "http://127.0.0.1:9".into();
+        let mut pipeline = Pipeline::start(
+            &cfg,
+            &paths,
+            &Options {
+                input: Input::Files {
+                    interviewer: fixture.join("interviewer.wav"),
+                    candidate: fixture.join("candidate.wav"),
+                },
+                speed: 8.0,
+                model: None,
+                threads: None,
+                vad_close_ms: None,
+                vad: None,
+                device: Some(dmn_core::config::SttDevice::Cpu),
+                language: None,
+                partials: Partials::Off,
+                spec_literal_detector: false,
+                question_source: None,
+                assist: Some(false),
+                no_llm: true,
+                no_store: true,
+                output: Output::Quiet,
+                policy: Policy::AnswerAll,
+                coding_solutions: None,
+            },
+        )
+        .unwrap();
+        let hub = pipeline.hub();
+        let controls = pipeline.controls();
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (setup, played) = crate::speaker::setup_with(llm.clone(), tts.clone(), true);
+        pipeline.attach_speaker(Speaker::start(setup, Arc::clone(&hub)).unwrap());
+        let worker = std::thread::spawn(move || {
+            pipeline.run(&mut Quiet, true);
+            pipeline.finish(&mut Quiet).unwrap()
+        });
+        let yours = |s: &Session| -> Vec<String> {
+            s.transcript
+                .iter()
+                .filter(|l| l.speaker == dmn_session::Speaker::You && !l.text.is_empty())
+                .map(|l| l.text.clone())
+                .collect()
+        };
+        let heard = wait_until(&hub, "a You final", |s| !yours(s).is_empty());
+        controls.speak();
+        let after = wait_until(&hub, "the press played", |s| {
+            s.speech.is_none() && (!tts.requests().is_empty() || s.speak_failed.is_some())
+        });
+        controls.quit();
+        worker.join().unwrap();
+        assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+        let asked = llm.requests();
+        assert_eq!(asked.len(), 1, "one translate request");
+        let body = &asked[0].messages[1].content;
+        assert!(!body.is_empty());
+        assert!(
+            yours(&after).join(" ").contains(body.as_str()),
+            "the body is the candidate's last turn: {body:?} in {:?} (first heard {:?})",
+            yours(&after),
+            yours(&heard)
+        );
+        let synthesized = tts.requests();
+        assert_eq!(synthesized.len(), 1, "one synthesize request");
+        assert_eq!(synthesized[0].text, SPANISH);
+        assert!(!played.lock().unwrap().is_empty(), "playback started");
     }
 }
