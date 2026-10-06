@@ -9,6 +9,8 @@ use directories::ProjectDirs;
 pub struct Paths {
     /// `~/.config/dmn/config.toml`
     pub config_file: PathBuf,
+    /// `~/.local/share/dmn/`: the data root (the enrolled voice clip lives directly here).
+    pub data_dir: PathBuf,
     /// `~/.local/share/dmn/sources/`: copies of ingested resume, JD, notes, stories.
     pub sources_dir: PathBuf,
     /// `~/.local/share/dmn/dmn.sqlite`
@@ -31,6 +33,7 @@ impl Paths {
             .unwrap_or_else(|| dirs.data_local_dir().to_path_buf());
         Some(Self {
             config_file: dirs.config_dir().join("config.toml"),
+            data_dir: dirs.data_dir().to_path_buf(),
             sources_dir: dirs.data_dir().join("sources"),
             db_file: dirs.data_dir().join("dmn.sqlite"),
             sessions_dir: dirs.data_dir().join("sessions"),
@@ -43,6 +46,7 @@ impl Paths {
     pub fn under(root: &Path) -> Self {
         Self {
             config_file: root.join("config/config.toml"),
+            data_dir: root.join("share"),
             sources_dir: root.join("share/sources"),
             db_file: root.join("share/dmn.sqlite"),
             sessions_dir: root.join("share/sessions"),

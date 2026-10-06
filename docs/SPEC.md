@@ -78,6 +78,7 @@ Audio enters as two labelled streams, so speaker attribution is a property of th
 | `crates/dmn-detect/` | Question detector: cue rules, scoring, pin logic |
 | `crates/dmn-context/` | Source ingestion (PDF via `pdf-extract`, MD, TXT), chunking, BM25 retrieval, session summariser |
 | `crates/dmn-llm/` | `Provider` trait; `ollama`, `openai`, `anthropic` modules; prompt templates; JSON schema + `limits.rs` |
+| `crates/dmn-tts/` | `TtsProvider` trait; the chatterbox-tts-api client (#107): voice enrollment, synthesis, the WAV body decoded into mono f32 chunks on a bounded channel |
 | `crates/dmn-session/` | `Session` state, reducers, `broadcast` fan-out |
 | `crates/dmn-store/` | `rusqlite` schema + migrations |
 | `crates/dmn-core/` | Wires the pipeline; the only crate that knows every stage; used by both binaries |
@@ -283,7 +284,7 @@ Shortcuts are registered inside the window (WebKit key events), not globally; a 
 
 ## Data, config and privacy
 
-Everything lives under XDG paths, audio is never written to disk unless the user turns on session recording, and the only network calls are to the configured LLM endpoint, to model downloads the user starts, and, with the web lookup on (#102), the search query to `[lookup].base_url`.
+Everything lives under XDG paths, the call's audio is never written to disk unless the user turns on session recording (`dmn speak` writes only the files its own command line names, below), and the only network calls are to the configured LLM endpoint, to model downloads the user starts, with the web lookup on (#102) the search query to `[lookup].base_url`, and with `dmn speak` (#107) the text and the enrolled clip to the TTS server on this machine at `[speak].tts_url`.
 
 | Path | Contents |
 | --- | --- |
@@ -291,6 +292,7 @@ Everything lives under XDG paths, audio is never written to disk unless the user
 | `~/.local/share/dmn/sources/` | Copies of ingested resume, JD, notes, stories (originals untouched) |
 | `~/.local/share/dmn/dmn.sqlite` | Sessions, segments (with the detected language, #77), questions, suggestions, chunks, summaries |
 | `~/.local/share/dmn/sessions/<id>.jsonl` | Optional export of a session's transcript + suggestions |
+| `~/.local/share/dmn/<name>.wav` | The voice clip `dmn speak enroll --wav` registered (#107; `voice.wav` by default), named by `[speak].voice_ref` |
 | `~/.cache/dmn/models/` | whisper ggml files |
 | `~/.local/state/dmn/dmn.log` | Structured log (tracing, JSON), rotated at 10 MB |
 
@@ -335,6 +337,12 @@ max_results = 5
 [assist]
 enabled = true                       # false = transcribe / translate only (Ctrl+Shift+A toggles)
 
+[speak]
+enabled = false                      # `dmn speak` (#107): clone-voice TTS through a local server
+tts_url = "http://localhost:4123"    # chatterbox-tts-api (OpenAI-compatible); this machine only
+voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
+device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
+
 [ui]
 always_on_top = true
 force_x11 = false                    # launch under XWayland for keep-above
@@ -350,7 +358,8 @@ keep_transcripts = true
 
 **Privacy rules**
 
-- Audio buffers are in memory only; `record_audio=true` writes WAVs under `sessions/` and shows a red REC dot.
+- Audio buffers are in memory only; `record_audio=true` writes WAVs under `sessions/` and shows a red REC dot. That rule is about the call. `dmn speak` (#107) writes audio only where its own command line asks: `dmn speak "text" --out <file>` writes the synthesized speech to that file, and `dmn speak enroll --wav <clip>` keeps a copy of the user's own clip at `~/.local/share/dmn/<name>.wav`. Neither records anything from a call, and without `--out` nothing is written.
+- Synthesized text goes only to a TTS server on this machine: `dmn speak` refuses a `[speak].tts_url` whose host is not a loopback name or address. `dmn speak` sends that server the text; `dmn speak enroll` uploads the clip once, and the server (chatterbox-tts-api) keeps its own copy in its voice library until the user deletes it there (`DELETE /v1/voices/<name>`).
 - What leaves the machine, and when: audio never. Transcript text only with a remote model: with any provider but `ollama` on this machine, the exact payload (transcript window, retrieved chunks, summary) goes to that provider; Settings says so in one sentence and `dmn doctor` prints the provider in use. A web search query only with the web lookup on (`[lookup].enabled`, off by default, #102): the few words of the fast phase's `lookup` (at most 80 characters, written by the model from the question); nothing from the transcript, the candidate's material or the session goes with it. With `provider = "ollama"` it goes, with the number of results and the key from `[lookup].api_key_env`, to Ollama's web search (`https://ollama.com` by default). With `provider = "searxng"` it goes to the user's own SearXNG instance (`http://localhost:8888` by default), with no account or key, and that instance forwards it to the search engines it is configured with. With `provider=ollama` and the lookup off, nothing leaves the machine. While the lookup is on the status line says `web`, `dmn run --headless`, `dmn replay` and `dmn config show` say what is sent and where, and `dmn doctor`'s header says so.
 - API keys (the remote model's, and the web lookup's) are read from the named environment variable at start and never written to config, logs or the database.
 - `dmn sessions purge <id|all>` deletes rows and files; there is no cloud copy to purge.
