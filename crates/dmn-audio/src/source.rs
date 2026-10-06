@@ -61,6 +61,9 @@ pub enum AudioError {
     /// callback may still be running and writing into the ring.
     #[error("the capture stream was still {state} after {ms} ms; its callback may still run")]
     StopTimeout { state: &'static str, ms: u64 },
+    /// The virtual microphone (#108) could not be created, fed or kept.
+    #[error("virtual microphone dmn-voice: {0}")]
+    VirtualMic(String),
 }
 
 /// A labelled producer of 16 kHz mono frames. `start` hands the source its ring producer and

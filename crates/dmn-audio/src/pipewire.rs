@@ -2,7 +2,7 @@
 //! live [`NodeTable`] of capture sources and app output streams (docs/SPEC.md § Audio capture on
 //! PipeWire, Discovery). The same loop thread owns the capture streams of
 //! [`crate::PipeWireSource`] (issue #5), which it creates, retargets and closes on
-//! [`Command`]s.
+//! [`Command`]s, and the playback stream behind [`crate::VirtualMic`] (#108).
 //!
 //! Threading: everything PipeWire-owned (`MainLoopRc`, `CoreRc`, `RegistryRc`, proxies,
 //! listeners) lives on the loop thread and is `!Send`; the table is shared through an
@@ -31,6 +31,7 @@ use pw::types::ObjectType;
 
 use crate::capture::{LoopCapture, OpenSpec};
 use crate::frames::FrameSink;
+use crate::vmic::{LoopVmic, VmicSpec, VoiceReader};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipeWireError {
@@ -91,6 +92,9 @@ pub enum RegistryEvent {
     Removed(u32),
     /// The `default.audio.source` metadata changed; `None` clears it.
     DefaultSource(Option<String>),
+    /// The `settings` metadata's `clock.rate` (the graph's sample rate) changed; `None` clears
+    /// it. `forced` carries `clock.force-rate`, which wins while it is set.
+    ClockRate { rate: Option<u32>, forced: bool },
     /// The initial registry enumeration finished (core `done` for our sync).
     Synced,
     /// The server connection is gone; the table is frozen from now on.
@@ -105,6 +109,10 @@ pub struct NodeTable {
     streams: BTreeMap<u32, AppStream>,
     /// `node.name` of PipeWire's default source, from the `default` metadata object.
     pub default_source: Option<String>,
+    /// The graph's sample rate (`clock.rate` in the `settings` metadata), if seen.
+    pub clock_rate: Option<u32>,
+    /// `clock.force-rate`, if set and non-zero: the rate the graph is pinned to.
+    pub force_rate: Option<u32>,
     /// True once the first enumeration is complete.
     pub synced: bool,
     /// Set when the server went away; the table stops changing.
@@ -128,6 +136,14 @@ impl NodeTable {
     pub fn default_capture(&self) -> Option<&CaptureNode> {
         let name = self.default_source.as_deref()?;
         self.sources.values().find(|n| n.name == name)
+    }
+
+    /// The rate the graph runs at: `clock.force-rate` when set, else `clock.rate`, else
+    /// PipeWire's own default of 48 kHz.
+    pub fn graph_rate(&self) -> u32 {
+        self.force_rate
+            .or(self.clock_rate)
+            .unwrap_or(DEFAULT_GRAPH_RATE)
     }
 
     /// Fold one event in. Returns true when something observable changed.
@@ -221,6 +237,16 @@ impl NodeTable {
                 self.default_source = name;
                 changed
             }
+            RegistryEvent::ClockRate { rate, forced } => {
+                let slot = if forced {
+                    &mut self.force_rate
+                } else {
+                    &mut self.clock_rate
+                };
+                let changed = *slot != rate;
+                *slot = rate;
+                changed
+            }
             RegistryEvent::Synced => {
                 let changed = !self.synced;
                 self.synced = true;
@@ -249,6 +275,16 @@ pub fn parse_default_name(value: &str) -> Option<String> {
     let end = rest.find('"')?;
     let name = &rest[..end];
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// PipeWire's default `clock.rate` when the `settings` metadata does not say.
+pub const DEFAULT_GRAPH_RATE: u32 = 48_000;
+
+/// Parse a `settings` metadata rate value (`"48000"`, or a JSON number). Zero, which is how
+/// `clock.force-rate` says "not forced", and anything unparseable are `None`.
+pub fn parse_rate(value: &str) -> Option<u32> {
+    let rate: u32 = value.trim().trim_matches('"').parse().ok()?;
+    (rate != 0).then_some(rate)
 }
 
 struct Shared {
@@ -292,6 +328,16 @@ pub(crate) enum Command {
     },
     /// Disconnect and destroy the stream under `key`.
     Close {
+        key: u64,
+    },
+    /// Create and connect the virtual microphone's playback stream under `key` (#108).
+    OpenVmic {
+        key: u64,
+        spec: VmicSpec,
+        reader: VoiceReader,
+    },
+    /// Disconnect and destroy the virtual microphone under `key`; its node leaves the graph.
+    CloseVmic {
         key: u64,
     },
 }
@@ -434,9 +480,12 @@ fn loop_thread(
     };
 
     // Commands from other threads run here, on the loop. Drop sends Command::Quit; capture
-    // sources open, retarget and close their streams through the rest.
+    // sources open, retarget and close their streams through the rest, and the virtual
+    // microphone opens and closes its playback stream the same way.
     let captures: Rc<RefCell<HashMap<u64, LoopCapture>>> = Rc::new(RefCell::new(HashMap::new()));
+    let vmics: Rc<RefCell<HashMap<u64, LoopVmic>>> = Rc::new(RefCell::new(HashMap::new()));
     let cmd_captures = Rc::clone(&captures);
+    let cmd_vmics = Rc::clone(&vmics);
     let cmd_core = core.clone();
     let loop_weak = main_loop.downgrade();
     let _commands = quit_rx.attach(main_loop.loop_(), move |cmd| match cmd {
@@ -470,6 +519,19 @@ fn loop_thread(
         }
         Command::Close { key } => {
             let closed = cmd_captures.borrow_mut().remove(&key);
+            drop(closed);
+        }
+        Command::OpenVmic { key, spec, reader } => {
+            let status = Arc::clone(&spec.status);
+            match LoopVmic::open(&cmd_core, spec, reader) {
+                Ok(v) => {
+                    cmd_vmics.borrow_mut().insert(key, v);
+                }
+                Err(e) => status.set_error(e),
+            }
+        }
+        Command::CloseVmic { key } => {
+            let closed = cmd_vmics.borrow_mut().remove(&key);
             drop(closed);
         }
     });
@@ -551,7 +613,11 @@ fn loop_thread(
                         }
                     }
                 }
-                ObjectType::Metadata if props.get("metadata.name") == Some("default") => {
+                // `default` carries the default source; `settings` the graph's clock rate
+                // (#108: the virtual microphone plays at that rate).
+                ObjectType::Metadata
+                    if matches!(props.get("metadata.name"), Some("default" | "settings")) =>
+                {
                     let Some(registry) = registry_weak.upgrade() else {
                         return;
                     };
@@ -562,10 +628,19 @@ fn loop_thread(
                     let listener = metadata
                         .add_listener_local()
                         .property(move |_subject, key, _type, value| {
-                            if key == Some("default.audio.source") {
-                                meta_shared.apply(RegistryEvent::DefaultSource(
-                                    value.and_then(parse_default_name),
-                                ));
+                            match key {
+                                Some("default.audio.source") => {
+                                    meta_shared.apply(RegistryEvent::DefaultSource(
+                                        value.and_then(parse_default_name),
+                                    ));
+                                }
+                                Some(key @ ("clock.rate" | "clock.force-rate")) => {
+                                    meta_shared.apply(RegistryEvent::ClockRate {
+                                        rate: value.and_then(parse_rate),
+                                        forced: key == "clock.force-rate",
+                                    });
+                                }
+                                _ => {}
                             }
                             0
                         })
@@ -602,9 +677,11 @@ fn loop_thread(
 
     main_loop.run();
 
-    // Capture streams first (they hang off the core), then listeners before proxies before the
-    // core: drop in reverse creation order.
+    // Streams first (they hang off the core; closing the virtual microphone's is what takes
+    // its node out of the graph), then listeners before proxies before the core: drop in
+    // reverse creation order.
     captures.borrow_mut().clear();
+    vmics.borrow_mut().clear();
     drop(_commands);
     drop(_registry_listener);
     drop(nodes);
@@ -784,6 +861,39 @@ mod tests {
         assert_eq!(parse_default_name(r#"{"name":""}"#), None);
         assert_eq!(parse_default_name("{}"), None);
         assert_eq!(parse_default_name("not json"), None);
+    }
+
+    #[test]
+    fn graph_rate_follows_settings_and_a_forced_rate_wins() {
+        let mut t = NodeTable::default();
+        assert_eq!(
+            t.graph_rate(),
+            DEFAULT_GRAPH_RATE,
+            "nothing seen: PipeWire's default"
+        );
+        assert!(t.apply(RegistryEvent::ClockRate {
+            rate: Some(44_100),
+            forced: false
+        }));
+        assert_eq!(t.graph_rate(), 44_100);
+        assert!(!t.apply(RegistryEvent::ClockRate {
+            rate: Some(44_100),
+            forced: false
+        }));
+        assert!(t.apply(RegistryEvent::ClockRate {
+            rate: Some(96_000),
+            forced: true
+        }));
+        assert_eq!(t.graph_rate(), 96_000, "clock.force-rate pins the graph");
+        // force-rate back to 0 ("not forced") is reported as None and the clock rate shows again.
+        assert!(t.apply(RegistryEvent::ClockRate {
+            rate: parse_rate("0"),
+            forced: true
+        }));
+        assert_eq!(t.graph_rate(), 44_100);
+        assert_eq!(parse_rate("48000"), Some(48_000));
+        assert_eq!(parse_rate(" \"48000\" "), Some(48_000));
+        assert_eq!(parse_rate("fast"), None);
     }
 
     /// Needs a running PipeWire server: `just probe`.

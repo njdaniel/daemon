@@ -603,7 +603,7 @@ impl LoopCapture {
                 (c"stream.capture.sink", Some(sink_flag)),
             ],
         )?;
-        let pod = enum_format_pod()?;
+        let pod = enum_format_pod(SAMPLE_RATE)?;
         let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or("bad EnumFormat pod")?];
         self.stream
             .connect(
@@ -648,12 +648,13 @@ pub(crate) struct OpenSpec {
     pub(crate) status: Arc<CaptureStatus>,
 }
 
-/// `SPA_PARAM_EnumFormat` with one fixed choice: F32LE, 16 kHz, mono. PipeWire's adapter
-/// resamples and downmixes whatever the target produces.
-fn enum_format_pod() -> Result<Vec<u8>, String> {
+/// `SPA_PARAM_EnumFormat` with one fixed choice: F32LE, `rate` Hz, mono. PipeWire's adapter
+/// resamples and downmixes whatever the target produces (capture asks for 16 kHz; the virtual
+/// microphone of `vmic.rs` asks for the graph rate).
+pub(crate) fn enum_format_pod(rate: u32) -> Result<Vec<u8>, String> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
-    info.set_rate(SAMPLE_RATE);
+    info.set_rate(rate);
     info.set_channels(1);
     let mut position = [0u32; spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
     position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
@@ -1154,7 +1155,7 @@ mod tests {
 
     #[test]
     fn enum_format_pod_serialises() {
-        let pod = enum_format_pod().unwrap();
+        let pod = enum_format_pod(SAMPLE_RATE).unwrap();
         assert!(spa::pod::Pod::from_bytes(&pod).is_some());
     }
 
