@@ -399,6 +399,37 @@ fn no_offload(cpu_percent: &u8) -> bool {
     *cpu_percent == 0
 }
 
+/// Where a `t` press (#109) is: the status line's tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeakStage {
+    /// The user's last turn is with the model: `translating…`.
+    Translating,
+    /// The translation is with the TTS server, then playing into `dmn-voice`: `speaking…`.
+    Speaking,
+}
+
+/// The `t` press in flight (#109). Only one at a time: a press while one is in flight does
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Speech {
+    pub id: u64,
+    pub stage: SpeakStage,
+    /// The translation being spoken, once it has arrived; the one dim line under the question.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Whole seconds since the press, for the status line.
+    #[serde(default)]
+    pub secs: u32,
+}
+
+/// A `t` press that spoke nothing (#109), on the status line for 5 s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakNotice {
+    pub id: u64,
+    pub reason: String,
+}
+
 /// Running totals, for the status line and the end-of-run summary.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Counts {
@@ -494,6 +525,16 @@ pub struct Session {
     /// or another question takes the screen.
     #[serde(default, skip_serializing_if = "not_scrolled")]
     pub scroll: u16,
+    /// #109: `t` speaks in this session (`[speak].enabled`). Off in every log from before it,
+    /// and left out of the JSON while off, as are the two fields after it while empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub speak: bool,
+    /// #109: the `t` press in flight, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech: Option<Speech>,
+    /// #109: why the last `t` press spoke nothing, for 5 s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speak_failed: Option<SpeakNotice>,
 }
 
 fn not_scrolled(rows: &u16) -> bool {
@@ -997,6 +1038,47 @@ fn apply(s: &mut Session, action: &Action) {
         Action::QuestionSource { source } => s.question_source = *source,
         Action::LlmOffload { cpu_percent } => s.status.llm_cpu_percent = *cpu_percent,
         Action::WebLookup { enabled } => s.status.web = *enabled,
+        Action::SpeakEnabled { enabled } => s.speak = *enabled,
+        Action::SpeakStarted { id } => {
+            s.speech = Some(Speech {
+                id: *id,
+                stage: SpeakStage::Translating,
+                text: String::new(),
+                secs: 0,
+            });
+            // A new press is a new attempt: the last one's failure goes.
+            s.speak_failed = None;
+        }
+        Action::SpeakTranslated { id, text } => {
+            if let Some(sp) = s.speech.as_mut().filter(|sp| sp.id == *id) {
+                sp.stage = SpeakStage::Speaking;
+                sp.text.clone_from(text);
+            }
+        }
+        Action::SpeakElapsed { id, secs } => {
+            if let Some(sp) = s.speech.as_mut().filter(|sp| sp.id == *id) {
+                sp.secs = *secs;
+            }
+        }
+        Action::SpeakDone { id } => {
+            if s.speech.as_ref().is_some_and(|sp| sp.id == *id) {
+                s.speech = None;
+            }
+        }
+        Action::SpeakFailed { id, reason } => {
+            if s.speech.as_ref().is_some_and(|sp| sp.id == *id) {
+                s.speech = None;
+            }
+            s.speak_failed = Some(SpeakNotice {
+                id: *id,
+                reason: reason.clone(),
+            });
+        }
+        Action::SpeakNoticeExpired { id } => {
+            if s.speak_failed.as_ref().is_some_and(|n| n.id == *id) {
+                s.speak_failed = None;
+            }
+        }
         // Measurements for the session log; nothing on screen depends on them.
         Action::Timing { .. } | Action::Cpu { .. } | Action::EchoDropped { .. } => {}
     }

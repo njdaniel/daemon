@@ -2212,3 +2212,126 @@ fn browsing_and_scrolling_survive_the_action_log_and_older_sessions_still_load()
     }
     assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
 }
+
+// --- #109: `t` speaks the user's last turn in the interview's language ------------------------
+
+fn speak_on() -> Vec<Action> {
+    vec![
+        Action::Started {
+            label: "live".into(),
+            at: 1_790_200_000,
+        },
+        Action::SpeakEnabled { enabled: true },
+    ]
+}
+
+#[test]
+fn a_speak_press_goes_translating_then_speaking_with_its_seconds_then_clears() {
+    let mut log = speak_on();
+    log.push(Action::SpeakStarted { id: 1 });
+    let s = Session::replay(&log);
+    assert!(s.speak);
+    let sp = s.speech.clone().unwrap();
+    assert_eq!((sp.id, sp.stage, sp.secs), (1, SpeakStage::Translating, 0));
+    assert!(sp.text.is_empty(), "no translation yet");
+
+    log.push(Action::SpeakElapsed { id: 1, secs: 1 });
+    log.push(Action::SpeakTranslated {
+        id: 1,
+        text: "Empezaría con un token bucket.".into(),
+    });
+    log.push(Action::SpeakElapsed { id: 1, secs: 9 });
+    let sp = Session::replay(&log).speech.unwrap();
+    assert_eq!(sp.stage, SpeakStage::Speaking);
+    assert_eq!(sp.text, "Empezaría con un token bucket.");
+    assert_eq!(sp.secs, 9);
+
+    // A stale press's actions change nothing.
+    log.push(Action::SpeakElapsed { id: 7, secs: 99 });
+    log.push(Action::SpeakDone { id: 7 });
+    assert_eq!(Session::replay(&log).speech.unwrap().secs, 9);
+
+    log.push(Action::SpeakDone { id: 1 });
+    let s = Session::replay(&log);
+    assert_eq!(s.speech, None, "the tag and the line go");
+    assert_eq!(s.speak_failed, None);
+}
+
+#[test]
+fn a_press_that_speaks_nothing_shows_why_until_its_notice_expires() {
+    let mut log = speak_on();
+    // Nothing said yet: the pipeline answers the press with a failure and no start.
+    log.push(Action::SpeakFailed {
+        id: 1,
+        reason: "nothing to speak".into(),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(s.speech, None);
+    assert_eq!(
+        s.speak_failed,
+        Some(SpeakNotice {
+            id: 1,
+            reason: "nothing to speak".into()
+        })
+    );
+    // The next press clears it at once.
+    log.push(Action::SpeakStarted { id: 2 });
+    assert_eq!(Session::replay(&log).speak_failed, None);
+    // A press that fails midway ends and says so.
+    log.push(Action::SpeakFailed {
+        id: 2,
+        reason: "translate failed: timed out after 4 s".into(),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(s.speech, None);
+    assert_eq!(s.speak_failed.as_ref().unwrap().id, 2);
+    // An older notice's expiry leaves the newer one; its own takes it down.
+    log.push(Action::SpeakNoticeExpired { id: 1 });
+    assert!(Session::replay(&log).speak_failed.is_some());
+    log.push(Action::SpeakNoticeExpired { id: 2 });
+    assert_eq!(Session::replay(&log).speak_failed, None);
+}
+
+#[test]
+fn speak_state_survives_the_action_log_and_older_sessions_still_load() {
+    let mut log = speak_on();
+    log.extend([
+        Action::SpeakStarted { id: 3 },
+        Action::SpeakTranslated {
+            id: 3,
+            text: "Hola.".into(),
+        },
+        Action::SpeakElapsed { id: 3, secs: 4 },
+    ]);
+    let text: String = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap() + "\n")
+        .collect();
+    for line in [
+        r#"{"type":"speak_enabled","enabled":true}"#,
+        r#"{"type":"speak_started","id":3}"#,
+        r#"{"type":"speak_translated","id":3,"text":"Hola."}"#,
+        r#"{"type":"speak_elapsed","id":3,"secs":4}"#,
+    ] {
+        assert!(text.contains(line), "{line} in\n{text}");
+    }
+    let back: Vec<Action> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let s = Session::replay(&back);
+    assert_eq!(s, Session::replay(&log));
+    let again: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert_eq!(again, s);
+
+    // A session that never spoke serialises as it did before #109.
+    let bare = Session::replay(&[Action::Started {
+        label: "x".into(),
+        at: 1,
+    }]);
+    let json = serde_json::to_string(&bare).unwrap();
+    for key in ["\"speak\"", "\"speech\"", "\"speak_failed\""] {
+        assert!(!json.contains(key), "{key} in {json}");
+    }
+    assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
+}

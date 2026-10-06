@@ -449,6 +449,15 @@ impl StoreWriter {
             // declined one gets, are screen state.
             | Action::Asked { .. }
             | Action::NoticeExpired { .. }
+            // #109: what `t` spoke is the user's own turn, already a segment row; the
+            // translation, the tag and the notice are screen state, kept in the action log.
+            | Action::SpeakEnabled { .. }
+            | Action::SpeakStarted { .. }
+            | Action::SpeakTranslated { .. }
+            | Action::SpeakElapsed { .. }
+            | Action::SpeakDone { .. }
+            | Action::SpeakFailed { .. }
+            | Action::SpeakNoticeExpired { .. }
             | Action::Status { .. } => {}
         }
         Ok(())
