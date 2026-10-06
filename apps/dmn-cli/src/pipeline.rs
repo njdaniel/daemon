@@ -4635,30 +4635,54 @@ mod tests {
             pipeline.run(&mut Quiet, true);
             pipeline.finish(&mut Quiet).unwrap()
         });
-        let yours = |s: &Session| -> Vec<String> {
+        // The pipeline keeps serving keys until quit: a failed assertion must still stop it, or
+        // the test binary never exits.
+        struct QuitOnDrop(Controls);
+        impl Drop for QuitOnDrop {
+            fn drop(&mut self) {
+                self.0.quit();
+            }
+        }
+        let _quit = QuitOnDrop(controls.clone());
+        // Generous waits: `just probe` runs this beside other whisper-heavy tests.
+        let wait = |what: &str, done: &dyn Fn(&Session) -> bool| -> Session {
+            let until = Instant::now() + Duration::from_secs(120);
+            loop {
+                let s = hub.snapshot();
+                if done(&s) {
+                    return s;
+                }
+                assert!(Instant::now() < until, "never: {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait("a You final", &|s| {
             s.transcript
                 .iter()
-                .filter(|l| l.speaker == dmn_session::Speaker::You && !l.text.is_empty())
-                .map(|l| l.text.clone())
-                .collect()
-        };
-        let heard = wait_until(&hub, "a You final", |s| !yours(s).is_empty());
+                .any(|l| l.speaker == dmn_session::Speaker::You && !l.text.is_empty())
+        });
         controls.speak();
-        let after = wait_until(&hub, "the press played", |s| {
+        let after = wait("the press played", &|s| {
             s.speech.is_none() && (!tts.requests().is_empty() || s.speak_failed.is_some())
         });
         controls.quit();
-        worker.join().unwrap();
+        let report = worker.join().unwrap();
         assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
         let asked = llm.requests();
         assert_eq!(asked.len(), 1, "one translate request");
         let body = &asked[0].messages[1].content;
         assert!(!body.is_empty());
+        // The session keeps 60 s of transcript; the log keeps the whole run.
+        let yours: Vec<&str> = report
+            .log
+            .finals()
+            .iter()
+            .filter(|s| s.source == Source::You)
+            .map(|s| s.text.trim())
+            .collect();
         assert!(
-            yours(&after).join(" ").contains(body.as_str()),
-            "the body is the candidate's last turn: {body:?} in {:?} (first heard {:?})",
-            yours(&after),
-            yours(&heard)
+            yours.join(" ").contains(body.as_str()),
+            "the body is the candidate's last turn: {body:?} in {yours:?}"
         );
         let synthesized = tts.requests();
         assert_eq!(synthesized.len(), 1, "one synthesize request");
