@@ -4,7 +4,7 @@
 
 Daemon listens to a live interview call, transcribes the conversation, detects interviewer questions, and surfaces a short answer scaffold designed to be understood in a few seconds.
 
-The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, type or speak on the user's behalf, or attempt to hide itself from screen sharing.
+The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, does not type on the user's behalf, and does not attempt to hide itself from screen sharing. It never speaks unprompted and never speaks words the user did not say or ask for: with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user asks (`dmn speak`; a key in the TUI with #109).
 
 > **Status:** early development. The foundation CLI is working; the live TUI pipeline and desktop UI are under active development.
 
@@ -109,7 +109,8 @@ dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
 dmn sessions list | export ID | purge ID|all
 dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server
-dmn speak "TEXT" --out FILE.wav           # synthesize TEXT in your cloned voice (playback: #108)
+dmn speak "TEXT"                          # speak TEXT in your cloned voice into the virtual mic dmn-voice
+dmn speak "TEXT" --out FILE.wav           # or write it to a WAV file instead
 ```
 
 `dmn sources` (context documents) arrives with M2.
@@ -258,9 +259,9 @@ says `web` beside the model dot while it is on. What it sends, and to whom, is u
 #### Speak in your cloned voice (`dmn speak`, off by default)
 
 `dmn speak` synthesizes text in a clone of your own voice, from a 10–30 s recording of you, through
-a text-to-speech server on this machine (#107). It writes the speech to a WAV file; playing it into
-the call through a virtual microphone is #108, and translating what you just said before speaking
-it is #109.
+a text-to-speech server on this machine (#107), and plays it into a virtual microphone named
+`dmn-voice` that the call selects as its microphone (#108), so the interviewer hears it and your
+own speakers stay silent. Translating what you just said before speaking it is #109.
 
 The server is [chatterbox-tts-api](https://github.com/travisvn/chatterbox-tts-api), an
 OpenAI-compatible server around Resemble AI's [Chatterbox](https://github.com/resemble-ai/chatterbox)
@@ -284,13 +285,18 @@ curl -s http://localhost:4123/health    # "status": "healthy" once the model has
 ```
 
 The first start downloads the model, which takes a while. On the dev box's CPU (Ryzen 7700X) one
-sentence (about 4 s of speech) takes 11–14 s to render, roughly 3× slower than real time.
+sentence (about 4 s of speech) takes 11–14 s to render, roughly 3× slower than real time. `dmn
+speak` plays from the server's streaming route, so the first sentence is heard while the next
+renders; measured 2026-10-06 for "Gracias por la oportunidad." (2.3 s of speech), the call hears
+the first sound 7.9–8.8 s after the command starts and the last 10.3–11.2 s after it. That wait is
+the server's; the virtual microphone adds about 0.1 s.
 
 **GPU: check your VRAM first.** The default LLM (`qwen3.6:35b-a3b`) takes about 22 of an RTX
 4090's 24 GB, so the TTS server on the same GPU will not fit beside it. Run `nvidia-smi` before
-choosing `docker/docker-compose.gpu.yml` (or `DEVICE=cuda`), and expect to need a smaller LLM, a
-remote one, or assistance off. `[speak].device` records your choice for this setup; dmn does not
-read it.
+choosing `docker/docker-compose.gpu.yml` (or `DEVICE=cuda`) in place of the CPU compose file
+above, and expect to need a smaller LLM, a remote one, or assistance off. With VRAM to spare the
+GPU build renders a sentence in about a second, which makes the wait above mostly disappear.
+`[speak].device` records your choice for this setup; dmn does not read it.
 
 Then turn speak on, enroll a clip of your voice, and speak:
 
@@ -304,8 +310,8 @@ enabled = true
 # A WAV of you speaking for at least 6 s (10-30 s is better), mono 16 kHz or more preferred.
 # --language is the language the voice will speak (the server ties it to the voice); default en.
 dmn speak enroll --wav ~/my-voice.wav --language es
-dmn speak "Buenas tardes, gracias por la oportunidad." --out /tmp/dmn-speak.wav
-pw-play /tmp/dmn-speak.wav
+dmn speak "Buenas tardes, gracias por la oportunidad."                       # into dmn-voice
+dmn speak "Buenas tardes, gracias por la oportunidad." --out /tmp/dmn-speak.wav   # or to a file
 ```
 
 `enroll` checks the clip (a WAV, at least 6 s, at most 10 MB; a stereo or sub-16 kHz clip works,
@@ -314,7 +320,28 @@ enrolling a name again replaces that voice), keeps a copy at `~/.local/share/dmn
 sets `[speak].voice_ref` to that copy in your config, editing that one line and leaving the rest
 of the file as it was. `dmn speak` checks the voice is still in the server's library before asking
 for speech (the server would otherwise answer in its default voice) and says how to enroll it again
-if not. Without `--out` it says playback lands in #108.
+if not.
+
+**The virtual microphone.** Without `--out`, `dmn speak` creates a PipeWire source node named
+`dmn-voice` (shown as "Daemon voice (dmn speak)"), plays the speech into it, and removes it when
+the command ends. In the call, pick **dmn-voice** as the microphone: in Meet, Zoom or Teams it is in
+the microphone list beside your real one, and in the desktop's sound settings it is a new input
+device. The call then transmits the cloned voice; your own speakers and headphones stay silent, and
+your real microphone is not touched. The node exists only while the command runs, so start the
+command and then select it (the server's render time leaves several seconds for that), or select
+it in a call before a second `dmn speak`; a session that speaks repeatedly (#109) can keep one node
+open for its whole run. If nothing has selected `dmn-voice`, PipeWire does not pull from it: the
+command finishes and reports how much was never played, and asks whether the node is selected
+anywhere. To check from a terminal:
+
+```bash
+dmn speak "Gracias por la oportunidad." &
+pw-dump | grep -c '"node.name": "dmn-voice"'     # 1 while the command runs, 0 afterwards
+pw-record --target dmn-voice /tmp/vmic.wav       # what the call hears; Ctrl-C when the command ends
+pw-play /tmp/vmic.wav                            # intelligible, right speed, your voice
+```
+
+Without a running PipeWire server the command says so and suggests `--out`; nothing panics.
 
 ### Initialize and inspect your system
 
