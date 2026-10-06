@@ -1,20 +1,29 @@
-//! `dmn speak` (#107): enroll a reference clip and synthesize text in the cloned voice through
-//! the local TTS server (chatterbox-tts-api, `[speak].tts_url`). Nothing plays audio yet:
-//! without `--out` the speak command says so (playback is #108). Both subcommands refuse to run
-//! while `[speak].enabled = false`, and while `tts_url` is not on this machine.
+//! `dmn speak` (#107, #108): enroll a reference clip and synthesize text in the cloned voice
+//! through the local TTS server (chatterbox-tts-api, `[speak].tts_url`). Without `--out` the
+//! speech plays into the PipeWire virtual microphone `dmn-voice` (#108, `dmn_audio::VirtualMic`)
+//! for the call to hear: the node is created before the request goes out, so a call or
+//! `pw-record --target dmn-voice` can select it during the seconds the server takes, playback
+//! starts at the first decoded chunk of the server's streaming route, and the node is gone when
+//! the command ends, on success or error. With `--out <file>` the speech is written there
+//! instead, as before. Both subcommands refuse to run while `[speak].enabled = false`, and while
+//! `tts_url` is not on this machine.
 //!
 //! Audio on disk (CLAUDE.md: never unless `privacy.record_audio`): that rule is about the
 //! call. These commands write audio only where the user asks by name, in the same command:
 //! `--out <file>` writes the synthesized speech there, and `enroll --wav <clip>` copies the
 //! user's own clip to `<data dir>/<name>.wav` (the file `[speak].voice_ref` names, kept so the
 //! voice can be enrolled again after the server's library is reset). Nothing from the call is
-//! recorded, and nothing is written that the command line did not name.
+//! recorded, and nothing is written that the command line did not name; playback writes
+//! nothing at all.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use dmn_audio::{AudioError, PipeWireContext, PipeWireError, VMIC_NODE_NAME, VirtualMic};
 use dmn_core::Paths;
 use dmn_core::config::{Config, ConfigError};
-use dmn_tts::{SpeakRequest, TtsError, TtsProvider};
+use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider};
 
 /// A reference clip needs at least this much clean speech for the clone to hold up.
 const MIN_CLIP_SECS: f64 = 6.0;
@@ -23,6 +32,10 @@ const MAX_CLIP_BYTES: u64 = 10 * 1024 * 1024;
 /// The default voice name, and so the stored clip `voice.wav` the issue names.
 const DEFAULT_NAME: &str = "voice";
 const MAX_NAME: usize = 64;
+/// How long to wait for PipeWire's registry (the graph rate comes from it).
+const PW_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
+/// Margin over the queued audio's own length when waiting for the last sample to play.
+const DRAIN_MARGIN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpeakError {
@@ -51,9 +64,11 @@ pub enum SpeakError {
     )]
     NotEnrolled { config: String },
     #[error(
-        "nothing plays audio yet: playback lands in #108; pass --out <file.wav> to write the synthesized speech to a file"
+        "cannot reach PipeWire ({detail}); dmn speak plays into the virtual microphone {VMIC_NODE_NAME}, which needs a running PipeWire server, or pass --out <file.wav> to write the speech to a file instead"
     )]
-    NoPlayback,
+    NoPipeWire { detail: String },
+    #[error("playback into {VMIC_NODE_NAME} failed: {0}")]
+    Playback(AudioError),
     #[error("nothing to say: the text is empty")]
     EmptyText,
     #[error("{path} is not a usable voice clip: {detail}")]
@@ -253,7 +268,10 @@ pub fn enroll(
     Ok(out)
 }
 
-/// Speak: synthesize `text` in the enrolled voice and write it to `out` as a 16-bit mono WAV.
+/// Speak: synthesize `text` in the enrolled voice and play it into the virtual microphone
+/// `dmn-voice`, or with `out` write it there as a 16-bit mono WAV. For playback `provider`
+/// should be the streaming one (`ChatterboxProvider::streaming`), so the first sentence plays
+/// while the server renders the next.
 pub fn speak(
     cfg: &Config,
     paths: &Paths,
@@ -261,19 +279,24 @@ pub fn speak(
     out: Option<&Path>,
     provider: &dyn TtsProvider,
 ) -> Result<String, SpeakError> {
+    let started = Instant::now();
     check_gates(cfg, paths)?;
     if cfg.speak.voice_ref.is_empty() {
         return Err(SpeakError::NotEnrolled {
             config: paths.config_file.display().to_string(),
         });
     }
-    let out = out.ok_or(SpeakError::NoPlayback)?;
     if text.trim().is_empty() {
         return Err(SpeakError::EmptyText);
     }
+    // The microphone first: a missing PipeWire is reported before any speech is asked for,
+    // and the node is in the graph while the server renders, so the call can select it.
+    let mic = match out {
+        Some(_) => None,
+        None => Some(open_vmic()?),
+    };
     let voice = voice_name(&cfg.speak.voice_ref);
     let req = SpeakRequest::new(text.trim(), voice.clone());
-    let started = std::time::Instant::now();
     let stream = rt()?
         .block_on(provider.synthesize(req))
         .map_err(|e| match e {
@@ -284,14 +307,159 @@ pub fn speak(
             other => tts_error(other, paths),
         })?;
     let sample_rate = stream.sample_rate();
-    let frames = write_wav(out, stream, paths)?;
-    let secs = frames as f64 / f64::from(sample_rate);
-    tracing::info!(voice = %voice, path = %out.display(), frames, "spoke");
-    Ok(format!(
-        "wrote {secs:.1} s of speech at {sample_rate} Hz in voice {voice:?} to {} ({:.1} s)\n",
-        out.display(),
-        started.elapsed().as_secs_f64()
-    ))
+    match (out, mic) {
+        (Some(out), _) => {
+            let frames = write_wav(out, stream, paths)?;
+            let secs = frames as f64 / f64::from(sample_rate);
+            tracing::info!(voice = %voice, path = %out.display(), frames, "spoke");
+            Ok(format!(
+                "wrote {secs:.1} s of speech at {sample_rate} Hz in voice {voice:?} to {} ({:.1} s)\n",
+                out.display(),
+                started.elapsed().as_secs_f64()
+            ))
+        }
+        (None, Some((ctx, mut mic))) => {
+            let played = play_into(&mut mic, stream, started, paths);
+            // Take the node out of the graph before reporting, on success or error; the
+            // context (and its loop thread) goes after it.
+            let closed = mic.close();
+            drop(ctx);
+            let played = played?;
+            closed.map_err(SpeakError::Playback)?;
+            tracing::info!(
+                voice = %voice,
+                tenths = played.tenths,
+                first_audio_ms = played.first_audio.map(|d| d.as_millis() as u64),
+                underruns = played.underruns,
+                "spoke into dmn-voice"
+            );
+            Ok(played.report(&voice, started.elapsed()))
+        }
+        (None, None) => Err(SpeakError::Playback(AudioError::VirtualMic(
+            "not opened".into(),
+        ))),
+    }
+}
+
+/// Connect to PipeWire and put `dmn-voice` in the graph at the graph's rate.
+fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakError> {
+    let ctx = Arc::new(PipeWireContext::connect().map_err(|e| match e {
+        PipeWireError::Init(detail) | PipeWireError::Connect(detail) => {
+            SpeakError::NoPipeWire { detail }
+        }
+        other => SpeakError::Playback(AudioError::PipeWire(other)),
+    })?);
+    let table = ctx.wait_for_sync(PW_SYNC_TIMEOUT);
+    if let Some(why) = table.disconnected {
+        return Err(SpeakError::NoPipeWire { detail: why });
+    }
+    let mic =
+        VirtualMic::open(Arc::clone(&ctx), table.graph_rate()).map_err(SpeakError::Playback)?;
+    Ok((ctx, mic))
+}
+
+/// Where the speech goes when it is not a file: `VirtualMic`, or a test's sink.
+trait SpeechSink {
+    fn rate(&self) -> u32;
+    fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError>;
+    /// Wait for the queued audio to play; `Ok(false)` when it did not within `timeout`.
+    fn drain(&mut self, timeout: Duration) -> Result<bool, AudioError>;
+    /// (samples written at `rate`, samples played, underruns, when the first one played).
+    fn stats(&self) -> (u64, u64, u64, Option<Instant>);
+}
+
+impl SpeechSink for VirtualMic {
+    fn rate(&self) -> u32 {
+        VirtualMic::rate(self)
+    }
+
+    fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
+        VirtualMic::write(self, samples, sample_rate)
+    }
+
+    fn drain(&mut self, timeout: Duration) -> Result<bool, AudioError> {
+        VirtualMic::drain(self, timeout)
+    }
+
+    fn stats(&self) -> (u64, u64, u64, Option<Instant>) {
+        let s = VirtualMic::stats(self);
+        (s.written, s.pulled, s.underruns, s.first_pull)
+    }
+}
+
+/// What a playback came to, for the report and the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Played {
+    /// Tenths of a second of speech at the sink's rate.
+    tenths: u64,
+    rate: u32,
+    /// From the command's start to the first sample PipeWire pulled.
+    first_audio: Option<Duration>,
+    underruns: u64,
+    /// Samples still queued when the drain timed out (0 when everything played).
+    unplayed: u64,
+}
+
+impl Played {
+    fn report(&self, voice: &str, total: Duration) -> String {
+        let mut s = format!(
+            "spoke {}.{} s of speech into {VMIC_NODE_NAME} at {} Hz in voice {voice:?}: ",
+            self.tenths / 10,
+            self.tenths % 10,
+            self.rate
+        );
+        match self.first_audio {
+            Some(d) => s.push_str(&format!("first audio after {:.1} s, ", d.as_secs_f64())),
+            None => s.push_str("nothing was pulled, "),
+        }
+        s.push_str(&format!("done after {:.1} s", total.as_secs_f64()));
+        if self.underruns > 0 {
+            s.push_str(&format!(
+                " ({} gaps: the server rendered slower than real time)",
+                self.underruns
+            ));
+        }
+        if self.unplayed > 0 {
+            s.push_str(&format!(
+                "; {:.1} s were never pulled: is {VMIC_NODE_NAME} selected as the microphone anywhere?",
+                self.unplayed as f64 / f64::from(self.rate)
+            ));
+        }
+        s.push('\n');
+        s
+    }
+}
+
+/// Feed the stream into the sink as it arrives, then wait for the last sample to play.
+fn play_into<S: SpeechSink>(
+    sink: &mut S,
+    stream: PcmStream,
+    started: Instant,
+    paths: &Paths,
+) -> Result<Played, SpeakError> {
+    for chunk in stream {
+        let chunk = chunk.map_err(|e| tts_error(e, paths))?;
+        sink.write(&chunk.samples, chunk.sample_rate)
+            .map_err(SpeakError::Playback)?;
+    }
+    let rate = sink.rate().max(1);
+    let (written, pulled, _, _) = sink.stats();
+    let queued = Duration::from_secs_f64(written.saturating_sub(pulled) as f64 / f64::from(rate));
+    let drained = sink
+        .drain(queued + DRAIN_MARGIN)
+        .map_err(SpeakError::Playback)?;
+    let (written, pulled, underruns, first_pull) = sink.stats();
+    Ok(Played {
+        tenths: written * 10 / u64::from(rate),
+        rate,
+        first_audio: first_pull.map(|t| t.saturating_duration_since(started)),
+        underruns,
+        unplayed: if drained {
+            0
+        } else {
+            written.saturating_sub(pulled)
+        },
+    })
 }
 
 /// Drain the stream into a 16-bit mono WAV at `path`, through a sibling temp file renamed into
@@ -606,15 +774,150 @@ enabled = true          # turned on for #107
         );
     }
 
+    /// A sink standing in for `dmn-voice`: keeps what it was given, "plays" it all at `drain`.
+    struct TestSink {
+        rate: u32,
+        chunks: Vec<(usize, u32)>,
+        written: u64,
+        pulled: u64,
+        first: Option<Instant>,
+        drains: bool,
+    }
+
+    impl TestSink {
+        fn new(rate: u32, drains: bool) -> Self {
+            Self {
+                rate,
+                chunks: Vec::new(),
+                written: 0,
+                pulled: 0,
+                first: None,
+                drains,
+            }
+        }
+    }
+
+    impl SpeechSink for TestSink {
+        fn rate(&self) -> u32 {
+            self.rate
+        }
+
+        fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
+            self.chunks.push((samples.len(), sample_rate));
+            // What a 24 kHz chunk becomes at the sink's rate.
+            self.written += samples.len() as u64 * u64::from(self.rate) / u64::from(sample_rate);
+            Ok(())
+        }
+
+        fn drain(&mut self, _timeout: Duration) -> Result<bool, AudioError> {
+            if self.drains {
+                self.pulled = self.written;
+                self.first.get_or_insert_with(Instant::now);
+            }
+            Ok(self.drains)
+        }
+
+        fn stats(&self) -> (u64, u64, u64, Option<Instant>) {
+            (self.written, self.pulled, 0, self.first)
+        }
+    }
+
+    /// Without `--out`, every decoded chunk reaches the sink at the server's rate, in order,
+    /// and the report carries the speech length, the first-audio time and the total.
     #[test]
-    fn speak_without_out_says_playback_is_108() {
-        let (_dir, paths, mut cfg) = setup("http://localhost:4123");
-        cfg.speak.voice_ref = "/data/voice.wav".into();
-        let mock = MockTtsProvider::new();
-        let err = speak(&cfg, &paths, "hola", None, &mock).unwrap_err();
-        assert!(matches!(err, SpeakError::NoPlayback), "{err}");
-        assert!(err.to_string().contains("playback lands in #108"), "{err}");
-        assert!(mock.requests().is_empty());
+    fn play_into_hands_every_chunk_to_the_sink_and_reports() {
+        let server = serve(vec![
+            Reply::voices(&["voice"]),
+            Reply::wav(sine_answer()).in_pieces_of(333),
+        ])
+        .unwrap();
+        let (_dir, paths, _cfg) = setup(&server.url);
+        let p = dmn_tts::ChatterboxProvider::new(&server.url).streaming();
+        let stream = rt()
+            .unwrap()
+            .block_on(p.synthesize(SpeakRequest::new("hola", "voice")))
+            .unwrap();
+        let started = Instant::now();
+        let mut sink = TestSink::new(48_000, true);
+        let played = play_into(&mut sink, stream, started, &paths).unwrap();
+        let total: usize = sink.chunks.iter().map(|(n, _)| n).sum();
+        assert_eq!(total, 12_000, "every sample of the 0.5 s answer");
+        assert!(sink.chunks.iter().all(|(_, r)| *r == 24_000));
+        assert!(sink.chunks.len() > 1, "fed as it arrived, not as one block");
+        assert_eq!(played.tenths, 5, "0.5 s at the sink's rate");
+        assert_eq!(played.rate, 48_000);
+        assert_eq!(played.unplayed, 0);
+        assert!(played.first_audio.is_some());
+        let report = played.report("voice", Duration::from_millis(1_234));
+        assert!(report.starts_with("spoke 0.5 s of speech into dmn-voice at 48000 Hz in voice \"voice\": first audio after 0."), "{report}");
+        assert!(report.contains("done after 1.2 s\n"), "{report}");
+        assert!(
+            !report.contains("gaps") && !report.contains("never pulled"),
+            "{report}"
+        );
+    }
+
+    /// Nothing selected `dmn-voice`: the report says how much never played and asks the
+    /// question, instead of failing (the speech was synthesized and the node was there).
+    #[test]
+    fn a_drain_that_times_out_is_reported_not_hidden() {
+        let server = serve(vec![Reply::voices(&["voice"]), Reply::wav(sine_answer())]).unwrap();
+        let (_dir, paths, _cfg) = setup(&server.url);
+        let p = dmn_tts::ChatterboxProvider::new(&server.url).streaming();
+        let stream = rt()
+            .unwrap()
+            .block_on(p.synthesize(SpeakRequest::new("hola", "voice")))
+            .unwrap();
+        let mut sink = TestSink::new(48_000, false);
+        let played = play_into(&mut sink, stream, Instant::now(), &paths).unwrap();
+        assert_eq!(played.unplayed, 24_000);
+        assert!(played.first_audio.is_none());
+        let report = played.report("voice", Duration::from_secs(3));
+        assert!(report.contains("nothing was pulled"), "{report}");
+        assert!(
+            report.contains(
+                "0.5 s were never pulled: is dmn-voice selected as the microphone anywhere?"
+            ),
+            "{report}"
+        );
+        let mut gaps = played;
+        gaps.underruns = 3;
+        assert!(gaps.report("voice", Duration::ZERO).contains("3 gaps"));
+    }
+
+    /// The answer breaks off mid-stream during playback: the error surfaces through the same
+    /// path as a file write, after whatever arrived was fed.
+    #[test]
+    fn a_stream_that_fails_midway_during_playback_surfaces_the_error() {
+        let mut cut = sine_answer();
+        cut.truncate(cut.len() / 2);
+        let server = serve(vec![Reply::voices(&["voice"]), Reply::wav(cut)]).unwrap();
+        let (_dir, paths, _cfg) = setup(&server.url);
+        let p = dmn_tts::ChatterboxProvider::new(&server.url);
+        let stream = rt()
+            .unwrap()
+            .block_on(p.synthesize(SpeakRequest::new("hola", "voice")))
+            .unwrap();
+        let mut sink = TestSink::new(48_000, true);
+        let err = play_into(&mut sink, stream, Instant::now(), &paths).unwrap_err();
+        assert!(
+            matches!(err, SpeakError::Tts(TtsError::Decode { .. })),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_no_pipewire_error_names_the_node_the_server_and_the_file_alternative() {
+        let err = SpeakError::NoPipeWire {
+            detail: "Host is down".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot reach PipeWire (Host is down)"),
+            "{msg}"
+        );
+        assert!(msg.contains("dmn-voice"), "{msg}");
+        assert!(msg.contains("--out <file.wav>"), "{msg}");
     }
 
     #[test]

@@ -263,16 +263,16 @@ enum Command {
         #[command(subcommand)]
         action: SessionsAction,
     },
-    /// Synthesize text in your enrolled voice clone through the local TTS server (#107):
-    /// `dmn speak "text" --out file.wav`, or `dmn speak enroll --wav <clip>` first
+    /// Speak text in your enrolled voice clone through the local TTS server (#107) into the
+    /// virtual microphone dmn-voice the call selects (#108): `dmn speak "text"`, or
+    /// `dmn speak enroll --wav <clip>` first
     #[command(args_conflicts_with_subcommands = true)]
     Speak {
         #[command(subcommand)]
         action: Option<SpeakAction>,
         /// The text to synthesize
         text: Option<String>,
-        /// Write the synthesized speech to this WAV file. Nothing plays audio yet:
-        /// playback lands in #108
+        /// Write the synthesized speech to this WAV file instead of playing it into dmn-voice
         #[arg(long)]
         out: Option<std::path::PathBuf>,
     },
@@ -558,8 +558,15 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 }
                 None => {
                     let text = text.ok_or(CliError::Usage(
-                        "speak needs the text to synthesize: dmn speak \"text\" --out <file.wav> (or `dmn speak enroll --wav <clip>`)".into(),
+                        "speak needs the text to synthesize: dmn speak \"text\" [--out <file.wav>] (or `dmn speak enroll --wav <clip>`)".into(),
                     ))?;
+                    // Playback takes the streaming route, so the first sentence plays while
+                    // the server renders the next; a file is written from the whole WAV.
+                    let provider = if out.is_none() {
+                        provider.streaming()
+                    } else {
+                        provider
+                    };
                     print!(
                         "{}",
                         speak::speak(&cfg, &paths, &text, out.as_deref(), &provider)?
