@@ -7,7 +7,8 @@
 //! an utterance is open, then the final that replaces them. Hallucinations and low-confidence
 //! text are dropped and counted ([`filter`]). With `[stt].language` other than `en` (#77) a
 //! multilingual model detects each utterance's language and its text arrives translated to
-//! English; the segment carries the detected language.
+//! English; the segment carries the detected language. [`Language::Detect`] (#109) detects the
+//! same way and keeps the text in the language it heard: the You lane while `[speak]` is on.
 //! Owns: one worker thread and one `WhisperState` per source (inference serialised per state),
 //! and the ggml model files under the models directory the caller passes in (`dmn` passes
 //! `~/.cache/dmn/models/`).
