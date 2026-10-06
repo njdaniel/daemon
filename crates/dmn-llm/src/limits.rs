@@ -14,6 +14,9 @@
 //! #102 adds the web search results the second fast request carries ([`fresh_facts`]): text from
 //! the web, so control and invisible characters go, each field is one line, and title, snippet and
 //! count are capped here before any of it reaches a prompt.
+//!
+//! #109 adds the translation `t` speaks ([`limit_translation`]): one line of at most 600
+//! characters.
 
 use crate::lookup::{FreshFact, SearchResult, domain_of};
 use crate::schema::{Deeper, Example, Kind, ResumeContext, Star, Suggestion, Tradeoff};
@@ -60,6 +63,10 @@ pub const FACT_SNIPPET_CHARS: usize = 300;
 pub const FACT_DOMAIN_CHARS: usize = 60;
 /// The most results a prompt carries: what Ollama's web search returns at most.
 pub const FACTS_MAX: usize = crate::lookup::MAX_RESULTS;
+/// #109: the translation `t` speaks in the user's voice and shows as one dim line. A turn of up
+/// to 30 s of speech is about 75 words, 450 characters; this leaves room for a language that
+/// takes more characters to say it, and stops a reply that rambles from being spoken at length.
+pub const TRANSLATION_CHARS: usize = 600;
 
 /// One limit that model output broke. `field` names the place, like `approach[2]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -572,6 +579,31 @@ pub fn enforce(s: &mut Suggestion) -> Vec<Flag> {
         limit_star(star, &mut flags);
     }
     flags
+}
+
+/// The translation `t` speaks (#109): what the model wrote as one line (control characters and
+/// invisible ones as in [`web_line`], whitespace and line breaks collapsed), the quotes it may
+/// have wrapped the whole of it in removed, and at most [`TRANSLATION_CHARS`], cut at a sentence
+/// end when one keeps a third of it, else at a word with `…`. Every cut is flagged. An empty
+/// result means the model wrote nothing to speak.
+pub fn limit_translation(raw: &str, flags: &mut Vec<Flag>) -> String {
+    let line = web_line(raw);
+    let mut text = unquote(&line).to_owned();
+    limit_text("translation", &mut text, TRANSLATION_CHARS, flags);
+    text
+}
+
+/// `s` without one pair of quotes around the whole of it, when it has them.
+fn unquote(s: &str) -> &str {
+    for (open, close) in [('"', '"'), ('“', '”'), ('«', '»'), ('\'', '\''), ('`', '`')] {
+        if let Some(inner) = s.strip_prefix(open).and_then(|r| r.strip_suffix(close))
+            && !inner.contains(open)
+            && !inner.contains(close)
+        {
+            return inner.trim();
+        }
+    }
+    s
 }
 
 /// Remove a leading `1.`, `2)`, `-`, `*` or `•` marker.
