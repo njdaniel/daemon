@@ -22,6 +22,11 @@ M | Opus | 45
 - Measurement, in the PR body: translation quality on 10 en→de sentences for `[llm].model` vs the chosen small model (verbatim, no additions, judged by reading), translation latency, and key-to-first-audio with the TTS on the GPU vs the CPU.
 - README § Speak: the translation-only setup (config lines, the small model, the GPU server with its one-time host setup: `nvidia-container-toolkit`, then `docker compose -f docker/docker-compose.gpu.yml …`), and the measured times. SPEC § Speak: the two modes and what is resident in each.
 
+## Also found in the live test (2026-10-07, added the same day)
+- **Discord loses `dmn-voice` across a dmn restart.** #109 opens one `dmn-voice` node per `dmn run`; quitting and relaunching destroys it and creates a new one, and Discord's input does not follow: the next presses failed with "nobody hears dmn-voice: select it as the call's mic" until the device was re-selected in Discord. Make the node survive restarts as far as PipeWire allows (a stable `node.name` alone was not enough for Discord; try a fixed `object.path` / `node.nick`, or holding the node in a small long-lived helper). If no reliable way exists, say so, and have dmn print at start-up when no stream is linked to `dmn-voice` ("Discord: re-select dmn-voice as the microphone") so the user learns it before pressing `t`.
+- **The small model is fast enough.** With `[llm].model = "llama3.1:8b"` as a stand-in for `[speak].model`, en→de translation took 0.21–0.60 s (one 3.95 s outlier on first use), the same as the 35B model; quality was not judged. Whisper `medium` on the GPU for both lanes plus the 8B model used 10.4 GB of the 24 GB, leaving room for the TTS on the GPU.
+- **Long turns are the worst case.** A three-line turn took 43–62 s to first audio on the CPU TTS. Besides the GPU, consider speaking sentence by sentence as the TTS streams them (`t` could start playback after the first sentence rather than after the first chunk of the whole turn), measured in the PR.
+
 Out of scope: a smaller answer model, changing `[llm]` for the helper, auto-speak, the M3 window.
 
 ## Depends on
