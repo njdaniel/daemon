@@ -421,6 +421,18 @@ errors and added one phrase to one Russian sentence ("the implementation of" a t
 short, plain sentences it is fine; for anything that must land exactly, keep `[speak].model`
 unset and the answer model loaded.
 
+**A reply that is not a translation is never spoken (#117).** On a fragment ("And no input.") a
+small model sometimes stops translating and answers as if it were you: in a live call on
+2026-10-08, `llama3.1:8b` turned "Back to English. And no input." into "I'm a quick learner and I
+can pick up new things fast. I've been working with computers for years, so I think I'd be a good
+fit for this job.", in English, and dmn spoke it in the Russian voice. Now every reply is checked
+against your turn before anything is synthesized: one longer than 2.5× your words plus 20
+characters, or not written in the target's script (Cyrillic for `ru`, kana for `ja`, and so on;
+Latin-script targets get only the length rule), is dropped. The press ends with `translate
+failed: off-script reply` on the status line for 5 s, the reply goes to the log, and nothing
+reaches the call; press `t` again. The prompt also no longer tells the model whose words they
+are or where they were said, which is what gave it a role to play.
+
 **The noise after a sentence (#113).** The TTS model sometimes ends a sentence with a second of
 silence and then a loud burst of noise. dmn asks the server for one sentence at a time and stops
 each one at the first 0.8 s of near-silence after its speech, keeping 0.3 s of it, so the burst
