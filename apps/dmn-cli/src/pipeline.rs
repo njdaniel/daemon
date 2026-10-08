@@ -1849,6 +1849,9 @@ struct Utterance {
     text: String,
     from: Duration,
     to: Duration,
+    /// The interviewer spoke after this turn was finalized (#114): a later You final is a new
+    /// turn, not more of this one, as #109's `last_turn` grouping ends at the other speaker.
+    sealed: bool,
 }
 
 impl Speaking {
@@ -1927,6 +1930,7 @@ impl Speaking {
             text: turn.text,
             from: turn.start,
             to: turn.end,
+            sealed: false,
         };
         match self.mode {
             VoiceMode::Passthrough => self.start(utterance),
@@ -1940,26 +1944,37 @@ impl Speaking {
     /// #114: a segment the guard let through. In translate mode a final You line with text is
     /// a turn to speak: queued, or joined to the turn already waiting (the VAD split one
     /// sentence; what is said while another plays is one utterance), then started if nothing
-    /// is in flight.
+    /// is in flight. An interviewer final with text seals the waiting turn: what the user says
+    /// after the interviewer spoke is a turn of its own, as `last_turn` groups them (#109).
     fn heard(&mut self, seg: &Segment) {
         if self.speaker.is_none()
             || self.mode != VoiceMode::Translate
-            || seg.source != Source::You
             || !seg.is_final
             || seg.text.trim().is_empty()
         {
             return;
         }
+        match seg.source {
+            Source::You => {}
+            Source::Interviewer => {
+                if let Some(waiting) = self.queue.back_mut() {
+                    waiting.sealed = true;
+                }
+                return;
+            }
+            Source::Unknown => return,
+        }
         match self.queue.back_mut() {
-            Some(waiting) => {
+            Some(waiting) if !waiting.sealed => {
                 waiting.text.push(' ');
                 waiting.text.push_str(seg.text.trim());
                 waiting.to = waiting.to.max(seg.end);
             }
-            None => self.queue.push_back(Utterance {
+            _ => self.queue.push_back(Utterance {
                 text: seg.text.trim().to_owned(),
                 from: seg.start,
                 to: seg.end,
+                sealed: false,
             }),
         }
         self.start_next();
@@ -4964,6 +4979,64 @@ mod tests {
         );
         assert!(screen(&after).contains("You → es"), "{}", screen(&after));
         assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+        s.finish();
+    }
+
+    /// #114 (review of PR #119): while a turn waits, a You final joins it only until the
+    /// interviewer speaks; what the user says after that is a turn of its own, as `last_turn`
+    /// groups them. Here the first turn is in flight, the second waits, the interviewer answers,
+    /// and the third and fourth finals arrive: three translate requests, the third and fourth
+    /// finals joined into the third.
+    #[test]
+    fn in_translate_mode_the_interviewer_speaking_ends_the_waiting_turn() {
+        let hub = Arc::new(SessionHub::default());
+        let llm = spanish().with_delay(Duration::from_millis(300));
+        let tts = dmn_tts::MockTtsProvider::new();
+        let (mut s, _played, gate) = speaking_in(&hub, &llm, &tts, VoiceMode::Translate);
+        gate_settles(&gate, false);
+        let mut log = TranscriptLog::new();
+        let first = final_at(Source::You, 6_000, 9_000, SAID);
+        hear(&hub, &mut log, first.clone());
+        s.heard(&first);
+        let second = final_at(Source::You, 12_000, 15_000, SAID_REST);
+        hear(&hub, &mut log, second.clone());
+        s.heard(&second);
+        assert_eq!(s.queue.len(), 1, "the second waits");
+        let asked = final_at(Source::Interviewer, 16_000, 18_000, FIRST);
+        hear(&hub, &mut log, asked.clone());
+        s.heard(&asked);
+        assert_eq!(
+            s.queue.len(),
+            1,
+            "the interviewer's line is not a turn to speak"
+        );
+        // Long enough that the mock's Spanish passes #117's length rule for the joined turn.
+        let third = final_at(Source::You, 19_000, 21_000, SAID);
+        hear(&hub, &mut log, third.clone());
+        s.heard(&third);
+        assert_eq!(
+            s.queue.len(),
+            2,
+            "after the interviewer spoke, a turn of its own"
+        );
+        let fourth = final_at(Source::You, 21_500, 23_000, SAID_REST);
+        hear(&hub, &mut log, fourth.clone());
+        s.heard(&fourth);
+        assert_eq!(s.queue.len(), 2, "nothing in between: joined to the third");
+        let joined = format!("{SAID} {SAID_REST}");
+        assert_eq!(
+            s.queue.back().map(|u| u.text.as_str()),
+            Some(joined.as_str())
+        );
+        let _ = drive(&mut s, &hub, "all turns played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 3
+        });
+        let asked: Vec<String> = llm
+            .requests()
+            .iter()
+            .map(|r| r.messages[1].content.clone())
+            .collect();
+        assert_eq!(asked, [SAID, SAID_REST, joined.as_str()]);
         s.finish();
     }
 
