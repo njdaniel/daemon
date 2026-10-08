@@ -437,9 +437,10 @@ temperature = 0.6                     # 0.05-5.0
 
 **After a restart, select `dmn-voice` again.** Each `dmn run` creates a new `dmn-voice` node.
 PipeWire links an app back to it only when the app names the device in its own stream (`pw-record
---target dmn-voice` does); Discord (and other Chromium-based apps that pin a chosen microphone)
-and a stream you moved by hand in the sound settings stay on the old node's choice, and no setting
-of the node changes that (#113, measured with `just probe`). So a moment after start, when nothing
+--target dmn-voice` does) and nothing else played or recorded while dmn was down; Discord (and
+other Chromium-based apps that pin a chosen microphone) and a stream you moved by hand in the sound
+settings stay on the old node's choice, and no setting of the node changes that (#113, measured
+with `just probe`). So a moment after start, when nothing
 is linked to `dmn-voice`, the status line says `Discord: re-select dmn-voice as the microphone`
 for 5 s; a press nothing heard says the same.
 

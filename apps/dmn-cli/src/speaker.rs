@@ -26,8 +26,9 @@
 //!
 //! **Nothing linked (#113).** A call that selected `dmn-voice` loses it when dmn restarts: the
 //! node is a new one, and PipeWire relinks only a stream that names its target by name in its
-//! own properties (`pw-record --target dmn-voice` does; Discord's, which asks not to be moved,
-//! and a stream moved by hand, which the session manager keeps by serial, do not). So a moment
+//! own properties (`pw-record --target dmn-voice` does), and only if no other stream came or went
+//! meanwhile; Discord's, which asks not to be moved, and a stream moved by hand, which the
+//! session manager keeps by serial, never. So a moment
 //! after start, if nothing is linked to the node, the status line says [`NOT_LINKED`] for 5 s
 //! (and the log says why); a press that nothing heard says the same.
 //!
