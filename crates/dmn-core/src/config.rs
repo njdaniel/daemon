@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-pub use dmn_session::CodingSolutions;
+pub use dmn_session::{CodingSolutions, VoiceMode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -510,6 +510,10 @@ pub struct Speak {
     /// #113: the TTS model's emotion intensity, 0.25–2.0; sent only when set (the server's
     /// default is 0.5).
     pub exaggeration: Option<f64>,
+    /// #114: what `dmn-voice` carries when `dmn run` starts: `passthrough` (the default: your
+    /// own voice, live; `t` speaks one turn translated over it) or `translate` (every turn you
+    /// finish is translated into `target` and spoken instead). `l` switches during the run.
+    pub mode: VoiceMode,
 }
 
 /// `[speak].temperature`'s default (#113).
@@ -552,6 +556,7 @@ impl Default for Speak {
             temperature: SPEAK_TEMPERATURE,
             cfg_weight: None,
             exaggeration: None,
+            mode: VoiceMode::Passthrough,
         }
     }
 }
@@ -685,6 +690,7 @@ target = ""                          # dmn run: `t` speaks your last turn in thi
 temperature = 0.6                    # the TTS model's sampling temperature (server default 0.8); lower = fewer noise bursts after a sentence
 # cfg_weight = 0.5                   # the TTS model's pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # the TTS model's emotion intensity, 0.25-2.0; left out: the server's
+mode = "passthrough"                 # dmn run: passthrough = your own voice live into dmn-voice, `t` speaks one turn translated; translate = every turn you finish goes out translated (`l` toggles, #114)
 
 [ui]
 always_on_top = true
@@ -1102,6 +1108,7 @@ target = ""                          # `t` (#109) speaks in this language (es, d
 temperature = 0.6                    # TTS sampling temperature (#113); lower = fewer noise bursts
 # cfg_weight = 0.5                   # TTS pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
+mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114)
 
 [ui]
 always_on_top = true
@@ -1126,6 +1133,25 @@ keep_transcripts = true
             parsed,
             Config::default(),
             "every key in the spec example is a default"
+        );
+    }
+
+    /// #114: `[speak].mode` is `passthrough` unless the file says `translate`; anything else
+    /// names both.
+    #[test]
+    fn speak_mode_defaults_to_passthrough_and_parses_translate() {
+        assert_eq!(Config::default().speak.mode, VoiceMode::Passthrough);
+        let c = Config::from_toml("[speak]\nmode = \"translate\"\n", "m").unwrap();
+        assert_eq!(c.speak.mode, VoiceMode::Translate);
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("mode = \"translate\""), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+        let err = Config::from_toml("[speak]\nmode = \"both\"\n", "bad")
+            .expect_err("an unknown mode is a config error")
+            .to_string();
+        assert!(
+            err.contains("passthrough") && err.contains("translate"),
+            "{err}"
         );
     }
 
@@ -1203,7 +1229,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 41, "spec example has 41 keys: {keys:?}");
+        assert_eq!(keys.len(), 42, "spec example has 42 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

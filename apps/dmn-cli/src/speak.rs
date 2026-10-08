@@ -361,6 +361,14 @@ pub fn speak(
 
 /// Connect to PipeWire and put `dmn-voice` in the graph at the graph's rate.
 pub(crate) fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakError> {
+    open_vmic_with(None)
+}
+
+/// [`open_vmic`], with the user's own microphone passing through the node when `passthrough`
+/// says (#114, `dmn run`).
+pub(crate) fn open_vmic_with(
+    passthrough: Option<dmn_audio::Passthrough>,
+) -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakError> {
     let ctx = Arc::new(PipeWireContext::connect().map_err(|e| match e {
         PipeWireError::Init(detail) | PipeWireError::Connect(detail) => {
             SpeakError::NoPipeWire { detail }
@@ -371,8 +379,12 @@ pub(crate) fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakErr
     if let Some(why) = table.disconnected {
         return Err(SpeakError::NoPipeWire { detail: why });
     }
-    let mic =
-        VirtualMic::open(Arc::clone(&ctx), table.graph_rate()).map_err(SpeakError::Playback)?;
+    let rate = table.graph_rate();
+    let mic = match passthrough {
+        Some(p) => VirtualMic::open_passthrough(Arc::clone(&ctx), rate, p),
+        None => VirtualMic::open(Arc::clone(&ctx), rate),
+    }
+    .map_err(SpeakError::Playback)?;
     Ok((ctx, mic))
 }
 
@@ -399,6 +411,10 @@ pub(crate) trait SpeechSink {
     fn drain(&mut self, timeout: Duration) -> Result<bool, AudioError>;
     /// (samples written at `rate`, samples played, underruns, when the first one played).
     fn stats(&self) -> (u64, u64, u64, Option<Instant>);
+    /// #114: let the user's own microphone through the sink (pass-through mode) or not
+    /// (translate mode). Speech in flight keeps it out whatever this says. Nothing for a sink
+    /// with no microphone (a file, `dmn speak`'s node).
+    fn set_passthrough(&mut self, _on: bool) {}
 }
 
 impl SpeechSink for VirtualMic {

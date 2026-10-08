@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use dmn_session::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
     QuestionSource, Section, Session, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
+    VoiceMode,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -22,7 +23,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 37] = [
+const STATES: [&str; 41] = [
     "listening",
     "live",
     "pinned",
@@ -76,6 +77,13 @@ const STATES: [&str; 37] = [
     "speak-speaking",
     "speak-nothing",
     "speak-assist-off",
+    // #114: your own voice through `dmn-voice` (the tag `voice: you (en)`); translate mode,
+    // with one turn gone out as `You → de` and the next in flight (the tag amber); both with
+    // assistance off, on the transcript-first screen.
+    "voice-you",
+    "voice-translate",
+    "voice-you-assist-off",
+    "voice-translate-assist-off",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -890,6 +898,45 @@ fn actions(state: &str) -> Vec<Action> {
             ]);
             return a;
         }
+        // #114: pass-through mode, the call hearing your own voice: only the tag changes.
+        "voice-you" => {
+            a.push(Action::SpeakEnabled { enabled: true });
+            a.push(voice(VoiceMode::Passthrough));
+            a.extend(rate_limiter());
+            a.push(seg(Speaker::You, 31.0, 36.5, YOUR_ANSWER, true));
+        }
+        // #114: `l` after your answer, then a turn that went out in German (`You → de`, the
+        // translation under it) and the next one translating: the tag is amber.
+        "voice-translate" => {
+            a.push(Action::SpeakEnabled { enabled: true });
+            a.push(voice(VoiceMode::Passthrough));
+            a.extend(rate_limiter());
+            a.push(seg(Speaker::You, 31.0, 36.5, YOUR_ANSWER, true));
+            a.push(voice(VoiceMode::Translate));
+            a.extend(spoken_turn(1, 40.0, 44.0, YOUR_FAILOVER, YOUR_FAILOVER_DE));
+            a.push(seg(Speaker::You, 46.0, 48.0, YOUR_SHARDING, true));
+            a.push(Action::SpeakStarted { id: 2 });
+            a.push(Action::SpeakTurn {
+                id: 2,
+                from: 46.0,
+                to: 48.0,
+            });
+            a.push(Action::SpeakElapsed { id: 2, secs: 1 });
+        }
+        "voice-you-assist-off" => {
+            let mut a = actions("assist-off");
+            a.insert(1, Action::SpeakEnabled { enabled: true });
+            a.insert(2, voice(VoiceMode::Passthrough));
+            return a;
+        }
+        "voice-translate-assist-off" => {
+            let mut a = actions("assist-off");
+            a.insert(1, Action::SpeakEnabled { enabled: true });
+            a.insert(2, voice(VoiceMode::Passthrough));
+            a.push(voice(VoiceMode::Translate));
+            a.extend(spoken_turn(1, 92.5, 97.0, YOUR_ANSWER, YOUR_ANSWER_DE));
+            return a;
+        }
         "long-items" => {
             a.extend(long_items());
             a.push(Action::ToggleSection {
@@ -907,6 +954,37 @@ const YOUR_ANSWER: &str =
     "I'd start with a token bucket per API key and keep the counters in regional Redis.";
 const YOUR_ANSWER_ES: &str = "Empezaría con un token bucket por clave de API y guardaría los \
                               contadores en un Redis regional.";
+/// #114: the same in German, and two more turns translate mode speaks.
+const YOUR_ANSWER_DE: &str = "Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und die \
+                              Zähler in einem regionalen Redis halten.";
+const YOUR_FAILOVER: &str = "If Redis goes down, I'd fail open with a local limit.";
+const YOUR_FAILOVER_DE: &str = "Wenn Redis ausfällt, würde ich mit einem lokalen Limit \
+                                durchlassen.";
+const YOUR_SHARDING: &str = "Then I'd shard the counters by key.";
+
+/// #114: the voice state `dmn run` dispatches: into German, the user speaking English.
+fn voice(mode: VoiceMode) -> Action {
+    Action::Voice {
+        mode,
+        target: "de".into(),
+        own: Some("en".into()),
+    }
+}
+
+/// #114: a You turn said between `from` and `to`, spoken as press `id` and done: the line goes
+/// out as `You → de` with `translation` under it.
+fn spoken_turn(id: u64, from: f64, to: f64, said: &str, translation: &str) -> Vec<Action> {
+    vec![
+        seg(Speaker::You, from, to, said, true),
+        Action::SpeakStarted { id },
+        Action::SpeakTurn { id, from, to },
+        Action::SpeakTranslated {
+            id,
+            text: translation.into(),
+        },
+        Action::SpeakDone { id },
+    ]
+}
 
 /// #94: four Deeper Answer items, each exactly the 240 characters `dmn-llm`'s limits allow.
 const LONG_ITEMS: [(&str, &str); 4] = [
@@ -1670,15 +1748,107 @@ fn tui_the_keys_offer_ask_whenever_assistance_is_on() {
     // #96: in every state of the screen, since the detector's miss can come in any; not while
     // assistance is off, when Enter sends nothing.
     // #109: with `[speak]` on, `t speak` follows it.
+    // #114: `l translate` / `l own voice` may follow once the voice mode is known, when the
+    // line has room for it; it is the only key the voice tag's width can take away.
     for state in STATES {
         let session = load(state);
         let last = status_line(&session, (100, 30));
+        let last = last
+            .trim_end_matches(" · l translate")
+            .trim_end_matches(" · l own voice");
         let tail = if session.speak {
             " · ⏎ ask · t speak"
         } else {
             " · ⏎ ask"
         };
         assert_eq!(last.ends_with(tail), !session.assist_off, "{state}: {last}");
+    }
+}
+
+/// #114: the voice tag opens the status line, wide and coloured for its mode, assistance on or
+/// off and at both sizes; a line that went out translated is labelled `You → de` with the
+/// translation dim under it; the mode change is a dim marker row; the key names the other mode.
+#[test]
+fn tui_the_voice_tag_leads_the_status_line_and_the_transcript_marks_what_went_out_translated() {
+    // The mode key is offered where the line has room for it: at 100 columns, unless a press's
+    // tag is up too; never at 80, where the tag and the dots come first.
+    for size in SIZES {
+        let wide = size.0 >= 100;
+        let you = render(&load("voice-you"), size);
+        let last = usize::from(size.1) - 1;
+        let row = text(&you).lines().nth(last).unwrap().to_owned();
+        assert!(row.starts_with(" voice: you (en) "), "{row}");
+        let cell = &you[(1, last as u16)];
+        assert_eq!((cell.bg, cell.fg), (Color::Magenta, Color::Black));
+        assert!(row.contains("● model"), "the dots stay: {row}");
+        assert_eq!(row.ends_with("t speak · l translate"), wide, "{row}");
+        assert!(row.ends_with("t speak") || wide, "{row}");
+
+        let buf = render(&load("voice-translate"), size);
+        let screen = text(&buf);
+        let row = screen.lines().nth(last).unwrap().to_owned();
+        assert!(row.starts_with(" voice: → de "), "{row}");
+        let cell = &buf[(1, last as u16)];
+        assert_eq!(cell.bg, Color::Yellow, "amber while a turn is in flight");
+        // The press's seconds outrank the mode key; at 80 columns the left side is cut before
+        // the keys, as it always was.
+        assert_eq!(row.contains("translating… 1s"), wide, "{row}");
+        assert!(row.ends_with("⏎ ask · t speak"), "{row}");
+        // The strip has two rows: the newest line, and the one before it labelled for what it
+        // went out as (its translation would have been a third row).
+        assert!(
+            screen.contains("You → de    If Redis goes down"),
+            "the line that went out translated is labelled:\n{screen}"
+        );
+        assert!(!screen.contains("» Wenn Redis"), "{screen}");
+    }
+    // Once the newest line is the translated one, its translation is the strip's second row.
+    let mut done = actions("voice-translate");
+    done.push(Action::SpeakTranslated {
+        id: 2,
+        text: "Dann würde ich die Zähler nach Schlüssel sharden.".into(),
+    });
+    done.push(Action::SpeakDone { id: 2 });
+    let buf = render(&Session::replay(&done), (100, 30));
+    assert_eq!(
+        buf[(1, 29)].bg,
+        Color::Cyan,
+        "nothing in flight: the tag is teal"
+    );
+    let rows: Vec<String> = text(&buf).lines().map(str::to_owned).collect();
+    assert!(
+        rows[27].starts_with("You → de    Then I'd shard"),
+        "{}",
+        rows[27]
+    );
+    assert!(rows[28].starts_with("            » "), "{}", rows[28]);
+    // The side column (#88) wraps every line with its translation under it, dim.
+    let buf = render(&load("voice-translate"), WIDE);
+    let (x, y) = row_containing(&buf, "» Wenn Redis ausfällt");
+    assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the translation is dim");
+    assert!(text(&buf).contains("You → de"), "{}", text(&buf));
+
+    // Assistance off: the same tag and the same marks on the transcript-first screen, the mode
+    // change as a dim marker row.
+    for size in SIZES {
+        let wide = size.0 >= 100;
+        let buf = render(&load("voice-you-assist-off"), size);
+        let last = usize::from(size.1) - 1;
+        let row = text(&buf).lines().nth(last).unwrap().to_owned();
+        assert!(row.starts_with(" voice: you (en) "), "{row}");
+        assert!(row.contains("assist off · C-S-a on · t speak"), "{row}");
+        assert_eq!(row.ends_with("t speak · l translate"), wide, "{row}");
+        let buf = render(&load("voice-translate-assist-off"), size);
+        let screen = text(&buf);
+        let row = screen.lines().nth(last).unwrap().to_owned();
+        assert!(row.starts_with(" voice: → de "), "{row}");
+        assert_eq!(buf[(1, last as u16)].bg, Color::Cyan);
+        assert_eq!(row.ends_with("t speak · l own voice"), wide, "{row}");
+        let (x, y) = row_containing(&buf, "— translate mode on: → de —");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the marker is dim");
+        assert!(screen.contains("You → de"), "{screen}");
+        let (x, y) = row_containing(&buf, "» Ich würde");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray);
     }
 }
 

@@ -7,7 +7,7 @@
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
 //! what the asking lane last said (the interviewer, by default) when the detector missed the
 //! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
-//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `q` (or Ctrl-C) quit. Nothing
+//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `l` switch `dmn-voice` between your own voice live and every turn translated (#114), `q` (or Ctrl-C) quit. Nothing
 //! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal, mouse capture included, is restored on the
 //! way out, on an error, and (through ratatui's panic hook and ours) on a panic.
@@ -115,6 +115,10 @@ pub enum Key {
     /// voice into `dmn-voice`. Not `s`, which coding solutions (#50) had; `t` for talk and
     /// translate.
     Speak,
+    /// `l` (#114): `dmn-voice` carries your own voice live (pass-through) ↔ every turn you
+    /// finish, translated (translate mode). `l` for language: the letters a speech key would
+    /// want (`v`oice, `t`ranslate) are either `t`'s or too close to `q`; `l` was free.
+    Voice,
     Quit,
 }
 
@@ -138,6 +142,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('s' | 'S') => Some(Key::Solutions),
         KeyCode::Char('w' | 'W') => Some(Key::Swap),
         KeyCode::Char('t' | 'T') => Some(Key::Speak),
+        KeyCode::Char('l' | 'L') => Some(Key::Voice),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -171,6 +176,7 @@ pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
         Key::Later => controls.later(),
         Key::Scroll(by) => controls.scroll(|session| tui::scroll_to(session, pane, by)),
         Key::Speak => controls.speak(),
+        Key::Voice => controls.toggle_voice(),
         Key::Quit => {
             controls.quit();
             return true;
@@ -245,9 +251,10 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     }
     // #109: everything `t` needs is checked before any audio moves, so a TTS server that is
     // down or a voice enrolled in the wrong language fails here, with the fix, not mid-call.
-    // Only the TUI has the key.
+    // Only the TUI has the key. #114: the session's microphone passes through `dmn-voice`.
     let speak = if cfg.speak.enabled && !args.headless {
-        Some(speaker::setup(cfg, paths)?)
+        let mic = args.mic.as_deref().unwrap_or(&cfg.audio.mic);
+        Some(speaker::setup(cfg, paths, Some(mic))?)
     } else {
         None
     };
@@ -290,7 +297,11 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         },
     )?;
     if let Some(setup) = speak {
-        pipeline.attach_speaker(Speaker::start(setup, pipeline.hub())?);
+        pipeline.attach_speaker(
+            Speaker::start(setup, pipeline.hub())?,
+            cfg.speak.mode,
+            cfg.speak.target.clone(),
+        );
     }
     let audio = pipeline.info().audio;
     let live = pipeline.info().live;
@@ -789,6 +800,21 @@ mod tests {
         let before = controls.hub().snapshot();
         assert!(!press(key(press_key('t')).unwrap(), &controls));
         assert_eq!(commands.try_recv(), Ok(crate::pipeline::Command::Speak));
+        assert_eq!(controls.hub().snapshot(), before);
+    }
+
+    /// #114: `l` (for language) switches `dmn-voice` between your own voice and translate
+    /// mode; the pipeline thread owns the mode and the turns that wait, so the key only tells
+    /// it. The letters nearer the word were taken: `t` is `t speak`, `v` sits by `c`/`b` in a
+    /// row the hand finds blind, and `s`/`w`/`m`/`p`/`r` are spoken for.
+    #[test]
+    fn l_goes_to_the_pipeline_thread() {
+        assert_eq!(key(press_key('l')), Some(Key::Voice));
+        assert_eq!(key(press_key('L')), Some(Key::Voice));
+        let (controls, commands) = Controls::for_test();
+        let before = controls.hub().snapshot();
+        assert!(!press(key(press_key('l')).unwrap(), &controls));
+        assert_eq!(commands.try_recv(), Ok(crate::pipeline::Command::Voice));
         assert_eq!(controls.hub().snapshot(), before);
     }
 

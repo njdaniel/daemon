@@ -31,7 +31,7 @@ use pw::types::ObjectType;
 
 use crate::capture::{LoopCapture, OpenSpec};
 use crate::frames::FrameSink;
-use crate::vmic::{LoopVmic, VmicSpec, VoiceReader};
+use crate::vmic::{LoopVmic, Mixer, VmicSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipeWireError {
@@ -330,11 +330,12 @@ pub(crate) enum Command {
     Close {
         key: u64,
     },
-    /// Create and connect the virtual microphone's playback stream under `key` (#108).
+    /// Create and connect the virtual microphone's playback stream under `key` (#108), and
+    /// the pass-through's capture stream when the spec has one (#114).
     OpenVmic {
         key: u64,
         spec: VmicSpec,
-        reader: VoiceReader,
+        mixer: Mixer,
     },
     /// Disconnect and destroy the virtual microphone under `key`; its node leaves the graph.
     CloseVmic {
@@ -521,9 +522,9 @@ fn loop_thread(
             let closed = cmd_captures.borrow_mut().remove(&key);
             drop(closed);
         }
-        Command::OpenVmic { key, spec, reader } => {
+        Command::OpenVmic { key, spec, mixer } => {
             let status = Arc::clone(&spec.status);
-            match LoopVmic::open(&cmd_core, spec, reader) {
+            match LoopVmic::open(&cmd_core, spec, mixer) {
                 Ok(v) => {
                     cmd_vmics.borrow_mut().insert(key, v);
                 }

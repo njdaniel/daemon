@@ -1,12 +1,15 @@
 //! Audio capture, and the virtual microphone.
 //!
 //! Input: a PipeWire node (mic `Audio/Source` or an app's `Stream/Output/Audio`) or a WAV file;
-//! for the virtual microphone (#108), mono f32 speech at any rate (the TTS server's 24 kHz).
+//! for the virtual microphone (#108), mono f32 speech at any rate (the TTS server's 24 kHz),
+//! and (#114) the user's own microphone, captured again at the graph rate for pass-through.
 //! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer); for the
-//! virtual microphone, a PipeWire `Audio/Source` node named `dmn-voice` that plays that speech
-//! at the graph rate to whatever selects it as its microphone.
+//! virtual microphone, a PipeWire `Audio/Source` node named `dmn-voice` that plays that speech,
+//! and the microphone while pass-through is on and nothing is being spoken, at the graph rate
+//! to whatever selects it as its microphone.
 //! Owns: the PipeWire main-loop thread, one lock-free `ringbuf` producer per capture stream,
-//! and the lock-free ring the virtual microphone's callback reads.
+//! the lock-free ring the virtual microphone's callback reads, and the lock-free ring between
+//! the pass-through's capture callback and that same playback callback.
 //! The process callbacks allocate nothing, lock nothing, log nothing.
 //!
 //! Shape (issue #3): an [`AudioSource`] is started with a [`FrameSink`] and pushes 20 ms frames
@@ -18,7 +21,10 @@
 //! thread, and re-attaches when the app restarts; [`PwRecordSource`] is the `pw-record`
 //! emergency fallback behind the same trait. [`VirtualMic`] (#108) is the one output: samples
 //! written to it are resampled by [`LinearResampler`] on the writer's thread into a ring the
-//! playback callback drains; an underrun is silence, never a stall.
+//! playback callback drains; an underrun is silence, never a stall. With a [`Passthrough`]
+//! (#114) the playback callback's [`Mixer`] also pops the microphone's ring, filled by a second
+//! capture stream's callback, under a gain that fades at every switch and is shut while speech
+//! plays.
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -42,8 +48,10 @@ pub use pipewire::{
 pub use pwrecord::PwRecordSource;
 pub use source::{AudioError, AudioSource, Source};
 pub use vmic::{
-    DEFAULT_RING_SECS, LinearResampler, RingStats, VMIC_DESCRIPTION, VMIC_NODE_NAME, VirtualMic,
-    VmicState, VmicStats, VmicStatus, VoiceReader, VoiceWriter, voice_ring,
+    DEFAULT_RING_SECS, LinearResampler, Mixer, PASSTHROUGH_FADE_MS, Passthrough, PassthroughStats,
+    RingStats, TAP_MAX_BACKLOG_MS, TAP_NODE_NAME, TAP_TARGET_BACKLOG_MS, TapReader, TapStats,
+    TapWriter, VMIC_DESCRIPTION, VMIC_NODE_NAME, VirtualMic, VmicState, VmicStats, VmicStatus,
+    VoiceReader, VoiceWriter, tap_ring, voice_ring,
 };
 pub use wav::{Speed, WavSource};
 
