@@ -101,7 +101,7 @@ pub const OFF_SCRIPT: &str = "off-script";
 /// A reply may be this many times the turn's characters, plus [`SLACK_CHARS`], before it cannot
 /// be its translation: German and Russian run 1.2–1.6× English.
 const LENGTH_RATIO: usize = 5; // halves: 2.5×
-const SLACK_CHARS: usize = 40;
+const SLACK_CHARS: usize = 20;
 
 /// The script a target language is written in, when it is not Latin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,7 +178,7 @@ impl Script {
 
 /// Whether `reply` can be a translation of `turn` into the language `code` (#117). Two rules, in
 /// Rust so the prompt cannot be talked out of them: the reply is at most 2.5× the turn's
-/// characters plus 40 (a model that answered instead of translating writes far more), and, for a
+/// characters plus 20 (a model that answered instead of translating writes far more), and, for a
 /// target written in a script other than Latin, most of its letters are in that script (a
 /// loanword or a brand name in Latin letters is fine; a whole reply in them is not). For a
 /// Latin-script target there is no script rule: English and German cannot be told apart cheaply.
@@ -346,12 +346,12 @@ mod tests {
         );
         assert!(check_translation(SAID, "Back.", "").is_ok());
         assert_eq!(
-            check_translation("abc", &"x".repeat(48), "de"),
+            check_translation("abc", &"x".repeat(28), "de"),
             Err(format!(
-                "{OFF_SCRIPT}: 48 characters for a turn of 3 (at most 47)"
+                "{OFF_SCRIPT}: 28 characters for a turn of 3 (at most 27)"
             ))
         );
-        assert!(check_translation("abc", &"x".repeat(47), "de").is_ok());
+        assert!(check_translation("abc", &"x".repeat(27), "de").is_ok());
     }
 
     #[test]
