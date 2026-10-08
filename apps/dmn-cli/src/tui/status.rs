@@ -1,8 +1,16 @@
 //! Area 3: the transcript, then the status dots and shortcuts. The transcript is the last two
 //! lines under the Approach on a stacked screen, a right-hand column on a wide one (#88), or the
 //! whole screen above the status line with assistance off (#79); the last two are wrapped.
+//!
+//! #114: the status line opens with the voice tag while `[speak]` is on: `voice: you (en)` in
+//! pass-through mode (the You lane's colour), `voice: → de` in translate mode (teal, amber
+//! while a turn is in flight). A transcript line that went out translated is labelled
+//! `You → de`, its translation dim on the row under it, and a mode change is one dim marker
+//! row (`— translate mode on: → de —`).
 
-use dmn_session::{Health, Line as TranscriptLine, QuestionSource, Section, SpeakStage, Speaker};
+use dmn_session::{
+    Health, Line as TranscriptLine, QuestionSource, Section, SpeakStage, Speaker, VoiceMode,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -74,13 +82,23 @@ pub(super) fn render_transcript(
         Paragraph::new(rows).render(bottom, buf);
         return;
     }
-    let newest = &all[all.len().saturating_sub(TRANSCRIPT_LINES)..];
-
-    let lines: Vec<Line<'static>> = newest
-        .iter()
-        .map(|(l, partial)| transcript_line(l, *partial, cells))
-        .collect();
-    Paragraph::new(lines).render(inner, buf);
+    // The newest rows: a line that went out translated takes two (#114), so it may be the only
+    // one shown.
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for (l, partial) in all.iter().rev() {
+        if rows.len() >= TRANSCRIPT_LINES {
+            break;
+        }
+        let mut lines = transcript_lines(l, *partial, cells);
+        // A line's own row comes before its translation: when only one fits, the label
+        // (`You → de`) is the mark to keep.
+        lines.truncate(TRANSCRIPT_LINES - rows.len());
+        lines.reverse();
+        rows.extend(lines);
+    }
+    rows.truncate(TRANSCRIPT_LINES);
+    rows.reverse();
+    Paragraph::new(rows).render(inner, buf);
 }
 
 /// #79, the transcript-first screen: the newest lines that fit in `rows`, each wrapped under
@@ -93,7 +111,15 @@ fn wrapped(all: &[(&TranscriptLine, bool)], cells: usize, rows: usize) -> Vec<Li
         if out.len() >= rows {
             break;
         }
-        let (label, colour) = speaker(l.speaker);
+        if l.note {
+            // #114: a marker the session wrote, one dim row, no speaker.
+            out.push(Line::from(Span::styled(
+                truncate(&l.text, cells),
+                Style::new().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+        let (label, colour) = label_of(l);
         let room = cells.saturating_sub(LABEL_CELLS + 1 + if *partial { width(CURSOR) } else { 0 });
         // Wrapped in full, not to `rows`: `wrap` keeps the first lines and marks the cut with
         // `…`, and the newest words are the ones to keep (Copilot, PR #80). The rows past the
@@ -103,7 +129,7 @@ fn wrapped(all: &[(&TranscriptLine, bool)], cells: usize, rows: usize) -> Vec<Li
             text.push(String::new());
         }
         let last = text.len() - 1;
-        let lines: Vec<Line<'static>> = text
+        let mut lines: Vec<Line<'static>> = text
             .into_iter()
             .enumerate()
             .map(|(i, t)| {
@@ -122,6 +148,15 @@ fn wrapped(all: &[(&TranscriptLine, bool)], cells: usize, rows: usize) -> Vec<Li
                 Line::from(spans)
             })
             .collect();
+        // #114: what the call heard, dim, under the line it translates; wrapped the same way.
+        if let Some(tr) = &l.translation {
+            let dim = Style::new().fg(Color::DarkGray);
+            lines.extend(
+                wrap(&format!("{SPOKEN_MARK}{tr}"), room, usize::MAX)
+                    .into_iter()
+                    .map(|t| Line::from(vec![Span::raw(indent.clone()), Span::styled(t, dim)])),
+            );
+        }
         // Newest first while collecting; each line's rows go in bottom-up too.
         out.extend(lines.into_iter().rev());
     }
@@ -138,8 +173,27 @@ fn speaker(s: Speaker) -> (&'static str, Color) {
     }
 }
 
-fn transcript_line(l: &TranscriptLine, partial: bool, cells: usize) -> Line<'static> {
+/// A line's label: the speaker, or `You → de` for a line that went out translated (#114).
+fn label_of(l: &TranscriptLine) -> (String, Color) {
     let (label, colour) = speaker(l.speaker);
+    match &l.spoken_as {
+        Some(target) => (format!("{label} → {target}"), colour),
+        None => (label.to_owned(), colour),
+    }
+}
+
+/// #114: leads the translation under a line that went out translated (the question block's
+/// own mark for the one being spoken).
+const SPOKEN_MARK: &str = "» ";
+
+/// The strip's rows for one line: one, cut at the front, and (#114) the translation it went
+/// out as, dim, on a second; a marker is one dim row.
+fn transcript_lines(l: &TranscriptLine, partial: bool, cells: usize) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    if l.note {
+        return vec![Line::from(Span::styled(truncate(&l.text, cells), dim))];
+    }
+    let (label, colour) = label_of(l);
     let room = cells.saturating_sub(LABEL_CELLS + 1 + if partial { width(CURSOR) } else { 0 });
     let mut spans = vec![
         Span::styled(
@@ -149,15 +203,52 @@ fn transcript_line(l: &TranscriptLine, partial: bool, cells: usize) -> Line<'sta
         Span::raw(truncate_front(&l.text, room)),
     ];
     if partial {
-        spans.push(Span::styled(CURSOR, Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled(CURSOR, dim));
     }
-    Line::from(spans)
+    let mut lines = vec![Line::from(spans)];
+    if let Some(tr) = &l.translation {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(LABEL_CELLS + 1)),
+            Span::styled(truncate(&format!("{SPOKEN_MARK}{tr}"), room), dim),
+        ]));
+    }
+    lines
 }
 
 pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     let st = &view.session.status;
     let mut spans = Vec::new();
     let mut detail = None;
+    // #114: what `dmn-voice` carries, first and wide, so which voice the call hears is never
+    // in doubt: your own (the You lane's colour), or the translation (teal; amber while a
+    // turn is in flight). Assistance on or off.
+    if let Some(v) = &view.session.voice {
+        let (text, bg) = match v.mode {
+            VoiceMode::Passthrough => {
+                let own = v
+                    .own
+                    .as_ref()
+                    .map(|l| format!(" ({l})"))
+                    .unwrap_or_default();
+                (format!(" {VOICE_YOU}{own} "), Color::Magenta)
+            }
+            VoiceMode::Translate => {
+                let bg = if view.session.speech.is_some() {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                };
+                (format!(" {VOICE_TO} {} ", v.target), bg)
+            }
+        };
+        spans.push(Span::styled(
+            text,
+            Style::new()
+                .fg(Color::Black)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     // #59: the model dot is named after the provider answering, once one has been announced.
     let model = st.provider.as_ref().map_or("model", |p| p.name.as_str());
     for (name, health) in [("mic", &st.mic), ("system", &st.system), (model, &st.model)] {
@@ -261,16 +352,22 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     // #96: the keys as long as the note fits whole beside them, `⏎ ask` going first: the note
     // had those cells before the key did. `← earlier` (#94) is the next to go. A note too long
     // for any form is cut, as it always was, beside the full keys.
-    let Keys { lead, forms } = shortcuts(view);
+    // #114: the mode key (`l translate` / `l own voice`) is added only when the whole line
+    // then fits: the voice tag at the front already says the mode, and a press's seconds or a
+    // dot are worth more than a hint on a narrow pane.
+    let Keys { lead, forms, voice } = shortcuts(view);
     let whole = |keys: &&String| {
         note.as_ref()
             .is_none_or(|(d, _)| used + 2 + width(d) + width(keys) <= usize::from(area.width))
     };
-    let keys = forms
-        .iter()
-        .find(whole)
-        .or(forms.first())
-        .cloned()
+    let note_cells = note.as_ref().map_or(0, |(d, _)| 2 + width(d));
+    let with_voice = forms
+        .first()
+        .zip(voice.as_ref())
+        .map(|(first, key)| format!("{}{SEP}{key} ", first.trim_end()));
+    let keys = with_voice
+        .filter(|keys| used + note_cells + width(keys) <= usize::from(area.width))
+        .or_else(|| forms.iter().find(whole).or(forms.first()).cloned())
         .unwrap_or_default();
     let keys_cells = u16::try_from(width(&keys)).unwrap_or(u16::MAX);
     let [left, right] =
@@ -303,12 +400,14 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
 struct Keys {
     lead: String,
     forms: Vec<String>,
+    /// #114: the mode key, appended to the longest form when the line has room for it.
+    voice: Option<String>,
 }
 
 impl Keys {
     /// `lead`, then `parts`, each form one part shorter than the one before. The lead is the
     /// last to go; with none, the first part (the two keys for the state) always stays.
-    fn new(lead: &[String], parts: &[String]) -> Self {
+    fn new(lead: &[String], parts: &[String], voice: Option<String>) -> Self {
         let least = usize::from(lead.is_empty());
         let forms = (least..=parts.len())
             .rev()
@@ -320,6 +419,7 @@ impl Keys {
         Self {
             lead: lead.join(SEP),
             forms,
+            voice,
         }
     }
 }
@@ -391,6 +491,15 @@ fn shortcuts(view: &View<'_>) -> Keys {
     // #109: why the last `t` spoke nothing leads the keys for its 5 s, assistance on or off.
     let speak_failed = view.session.speak_failed.as_ref().map(|n| n.reason.clone());
     let speak = view.session.speak.then(|| SPEAK.to_owned());
+    // #114: the mode key, named for what it switches to; after `t speak`, and only when the
+    // line has room for it (the tag at the front says the mode either way).
+    let voice = view.session.voice.as_ref().map(|v| {
+        match v.mode {
+            VoiceMode::Passthrough => VOICE_TRANSLATE,
+            VoiceMode::Translate => VOICE_OWN,
+        }
+        .to_owned()
+    });
     if view.session.assist_off {
         // Ctrl+Shift+A in tmux's notation: short enough that an 80-column pane with every tag
         // (`system: all audio`, `es→en`) still shows the whole state. #109: `t` works with
@@ -405,7 +514,7 @@ fn shortcuts(view: &View<'_>) -> Keys {
             Some(key) => vec![format!("{on} · {key} "), format!("{on} ")],
             None => vec![format!("{on} ")],
         };
-        return Keys { lead, forms };
+        return Keys { lead, forms, voice };
     }
     // What leads the keys is the last part to go: the answer to Enter, and on an earlier
     // question the count of those that arrived behind it.
@@ -436,7 +545,7 @@ fn shortcuts(view: &View<'_>) -> Keys {
             .into_iter()
             .flatten()
             .collect();
-        return Keys::new(&lead, &parts);
+        return Keys::new(&lead, &parts, voice);
     }
     let pair = match (view.mode, view.loading, coding, sections) {
         (Mode::Listening, ..) | (Mode::Live, true, false, _) => "m mute · q quit".to_owned(),
@@ -452,12 +561,22 @@ fn shortcuts(view: &View<'_>) -> Keys {
         .into_iter()
         .flatten()
         .collect();
-    Keys::new(&lead, &parts)
+    Keys::new(&lead, &parts, voice)
 }
 
 /// #109: `t` translates what you last said into `[speak].target` and speaks it in your voice.
-/// Offered while `[speak]` is on, last, so it is the first key a narrow pane gives up.
+/// Offered while `[speak]` is on, after `⏎ ask`.
 const SPEAK: &str = "t speak";
+
+/// #114: `l` in pass-through mode: switch to translate mode. Offered last, and only when the
+/// line has room: the voice tag at the front says the mode.
+const VOICE_TRANSLATE: &str = "l translate";
+/// #114: `l` in translate mode: back to your own voice.
+const VOICE_OWN: &str = "l own voice";
+/// #114: the voice tag in pass-through mode (`voice: you (en)` when the language is known).
+pub(super) const VOICE_YOU: &str = "voice: you";
+/// #114: the voice tag in translate mode, followed by the target (`voice: → de`).
+pub(super) const VOICE_TO: &str = "voice: →";
 
 /// #109: the status line's tag while the model translates a `t` press.
 pub(super) const TRANSLATING: &str = "translating…";

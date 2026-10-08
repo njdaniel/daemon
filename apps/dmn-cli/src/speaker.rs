@@ -38,17 +38,25 @@
 //!
 //! **Cancellation.** [`Speaker::stop`] (on `q`) cancels the translation and the wait for the TTS
 //! server's first bytes, stops feeding at the next chunk, and joins the thread.
+//!
+//! **Pass-through (#114).** The node is opened with the session's microphone passing through
+//! it (`[audio].mic`, the lane whisper hears), on from the start in pass-through mode and shut
+//! in translate mode; [`Speaker::set_passthrough`] flips it on `l`, through the worker, which
+//! also applies the current mode to a node it opens again after a failed playback. The gate's
+//! fade and its shutting while speech plays are the node's own (`dmn_audio::Mixer`). The queue
+//! of turns translate mode speaks is the pipeline's (`Speaking`): the worker still takes one
+//! job at a time.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use dmn_audio::{AudioError, VMIC_NODE_NAME, VmicState};
+use dmn_audio::{AudioError, CaptureTarget, Passthrough, VMIC_NODE_NAME, VmicState};
 use dmn_core::config::Config;
 use dmn_core::{Paths, wire};
 use dmn_llm::{CancellationToken, LlmError, Provider};
-use dmn_session::{Action, SessionHub};
+use dmn_session::{Action, SessionHub, VoiceMode};
 use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider, Tuning};
 
 use crate::speak::{self, DRAIN_MARGIN, SpeakError, SpeechSink};
@@ -90,6 +98,8 @@ pub struct SpeakSetup {
     pub tuning: Tuning,
     /// #113: warm the TTS server up at start (off in tests, whose mock would record it).
     pub warm_tts: bool,
+    /// #114: whether the microphone passes through the node from the start (`[speak].mode`).
+    pub passthrough: bool,
 }
 
 /// When a press's speech played, on the wall clock, for the echo guard's window.
@@ -107,9 +117,16 @@ struct Job {
     pressed: Instant,
 }
 
+/// What the pipeline sends the worker.
+enum Msg {
+    Speak(Job),
+    /// #114: the microphone's gate, open (pass-through mode) or shut (translate mode).
+    Passthrough(bool),
+}
+
 /// The worker that speaks `t`'s presses. See the module doc.
 pub struct Speaker {
-    jobs: Option<crossbeam_channel::Sender<Job>>,
+    msgs: Option<crossbeam_channel::Sender<Msg>>,
     windows: crossbeam_channel::Receiver<Window>,
     stop: Arc<AtomicBool>,
     cancel: CancellationToken,
@@ -124,11 +141,13 @@ impl Speaker {
             .enable_all()
             .build()
             .map_err(|e| SpeakError::Runtime(e.to_string()))?;
-        // One job waits at most: the pipeline sends only while none is in flight.
-        let (jobs, jobs_rx) = crossbeam_channel::bounded(1);
+        // One job is in flight at most: the pipeline sends the next only when it is done. The
+        // mode switch (#114) rides the same channel so it is applied in order with the jobs.
+        let (msgs, msgs_rx) = crossbeam_channel::unbounded();
         let (windows_tx, windows) = crossbeam_channel::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
+        let passthrough = setup.passthrough;
         let worker = Worker {
             setup,
             hub,
@@ -137,13 +156,14 @@ impl Speaker {
             windows: windows_tx,
             stop: Arc::clone(&stop),
             cancel: cancel.clone(),
+            passthrough,
         };
         let handle = std::thread::Builder::new()
             .name("dmn-speak".to_owned())
-            .spawn(move || worker.run(&jobs_rx))
+            .spawn(move || worker.run(&msgs_rx))
             .map_err(|e| SpeakError::Runtime(format!("cannot spawn the speak thread: {e}")))?;
         Ok(Self {
-            jobs: Some(jobs),
+            msgs: Some(msgs),
             windows,
             stop,
             cancel,
@@ -153,14 +173,23 @@ impl Speaker {
 
     /// Speak `text` (the user's turn) as press `id`. False when the worker cannot take it.
     pub fn speak(&self, id: u64, text: String) -> bool {
-        self.jobs.as_ref().is_some_and(|jobs| {
-            jobs.try_send(Job {
+        self.msgs.as_ref().is_some_and(|msgs| {
+            msgs.send(Msg::Speak(Job {
                 id,
                 text,
                 pressed: Instant::now(),
-            })
+            }))
             .is_ok()
         })
+    }
+
+    /// #114: let the microphone through `dmn-voice` (pass-through mode) or not (translate
+    /// mode), from the node's next buffer; applied after a job in flight, during which the
+    /// microphone is out anyway.
+    pub fn set_passthrough(&self, on: bool) {
+        if let Some(msgs) = &self.msgs {
+            let _ = msgs.send(Msg::Passthrough(on));
+        }
     }
 
     /// The playback windows reported since the last call.
@@ -176,7 +205,7 @@ impl Speaker {
     fn shut_down(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.cancel.cancel();
-        self.jobs = None;
+        self.msgs = None;
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -197,10 +226,12 @@ struct Worker {
     windows: crossbeam_channel::Sender<Window>,
     stop: Arc<AtomicBool>,
     cancel: CancellationToken,
+    /// #114: the microphone's gate as the mode has it now, applied to every sink opened.
+    passthrough: bool,
 }
 
 impl Worker {
-    fn run(mut self, jobs: &crossbeam_channel::Receiver<Job>) {
+    fn run(mut self, msgs: &crossbeam_channel::Receiver<Msg>) {
         self.open_sink();
         let opened = Instant::now();
         // #113: the TTS server's first request pays for its warm-up; on its own thread, so a
@@ -225,11 +256,18 @@ impl Worker {
         let mut look_at = Some(opened + LINK_GRACE);
         loop {
             let next = match look_at {
-                Some(at) => jobs.recv_deadline(at).map_err(|e| e.is_timeout()),
-                None => jobs.recv().map_err(|_| false),
+                Some(at) => msgs.recv_deadline(at).map_err(|e| e.is_timeout()),
+                None => msgs.recv().map_err(|_| false),
             };
             let job = match next {
-                Ok(job) => job,
+                Ok(Msg::Speak(job)) => job,
+                Ok(Msg::Passthrough(on)) => {
+                    self.passthrough = on;
+                    if let Some(sink) = self.sink.as_mut() {
+                        sink.set_passthrough(on);
+                    }
+                    continue;
+                }
                 Err(true) => {
                     look_at = None;
                     self.check_linked();
@@ -328,7 +366,8 @@ impl Worker {
 
     fn open_sink(&mut self) -> Option<String> {
         match (self.setup.open_sink)() {
-            Ok(sink) => {
+            Ok(mut sink) => {
+                sink.set_passthrough(self.passthrough);
                 self.sink = Some(sink);
                 None
             }
@@ -560,37 +599,53 @@ pub fn check(cfg: &Config, paths: &Paths, tts: &dyn TtsProvider) -> Result<Strin
 }
 
 /// The session's speaker for `dmn run`, after [`check`]: the translator (`[llm]` with
-/// `[speak].model`, #113), the TTS server's streaming route, and `dmn-voice`.
-pub fn setup(cfg: &Config, paths: &Paths) -> Result<SpeakSetup, SpeakError> {
+/// `[speak].model`, #113), the TTS server's streaming route, and `dmn-voice` with the
+/// session's microphone `mic` (`[audio].mic` or `--mic`; `"default"` is PipeWire's default
+/// source) passing through it (#114). `None` opens the node without a pass-through, which the
+/// live tests do so that none of them captures the real microphone.
+pub fn setup(cfg: &Config, paths: &Paths, mic: Option<&str>) -> Result<SpeakSetup, SpeakError> {
     let tts = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url).streaming();
     let voice = check(cfg, paths, &tts)?;
     let provider = wire::provider(&cfg.translator_llm())
         .map_err(|e: LlmError| SpeakError::Llm(e.to_string()))?;
     let target = cfg.speak.target.clone();
+    let passthrough = cfg.speak.mode == VoiceMode::Passthrough;
+    let tap = mic.map(|mic| Passthrough {
+        target: match CaptureTarget::mic(mic) {
+            CaptureTarget::Mic(name) => name,
+            _ => None,
+        },
+        on: passthrough,
+    });
     Ok(SpeakSetup {
         provider,
         model: cfg.translator_model().to_owned(),
         tts: Arc::new(tts),
-        open_sink: Box::new(open_dmn_voice),
+        open_sink: Box::new(move || open_dmn_voice(tap.clone())),
         target_name: target_name(&target).unwrap_or_else(|| target.clone()),
         target,
         voice,
         timeout: Duration::from_millis(cfg.llm.fast_timeout_ms),
         tuning: speak::tuning(cfg),
         warm_tts: true,
+        passthrough,
     })
 }
 
-/// `dmn-voice` on its own PipeWire connection, which lives as long as the node.
+/// `dmn-voice` on its own PipeWire connection, which lives as long as the node, with the
+/// microphone passing through it when `passthrough` says (#114).
 /// `Err` is short: it follows `no dmn-voice: ` on the status line, and the full error is logged.
-fn open_dmn_voice() -> Result<Box<dyn SpeechSink + Send>, String> {
-    let (ctx, mic) = speak::open_vmic().map_err(|e| {
+fn open_dmn_voice(passthrough: Option<Passthrough>) -> Result<Box<dyn SpeechSink + Send>, String> {
+    let (ctx, mic) = speak::open_vmic_with(passthrough).map_err(|e| {
         tracing::warn!(error = %e, "speak: cannot open {VMIC_NODE_NAME}");
         match e {
             SpeakError::NoPipeWire { .. } => "PipeWire is not running".to_owned(),
             other => other.to_string().chars().take(40).collect(),
         }
     })?;
+    if let Some(why) = mic.passthrough_error() {
+        tracing::warn!(error = %why, "speak: the microphone does not pass through {VMIC_NODE_NAME}");
+    }
     Ok(Box::new(SessionMic { mic, _ctx: ctx }))
 }
 
@@ -621,11 +676,17 @@ impl SpeechSink for SessionMic {
         let s = self.mic.stats();
         (s.written, s.pulled, s.underruns, s.first_pull)
     }
+
+    fn set_passthrough(&mut self, on: bool) {
+        self.mic.set_passthrough(on);
+    }
 }
 
-/// What reached a [`MemorySink`]: each chunk's sample count and rate, in order.
+/// What reached a [`MemorySink`]: each chunk's sample count and rate, in order, and whether
+/// the microphone's gate was set open at the time (#114: it never is while speech is written
+/// in translate mode).
 #[cfg(test)]
-pub type Fed = Arc<std::sync::Mutex<Vec<(usize, u32)>>>;
+pub type Fed = Arc<std::sync::Mutex<Vec<(usize, u32, bool)>>>;
 
 /// A sink standing in for `dmn-voice` in tests: keeps every chunk, and "plays" all it has at the
 /// first `drain` (or never, for a call that has not selected it).
@@ -636,6 +697,8 @@ pub struct MemorySink {
     pub plays: bool,
     written: u64,
     pulled: u64,
+    /// #114: the gate as last set; shared so a test can read it.
+    pub passthrough: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -649,6 +712,7 @@ impl MemorySink {
                 plays,
                 written: 0,
                 pulled: 0,
+                passthrough: Arc::new(AtomicBool::new(true)),
             },
             log,
         )
@@ -669,7 +733,11 @@ impl SpeechSink for MemorySink {
         self.log
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((samples.len(), sample_rate));
+            .push((
+                samples.len(),
+                sample_rate,
+                self.passthrough.load(Ordering::Relaxed),
+            ));
         self.written += samples.len() as u64 * u64::from(self.rate) / u64::from(sample_rate);
         Ok(())
     }
@@ -686,6 +754,10 @@ impl SpeechSink for MemorySink {
 
     fn stats(&self) -> (u64, u64, u64, Option<Instant>) {
         (self.written, self.pulled, 0, None)
+    }
+
+    fn set_passthrough(&mut self, on: bool) {
+        self.passthrough.store(on, Ordering::Relaxed);
     }
 }
 
@@ -707,7 +779,19 @@ pub fn setup_on(
     tts: dmn_tts::MockTtsProvider,
     plays: bool,
 ) -> (SpeakSetup, Fed) {
+    let (setup, log, _) = setup_sink(llm, tts, plays);
+    (setup, log)
+}
+
+/// [`setup_on`], with the first sink's microphone gate too (#114).
+#[cfg(test)]
+pub fn setup_sink(
+    llm: Arc<dyn Provider>,
+    tts: dmn_tts::MockTtsProvider,
+    plays: bool,
+) -> (SpeakSetup, Fed, Arc<AtomicBool>) {
     let (sink, log) = MemorySink::new(plays);
+    let gate = Arc::clone(&sink.passthrough);
     let mut sink = Some(sink);
     let open: OpenSink = Box::new(move || match sink.take() {
         Some(s) => Ok(Box::new(s) as Box<dyn SpeechSink + Send>),
@@ -728,8 +812,10 @@ pub fn setup_on(
             timeout: Duration::from_secs(4),
             tuning: Tuning::default(),
             warm_tts: false,
+            passthrough: true,
         },
         log,
+        gate,
     )
 }
 
@@ -851,7 +937,7 @@ pub(crate) mod tests {
         assert_eq!(spoken[0].text, SPANISH);
         assert_eq!(spoken[0].voice, "me");
         assert_eq!(spoken[0].language.as_deref(), Some("es"));
-        let fed: usize = played.lock().unwrap().iter().map(|(n, _)| n).sum();
+        let fed: usize = played.lock().unwrap().iter().map(|(n, ..)| n).sum();
         assert_eq!(fed, 12_000, "the mock's 0.5 s at 24 kHz reached the sink");
         let windows = speaker.windows();
         assert!(
@@ -904,7 +990,7 @@ pub(crate) mod tests {
             assert_eq!(req.tuning.cfg_weight, Some(0.4));
             assert_eq!(req.tuning.exaggeration, None);
         }
-        let fed: usize = played.lock().unwrap().iter().map(|(n, _)| n).sum();
+        let fed: usize = played.lock().unwrap().iter().map(|(n, ..)| n).sum();
         assert_eq!(
             fed, 12_000,
             "only the press reached the sink, not the warm-up"
