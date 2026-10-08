@@ -204,7 +204,9 @@ impl Worker {
         let opened = Instant::now();
         // #113: the TTS server's first request pays for its warm-up; on its own thread, so a
         // first press never queues behind it.
-        let _warming = self.setup.warm_tts.then(|| self.warm_tts());
+        if self.setup.warm_tts {
+            self.warm_tts();
+        }
         // The model loads before the first press needs it, not during it (a cold model takes
         // longer than the translation's budget). A failure shows on that press.
         let provider = Arc::clone(&self.setup.provider);
@@ -255,15 +257,16 @@ impl Worker {
         self.stop.load(Ordering::Acquire)
     }
 
-    /// #113: one word to the TTS server, its audio thrown away, on a thread of its own. Logs
-    /// how long the server took; a failure is only logged (the first press says it).
-    fn warm_tts(&self) -> Option<std::thread::JoinHandle<()>> {
+    /// #113: one word to the TTS server, its audio thrown away, on a thread of its own that
+    /// nothing waits for. Logs how long the server took; a failure is only logged (the first
+    /// press says it).
+    fn warm_tts(&self) {
         let tts = Arc::clone(&self.setup.tts);
         let req = SpeakRequest::new(WARM_UP_TEXT, self.setup.voice.clone())
             .with_language(self.setup.target.clone())
             .with_tuning(self.setup.tuning);
         let stop = Arc::clone(&self.stop);
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("dmn-speak-warm".to_owned())
             .spawn(move || {
                 let t = Instant::now();
@@ -298,9 +301,10 @@ impl Worker {
                         "speak: the TTS warm-up failed"
                     ),
                 }
-            })
-            .map_err(|e| tracing::warn!(error = %e, "speak: cannot spawn the TTS warm-up"))
-            .ok()
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "speak: cannot spawn the TTS warm-up");
+        }
     }
 
     /// #113: nothing linked to `dmn-voice` a moment after start: the call does not have it
