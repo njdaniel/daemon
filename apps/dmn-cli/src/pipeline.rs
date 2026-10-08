@@ -4612,20 +4612,33 @@ mod tests {
         );
     }
 
-    /// #109 live, the issue's measurement: an English You line, `t`, the real model (Ollama,
-    /// `qwen3.6:35b-a3b`, `think: false`) translating it into Spanish, the real TTS server
-    /// (chatterbox-tts-api on :4123) speaking it in a test voice, and `pw-record` on `dmn-voice`
-    /// hearing it, on a pipe. Prints key → translation, key → first audio, key → done. The test
-    /// voice `dmn-test-109` is enrolled from 15 s of the Spanish fixture with `--language es`
-    /// (so the start-up check passes) and deleted afterwards; everything else lives in a
-    /// tempdir. Skips when either server is not answering.
-    #[test]
-    #[ignore = "needs PipeWire, Ollama with qwen3.6:35b-a3b, the TTS server on :4123 and the es fixture"]
-    fn live_t_speaks_your_english_line_in_spanish_into_dmn_voice() {
+    /// What one live `t` came to (#109, #113).
+    struct LiveT {
+        text: String,
+        translated: Duration,
+        first_audio: Option<Duration>,
+        done: Duration,
+        /// Seconds of speech `pw-record` heard.
+        heard: f64,
+    }
+
+    /// A live `t`: `voice` enrolled in `target` from `secs` seconds of `fixture` (from
+    /// `from`), `cfg` with `[speak]` on that voice and target (and `edit`'s changes), the real
+    /// speaker, `pw-record` on `dmn-voice` on a pipe, then each of `turns` said on the You
+    /// lane and spoken with `t`, one after the other. The voice is deleted afterwards and
+    /// everything else lives in a tempdir. `None` when a server is not answering or the
+    /// fixture is missing.
+    fn live_t(
+        voice: &str,
+        target: &str,
+        fixture: &str,
+        from: usize,
+        edit: impl FnOnce(&mut Config),
+        turns: &[&str],
+    ) -> Option<Vec<LiveT>> {
         use std::io::Read as _;
         use std::process::{Command as Proc, Stdio};
         const TTS: &str = "http://localhost:4123";
-        const VOICE: &str = "dmn-test-109";
         let up = |url: &str| {
             Proc::new("curl")
                 .args(["-sf", "-m", "2", url])
@@ -4635,24 +4648,26 @@ mod tests {
         };
         if !up(&format!("{TTS}/health")) || !up("http://localhost:11434/api/version") {
             eprintln!("skipped: the TTS server or Ollama is not answering");
-            return;
+            return None;
         }
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/es/candidate.wav");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata")
+            .join(fixture)
+            .join("candidate.wav");
         if !fixture.exists() {
             eprintln!("skipped: {} is missing", fixture.display());
-            return;
+            return None;
         }
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
-        // Seconds 47–62 of the fixture, as #108's live check cuts it.
-        let clip = dir.path().join(format!("{VOICE}.wav"));
+        let clip = dir.path().join(format!("{voice}.wav"));
         {
             let mut r = hound::WavReader::open(&fixture).unwrap();
             let spec = r.spec();
             let rate = spec.sample_rate as usize;
             let samples: Vec<i16> = r
                 .samples::<i16>()
-                .skip(47 * rate)
+                .skip(from * rate)
                 .take(15 * rate)
                 .map(|s| s.unwrap())
                 .collect();
@@ -4662,30 +4677,31 @@ mod tests {
             }
             w.finalize().unwrap();
         }
-        struct DeleteVoice;
+        struct DeleteVoice(String);
         impl Drop for DeleteVoice {
             fn drop(&mut self) {
                 let _ = std::process::Command::new("curl")
-                    .args(["-s", "-X", "DELETE", &format!("{TTS}/v1/voices/{VOICE}")])
+                    .args(["-s", "-X", "DELETE", &format!("{TTS}/v1/voices/{}", self.0)])
                     .stdout(std::process::Stdio::null())
                     .status();
             }
         }
-        let _cleanup = DeleteVoice;
+        let _cleanup = DeleteVoice(voice.to_owned());
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         use dmn_tts::TtsProvider as _;
-        rt.block_on(dmn_tts::ChatterboxProvider::new(TTS).enroll(VOICE, &clip, Some("es")))
+        rt.block_on(dmn_tts::ChatterboxProvider::new(TTS).enroll(voice, &clip, Some(target)))
             .unwrap();
 
         let mut cfg = Config::default();
         cfg.speak.enabled = true;
-        cfg.speak.target = "es".into();
+        cfg.speak.target = target.into();
         cfg.speak.tts_url = TTS.into();
         cfg.speak.voice_ref = clip.display().to_string();
         cfg.llm.num_ctx = 8192;
+        edit(&mut cfg);
         let setup = crate::speaker::setup(&cfg, &paths).unwrap();
         let hub = Arc::new(SessionHub::default());
         let mut s = Speaking::new(Arc::clone(&hub));
@@ -4707,8 +4723,9 @@ mod tests {
             .spawn()
             .unwrap();
         let mut out = rec.stdout.take().unwrap();
+        // Each loud read's time, and how many loud samples it had.
         let reader = std::thread::spawn(move || {
-            let (mut first, mut loud, mut buf) = (None, 0usize, [0u8; 4096]);
+            let (mut loud, mut buf) = (Vec::new(), [0u8; 4096]);
             while let Ok(n) = out.read(&mut buf) {
                 if n == 0 {
                     break;
@@ -4718,61 +4735,136 @@ mod tests {
                     .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() > 0.005)
                     .count();
                 if hits > 0 {
-                    first.get_or_insert_with(Instant::now);
-                    loud += hits;
+                    loud.push((Instant::now(), hits));
                 }
             }
-            (first, loud)
+            loud
         });
-        std::thread::sleep(Duration::from_millis(500));
+        // The model and the TTS server warm up at start (#113); a press is measured warm.
+        std::thread::sleep(Duration::from_secs(4));
 
         let mut log = TranscriptLog::new();
-        hear(
-            &hub,
-            &mut log,
-            final_at(
-                Source::You,
-                6_000,
-                11_000,
-                "I would start with a token bucket for each API key and keep the counters in Redis.",
-            ),
-        );
-        let pressed = Instant::now();
-        s.press(&log);
-        let mut translated = None;
-        let done = loop {
-            let snap = hub.snapshot();
-            match &snap.speech {
-                Some(sp) if sp.stage == dmn_session::SpeakStage::Speaking => {
-                    translated.get_or_insert_with(|| (pressed.elapsed(), sp.text.clone()));
-                }
-                Some(_) => {}
-                None => break (pressed.elapsed(), snap),
+        let mut presses = Vec::new();
+        for (n, turn) in turns.iter().enumerate() {
+            let at = 6_000 + 20_000 * n as u64;
+            if n > 0 {
+                // The interviewer between two turns, so each press speaks only its own.
+                hear(
+                    &hub,
+                    &mut log,
+                    final_at(Source::Interviewer, at - 3_000, at - 1_000, "Go on."),
+                );
             }
-            assert!(pressed.elapsed() < Duration::from_secs(120), "never done");
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        std::thread::sleep(Duration::from_millis(300));
+            hear(&hub, &mut log, final_at(Source::You, at, at + 5_000, turn));
+            let pressed = Instant::now();
+            s.press(&log);
+            let mut translated = None;
+            let done = loop {
+                let snap = hub.snapshot();
+                match &snap.speech {
+                    Some(sp) if sp.stage == dmn_session::SpeakStage::Speaking => {
+                        translated.get_or_insert_with(|| (pressed.elapsed(), sp.text.clone()));
+                    }
+                    Some(_) => {}
+                    None => break (pressed.elapsed(), snap),
+                }
+                assert!(pressed.elapsed() < Duration::from_secs(120), "never done");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(done.1.speak_failed, None, "{:?}", done.1.speak_failed);
+            presses.push((pressed, translated.expect("a translation"), done.0));
+            std::thread::sleep(Duration::from_millis(500));
+        }
         let _ = rec.kill();
         let _ = rec.wait();
-        let (first, loud) = reader.join().unwrap();
+        let loud = reader.join().unwrap();
         s.finish();
-        let (done_after, snap) = done;
-        assert_eq!(snap.speak_failed, None, "{:?}", snap.speak_failed);
-        let (translated_after, text) = translated.expect("a translation");
-        let first_after = first.map(|t| t.saturating_duration_since(pressed));
-        eprintln!("translation: {text}");
-        eprintln!(
-            "key → translation {:.2} s, key → first audio {}, key → done {:.2} s, {:.1} s of speech heard by pw-record",
-            translated_after.as_secs_f64(),
-            first_after.map_or("never".into(), |d| format!("{:.2} s", d.as_secs_f64())),
-            done_after.as_secs_f64(),
-            loud as f64 / 48_000.0
-        );
+        let results: Vec<LiveT> = presses
+            .into_iter()
+            .map(|(pressed, (translated, text), done)| {
+                let mine = loud
+                    .iter()
+                    .filter(|(t, _)| *t >= pressed && *t <= pressed + done);
+                let first_audio = mine
+                    .clone()
+                    .next()
+                    .map(|(t, _)| t.saturating_duration_since(pressed));
+                let heard = mine.map(|(_, n)| n).sum::<usize>() as f64 / 48_000.0;
+                LiveT {
+                    text,
+                    translated,
+                    first_audio,
+                    done,
+                    heard,
+                }
+            })
+            .collect();
+        for r in &results {
+            eprintln!("translation: {}", r.text);
+            eprintln!(
+                "key → translation {:.2} s, key → first audio {}, key → done {:.2} s, {:.1} s of speech heard by pw-record",
+                r.translated.as_secs_f64(),
+                r.first_audio
+                    .map_or("never".into(), |d| format!("{:.2} s", d.as_secs_f64())),
+                r.done.as_secs_f64(),
+                r.heard
+            );
+        }
+        Some(results)
+    }
+
+    /// #109 live, the issue's measurement: an English You line, `t`, the real model (Ollama,
+    /// `qwen3.6:35b-a3b`, `think: false`) translating it into Spanish, the real TTS server
+    /// (chatterbox-tts-api on :4123) speaking it in a test voice, and `pw-record` on `dmn-voice`
+    /// hearing it, on a pipe. Prints key → translation, key → first audio, key → done. The test
+    /// voice `dmn-test-109` is enrolled from 15 s of the Spanish fixture with `--language es`
+    /// (so the start-up check passes) and deleted afterwards; everything else lives in a
+    /// tempdir. Skips when either server is not answering.
+    #[test]
+    #[ignore = "needs PipeWire, Ollama with qwen3.6:35b-a3b, the TTS server on :4123 and the es fixture"]
+    fn live_t_speaks_your_english_line_in_spanish_into_dmn_voice() {
+        let Some(results) = live_t(
+            "dmn-test-109",
+            "es",
+            "es",
+            47,
+            |_| {},
+            &["I would start with a token bucket for each API key and keep the counters in Redis."],
+        ) else {
+            return;
+        };
         assert!(
-            first_after.is_some(),
+            results[0].first_audio.is_some(),
             "pw-record heard nothing from dmn-voice"
         );
+    }
+
+    /// #113 live, translation only: `[speak].model = "llama3.1:8b"` translates into German
+    /// (the answer model is never asked for), the TTS server speaks it (on the GPU on the dev
+    /// box), one sentence and then a three-sentence turn. Prints the issue's measurements:
+    /// key → translation, key → first audio, key → done. The test voice `dmn-test-113` is
+    /// enrolled from 15 s of the sysdesign candidate with `--language de` and deleted
+    /// afterwards. Skips when either server is not answering.
+    #[test]
+    #[ignore = "needs PipeWire, Ollama with llama3.1:8b, the TTS server on :4123 and the sysdesign fixture"]
+    fn live_t_translation_only_speaks_german_with_a_small_translator() {
+        let Some(results) = live_t(
+            "dmn-test-113",
+            "de",
+            "sysdesign",
+            31,
+            |cfg| cfg.speak.model = Some("llama3.1:8b".into()),
+            &[
+                "I would start with a token bucket for each API key and keep the counters in Redis.",
+                "First I'd clarify the requirements. Then I'd put a token bucket in front of each API key. If Redis goes down, we let the requests through.",
+            ],
+        ) else {
+            return;
+        };
+        for r in &results {
+            assert!(r.first_audio.is_some(), "pw-record heard nothing");
+            assert!(r.heard > 1.0, "{} s heard", r.heard);
+        }
     }
 
     /// The issue's first criterion end to end on a fixture: the real pipeline replays the

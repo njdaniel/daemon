@@ -293,13 +293,30 @@ renders; measured 2026-10-06 for "Gracias por la oportunidad." (2.3 s of speech)
 the first sound 7.9–8.8 s after the command starts and the last 10.3–11.2 s after it. That wait is
 the server's; the virtual microphone adds about 0.1 s.
 
-**GPU: check your VRAM first.** The default LLM (`qwen3.6:35b-a3b`) takes about 22 of an RTX
-4090's 24 GB, so the TTS server on the same GPU will not fit beside it. Run `nvidia-smi` before
-choosing `docker/docker-compose.gpu.yml` (or `DEVICE=cuda`) in place of the CPU compose file
-above, and expect to need a smaller LLM, a remote one, or assistance off. On the dev box the server
-runs on the CPU, and the times above are the CPU's; the GPU compose file exists for a machine with
-VRAM to spare, and its speed has not been measured here. `[speak].device` records your choice for
-this setup; dmn does not read it.
+**On the GPU (#113).** The GPU server renders about 3× faster than real time instead of 3–5×
+slower: on the dev box's RTX 4090, 1.9 s for 6.3 s of German and 2.2 s for 7.6 s of Russian (the
+CPU took 25.7 s for 9.6 s). It needs Docker's NVIDIA runtime, a one-time host step (the driver must
+already be installed; `nvidia-smi` works):
+
+```bash
+sudo apt install nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+sudo systemctl restart docker
+# then, in the chatterbox-tts-api clone, the GPU compose file in place of the CPU one
+# (the same volumes, so voices already enrolled carry over):
+docker compose -f docker/docker-compose.gpu.yml -f docker/docker-compose.dmn.yml up -d --build
+curl -s http://localhost:4123/health    # "device": "cuda"
+```
+
+The server holds about 4 GB of VRAM. The default LLM (`qwen3.6:35b-a3b`) takes about 22 of the
+4090's 24 GB, so the two do not both fit: with the TTS server on the GPU, `dmn run` with assistance
+on finds the answer model partly on the CPU (measured: 74 % of it on the GPU, translation p50 0.68 s
+instead of 0.37 s, and answers slower). The translation-only setup below keeps that model out of
+memory. `dmn doctor` reports the server's device, with this way to the GPU when it is `cpu`; the
+first request after the server starts takes several seconds longer (8.9 s against 1.9 s, CUDA
+warming up), so `dmn run` sends it one word at start, whose audio goes nowhere. `[speak].device`
+records your choice for this setup; dmn does not read it.
 
 Then turn speak on, enroll a clip of your voice, and speak:
 
@@ -356,8 +373,9 @@ Without a running PipeWire server the command says so and suggests `--out`; noth
 `[speak].enabled` and `target`, `dmn run` opens `dmn-voice` when it starts and keeps it for the
 whole session, so select it as the call's microphone once, before you need it. Say something
 (in English, say), then press `t`: your last turn (what you said since the interviewer last spoke,
-up to 30 s) is translated into `target` by the same `[llm]` model the answers use, synthesized in
-your enrolled voice, and played into `dmn-voice`. The status line shows `translating… 0s`, then
+up to 30 s) is translated into `target` by `[speak].model` (left out: the `[llm]` model the
+answers use; see translation only, below), synthesized in your enrolled voice, and played into
+`dmn-voice`. The status line shows `translating… 0s`, then
 `speaking… 9s` with the seconds since the key, and the translation sits as one dim line (`» …`)
 at the foot of the question block until it has played. The keys end with `t speak` while it is on.
 `t` works with assistance off (Ctrl+Shift+A), does nothing while `[speak]` is off, and does
@@ -368,8 +386,62 @@ is said in amber for 5 s, and nothing else changes.
 Translation on the local model adds well under a second (0.35–0.49 s for one sentence on the dev
 box, measured 2026-10-06); the CPU TTS server is the wait. For "I would start with a token bucket
 for each API key and keep the counters in Redis." (6.5 s of Spanish), the call heard the first
-sound 18.0–18.7 s after `t` and the last 24.5–25.5 s after it. Mid-call that is a long pause; a GPU
-TTS server, where VRAM allows, is the way to shorten it.
+sound 18.0–18.7 s after `t` and the last 24.5–25.5 s after it, and a three-line turn 43–62 s.
+With the TTS server on the GPU and the small translator below (measured 2026-10-08, German), the
+same sentence is heard 2.5–2.8 s after `t` (translation 0.34–0.40 s) and a three-sentence turn
+1.8–2.1 s after it: dmn asks the server for one sentence at a time, so the first is heard while
+the rest render (the whole turn in one request took 4.1–4.2 s to its first sound).
+
+**Translation only: a small translator, the answer model left out (#113).** If you only want `t`
+(no interview help), give translation a small model of its own and start with assistance off:
+
+```toml
+[assist]
+enabled = false                       # or `dmn run --no-assist`
+
+[speak]
+enabled = true
+target = "de"
+model = "llama3.1:8b"                 # `ollama pull llama3.1:8b` (4.6 GB); left out: [llm].model
+```
+
+With assistance off at start and `[speak].model` set, `dmn run` asks Ollama to drop `[llm].model`
+and never loads it; the translator (about 5.4 GB) is loaded at start, and whisper and the GPU TTS
+server share the rest. Ctrl+Shift+A loads `[llm].model` when you turn assistance on, as before;
+with assistance on both models are loaded, and the status line says `llm partly on cpu` when the
+GPU is short. `dmn doctor` names the translator and says whether Ollama has it.
+
+The small model is about twice as fast and noticeably rougher. Measured 2026-10-08 on 10 interview
+sentences into German and Russian (dmn's own prompt, temperature 0): `llama3.1:8b` took 0.30 s
+p50 against 0.68 s for `qwen3.6:35b-a3b` (partly on the CPU beside the TTS server). It answered
+nothing and added nothing but one pair of quotes, but made grammar slips in about half the German
+sentences ("das Engpass", "einer Dutzend", "shardet") and two meaning errors in the Russian
+("bootstrap" for "bottleneck", "paid" for "paying"), where `qwen3.6:35b-a3b` made no German
+errors and added one phrase to one Russian sentence ("the implementation of" a token bucket). For
+short, plain sentences it is fine; for anything that must land exactly, keep `[speak].model`
+unset and the answer model loaded.
+
+**The noise after a sentence (#113).** The TTS model sometimes ends a sentence with a second of
+silence and then a loud burst of noise. dmn asks the server for one sentence at a time and stops
+each one at the first 0.8 s of near-silence after its speech, keeping 0.3 s of it, so the burst
+never reaches the call (or `dmn speak --out`'s file). Lower sampling temperature makes the burst
+rarer, and dmn sends `[speak].temperature = 0.6` by default (the server's own is 0.8); `cfg_weight`
+(pace, 0.0–1.0) and `exaggeration` (emotion, 0.25–2.0) are sent when you set them:
+
+```toml
+[speak]
+temperature = 0.6                     # 0.05-5.0
+# cfg_weight = 0.5
+# exaggeration = 0.5
+```
+
+**After a restart, select `dmn-voice` again.** Each `dmn run` creates a new `dmn-voice` node.
+PipeWire links an app back to it only when the app names the device in its own stream (`pw-record
+--target dmn-voice` does); Discord (and other Chromium-based apps that pin a chosen microphone)
+and a stream you moved by hand in the sound settings stay on the old node's choice, and no setting
+of the node changes that (#113, measured with `just probe`). So a moment after start, when nothing
+is linked to `dmn-voice`, the status line says `Discord: re-select dmn-voice as the microphone`
+for 5 s; a press nothing heard says the same.
 
 At start-up, `dmn run` checks what a press would need and could not fix mid-call: the TTS server
 answers, your voice is in its library, and the voice speaks `target` (the server speaks each voice
