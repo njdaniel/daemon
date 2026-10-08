@@ -29,9 +29,16 @@ async fn live_five_turns_translate_into_spanish_within_the_fast_budget() {
     let mut times = Vec::new();
     for said in TURNS {
         let started = Instant::now();
-        let t = translate(&p, said, "Spanish (es)", budget, CancellationToken::new())
-            .await
-            .unwrap();
+        let t = translate(
+            &p,
+            said,
+            "Spanish (es)",
+            "es",
+            budget,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         let took = started.elapsed();
         eprintln!("{took:>8.3?}  {said}\n          -> {}", t.text);
         assert!(!t.text.is_empty());

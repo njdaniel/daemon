@@ -349,6 +349,7 @@ impl Worker {
                 &*provider,
                 &text,
                 &self.setup.target_name,
+                &self.setup.target,
                 self.setup.timeout,
                 self.cancel.child_token(),
             ))
