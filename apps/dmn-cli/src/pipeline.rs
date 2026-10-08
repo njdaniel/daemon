@@ -28,6 +28,8 @@
 //! nothing is asked of the model; on again, the next question is detected as usual. A run that
 //! starts with it off never warms the LLM, and with a local Ollama asks it to unload before
 //! whisper loads, so whisper can have the GPU; the suggester then starts on the first Ctrl+Shift+A.
+//! With `[speak]` on, `t` translates on `[llm].model` unless `[speak].model` names a translator
+//! of its own (#113), in which case only that one is loaded while assistance is off.
 //!
 //! `t` (#109) is the pipeline thread's too, and independent of assistance: [`Speaking`] takes the
 //! You lane's last turn (as [`last_turn`] builds the asking lane's for Enter) and hands it to the
@@ -1110,15 +1112,8 @@ impl Pipeline {
         let assist = opts.assist.unwrap_or(cfg.assist.enabled);
         // #90: `--question-source` over `[detect].question_source`, fixed for the session.
         let asks = opts.question_source.unwrap_or(cfg.detect.question_source);
-        // #109: `t` translates on the same model whether assistance is on or not, so with
-        // `[speak]` on the model is wanted even with assistance off.
-        let llm_wanted = assist || cfg.speak.enabled;
         if !opts.no_llm {
-            if !llm_wanted {
-                unload_local_llm(&cfg.llm);
-            } else if stt_cfg.device != DeviceChoice::Cpu {
-                warm_local_llm(&cfg.llm);
-            }
+            prepare_local_models(cfg, assist, stt_cfg.device != DeviceChoice::Cpu);
         }
 
         // Load both whisper models and spawn every worker first, then start both sources back
@@ -2236,6 +2231,32 @@ fn build_lane(
         sink,
         placement,
     ))
+}
+
+/// The local models before whisper loads (#61, #79, #113). The answer model (`[llm].model`) is
+/// wanted with assistance on, and with it off only when `t` translates on it too (#109:
+/// `[speak]` on with no `[speak].model` of its own); not wanted, a local one is asked to leave
+/// (Ollama keeps a model 30 minutes after its last request), so a translation-only session
+/// holds just the small translator and whisper and the TTS server get the rest of the GPU.
+/// Ctrl+Shift+A loads it later, as the suggester starts. With whisper on the GPU, what is wanted
+/// is loaded first, so it sizes itself against a GPU whisper has not claimed yet; the speaker
+/// warms the translator itself otherwise.
+fn prepare_local_models(cfg: &Config, assist: bool, gpu_whisper: bool) {
+    let translator = cfg.speak.enabled.then(|| cfg.translator_llm());
+    let llm_wanted = assist
+        || translator
+            .as_ref()
+            .is_some_and(|t| t.model == cfg.llm.model);
+    if !llm_wanted {
+        unload_local_llm(&cfg.llm);
+    } else if gpu_whisper {
+        warm_local_llm(&cfg.llm);
+    }
+    if let Some(t) = translator.filter(|t| t.model != cfg.llm.model)
+        && gpu_whisper
+    {
+        warm_local_llm(&t);
+    }
 }
 
 /// Block until the configured Ollama model is loaded (#61). A failure is only logged: the
@@ -4144,6 +4165,138 @@ mod tests {
         );
     }
 
+    // --- #113: translation-only: a translator of its own, the answer model left out ---------
+
+    /// `[speak]` on with a translator of its own, against a stand-in Ollama.
+    fn translator_cfg(url: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.llm.base_url = url.to_owned();
+        cfg.llm.model = "answer-35b".into();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "de".into();
+        cfg.speak.model = Some("translator-8b".into());
+        cfg
+    }
+
+    /// Assistance off at start with `[speak].model` set: the answer model is only asked to
+    /// leave, never loaded; the translator is loaded and every translation names it; and
+    /// Ctrl+Shift+A loads the answer model, as #79 does.
+    #[test]
+    fn with_assistance_off_and_a_translator_only_the_translator_is_loaded() {
+        let ollama =
+            crate::testollama::FakeOllama::start("Ich würde mit einem Token-Bucket anfangen.");
+        let cfg = translator_cfg(&ollama.url);
+
+        // Start-up, whisper on the GPU: the answer model leaves, the translator loads first.
+        prepare_local_models(&cfg, false, true);
+        let seen = ollama.seen();
+        assert!(
+            seen.iter()
+                .any(|r| r.model() == "answer-35b" && r.is_unload()),
+            "#79's unload is back: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|r| r.model() == "translator-8b" && r.is_warm_up()),
+            "{seen:?}"
+        );
+
+        // `t`: the speaker warms and translates on the translator.
+        let hub = Arc::new(SessionHub::default());
+        let provider = wire::provider(&cfg.translator_llm()).unwrap();
+        let (setup, played) =
+            crate::speaker::setup_on(provider, dmn_tts::MockTtsProvider::new(), true);
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        hub.dispatch(Action::SpeakStarted { id: 1 });
+        assert!(speaker.speak(1, SAID.into()));
+        let after = crate::speaker::tests::settled(&hub);
+        assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+        assert!(
+            !played.lock().unwrap().is_empty(),
+            "the translation was spoken"
+        );
+        speaker.stop();
+        let chats: Vec<_> = ollama.seen().into_iter().filter(|r| r.is_chat()).collect();
+        assert_eq!(chats.len(), 1, "one translation: {chats:?}");
+        assert_eq!(chats[0].model(), "translator-8b");
+        assert_eq!(chats[0].body["think"], false);
+        assert_eq!(chats[0].body["messages"][1]["content"], SAID);
+        assert!(
+            ollama
+                .seen()
+                .iter()
+                .all(|r| r.model() != "answer-35b" || r.is_unload()),
+            "nothing loads the answer model while assistance is off: {:?}",
+            ollama.seen()
+        );
+
+        // Ctrl+Shift+A: the suggester starts and loads the answer model.
+        let hub = Arc::new(SessionHub::default());
+        let launch = {
+            let (llm, hub) = (cfg.llm.clone(), Arc::clone(&hub));
+            Box::new(move || {
+                Suggester::start(
+                    &llm,
+                    &dmn_core::config::Lookup::default(),
+                    Output::Quiet,
+                    Policy::AnswerAll,
+                    hub,
+                    wire::SessionClock::start(1.0),
+                    AudioClock::new(Instant::now(), 1.0),
+                    ContextSource::Off,
+                    None,
+                )
+            }) as Launch
+        };
+        let mut a = Assistance::new(
+            false,
+            hub,
+            AudioClock::new(Instant::now(), 1.0),
+            detecting_for(QuestionSource::Interviewer),
+            Some(launch),
+        );
+        a.command(Command::Assist { on: true }, &TranscriptLog::new());
+        assert!(
+            ollama.wait_for(|r| r.model() == "answer-35b" && r.is_warm_up()),
+            "Ctrl+Shift+A loads [llm].model: {:?}",
+            ollama.seen()
+        );
+        let _ = a.finish(true);
+    }
+
+    /// With assistance on both models are wanted; with `[speak].model` left out `t` translates
+    /// on the answer model, which stays loaded with assistance off (#109, unchanged).
+    #[test]
+    fn with_assistance_on_or_no_translator_the_answer_model_is_kept() {
+        let ollama = crate::testollama::FakeOllama::start("");
+        let cfg = translator_cfg(&ollama.url);
+        prepare_local_models(&cfg, true, true);
+        let seen = ollama.seen();
+        assert!(seen.iter().all(|r| !r.is_unload()), "{seen:?}");
+        for model in ["answer-35b", "translator-8b"] {
+            assert!(
+                seen.iter().any(|r| r.model() == model && r.is_warm_up()),
+                "{model}: {seen:?}"
+            );
+        }
+
+        let ollama = crate::testollama::FakeOllama::start("");
+        let mut cfg = translator_cfg(&ollama.url);
+        cfg.speak.model = None;
+        prepare_local_models(&cfg, false, true);
+        let seen = ollama.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].model() == "answer-35b" && seen[0].is_warm_up());
+        // Whisper on the CPU: nothing is loaded before it; the speaker and the suggester warm
+        // their own.
+        let ollama = crate::testollama::FakeOllama::start("");
+        let cfg = translator_cfg(&ollama.url);
+        prepare_local_models(&cfg, false, false);
+        let seen = ollama.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].model() == "answer-35b" && seen[0].is_unload());
+    }
+
     // --- #109: `t` speaks your last turn in the interview's language ---------------------------
 
     const SAID: &str = "I'd start with a token bucket per API key.";
@@ -4248,6 +4401,47 @@ mod tests {
         assert!(llm.requests().is_empty(), "no LLM request");
         assert!(tts.requests().is_empty(), "no TTS request");
         assert!(played.lock().unwrap().is_empty());
+    }
+
+    /// #113: the start-up notice that nothing is linked to `dmn-voice` is on the status line
+    /// for 5 s, like a press's, and a press meanwhile is not disturbed by it.
+    #[test]
+    fn the_nothing_linked_notice_shows_for_five_seconds_and_a_press_still_speaks() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, _) = speaking(&hub, &llm, &tts);
+        hub.dispatch(Action::SpeakFailed {
+            id: crate::speaker::STARTUP_NOTICE,
+            reason: crate::speaker::NOT_LINKED.to_owned(),
+        });
+        assert!(
+            screen(&hub.snapshot()).contains("Discord: re-select dmn-voice"),
+            "{}",
+            screen(&hub.snapshot())
+        );
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(Instant::now(), 1.0);
+        let seen = Instant::now();
+        s.tick(seen, &mut echo, &clock);
+        s.tick(seen + SPEAK_FAILED_FOR, &mut echo, &clock);
+        assert_eq!(hub.snapshot().speak_failed, None);
+
+        // A notice up while a press is in flight leaves the press alone.
+        let mut log = TranscriptLog::new();
+        hear(&hub, &mut log, final_at(Source::You, 0, 3_000, SAID));
+        s.press(&log);
+        hub.dispatch(Action::SpeakFailed {
+            id: crate::speaker::STARTUP_NOTICE,
+            reason: crate::speaker::NOT_LINKED.to_owned(),
+        });
+        let after = crate::speaker::tests::settled(&hub);
+        assert_eq!(tts.requests().len(), 1, "the press was spoken");
+        assert_eq!(
+            after.speak_failed.map(|n| n.id),
+            Some(crate::speaker::STARTUP_NOTICE),
+            "only the notice"
+        );
+        s.finish();
     }
 
     #[test]
