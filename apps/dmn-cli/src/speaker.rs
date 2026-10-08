@@ -675,7 +675,6 @@ pub fn check(
                         speaks: speaks.to_owned(),
                         voice,
                         clip,
-                        config,
                     }
                 } else {
                     SpeakError::LanguageMismatch {

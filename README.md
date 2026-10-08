@@ -92,8 +92,9 @@ Keys in `dmn run`:
 | `m` | Mute or unmute your microphone |
 | `t` | With `[speak]` on: translate what you last said into `[speak].target` and speak it in your cloned voice into `dmn-voice` (below, § Speak) |
 | `l` | With `[speak]` on: switch `dmn-voice` between your own voice, live (the default), and translate mode, where every sentence you finish goes out translated (#114, below) |
+| `v` | With `[speak]` on: open the language picker over the screen; `↑` `↓` move, Enter makes that language (and its voice) the one the next sentence goes out in and saves it to the config, Esc closes (#115, below) |
 | Ctrl+Shift+A | Interview assistance on ↔ off |
-| `q`, Esc, Ctrl+C | Quit |
+| `q`, Esc, Ctrl+C | Quit (Esc closes the picker first while it is open) |
 
 ## Current CLI
 
@@ -110,7 +111,7 @@ dmn run --replay INTERVIEWER.wav CANDIDATE.wav [--headless]
 dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
 dmn sessions list | export ID | purge ID|all
-dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server
+dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server; --language adds it to [speak].languages
 dmn speak "TEXT"                          # speak TEXT in your cloned voice into the virtual mic dmn-voice
 dmn speak "TEXT" --out FILE.wav           # or write it to a WAV file instead
 ```
@@ -494,7 +495,42 @@ At start-up, `dmn run` checks what a press would need and could not fix mid-call
 answers, your voice is in its library, and the voice speaks `target` (the server speaks each voice
 only in the language it was enrolled with). A voice enrolled for another language is an error
 naming both and the fix: `dmn speak enroll --wav <clip> --language es`. One enrolled voice per
-language; switching languages means re-enrolling.
+language; to switch languages during a call, enroll one voice per language and use the picker
+below.
+
+**Several languages, and the picker (#115).** Enroll a voice for each language you want to speak
+in; each enroll names its voice `voice-<code>` (unless `--name` says otherwise) and adds the pair
+to `[speak].languages`, editing that one line of your config and nothing else:
+
+```bash
+dmn speak enroll --wav ~/my-voice.wav --language de
+dmn speak enroll --wav ~/my-voice.wav --language es
+```
+
+```toml
+[speak]
+target = "de"                         # the language at start; must be one of the list
+languages = [{ code = "de", voice = "voice-de" }, { code = "es", voice = "voice-es" }]
+```
+
+A config from before #115 (a `target` and a `voice_ref`, no list) keeps working as it is: the one
+pair is the one language. The first `enroll --language` on such a file seeds the list with that
+pair, so `target` stays valid, and an unset `target` takes the enrolled language. With a list,
+`target` must be one of its codes (a config error names both otherwise), and the start-up check
+runs per entry: every listed voice must be in the server's library, enrolled for its language, or
+the error names the entry and the enroll command.
+
+In `dmn run`, `v` opens the picker: a small box over the screen listing the languages with their
+voices, the current one marked (`← now`), the cursor on it. `↑` `↓` move, Enter chooses, Esc (or
+`v`) closes; `q` still quits, and the other keys do nothing while it is open. The language you
+choose is the one the next sentence goes out in, in `t`'s one-shot and in translate mode alike;
+a sentence already being translated or spoken finishes in the language it started in, and the
+transcript marks it so. The status tag (`voice: → es`) changes at once, a dim marker row
+(`— language: → es —`) goes into the transcript, and the choice is written to `[speak].target` in
+your config, so the next run starts with it. A config that cannot be written (read-only, a
+directory in its place) is said on the status line for 5 s (`language not saved: …`) and the run
+speaks the chosen language all the same. With one language enrolled the picker still opens, on
+that one row, with a hint on how to enroll more.
 
 With `[stt].language = "auto"` (or a code, for an interview in another language), whisper
 translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it

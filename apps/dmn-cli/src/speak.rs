@@ -116,16 +116,17 @@ pub enum SpeakError {
         voice: String,
         config: String,
     },
-    /// #115: a `[speak].languages` entry whose voice was enrolled for another language.
+    /// #115: a `[speak].languages` entry whose voice was enrolled for another language. (No
+    /// `config` field: a second five-string variant beside `LanguageMismatch` would cost the
+    /// enum its niche and push `CliError` over clippy's size limit.)
     #[error(
-        "[speak].languages in {config} says the voice {voice:?} speaks {code:?}, but the TTS server has it enrolled for {speaks:?}; re-enroll it: dmn speak enroll --wav {clip} --language {code} --name {voice}"
+        "[speak].languages says the voice {voice:?} speaks {code:?}, but the TTS server has it enrolled for {speaks:?}; re-enroll it: dmn speak enroll --wav {clip} --language {code} --name {voice}"
     )]
     LanguageVoiceMismatch {
         code: String,
         speaks: String,
         voice: String,
         clip: String,
-        config: String,
     },
     /// #115: a `[speak].languages` code whisper does not know.
     #[error(

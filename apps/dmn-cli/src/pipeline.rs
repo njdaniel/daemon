@@ -5019,6 +5019,141 @@ mod tests {
         );
     }
 
+    /// #115, the issue's criteria at the pipeline: `attach` lists the languages for the
+    /// picker; choosing one updates the session's target (the tag, the marker row), the next
+    /// translate and synthesize requests name the new language and voice, a press in flight
+    /// keeps the old one, the choice is written to `[speak].target` in place, and a config
+    /// file that cannot be written is the 5 s notice, not a stop.
+    #[test]
+    fn choosing_a_language_speaks_it_from_the_next_press_and_saves_it_to_the_config() {
+        const GERMAN: &str = "Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen.";
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "# mine\n[speak]\nenabled = true\ntarget = \"es\"   # #109\nlanguages = [{ code = \"es\", voice = \"me\" }, { code = \"de\", voice = \"voice-de\" }, { code = \"ru\", voice = \"voice-ru\" }]\n\n[ui]\nmouse = false\n",
+        )
+        .unwrap();
+        let hub = Arc::new(SessionHub::default());
+        let llm = spanish()
+            .then(vec![
+                dmn_llm::mock::Step::Text(GERMAN.into()),
+                dmn_llm::mock::Step::Done,
+            ])
+            .with_delay(Duration::from_millis(150));
+        let tts = dmn_tts::MockTtsProvider::new();
+        let (mut s, _, _, languages) = speaking_saved_to(
+            &hub,
+            &llm,
+            &tts,
+            VoiceMode::Passthrough,
+            Some(config.clone()),
+        );
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.languages,
+            languages.iter().map(Language::listed).collect::<Vec<_>>()
+        );
+        assert_eq!(snap.languages.len(), 3);
+        assert_eq!(snap.speak_target(), Some("es"));
+
+        // Press 1 in Spanish; German is chosen while it is in flight.
+        let log = your_answer(&hub);
+        s.press(&log);
+        assert!(hub.snapshot().speech.is_some());
+        s.choose(1);
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.speak_target(),
+            Some("de"),
+            "the session changes at once"
+        );
+        assert_eq!(snap.voice.as_ref().unwrap().target, "de");
+        assert_eq!(
+            snap.transcript.last().unwrap().text,
+            "— language: → de —",
+            "the marker row"
+        );
+        assert!(screen(&snap).contains("voice: you (en)"));
+        let after = drive(&mut s, &hub, "the first press played", |s| {
+            s.speech.is_none() && !tts.requests().is_empty()
+        });
+        assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+        let said = after
+            .transcript
+            .iter()
+            .filter(|l| l.speaker == dmn_session::Speaker::You)
+            .collect::<Vec<_>>();
+        assert!(
+            said.iter().all(|l| l.spoken_as.as_deref() == Some("es")),
+            "spoken in the language it started in: {said:?}"
+        );
+        // Press 2: German, in `de`'s voice.
+        s.press(&log);
+        drive(&mut s, &hub, "the second press played", |s| {
+            s.speech.is_none() && tts.requests().len() == 2
+        });
+        let asked = llm.requests();
+        assert!(asked[0].messages[0].content.contains("into Spanish (es)"));
+        assert!(asked[1].messages[0].content.contains("into German (de)"));
+        let spoken = tts.requests();
+        assert_eq!(
+            (spoken[0].voice.as_str(), spoken[0].language.as_deref()),
+            ("me", Some("es"))
+        );
+        assert_eq!(
+            (spoken[1].voice.as_str(), spoken[1].language.as_deref()),
+            ("voice-de", Some("de"))
+        );
+        assert_eq!(spoken[1].text, GERMAN);
+        // `l` afterwards announces the new target.
+        s.toggle();
+        let snap = hub.snapshot();
+        assert!(screen(&snap).contains("voice: → de"), "{}", screen(&snap));
+
+        // Saved in place: only the target line changed.
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            text.starts_with("# mine\n[speak]\nenabled = true\ntarget = \"de\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("# #109") && text.ends_with("[ui]\nmouse = false\n"),
+            "{text}"
+        );
+        assert_eq!(Config::load(&config).unwrap().speak.target, "de");
+
+        // The same language again changes nothing; an index past the list does nothing.
+        let before = hub.snapshot();
+        s.choose(1);
+        s.choose(7);
+        assert_eq!(hub.snapshot(), before);
+
+        // A config that cannot be written: the language still changes, said for 5 s.
+        std::fs::remove_file(&config).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        s.choose(2);
+        let snap = hub.snapshot();
+        assert_eq!(snap.speak_target(), Some("ru"));
+        let notice = snap.speak_failed.clone().expect("the notice");
+        assert_eq!(notice.id, crate::speaker::STARTUP_NOTICE);
+        assert!(notice.reason.starts_with(NOT_SAVED), "{}", notice.reason);
+        assert!(screen(&snap).contains(NOT_SAVED), "{}", screen(&snap));
+        let seen = Instant::now();
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(seen, 1.0);
+        s.tick(seen, &mut echo, &clock);
+        s.tick(
+            seen + SPEAK_FAILED_FOR - Duration::from_millis(1),
+            &mut echo,
+            &clock,
+        );
+        assert!(hub.snapshot().speak_failed.is_some());
+        s.tick(seen + SPEAK_FAILED_FOR, &mut echo, &clock);
+        assert_eq!(hub.snapshot().speak_failed, None, "taken down after 5 s");
+        s.finish();
+    }
+
     /// The issue's criterion: two finalized You turns are two translate requests and two
     /// synthesize requests, in order, the second starting only when the first has played; the
     /// microphone is shut while either plays; both lines are marked for what they went out as.
