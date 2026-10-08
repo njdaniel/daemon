@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
     ProviderLabel, QuestionSource, Section, SectionState, SlowEnd, SlowField, Speaker, StarCards,
-    TradeoffItem,
+    TradeoffItem, VoiceMode,
 };
 use crate::memory::{self, Promise, SummaryLine};
 
@@ -24,6 +24,32 @@ pub struct Line {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// #114: the line went out of `dmn-voice` translated into this language (`de`): the
+    /// transcript labels it `You → de`. Left out of the JSON while unset, as the two below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken_as: Option<String>,
+    /// #114: the translation the call heard, on the last line of the turn, dim under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<String>,
+    /// #114: a marker the session wrote (`— translate mode on: → de —`), not speech: no
+    /// speaker label, dim, never a candidate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub note: bool,
+}
+
+impl Line {
+    /// A spoken line: the fields a segment fills.
+    pub fn spoken(speaker: Speaker, start: f64, end: f64, text: String) -> Self {
+        Self {
+            speaker,
+            start,
+            end,
+            text,
+            spoken_as: None,
+            translation: None,
+            note: false,
+        }
+    }
 }
 
 /// Where a question's fast phase is.
@@ -410,8 +436,8 @@ pub enum SpeakStage {
 }
 
 /// The `t` press in flight (#109). Only one at a time: a press while one is in flight does
-/// nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// nothing (#114: in translate mode the next turn waits for it instead).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Speech {
     pub id: u64,
     pub stage: SpeakStage,
@@ -421,6 +447,29 @@ pub struct Speech {
     /// Whole seconds since the press, for the status line.
     #[serde(default)]
     pub secs: u32,
+    /// #114: the You lines this press speaks, `(from, to)` in session seconds, once
+    /// [`Action::SpeakTurn`] has said; they are marked when the press is done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<(f64, f64)>,
+}
+
+/// #114: what `dmn-voice` carries, for the status line's first tag and the transcript's marks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Voice {
+    pub mode: VoiceMode,
+    /// `[speak].target`: the language translate mode speaks (`de`).
+    pub target: String,
+    /// The language the user speaks, when the config says (`en`); the tag says `you (en)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<String>,
+}
+
+/// #114: the transcript's marker line for a mode change.
+pub fn voice_marker(mode: VoiceMode, target: &str) -> String {
+    match mode {
+        VoiceMode::Translate => format!("— translate mode on: → {target} —"),
+        VoiceMode::Passthrough => "— translate mode off: your own voice —".to_owned(),
+    }
 }
 
 /// A `t` press that spoke nothing (#109), on the status line for 5 s.
@@ -535,6 +584,10 @@ pub struct Session {
     /// #109: why the last `t` press spoke nothing, for 5 s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speak_failed: Option<SpeakNotice>,
+    /// #114: what `dmn-voice` carries, once `dmn run` has said; `None` in every log from
+    /// before it and while `[speak]` is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<Voice>,
 }
 
 fn not_scrolled(rows: &u16) -> bool {
@@ -627,6 +680,13 @@ impl Session {
             .find(|c| c.candidate == candidate)
     }
 
+    /// Keep the transcript to its window behind the newest end, `end` included.
+    fn prune_transcript(&mut self, end: f64) {
+        let latest = self.transcript.iter().map(|l| l.end).fold(end, f64::max);
+        self.transcript
+            .retain(|l| l.end >= latest - TRANSCRIPT_WINDOW_S);
+    }
+
     /// Candidate `candidate`'s reply has ended: if Enter sent it (#96), it is no longer waiting.
     /// True when it was.
     fn take_asked(&mut self, candidate: u64) -> bool {
@@ -700,12 +760,7 @@ fn apply(s: &mut Session, action: &Action) {
         } => {
             s.partials
                 .retain(|p| !(p.speaker == *speaker && p.start == *start));
-            let line = Line {
-                speaker: *speaker,
-                start: *start,
-                end: *end,
-                text: text.clone(),
-            };
+            let line = Line::spoken(*speaker, *start, *end, text.clone());
             if !*is_final {
                 if !text.is_empty() {
                     s.partials.push(line);
@@ -742,9 +797,7 @@ fn apply(s: &mut Session, action: &Action) {
                 }
             }
             s.transcript.push(line);
-            let latest = s.transcript.iter().map(|l| l.end).fold(*end, f64::max);
-            s.transcript
-                .retain(|l| l.end >= latest - TRANSCRIPT_WINDOW_S);
+            s.prune_transcript(*end);
         }
         Action::Candidate { id, .. } => {
             s.counts.candidates += 1;
@@ -1039,15 +1092,44 @@ fn apply(s: &mut Session, action: &Action) {
         Action::LlmOffload { cpu_percent } => s.status.llm_cpu_percent = *cpu_percent,
         Action::WebLookup { enabled } => s.status.web = *enabled,
         Action::SpeakEnabled { enabled } => s.speak = *enabled,
+        Action::Voice { mode, target, own } => {
+            let was = s.voice.as_ref().map(|v| v.mode);
+            s.voice = Some(Voice {
+                mode: *mode,
+                target: target.clone(),
+                own: own.clone(),
+            });
+            // A change (not the start-up mode) is a line in the history, after everything
+            // said so far.
+            if was.is_some_and(|m| m != *mode) {
+                let at = s
+                    .transcript
+                    .iter()
+                    .chain(&s.partials)
+                    .map(|l| l.end)
+                    .fold(0.0, f64::max);
+                let mut marker =
+                    Line::spoken(Speaker::Unknown, at, at, voice_marker(*mode, target));
+                marker.note = true;
+                s.transcript.push(marker);
+                s.prune_transcript(at);
+            }
+        }
         Action::SpeakStarted { id } => {
             s.speech = Some(Speech {
                 id: *id,
                 stage: SpeakStage::Translating,
                 text: String::new(),
                 secs: 0,
+                span: None,
             });
             // A new press is a new attempt: the last one's failure goes.
             s.speak_failed = None;
+        }
+        Action::SpeakTurn { id, from, to } => {
+            if let Some(sp) = s.speech.as_mut().filter(|sp| sp.id == *id) {
+                sp.span = Some((*from, *to));
+            }
         }
         Action::SpeakTranslated { id, text } => {
             if let Some(sp) = s.speech.as_mut().filter(|sp| sp.id == *id) {
@@ -1062,7 +1144,27 @@ fn apply(s: &mut Session, action: &Action) {
         }
         Action::SpeakDone { id } => {
             if s.speech.as_ref().is_some_and(|sp| sp.id == *id) {
-                s.speech = None;
+                let done = s.speech.take();
+                // #114: the lines the call heard translated are marked so, the translation
+                // under the last of them.
+                if let Some(sp) = done
+                    && let Some((from, to)) = sp.span
+                    && let Some(target) = s.voice.as_ref().map(|v| v.target.clone())
+                    && !sp.text.is_empty()
+                {
+                    let mut last = None;
+                    for (i, l) in s.transcript.iter_mut().enumerate() {
+                        if l.speaker == Speaker::You && !l.note && l.start >= from && l.start <= to
+                        {
+                            l.spoken_as = Some(target.clone());
+                            l.translation = None;
+                            last = Some(i);
+                        }
+                    }
+                    if let Some(i) = last {
+                        s.transcript[i].translation = Some(sp.text);
+                    }
+                }
             }
         }
         Action::SpeakFailed { id, reason } => {

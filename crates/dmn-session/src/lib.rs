@@ -23,11 +23,11 @@ mod tests;
 pub use action::{
     Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
     ProviderLabel, QuestionSource, Section, SectionState, SlowEnd, SlowField, Speaker, Stage,
-    StarCards, TradeoffItem,
+    StarCards, TradeoffItem, VoiceMode,
 };
 pub use hub::{DEFAULT_ACTION_CAPACITY, SessionHub};
 pub use memory::{Promise, SummaryLine};
 pub use state::{
     Clarification, Counts, Line, Progress, Question, SectionStates, Sections, Session, SpeakNotice,
-    SpeakStage, Speech, Status, TRANSCRIPT_WINDOW_S, ignore_label, reduce,
+    SpeakStage, Speech, Status, TRANSCRIPT_WINDOW_S, Voice, ignore_label, reduce, voice_marker,
 };

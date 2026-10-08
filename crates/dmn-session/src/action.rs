@@ -50,6 +50,36 @@ impl QuestionSource {
     }
 }
 
+/// #114: what `dmn-voice` carries: the user's own voice, live, or every sentence they finish,
+/// translated and spoken in their cloned voice instead. `[speak].mode` at start, `l` toggles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceMode {
+    /// The microphone passes through `dmn-voice`; `t` speaks one turn translated over it.
+    #[default]
+    Passthrough,
+    /// The microphone is muted into `dmn-voice`; each finalized You turn goes out translated.
+    Translate,
+}
+
+impl VoiceMode {
+    /// The other mode: what `l` switches to.
+    pub fn toggled(self) -> Self {
+        match self {
+            VoiceMode::Passthrough => VoiceMode::Translate,
+            VoiceMode::Translate => VoiceMode::Passthrough,
+        }
+    }
+
+    /// The config-file spelling (`[speak].mode`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoiceMode::Passthrough => "passthrough",
+            VoiceMode::Translate => "translate",
+        }
+    }
+}
+
 /// A status dot (SPEC § Transcript & status): mic, system audio, model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -450,9 +480,25 @@ pub enum Action {
     /// `t` speaks (#109) in this session: `[speak].enabled` with its target, dispatched once
     /// after `Started` by `dmn run`. The status line's keys offer `t speak` while it is on.
     SpeakEnabled { enabled: bool },
+    /// #114: what `dmn-voice` carries from now on: `mode` with `target` (`[speak].target`,
+    /// the language translate mode speaks) and `own`, the language the user is taken to speak
+    /// when it is known (`[stt].language` fixed to a code). Dispatched once after
+    /// [`Action::SpeakEnabled`] from `[speak].mode`, and again on each `l`; a change of mode
+    /// writes one marker line into the transcript (`— translate mode on: → de —`).
+    Voice {
+        mode: VoiceMode,
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        own: Option<String>,
+    },
     /// `t` (#109): press `id` (numbered by the pipeline, from 1) took the user's last turn and
     /// sent it to be translated. The status line says `translating…` with the seconds since.
+    /// #114: in translate mode every finalized You turn is a press too, numbered the same way.
     SpeakStarted { id: u64 },
+    /// #114: press `id` speaks the You lines from `from` to `to` (session seconds). Dispatched
+    /// right after its [`Action::SpeakStarted`]; when the press is done, those transcript lines
+    /// are marked as having gone out translated (`You → de`), the translation under the last.
+    SpeakTurn { id: u64, from: f64, to: f64 },
     /// #109: press `id`'s translation arrived, already within `limits.rs`'s cap: it shows as one
     /// dim line under the question, and the status line says `speaking…` while the TTS server
     /// renders it and it plays into `dmn-voice`.

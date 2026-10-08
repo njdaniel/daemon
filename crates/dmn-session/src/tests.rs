@@ -2335,3 +2335,219 @@ fn speak_state_survives_the_action_log_and_older_sessions_still_load() {
     }
     assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
 }
+
+// --- #114: pass-through by default, translate mode by key ------------------------------------
+
+fn voice(mode: VoiceMode) -> Action {
+    Action::Voice {
+        mode,
+        target: "de".into(),
+        own: Some("en".into()),
+    }
+}
+
+#[test]
+fn the_voice_mode_is_session_state_and_a_change_writes_one_marker_line() {
+    let mut log = speak_on();
+    log.push(voice(VoiceMode::Passthrough));
+    log.push(seg(Speaker::You, 5.0, 8.0, "Hello there.", true));
+    let s = Session::replay(&log);
+    assert_eq!(
+        s.voice,
+        Some(Voice {
+            mode: VoiceMode::Passthrough,
+            target: "de".into(),
+            own: Some("en".into()),
+        })
+    );
+    assert_eq!(s.transcript.len(), 1, "the start-up mode is no line");
+
+    // `l`: translate mode on, said once in the transcript after what was said so far.
+    log.push(voice(VoiceMode::Translate));
+    let s = Session::replay(&log);
+    assert_eq!(s.voice.as_ref().unwrap().mode, VoiceMode::Translate);
+    let marker = s.transcript.last().unwrap();
+    assert!(marker.note);
+    assert_eq!(marker.text, "— translate mode on: → de —");
+    assert_eq!(
+        (marker.start, marker.end),
+        (8.0, 8.0),
+        "after the last line"
+    );
+    assert_eq!(voice_marker(VoiceMode::Translate, "de"), marker.text);
+    // The same mode again writes nothing; back writes the other marker.
+    log.push(voice(VoiceMode::Translate));
+    assert_eq!(Session::replay(&log).transcript.len(), 2);
+    log.push(voice(VoiceMode::Passthrough));
+    let s = Session::replay(&log);
+    assert_eq!(s.transcript.len(), 3);
+    assert_eq!(
+        s.transcript[2].text,
+        "— translate mode off: your own voice —"
+    );
+    assert_eq!(VoiceMode::Passthrough.toggled(), VoiceMode::Translate);
+    assert_eq!(VoiceMode::Translate.toggled(), VoiceMode::Passthrough);
+    assert_eq!(VoiceMode::default(), VoiceMode::Passthrough);
+    assert_eq!(
+        (
+            VoiceMode::Passthrough.as_str(),
+            VoiceMode::Translate.as_str()
+        ),
+        ("passthrough", "translate")
+    );
+}
+
+#[test]
+fn a_press_that_played_marks_the_lines_it_spoke_with_the_translation_under_the_last() {
+    let mut log = speak_on();
+    log.push(voice(VoiceMode::Translate));
+    log.extend([
+        seg(Speaker::Interviewer, 0.0, 4.0, "Go on.", true),
+        seg(
+            Speaker::You,
+            6.0,
+            9.0,
+            "I'd start with a token bucket.",
+            true,
+        ),
+        seg(
+            Speaker::You,
+            9.4,
+            12.0,
+            "And keep the counters in Redis.",
+            true,
+        ),
+        Action::SpeakStarted { id: 1 },
+        Action::SpeakTurn {
+            id: 1,
+            from: 6.0,
+            to: 12.0,
+        },
+    ]);
+    let s = Session::replay(&log);
+    assert_eq!(s.speech.as_ref().unwrap().span, Some((6.0, 12.0)));
+    assert!(
+        s.transcript.iter().all(|l| l.spoken_as.is_none()),
+        "nothing is marked until it has played"
+    );
+    log.push(Action::SpeakTranslated {
+        id: 1,
+        text: "Ich würde mit einem Token-Bucket anfangen. Und die Zähler in Redis halten.".into(),
+    });
+    log.push(Action::SpeakDone { id: 1 });
+    let s = Session::replay(&log);
+    assert_eq!(s.speech, None);
+    let marks: Vec<(Option<&str>, Option<&str>)> = s
+        .transcript
+        .iter()
+        .map(|l| (l.spoken_as.as_deref(), l.translation.as_deref()))
+        .collect();
+    assert_eq!(
+        marks,
+        [
+            (None, None),
+            (Some("de"), None),
+            (
+                Some("de"),
+                Some("Ich würde mit einem Token-Bucket anfangen. Und die Zähler in Redis halten.")
+            ),
+        ]
+    );
+
+    // A later line is not marked; a press that failed marks nothing; a press with no turn
+    // (an older pipeline's) marks nothing either.
+    log.push(seg(Speaker::You, 14.0, 15.0, "Also, sharding.", true));
+    log.push(Action::SpeakStarted { id: 2 });
+    log.push(Action::SpeakTurn {
+        id: 2,
+        from: 14.0,
+        to: 15.0,
+    });
+    log.push(Action::SpeakFailed {
+        id: 2,
+        reason: "tts failed: server down".into(),
+    });
+    log.push(Action::SpeakStarted { id: 3 });
+    log.push(Action::SpeakTranslated {
+        id: 3,
+        text: "Auch Sharding.".into(),
+    });
+    log.push(Action::SpeakDone { id: 3 });
+    let s = Session::replay(&log);
+    assert_eq!(s.transcript[3].spoken_as, None);
+    assert_eq!(s.transcript[3].translation, None);
+    assert_eq!(
+        s.transcript[1].spoken_as.as_deref(),
+        Some("de"),
+        "the first turn keeps its mark"
+    );
+}
+
+#[test]
+fn voice_state_survives_the_action_log_and_older_sessions_still_load() {
+    let mut log = speak_on();
+    log.extend([
+        voice(VoiceMode::Passthrough),
+        voice(VoiceMode::Translate),
+        seg(Speaker::You, 6.0, 9.0, "Hello.", true),
+        Action::SpeakStarted { id: 1 },
+        Action::SpeakTurn {
+            id: 1,
+            from: 6.0,
+            to: 9.0,
+        },
+        Action::SpeakTranslated {
+            id: 1,
+            text: "Hallo.".into(),
+        },
+        Action::SpeakDone { id: 1 },
+    ]);
+    let text: String = log
+        .iter()
+        .map(|a| serde_json::to_string(a).unwrap() + "\n")
+        .collect();
+    for line in [
+        r#"{"type":"voice","mode":"passthrough","target":"de","own":"en"}"#,
+        r#"{"type":"voice","mode":"translate","target":"de","own":"en"}"#,
+        r#"{"type":"speak_turn","id":1,"from":6.0,"to":9.0}"#,
+    ] {
+        assert!(text.contains(line), "{line} in\n{text}");
+    }
+    let back: Vec<Action> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let s = Session::replay(&back);
+    assert_eq!(s, Session::replay(&log));
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(
+        json.contains(r#""spoken_as":"de""#) && json.contains(r#""note":true"#),
+        "{json}"
+    );
+    let again: Session = serde_json::from_str(&json).unwrap();
+    assert_eq!(again, s);
+
+    // A session from before #114 has none of it: the keys are left out, and a line without
+    // them reads as plain speech.
+    let bare = Session::replay(&[
+        Action::Started {
+            label: "x".into(),
+            at: 1,
+        },
+        seg(Speaker::You, 1.0, 2.0, "Hi.", true),
+    ]);
+    let json = serde_json::to_string(&bare).unwrap();
+    for key in [
+        "\"voice\"",
+        "\"spoken_as\"",
+        "\"translation\"",
+        "\"note\"",
+        "\"span\"",
+    ] {
+        assert!(!json.contains(key), "{key} in {json}");
+    }
+    assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), bare);
+    let old: Line =
+        serde_json::from_str(r#"{"speaker":"you","start":1.0,"end":2.0,"text":"Hi."}"#).unwrap();
+    assert_eq!(old, Line::spoken(Speaker::You, 1.0, 2.0, "Hi.".into()));
+}

@@ -352,6 +352,7 @@ target = ""                          # `t` (#109) speaks in this language (es, d
 temperature = 0.6                    # TTS sampling temperature (#113); lower = fewer noise bursts
 # cfg_weight = 0.5                   # TTS pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
+mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114)
 
 [ui]
 always_on_top = true
