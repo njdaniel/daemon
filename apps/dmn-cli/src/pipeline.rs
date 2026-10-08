@@ -4639,6 +4639,12 @@ mod tests {
         use std::io::Read as _;
         use std::process::{Command as Proc, Stdio};
         const TTS: &str = "http://localhost:4123";
+        // Each run opens its own `dmn-voice`, and `pw-record --target dmn-voice` would pick
+        // either: one live `t` at a time.
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let up = |url: &str| {
             Proc::new("curl")
                 .args(["-sf", "-m", "2", url])
