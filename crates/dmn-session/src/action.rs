@@ -80,6 +80,31 @@ impl VoiceMode {
     }
 }
 
+/// #115: one language translate mode (and `t`) can speak into: a whisper language code and the
+/// name of the voice enrolled for it in the TTS server's library (`[speak].languages`, one
+/// entry per `dmn speak enroll --language`). The picker lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SpeakLanguage {
+    /// The language code (`de`), as `[speak].target` spells it.
+    pub code: String,
+    /// The enrolled voice that speaks it (`voice-de`).
+    pub voice: String,
+}
+
+/// #115: one key on the language picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PickerOp {
+    /// The picker key: the overlay opens with the cursor on the current language.
+    Open,
+    /// `↑`: the cursor moves up a row, stopping at the first.
+    Up,
+    /// `↓`: the cursor moves down a row, stopping at the last.
+    Down,
+    /// Esc (or the picker key again): the overlay closes, nothing chosen.
+    Close,
+}
+
 /// A status dot (SPEC § Transcript & status): mic, system audio, model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -491,6 +516,20 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         own: Option<String>,
     },
+    /// #115: the languages the session can speak (`[speak].languages`, or the one `target` +
+    /// `voice_ref` pair when the list is left out), dispatched once after [`Action::Voice`] by
+    /// `dmn run`. The picker lists them; a choice is [`Action::SpeakTarget`].
+    SpeakLanguages { languages: Vec<SpeakLanguage> },
+    /// #115: a key on the language picker: open it (the cursor on the current language), move
+    /// the cursor, or close it. Nothing while `[speak]` is off or no language is listed. UI
+    /// state like [`Action::Scroll`], so the screen is a function of the session and snapshots
+    /// pin the overlay.
+    Picker { op: PickerOp },
+    /// #115: the language chosen on the picker: `dmn-voice` translates into `target` from the
+    /// next utterance on; one in flight finishes in the language it started with. The picker
+    /// closes. A change writes one marker line into the transcript (`— language: → es —`); a
+    /// code not in [`Action::SpeakLanguages`]'s list is ignored.
+    SpeakTarget { target: String },
     /// `t` (#109): press `id` (numbered by the pipeline, from 1) took the user's last turn and
     /// sent it to be translated. The status line says `translating…` with the seconds since.
     /// #114: in translate mode every finalized You turn is a press too, numbered the same way.

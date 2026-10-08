@@ -2551,3 +2551,242 @@ fn voice_state_survives_the_action_log_and_older_sessions_still_load() {
         serde_json::from_str(r#"{"speaker":"you","start":1.0,"end":2.0,"text":"Hi."}"#).unwrap();
     assert_eq!(old, Line::spoken(Speaker::You, 1.0, 2.0, "Hi.".into()));
 }
+
+// --- #115: the language picker ----------------------------------------------------------------
+
+fn lang(code: &str) -> SpeakLanguage {
+    SpeakLanguage {
+        code: code.into(),
+        voice: format!("voice-{code}"),
+    }
+}
+
+fn three_languages() -> Vec<Action> {
+    let mut log = speak_on();
+    log.push(voice(VoiceMode::Translate));
+    log.push(Action::SpeakLanguages {
+        languages: vec![lang("de"), lang("es"), lang("ru")],
+    });
+    log
+}
+
+fn pick(op: PickerOp) -> Action {
+    Action::Picker { op }
+}
+
+#[test]
+fn the_picker_opens_on_the_current_language_moves_within_the_list_and_closes() {
+    let mut log = three_languages();
+    let s = Session::replay(&log);
+    assert_eq!(s.languages, [lang("de"), lang("es"), lang("ru")]);
+    assert_eq!(s.picker, None, "closed until the key");
+    assert_eq!(s.speak_target(), Some("de"));
+    // Up and Down with the picker closed do nothing (they scroll a section then).
+    log.push(pick(PickerOp::Down));
+    assert_eq!(Session::replay(&log).picker, None);
+
+    log.push(pick(PickerOp::Open));
+    let s = Session::replay(&log);
+    assert_eq!(
+        s.picker,
+        Some(Picker { cursor: 0 }),
+        "on the current language"
+    );
+    assert_eq!(s.picked(), Some(&lang("de")));
+    // A second Open leaves the cursor where it is.
+    log.push(pick(PickerOp::Down));
+    log.push(pick(PickerOp::Open));
+    assert_eq!(Session::replay(&log).picker, Some(Picker { cursor: 1 }));
+    // The cursor stops at both ends.
+    log.extend([
+        pick(PickerOp::Down),
+        pick(PickerOp::Down),
+        pick(PickerOp::Down),
+    ]);
+    let s = Session::replay(&log);
+    assert_eq!(s.picker, Some(Picker { cursor: 2 }));
+    assert_eq!(s.picked(), Some(&lang("ru")));
+    log.extend([
+        pick(PickerOp::Up),
+        pick(PickerOp::Up),
+        pick(PickerOp::Up),
+        pick(PickerOp::Up),
+    ]);
+    assert_eq!(Session::replay(&log).picker, Some(Picker { cursor: 0 }));
+    // Esc closes it with nothing chosen.
+    log.push(pick(PickerOp::Close));
+    let s = Session::replay(&log);
+    assert_eq!(s.picker, None);
+    assert_eq!(s.speak_target(), Some("de"));
+    assert!(s.transcript.is_empty(), "nothing chosen, no marker");
+
+    // The cursor starts on the current language, wherever it is in the list.
+    log.push(Action::SpeakTarget {
+        target: "ru".into(),
+    });
+    log.push(pick(PickerOp::Open));
+    assert_eq!(Session::replay(&log).picker, Some(Picker { cursor: 2 }));
+
+    // With no languages listed, or with `[speak]` off, the key does nothing.
+    let mut off = speak_on();
+    off.push(voice(VoiceMode::Translate));
+    off.push(pick(PickerOp::Open));
+    assert_eq!(Session::replay(&off).picker, None);
+    let mut disabled = three_languages();
+    disabled.push(Action::SpeakEnabled { enabled: false });
+    disabled.push(pick(PickerOp::Open));
+    assert_eq!(Session::replay(&disabled).picker, None);
+    // A new list closes the picker and starts it afresh.
+    let mut relisted = three_languages();
+    relisted.push(pick(PickerOp::Open));
+    relisted.push(Action::SpeakLanguages {
+        languages: vec![lang("es")],
+    });
+    let s = Session::replay(&relisted);
+    assert_eq!((s.picker, s.languages.len()), (None, 1));
+}
+
+#[test]
+fn choosing_a_language_changes_the_target_closes_the_picker_and_writes_one_marker() {
+    let mut log = three_languages();
+    log.push(seg(Speaker::You, 5.0, 8.0, "Hello there.", true));
+    log.push(pick(PickerOp::Open));
+    log.push(pick(PickerOp::Down));
+    log.push(Action::SpeakTarget {
+        target: "es".into(),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(s.picker, None);
+    assert_eq!(s.speak_target(), Some("es"));
+    assert_eq!(
+        s.voice,
+        Some(Voice {
+            mode: VoiceMode::Translate,
+            target: "es".into(),
+            own: Some("en".into()),
+        })
+    );
+    let marker = s.transcript.last().unwrap();
+    assert!(marker.note);
+    assert_eq!(marker.text, "— language: → es —");
+    assert_eq!(marker.text, language_marker("es"));
+    assert_eq!(
+        (marker.start, marker.end),
+        (8.0, 8.0),
+        "after the last line"
+    );
+    // The same language again writes nothing.
+    log.push(Action::SpeakTarget {
+        target: "es".into(),
+    });
+    assert_eq!(Session::replay(&log).transcript.len(), 2);
+    // A code the list does not have is ignored (the picker still closes).
+    log.push(pick(PickerOp::Open));
+    log.push(Action::SpeakTarget {
+        target: "xx".into(),
+    });
+    let s = Session::replay(&log);
+    assert_eq!((s.picker, s.speak_target()), (None, Some("es")));
+    assert_eq!(s.transcript.len(), 2);
+    // `l` afterwards announces the new target with the mode.
+    log.push(Action::Voice {
+        mode: VoiceMode::Passthrough,
+        target: "es".into(),
+        own: Some("en".into()),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(
+        s.transcript.last().unwrap().text,
+        "— translate mode off: your own voice —"
+    );
+    assert_eq!(s.speak_target(), Some("es"));
+}
+
+/// The issue's criterion: a press in flight finishes in the language it started with, and the
+/// lines it spoke are marked with that one; the next press speaks the chosen one.
+#[test]
+fn a_press_in_flight_keeps_its_language_and_the_next_one_takes_the_chosen_one() {
+    let mut log = three_languages();
+    log.extend([
+        seg(
+            Speaker::You,
+            6.0,
+            9.0,
+            "I'd start with a token bucket.",
+            true,
+        ),
+        Action::SpeakStarted { id: 1 },
+        Action::SpeakTurn {
+            id: 1,
+            from: 6.0,
+            to: 9.0,
+        },
+    ]);
+    let s = Session::replay(&log);
+    assert_eq!(s.speech.as_ref().unwrap().target.as_deref(), Some("de"));
+    // The user picks Spanish while the German press is in flight.
+    log.push(pick(PickerOp::Open));
+    log.push(pick(PickerOp::Down));
+    log.push(Action::SpeakTarget {
+        target: "es".into(),
+    });
+    log.push(Action::SpeakTranslated {
+        id: 1,
+        text: "Ich würde mit einem Token-Bucket anfangen.".into(),
+    });
+    log.push(Action::SpeakDone { id: 1 });
+    let s = Session::replay(&log);
+    assert_eq!(s.speak_target(), Some("es"));
+    let said = &s.transcript[0];
+    assert_eq!(said.spoken_as.as_deref(), Some("de"), "spoken in German");
+    assert_eq!(
+        said.translation.as_deref(),
+        Some("Ich würde mit einem Token-Bucket anfangen.")
+    );
+    assert_eq!(s.transcript[1].text, "— language: → es —");
+    // The next press is Spanish.
+    log.extend([
+        seg(Speaker::You, 12.0, 14.0, "Then sharding.", true),
+        Action::SpeakStarted { id: 2 },
+        Action::SpeakTurn {
+            id: 2,
+            from: 12.0,
+            to: 14.0,
+        },
+        Action::SpeakTranslated {
+            id: 2,
+            text: "Luego el sharding.".into(),
+        },
+        Action::SpeakDone { id: 2 },
+    ]);
+    let s = Session::replay(&log);
+    assert_eq!(s.transcript[2].spoken_as.as_deref(), Some("es"));
+    assert_eq!(s.transcript[0].spoken_as.as_deref(), Some("de"), "kept");
+
+    // A log from before #115 (no `target` on the press) marks with the voice's target.
+    let old: Speech =
+        serde_json::from_str(r#"{"id":1,"stage":"speaking","text":"Hallo.","span":[6.0,9.0]}"#)
+            .unwrap();
+    assert_eq!(old.target, None);
+    let json = serde_json::to_string(&s).unwrap();
+    assert!(
+        json.contains(r#""languages":[{"code":"de","voice":"voice-de"}"#),
+        "{json}"
+    );
+    assert!(!json.contains("\"picker\""), "closed: left out");
+    assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), s);
+    let bare = Session::replay(&speak_on());
+    let json = serde_json::to_string(&bare).unwrap();
+    assert!(
+        !json.contains("\"languages\"") && !json.contains("\"picker\""),
+        "{json}"
+    );
+    for line in [
+        r#"{"type":"speak_languages","languages":[{"code":"de","voice":"voice-de"}]}"#,
+        r#"{"type":"picker","op":"open"}"#,
+        r#"{"type":"speak_target","target":"es"}"#,
+    ] {
+        let a: Action = serde_json::from_str(line).unwrap();
+        assert_eq!(serde_json::to_string(&a).unwrap(), line);
+    }
+}

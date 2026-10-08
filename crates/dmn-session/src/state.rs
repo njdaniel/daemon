@@ -7,9 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::action::{
-    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
-    ProviderLabel, QuestionSource, Section, SectionState, SlowEnd, SlowField, Speaker, StarCards,
-    TradeoffItem, VoiceMode,
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason, PickerOp,
+    ProviderLabel, QuestionSource, Section, SectionState, SlowEnd, SlowField, SpeakLanguage,
+    Speaker, StarCards, TradeoffItem, VoiceMode,
 };
 use crate::memory::{self, Promise, SummaryLine};
 
@@ -451,6 +451,24 @@ pub struct Speech {
     /// [`Action::SpeakTurn`] has said; they are marked when the press is done.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<(f64, f64)>,
+    /// #115: the language this press speaks, fixed when it started: a language chosen on the
+    /// picker meanwhile applies to the next press, and the lines this one spoke are marked
+    /// with this one. `None` in a log from before #115 (then the voice's target at the end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+/// #115: the language picker while it is open: an overlay over the three areas listing the
+/// session's languages, the cursor on one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Picker {
+    /// The row the cursor is on, an index into [`Session::languages`].
+    pub cursor: usize,
+}
+
+/// #115: the transcript's marker line for a change of language.
+pub fn language_marker(target: &str) -> String {
+    format!("— language: → {target} —")
 }
 
 /// #114: what `dmn-voice` carries, for the status line's first tag and the transcript's marks.
@@ -588,6 +606,13 @@ pub struct Session {
     /// before it and while `[speak]` is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<Voice>,
+    /// #115: the languages the session can speak, each with its enrolled voice, in the config's
+    /// order; empty in every log from before it and while `[speak]` is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<SpeakLanguage>,
+    /// #115: the language picker, while it is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picker: Option<Picker>,
 }
 
 fn not_scrolled(rows: &u16) -> bool {
@@ -621,6 +646,40 @@ impl Session {
     /// The earlier question `←` stepped back to (#94), while one holds the screen.
     pub fn earlier(&self) -> Option<&Question> {
         self.history.get(self.browsing?)
+    }
+
+    /// #115: the language `dmn-voice` translates into from the next utterance on (`es`): the
+    /// picker's last choice, else `[speak].target`. `None` while `[speak]` is off.
+    pub fn speak_target(&self) -> Option<&str> {
+        self.voice.as_ref().map(|v| v.target.as_str())
+    }
+
+    /// #115: the language the picker's cursor is on, while it is open.
+    pub fn picked(&self) -> Option<&SpeakLanguage> {
+        self.languages.get(self.picker?.cursor)
+    }
+
+    /// #115: where the picker's cursor starts: on the current language, else the first.
+    fn current_language(&self) -> usize {
+        let target = self.speak_target();
+        self.languages
+            .iter()
+            .position(|l| Some(l.code.as_str()) == target)
+            .unwrap_or(0)
+    }
+
+    /// #115: one marker row after everything said so far (#114's mode marker is one too).
+    fn push_marker(&mut self, text: String) {
+        let at = self
+            .transcript
+            .iter()
+            .chain(&self.partials)
+            .map(|l| l.end)
+            .fold(0.0, f64::max);
+        let mut marker = Line::spoken(Speaker::Unknown, at, at, text);
+        marker.note = true;
+        self.transcript.push(marker);
+        self.prune_transcript(at);
     }
 
     /// The question on screen: the earlier one while browsing (#94), else the live one.
@@ -1102,17 +1161,46 @@ fn apply(s: &mut Session, action: &Action) {
             // A change (not the start-up mode) is a line in the history, after everything
             // said so far.
             if was.is_some_and(|m| m != *mode) {
-                let at = s
-                    .transcript
-                    .iter()
-                    .chain(&s.partials)
-                    .map(|l| l.end)
-                    .fold(0.0, f64::max);
-                let mut marker =
-                    Line::spoken(Speaker::Unknown, at, at, voice_marker(*mode, target));
-                marker.note = true;
-                s.transcript.push(marker);
-                s.prune_transcript(at);
+                s.push_marker(voice_marker(*mode, target));
+            }
+        }
+        Action::SpeakLanguages { languages } => {
+            s.languages.clone_from(languages);
+            // The list changed under the cursor: the picker starts afresh next time.
+            s.picker = None;
+        }
+        Action::Picker { op } => {
+            if s.languages.is_empty() || !s.speak {
+                return;
+            }
+            let last = s.languages.len() - 1;
+            s.picker = match (*op, s.picker) {
+                (PickerOp::Open, None) => Some(Picker {
+                    cursor: s.current_language(),
+                }),
+                (PickerOp::Open, open) => open,
+                (PickerOp::Up, Some(p)) => Some(Picker {
+                    cursor: p.cursor.saturating_sub(1).min(last),
+                }),
+                (PickerOp::Down, Some(p)) => Some(Picker {
+                    cursor: (p.cursor + 1).min(last),
+                }),
+                (PickerOp::Up | PickerOp::Down, None) => None,
+                (PickerOp::Close, _) => None,
+            };
+        }
+        Action::SpeakTarget { target } => {
+            s.picker = None;
+            let known = s.languages.is_empty() || s.languages.iter().any(|l| &l.code == target);
+            if !known {
+                return;
+            }
+            let Some(v) = s.voice.as_mut() else {
+                return;
+            };
+            if v.target != *target {
+                v.target.clone_from(target);
+                s.push_marker(language_marker(target));
             }
         }
         Action::SpeakStarted { id } => {
@@ -1122,6 +1210,8 @@ fn apply(s: &mut Session, action: &Action) {
                 text: String::new(),
                 secs: 0,
                 span: None,
+                // #115: the language this press speaks, whatever the picker chooses meanwhile.
+                target: s.speak_target().map(str::to_owned),
             });
             // A new press is a new attempt: the last one's failure goes.
             s.speak_failed = None;
@@ -1146,10 +1236,14 @@ fn apply(s: &mut Session, action: &Action) {
             if s.speech.as_ref().is_some_and(|sp| sp.id == *id) {
                 let done = s.speech.take();
                 // #114: the lines the call heard translated are marked so, the translation
-                // under the last of them.
+                // under the last of them. #115: in the language the press started in, not
+                // one chosen while it was in flight.
                 if let Some(sp) = done
                     && let Some((from, to)) = sp.span
-                    && let Some(target) = s.voice.as_ref().map(|v| v.target.clone())
+                    && let Some(target) = sp
+                        .target
+                        .clone()
+                        .or_else(|| s.voice.as_ref().map(|v| v.target.clone()))
                     && !sp.text.is_empty()
                 {
                     let mut last = None;
