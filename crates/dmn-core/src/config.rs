@@ -1136,6 +1136,25 @@ keep_transcripts = true
         );
     }
 
+    /// #114: `[speak].mode` is `passthrough` unless the file says `translate`; anything else
+    /// names both.
+    #[test]
+    fn speak_mode_defaults_to_passthrough_and_parses_translate() {
+        assert_eq!(Config::default().speak.mode, VoiceMode::Passthrough);
+        let c = Config::from_toml("[speak]\nmode = \"translate\"\n", "m").unwrap();
+        assert_eq!(c.speak.mode, VoiceMode::Translate);
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("mode = \"translate\""), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+        let err = Config::from_toml("[speak]\nmode = \"both\"\n", "bad")
+            .expect_err("an unknown mode is a config error")
+            .to_string();
+        assert!(
+            err.contains("passthrough") && err.contains("translate"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn assistance_defaults_to_on_and_parses_off() {
         assert!(Config::default().assist.enabled);

@@ -4,7 +4,7 @@
 
 Daemon listens to a live interview call, transcribes the conversation, detects interviewer questions, and surfaces a short answer scaffold designed to be understood in a few seconds.
 
-The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, does not type on the user's behalf, and does not attempt to hide itself from screen sharing. It never speaks unprompted and never speaks words the user did not say or ask for: with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user asks (`dmn speak`, or `t` in `dmn run`).
+The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, does not type on the user's behalf, and does not attempt to hide itself from screen sharing. It never speaks unprompted and never speaks words the user did not say or ask for: with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user asks (`dmn speak`, `t` in `dmn run`, or, in translate mode (#114), every sentence the user finishes while they have the mode on).
 
 > **Status:** early development. The foundation CLI is working; the live TUI pipeline and desktop UI are under active development.
 
@@ -91,6 +91,7 @@ Keys in `dmn run`:
 | `s` | Coding solutions: hints ↔ full |
 | `m` | Mute or unmute your microphone |
 | `t` | With `[speak]` on: translate what you last said into `[speak].target` and speak it in your cloned voice into `dmn-voice` (below, § Speak) |
+| `l` | With `[speak]` on: switch `dmn-voice` between your own voice, live (the default), and translate mode, where every sentence you finish goes out translated (#114, below) |
 | Ctrl+Shift+A | Interview assistance on ↔ off |
 | `q`, Esc, Ctrl+C | Quit |
 
@@ -434,6 +435,39 @@ temperature = 0.6                     # 0.05-5.0
 # cfg_weight = 0.5
 # exaggeration = 0.5
 ```
+
+**Your own voice through `dmn-voice`, and translate mode (#114).** With `dmn-voice` as the
+call's microphone, the call hears your real voice, live, from the moment `dmn run` starts:
+your microphone (`[audio].mic`, the one whisper hears) passes through the node. This is
+**pass-through mode**, the default, and `t` is as above: your last turn goes out translated over
+it (your voice fades out under the sentence's first 8 ms and back in after it; the call never
+hears both). Press `l` for **translate mode**: your microphone is shut off from the call and every
+sentence you finish (each turn whisper finalizes; two finals that arrive while one is still being
+spoken go out as one) is translated into `target` and spoken in your cloned voice instead, in
+order, one at a time; a turn that arrives while another is speaking waits its turn. `t` in
+translate mode speaks the last turn again (for when the automatic one failed). `l` again drops
+whatever is waiting (not what is playing) and lets your own voice through again.
+`[speak].mode = "passthrough" | "translate"` is the mode at start (default `passthrough`).
+
+You always know which the call is hearing: the status line opens with a wide coloured tag,
+`voice: you (en)` in pass-through mode (magenta, your voice's colour) and `voice: → de` in
+translate mode (teal, amber while a turn is being translated or spoken); the keys end with
+`l translate` or `l own voice` where the line has room. In the transcript a line that went out
+translated reads `You → de`, with the translation dim on the row under it, so you can read back
+what the call heard, and each switch writes one dim marker row (`— translate mode on: → de —`).
+All of it on the transcript-first screen with assistance off too.
+
+Pass-through adds no audible delay. The microphone is captured a second time at the graph rate
+(the whisper lane runs at 16 kHz, which would cut the call to telephone bandwidth) and its
+samples go from PipeWire's capture callback straight into the node's playback callback through a
+lock-free ring, no thread in between: measured 2026-10-08 with `just probe` (a 440 Hz tone played
+by `pw-play` into the capture, `pw-record` on `dmn-voice`), 0.0–0.1 ms inside dmn and 21.4 ms to
+`pw-record`'s pipe, one 1024-sample quantum, which is `pw-record`'s own buffering. The tone came
+out at 440 Hz and its full length; the mic's clock and the call's drifting apart is absorbed by
+skipping a backlog over 60 ms down to 20 ms. Translate mode's delay is the sentence's: the VAD's
+0.4 s, whisper, the echo guard's hold on a mic final (up to 1.5 s, `[audio].echo_guard`), then
+#113's translation and rendering, so with the GPU server a sentence is heard a few seconds after
+you finish it.
 
 **After a restart, select `dmn-voice` again.** Each `dmn run` creates a new `dmn-voice` node.
 PipeWire links an app back to it only when the app names the device in its own stream (`pw-record
