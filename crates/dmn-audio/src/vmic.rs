@@ -1070,6 +1070,76 @@ mod tests {
             assert!(on / off.max(1e-9) > 100.0, "440 Hz dominates: {}", on / off);
         }
 
+        /// Whether a recorder linked to `dmn-voice` is linked again after the node is closed
+        /// and a new one opened on a fresh connection, as a dmn restart does: (linked at
+        /// first, linked again within 5 s).
+        fn relinked_after_a_restart(recorder: &[&str]) -> (bool, bool) {
+            let wait_streaming = |mic: &VirtualMic, within: Duration| {
+                let t = Instant::now();
+                while mic.status().state() != VmicState::Streaming && t.elapsed() < within {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                mic.status().state() == VmicState::Streaming
+            };
+            let ctx = connect();
+            let rate = ctx.nodes().graph_rate();
+            let mic = VirtualMic::open(Arc::clone(&ctx), rate).expect("vmic opens");
+            // Raw samples on a pipe that is read and dropped: nothing on disk.
+            let mut rec = Proc::new(recorder[0])
+                .args(&recorder[1..])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("recorder on PATH");
+            let mut out = rec.stdout.take().unwrap();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65_536];
+                while out.read(&mut buf).is_ok_and(|n| n > 0) {}
+            });
+            let linked = wait_streaming(&mic, Duration::from_secs(3));
+            drop(mic);
+            drop(ctx);
+            std::thread::sleep(Duration::from_millis(1_000));
+            let ctx = connect();
+            let mic = VirtualMic::open(Arc::clone(&ctx), rate).expect("vmic reopens");
+            let relinked = wait_streaming(&mic, Duration::from_secs(5));
+            let _ = rec.kill();
+            let _ = rec.wait();
+            (linked, relinked)
+        }
+
+        /// #113: `dmn-voice` across a dmn restart. The node is a new one each run (same
+        /// `node.name`, new `object.serial`); WirePlumber relinks a stream to it only when the
+        /// stream names it by name in its own properties (`target.object = "dmn-voice"`, as
+        /// `pw-record --target` and a PulseAudio app opening the device by name do). A stream
+        /// with `node.dont-reconnect` (what a PulseAudio app gets when it asks not to be moved,
+        /// as Chromium-based apps such as Discord do for a chosen device) is never linked again
+        /// once handled (`linking/prepare-link.lua`), and a stream moved by hand is kept in the
+        /// `default` metadata by serial, which a new node never matches. No property of the
+        /// node changes either, so `dmn run` says so on the status line instead.
+        #[test]
+        #[ignore]
+        fn live_a_reopened_dmn_voice_is_relinked_only_to_a_stream_that_names_it() {
+            let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            let by_name = ["pw-record", "--target", VMIC_NODE_NAME, "--raw", "-"];
+            assert_eq!(relinked_after_a_restart(&by_name), (true, true));
+            let dont_move = [
+                "pw-record",
+                "--target",
+                VMIC_NODE_NAME,
+                "-P",
+                "{ node.dont-reconnect = true }",
+                "--raw",
+                "-",
+            ];
+            assert_eq!(
+                relinked_after_a_restart(&dont_move),
+                (true, false),
+                "if this now relinks, PipeWire keeps a call's choice across a restart and the \
+                 start-up notice in dmn-cli's speaker can go"
+            );
+        }
+
         /// Nothing linked: the node sits in the graph, nothing is pulled, and `write` reports
         /// that instead of blocking forever.
         #[test]
