@@ -55,8 +55,14 @@
 //! in flight); `l translate` / `l own voice` ends the keys. A transcript line the call heard
 //! translated is labelled `You → de` with the translation dim under it, and a mode change is a
 //! dim marker row in the transcript. The same on the transcript-first screen.
+//!
+//! The language picker (#115, `v`) is the one thing drawn over the areas rather than in them: a
+//! small centred box listing `[speak].languages` with their voices, the cursor on one and the
+//! current one marked, drawn last while [`Session::picker`] is open and gone with it; the three
+//! areas under it are laid out exactly as without it (`picker`).
 
 mod approach;
+mod picker;
 mod question;
 mod sections;
 mod status;
@@ -173,6 +179,13 @@ pub fn draw(frame: &mut Frame, session: &Session) {
 
 /// Draw the whole UI into `buf` within `area`.
 pub fn render(session: &Session, area: Rect, buf: &mut Buffer) {
+    render_areas(session, area, buf);
+    // #115: the picker goes over the finished frame, so nothing under it moves.
+    picker::render(session, area, buf);
+}
+
+/// The three areas (or the transcript-first screen), without the picker.
+fn render_areas(session: &Session, area: Rect, buf: &mut Buffer) {
     let mut view = View::new(session);
     if session.assist_off {
         // #79: transcript first. The question and Approach areas would only ever be empty (or

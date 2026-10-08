@@ -56,7 +56,7 @@ use dmn_audio::{AudioError, CaptureTarget, Passthrough, VMIC_NODE_NAME, VmicStat
 use dmn_core::config::Config;
 use dmn_core::{Paths, wire};
 use dmn_llm::{CancellationToken, LlmError, Provider};
-use dmn_session::{Action, SessionHub, VoiceMode};
+use dmn_session::{Action, SessionHub, SpeakLanguage, VoiceMode};
 use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider, Tuning};
 
 use crate::speak::{self, DRAIN_MARGIN, SpeakError, SpeechSink};
@@ -86,12 +86,11 @@ pub struct SpeakSetup {
     pub model: String,
     pub tts: Arc<dyn TtsProvider>,
     pub open_sink: OpenSink,
-    /// `[speak].target`, sent to the TTS server with the text.
-    pub target: String,
-    /// The target as the model reads it: "Spanish (es)".
-    pub target_name: String,
-    /// The enrolled voice's name in the server's library.
-    pub voice: String,
+    /// The language spoken at start: `[speak].target` with its voice.
+    pub language: Language,
+    /// #115: every language the run can speak (`[speak].languages`, checked against the
+    /// server's library), in the config's order; the picker lists them.
+    pub languages: Vec<Language>,
     /// The translation's budget: the fast phase's.
     pub timeout: Duration,
     /// #113: `[speak]`'s TTS knobs, sent with every speech request.
@@ -100,6 +99,34 @@ pub struct SpeakSetup {
     pub warm_tts: bool,
     /// #114: whether the microphone passes through the node from the start (`[speak].mode`).
     pub passthrough: bool,
+}
+
+/// One language a press can speak: the code the TTS request and the check carry (`es`), the
+/// name the model reads ("Spanish (es)"), and the voice enrolled for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Language {
+    pub code: String,
+    pub name: String,
+    pub voice: String,
+}
+
+impl Language {
+    /// `code` with the name whisper has for it (the code itself for one it does not know).
+    pub fn new(code: &str, voice: &str) -> Self {
+        Self {
+            code: code.to_owned(),
+            name: target_name(code).unwrap_or_else(|| code.to_owned()),
+            voice: voice.to_owned(),
+        }
+    }
+
+    /// The session's view of it (#115).
+    pub fn listed(&self) -> SpeakLanguage {
+        SpeakLanguage {
+            code: self.code.clone(),
+            voice: self.voice.clone(),
+        }
+    }
 }
 
 /// When a press's speech played, on the wall clock, for the echo guard's window.
@@ -122,6 +149,9 @@ enum Msg {
     Speak(Job),
     /// #114: the microphone's gate, open (pass-through mode) or shut (translate mode).
     Passthrough(bool),
+    /// #115: the language (and voice) every job from here on speaks; one in flight is done
+    /// before this is read, so it finishes in the language it started with.
+    Language(Language),
 }
 
 /// The worker that speaks `t`'s presses. See the module doc.
@@ -189,6 +219,14 @@ impl Speaker {
     pub fn set_passthrough(&self, on: bool) {
         if let Some(msgs) = &self.msgs {
             let _ = msgs.send(Msg::Passthrough(on));
+        }
+    }
+
+    /// #115: speak `language` from the next job on. A job sent before this call finishes in
+    /// its own language: the worker reads the channel in order, one job at a time.
+    pub fn set_language(&self, language: Language) {
+        if let Some(msgs) = &self.msgs {
+            let _ = msgs.send(Msg::Language(language));
         }
     }
 
@@ -268,6 +306,11 @@ impl Worker {
                     }
                     continue;
                 }
+                Ok(Msg::Language(language)) => {
+                    tracing::info!(code = %language.code, voice = %language.voice, "speak: language from the next press");
+                    self.setup.language = language;
+                    continue;
+                }
                 Err(true) => {
                     look_at = None;
                     self.check_linked();
@@ -301,8 +344,8 @@ impl Worker {
     /// press says it).
     fn warm_tts(&self) {
         let tts = Arc::clone(&self.setup.tts);
-        let req = SpeakRequest::new(WARM_UP_TEXT, self.setup.voice.clone())
-            .with_language(self.setup.target.clone())
+        let req = SpeakRequest::new(WARM_UP_TEXT, self.setup.language.voice.clone())
+            .with_language(self.setup.language.code.clone())
             .with_tuning(self.setup.tuning);
         let stop = Arc::clone(&self.stop);
         let spawned = std::thread::Builder::new()
@@ -378,17 +421,19 @@ impl Worker {
         }
     }
 
-    /// One press: translate, synthesize, play. `Err` is the status line's reason.
+    /// One press: translate, synthesize, play, in the language set when it starts (#115: a
+    /// language chosen meanwhile waits for the next press). `Err` is the status line's reason.
     fn speak(&mut self, job: Job) -> Result<(), String> {
         let Job { id, text, pressed } = job;
+        let language = self.setup.language.clone();
         let provider = Arc::clone(&self.setup.provider);
         let translated = self
             .rt
             .block_on(dmn_llm::translate(
                 &*provider,
                 &text,
-                &self.setup.target_name,
-                &self.setup.target,
+                &language.name,
+                &language.code,
                 self.setup.timeout,
                 self.cancel.child_token(),
             ))
@@ -409,8 +454,8 @@ impl Worker {
         {
             return Err(format!("no {VMIC_NODE_NAME}: {why}"));
         }
-        let req = SpeakRequest::new(translated.text, self.setup.voice.clone())
-            .with_language(self.setup.target.clone())
+        let req = SpeakRequest::new(translated.text, language.voice)
+            .with_language(language.code)
             .with_tuning(self.setup.tuning);
         let tts = &self.setup.tts;
         let cancel = self.cancel.clone();
@@ -556,18 +601,37 @@ pub fn target_name(code: &str) -> Option<String> {
 /// Check, before the run starts, everything a press would need and could not fix mid-call:
 /// speak is on and the TTS server is on this machine, a voice is enrolled and the server has
 /// it, and that voice speaks `[speak].target` (#109: a voice speaks only the language it was
-/// enrolled with). Returns the voice's name.
-pub fn check(cfg: &Config, paths: &Paths, tts: &dyn TtsProvider) -> Result<String, SpeakError> {
+/// enrolled with). #115: with `[speak].languages` listed, every entry is checked the same way
+/// (its voice is in the library, enrolled for its code), a missing one naming the enroll
+/// command. Returns the languages in the config's order, the start-up `target` among them.
+pub fn check(
+    cfg: &Config,
+    paths: &Paths,
+    tts: &dyn TtsProvider,
+) -> Result<Vec<Language>, SpeakError> {
     let config = paths.config_file.display().to_string();
     speak::check_gates(cfg, paths)?;
-    if cfg.speak.voice_ref.is_empty() {
+    let listed = !cfg.speak.languages.is_empty();
+    if !listed && cfg.speak.voice_ref.is_empty() {
         return Err(SpeakError::NotEnrolled { config });
     }
     let target = cfg.speak.target.clone();
     if target_name(&target).is_none() {
         return Err(SpeakError::UnknownTarget { target, config });
     }
-    let voice = speak::voice_name(&cfg.speak.voice_ref);
+    let entries = cfg.speak.voices();
+    for entry in &entries {
+        if target_name(&entry.code).is_none() {
+            return Err(SpeakError::UnknownLanguage {
+                code: entry.code.clone(),
+                config,
+            });
+        }
+    }
+    let languages: Vec<Language> = entries
+        .iter()
+        .map(|l| Language::new(&l.code, &l.voice))
+        .collect();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -576,27 +640,59 @@ pub fn check(cfg: &Config, paths: &Paths, tts: &dyn TtsProvider) -> Result<Strin
         .block_on(tts.voices())
         .map_err(|e| speak::tts_error(e, paths))?
     else {
-        tracing::warn!("the TTS server lists no voices; not checking the voice's language");
-        return Ok(voice);
+        tracing::warn!("the TTS server lists no voices; not checking the voices' languages");
+        return Ok(languages);
     };
-    let clip = cfg.speak.voice_ref.clone();
-    let Some(enrolled) = voices.iter().find(|v| v.answers_to(&voice)) else {
-        return Err(SpeakError::VoiceGone { voice, clip });
-    };
-    match enrolled.language.as_deref() {
-        Some(speaks) if speaks != target => Err(SpeakError::LanguageMismatch {
-            target,
-            speaks: speaks.to_owned(),
-            voice,
-            clip,
-            config,
-        }),
-        Some(_) => Ok(voice),
-        None => {
-            tracing::warn!(voice = %voice, "the TTS server does not say which language the voice speaks");
-            Ok(voice)
+    for language in &languages {
+        let (code, voice) = (language.code.clone(), language.voice.clone());
+        // The clip the fix would re-upload: `voice_ref`'s for the one pair, the stored copy
+        // `enroll` keeps for a listed voice.
+        let clip = if listed {
+            paths
+                .data_dir
+                .join(format!("{voice}.wav"))
+                .display()
+                .to_string()
+        } else {
+            cfg.speak.voice_ref.clone()
+        };
+        let Some(enrolled) = voices.iter().find(|v| v.answers_to(&voice)) else {
+            return Err(if listed {
+                SpeakError::LanguageVoiceGone {
+                    code,
+                    voice,
+                    config,
+                }
+            } else {
+                SpeakError::VoiceGone { voice, clip }
+            });
+        };
+        match enrolled.language.as_deref() {
+            Some(speaks) if speaks != code => {
+                return Err(if listed {
+                    SpeakError::LanguageVoiceMismatch {
+                        code,
+                        speaks: speaks.to_owned(),
+                        voice,
+                        clip,
+                    }
+                } else {
+                    SpeakError::LanguageMismatch {
+                        target: code,
+                        speaks: speaks.to_owned(),
+                        voice,
+                        clip,
+                        config,
+                    }
+                });
+            }
+            Some(_) => {}
+            None => {
+                tracing::warn!(voice = %voice, "the TTS server does not say which language the voice speaks");
+            }
         }
     }
+    Ok(languages)
 }
 
 /// The session's speaker for `dmn run`, after [`check`]: the translator (`[llm]` with
@@ -606,10 +702,19 @@ pub fn check(cfg: &Config, paths: &Paths, tts: &dyn TtsProvider) -> Result<Strin
 /// live tests do so that none of them captures the real microphone.
 pub fn setup(cfg: &Config, paths: &Paths, mic: Option<&str>) -> Result<SpeakSetup, SpeakError> {
     let tts = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url).streaming();
-    let voice = check(cfg, paths, &tts)?;
+    let languages = check(cfg, paths, &tts)?;
     let provider = wire::provider(&cfg.translator_llm())
         .map_err(|e: LlmError| SpeakError::Llm(e.to_string()))?;
     let target = cfg.speak.target.clone();
+    // `check` passed, so the target is listed (the config refuses one that is not).
+    let language = languages
+        .iter()
+        .find(|l| l.code == target)
+        .cloned()
+        .ok_or_else(|| SpeakError::UnknownTarget {
+            target: target.clone(),
+            config: paths.config_file.display().to_string(),
+        })?;
     let passthrough = cfg.speak.mode == VoiceMode::Passthrough;
     let tap = mic.map(|mic| Passthrough {
         target: match CaptureTarget::mic(mic) {
@@ -623,9 +728,8 @@ pub fn setup(cfg: &Config, paths: &Paths, mic: Option<&str>) -> Result<SpeakSetu
         model: cfg.translator_model().to_owned(),
         tts: Arc::new(tts),
         open_sink: Box::new(move || open_dmn_voice(tap.clone())),
-        target_name: target_name(&target).unwrap_or_else(|| target.clone()),
-        target,
-        voice,
+        language,
+        languages,
         timeout: Duration::from_millis(cfg.llm.fast_timeout_ms),
         tuning: speak::tuning(cfg),
         warm_tts: true,
@@ -807,9 +911,13 @@ pub fn setup_sink(
             model: "mock".into(),
             tts: Arc::new(tts),
             open_sink: open,
-            target: "es".into(),
-            target_name: "Spanish (es)".into(),
-            voice: "me".into(),
+            language: Language::new("es", "me"),
+            // #115: two more, for the picker; `de`'s voice is named as `enroll` would name it.
+            languages: vec![
+                Language::new("es", "me"),
+                Language::new("de", "voice-de"),
+                Language::new("ru", "voice-ru"),
+            ],
             timeout: Duration::from_secs(4),
             tuning: Tuning::default(),
             warm_tts: false,
@@ -847,7 +955,11 @@ pub(crate) mod tests {
     fn the_enrolled_voice_must_speak_the_target_language() {
         let (_dir, paths, cfg) = cfg("es");
         let ok = MockTtsProvider::new().with_voices(Some(&[("me", Some("es"))]));
-        assert_eq!(check(&cfg, &paths, &ok).unwrap(), "me");
+        assert_eq!(
+            check(&cfg, &paths, &ok).unwrap(),
+            [Language::new("es", "me")],
+            "no list: the one target + voice_ref pair"
+        );
 
         let english = MockTtsProvider::new().with_voices(Some(&[("me", Some("en"))]));
         let err = check(&cfg, &paths, &english).unwrap_err();
@@ -869,7 +981,76 @@ pub(crate) mod tests {
 
         // A server with no library cannot be asked; the run goes on.
         let no_library = MockTtsProvider::new().with_voices(None);
-        assert_eq!(check(&cfg, &paths, &no_library).unwrap(), "me");
+        assert_eq!(
+            check(&cfg, &paths, &no_library).unwrap(),
+            [Language::new("es", "me")]
+        );
+    }
+
+    /// #115: with `[speak].languages` listed, every entry's voice must be in the library,
+    /// enrolled for its code; a missing or mismatched one names the entry and the enroll
+    /// command, and `voice_ref` is not needed.
+    #[test]
+    fn every_listed_voice_must_be_in_the_library_in_its_language() {
+        let (_dir, paths, mut cfg) = cfg("de");
+        cfg.speak.voice_ref.clear();
+        cfg.speak.languages = vec![
+            SpeakLanguage {
+                code: "de".into(),
+                voice: "voice-de".into(),
+            },
+            SpeakLanguage {
+                code: "es".into(),
+                voice: "voice-es".into(),
+            },
+        ];
+        let all = MockTtsProvider::new()
+            .with_voices(Some(&[("voice-de", Some("de")), ("voice-es", Some("es"))]));
+        assert_eq!(
+            check(&cfg, &paths, &all).unwrap(),
+            [
+                Language::new("de", "voice-de"),
+                Language::new("es", "voice-es")
+            ]
+        );
+
+        let missing = MockTtsProvider::new().with_voices(Some(&[("voice-de", Some("de"))]));
+        let err = check(&cfg, &paths, &missing).unwrap_err();
+        assert!(matches!(err, SpeakError::LanguageVoiceGone { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("names the voice \"voice-es\" for \"es\"")
+                && msg.contains("dmn speak enroll --wav <clip> --language es --name voice-es"),
+            "{msg}"
+        );
+
+        let wrong = MockTtsProvider::new()
+            .with_voices(Some(&[("voice-de", Some("de")), ("voice-es", Some("en"))]));
+        let err = check(&cfg, &paths, &wrong).unwrap_err();
+        assert!(
+            matches!(err, SpeakError::LanguageVoiceMismatch { .. }),
+            "{err}"
+        );
+        let msg = err.to_string();
+        let clip = paths.data_dir.join("voice-es.wav").display().to_string();
+        assert!(
+            msg.contains("says the voice \"voice-es\" speaks \"es\"")
+                && msg.contains("enrolled for \"en\"")
+                && msg.contains(&format!(
+                    "dmn speak enroll --wav {clip} --language es --name voice-es"
+                )),
+            "{msg}"
+        );
+
+        // A code whisper does not know, anywhere in the list, is refused before the server
+        // is asked.
+        cfg.speak.languages.push(SpeakLanguage {
+            code: "xx".into(),
+            voice: "v".into(),
+        });
+        let err = check(&cfg, &paths, &all).unwrap_err();
+        assert!(matches!(err, SpeakError::UnknownLanguage { .. }), "{err}");
+        assert!(err.to_string().contains("\"xx\""), "{err}");
     }
 
     #[test]
@@ -944,6 +1125,66 @@ pub(crate) mod tests {
         assert!(
             matches!(windows.as_slice(), [Window::From(a), Window::Until(b)] if a <= b),
             "{windows:?}"
+        );
+        speaker.stop();
+    }
+
+    /// #115: the issue's criterion at the worker: a language set between two presses applies
+    /// to the second (its translate request names the new language, its synthesize request
+    /// the new voice and code); one set while a press is in flight waits for the next.
+    #[test]
+    fn a_language_set_between_presses_applies_to_the_next_one_and_never_to_one_in_flight() {
+        const GERMAN: &str = "Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen.";
+        let german = || vec![Step::Text(GERMAN.into()), Step::Done];
+        let llm = MockProvider::new(vec![Step::Text(SPANISH.into()), Step::Done])
+            .then(german())
+            .then(german())
+            .with_delay(Duration::from_millis(200));
+        let tts = MockTtsProvider::new();
+        let (setup, _) = setup_with(llm.clone(), tts.clone(), true);
+        let hub = Arc::new(SessionHub::default());
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        // Press 1 in Spanish; German is chosen while it translates.
+        hub.dispatch(Action::SpeakStarted { id: 1 });
+        assert!(speaker.speak(1, SAID.into()));
+        std::thread::sleep(Duration::from_millis(50));
+        speaker.set_language(Language::new("de", "voice-de"));
+        let s = settled(&hub);
+        assert_eq!(s.speak_failed, None, "{:?}", s.speak_failed);
+        // Press 2 and 3 in German.
+        hub.dispatch(Action::SpeakStarted { id: 2 });
+        assert!(speaker.speak(2, SAID.into()));
+        let s = settled(&hub);
+        assert_eq!(s.speak_failed, None, "{:?}", s.speak_failed);
+        speaker.set_language(Language::new("ru", "voice-ru"));
+        speaker.set_language(Language::new("de", "voice-de"));
+        hub.dispatch(Action::SpeakStarted { id: 3 });
+        assert!(speaker.speak(3, SAID.into()));
+        let s = settled(&hub);
+        assert_eq!(s.speak_failed, None, "{:?}", s.speak_failed);
+
+        let asked = llm.requests();
+        assert_eq!(asked.len(), 3);
+        assert!(asked[0].messages[0].content.contains("into Spanish (es)"));
+        assert!(
+            asked[1].messages[0].content.contains("into German (de)"),
+            "{}",
+            asked[1].messages[0].content
+        );
+        assert!(asked[2].messages[0].content.contains("into German (de)"));
+        let spoken = tts.requests();
+        let what: Vec<(&str, &str, Option<&str>)> = spoken
+            .iter()
+            .map(|r| (r.text.as_str(), r.voice.as_str(), r.language.as_deref()))
+            .collect();
+        assert_eq!(
+            what,
+            [
+                (SPANISH, "me", Some("es")),
+                (GERMAN, "voice-de", Some("de")),
+                (GERMAN, "voice-de", Some("de")),
+            ],
+            "the first press kept Spanish and its voice; the next two took German"
         );
         speaker.stop();
     }

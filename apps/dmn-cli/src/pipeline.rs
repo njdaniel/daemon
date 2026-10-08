@@ -71,7 +71,7 @@ use dmn_detect::{
 };
 use dmn_llm::{CurrentQuestion, Kind};
 use dmn_session::{
-    Action, CodingSolutions, Dot, Health, Section, Session, SessionHub, Stage, VoiceMode,
+    Action, CodingSolutions, Dot, Health, PickerOp, Section, Session, SessionHub, Stage, VoiceMode,
 };
 use dmn_stt::{
     DeviceChoice, Model, Placement, SttConfig, SttStats, SttWorker, SttWorkerConfig, Transcriber,
@@ -84,7 +84,7 @@ use dmn_vad::{
 use tokio::sync::watch;
 
 use crate::context::ContextSource;
-use crate::speaker::{Speaker, Window};
+use crate::speaker::{Language, Speaker, Window};
 use crate::suggest::{Answered, Output, Policy, Suggester, Tally};
 
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
@@ -716,6 +716,9 @@ pub enum Command {
     Speak,
     /// `l` (#114): pass-through ↔ translate mode.
     Voice,
+    /// Enter on the picker (#115): speak the language at `index` in the session's list from
+    /// the next utterance on, and save it to `[speak].target`.
+    SpeakTarget { index: usize },
 }
 
 /// The TUI's handle on a running pipeline. Cheap to clone; safe from any thread.
@@ -775,6 +778,34 @@ impl Controls {
     /// while `[speak]` is off.
     pub fn toggle_voice(&self) {
         let _ = self.commands.send(Command::Voice);
+    }
+
+    /// #115: whether the language picker is open, which gives `↑ ↓`, Enter and Esc to it.
+    pub fn picker_open(&self) -> bool {
+        self.hub.snapshot().picker.is_some()
+    }
+
+    /// #115: a key on the language picker (open it, move the cursor, close it). The reducer
+    /// owns the overlay, so the session changes at once; it ignores the key while `[speak]`
+    /// is off or no language is listed.
+    pub fn picker(&self, op: PickerOp) {
+        self.hub.dispatch(Action::Picker { op });
+    }
+
+    /// #115: Enter on the picker: the language under the cursor is the target from the next
+    /// utterance on. The overlay closes at once; the pipeline thread, which owns the speaker,
+    /// dispatches the change and saves it to the config. Nothing while the picker is closed.
+    pub fn choose_language(&self) {
+        let snap = self.hub.snapshot();
+        let Some(index) = snap.picker.map(|p| p.cursor) else {
+            return;
+        };
+        self.hub.dispatch(Action::Picker {
+            op: PickerOp::Close,
+        });
+        if index < snap.languages.len() {
+            let _ = self.commands.send(Command::SpeakTarget { index });
+        }
     }
 
     /// `m`: mute or unmute the mic. Muted, the mic lane's VAD hears only silence, so nothing
@@ -1346,10 +1377,19 @@ impl Pipeline {
 
     /// #109: `t` speaks through `speaker` from now on (`dmn run` with `[speak]` on); the
     /// status line offers the key. #114: `dmn-voice` carries `mode` from now, translating
-    /// into `target`; the user's own language is `en` when whisper runs English-only.
-    pub fn attach_speaker(&mut self, speaker: Speaker, mode: VoiceMode, target: String) {
+    /// into `target`; the user's own language is `en` when whisper runs English-only. #115:
+    /// `languages` is what the picker offers, and a choice is saved to `config_file`.
+    pub fn attach_speaker(
+        &mut self,
+        speaker: Speaker,
+        mode: VoiceMode,
+        target: String,
+        languages: Vec<Language>,
+        config_file: Option<PathBuf>,
+    ) {
         let own = (self.info.language == "en").then(|| "en".to_owned());
-        self.speaking.attach(speaker, mode, target, own);
+        self.speaking
+            .attach(speaker, mode, target, own, languages, config_file);
     }
 
     pub fn controls(&self) -> Controls {
@@ -1450,6 +1490,7 @@ impl Pipeline {
         match cmd {
             Command::Speak => self.speaking.press(&self.log),
             Command::Voice => self.speaking.toggle(),
+            Command::SpeakTarget { index } => self.speaking.choose(index),
             cmd => self.assist.command(cmd, &self.log),
         }
     }
@@ -1741,7 +1782,10 @@ impl Assistance {
             return;
         }
         match cmd {
-            Command::Assist { .. } | Command::Speak | Command::Voice => {}
+            Command::Assist { .. }
+            | Command::Speak
+            | Command::Voice
+            | Command::SpeakTarget { .. } => {}
             Command::Ask => self.ask(log),
             Command::Regenerate => {
                 let Some(s) = &self.suggester else {
@@ -1841,6 +1885,10 @@ pub struct Speaking {
     own: Option<String>,
     /// #114: turns waiting to be spoken in translate mode, oldest first.
     queue: VecDeque<Utterance>,
+    /// #115: the languages the picker offers, in the config's order, with their voices.
+    languages: Vec<Language>,
+    /// #115: where a chosen language is saved (`[speak].target`); `None` saves nothing.
+    config_file: Option<PathBuf>,
 }
 
 /// #114: one thing to speak: a turn's text and the session seconds of the You lines in it.
@@ -1867,19 +1915,35 @@ impl Speaking {
             target: String::new(),
             own: None,
             queue: VecDeque::new(),
+            languages: Vec::new(),
+            config_file: None,
         }
     }
 
     /// `[speak]` on: `t` speaks through `speaker`; `dmn-voice` carries `mode` from now (#114),
-    /// translating into `target`; `own` is the user's own language when known.
-    fn attach(&mut self, speaker: Speaker, mode: VoiceMode, target: String, own: Option<String>) {
+    /// translating into `target`; `own` is the user's own language when known. #115: the
+    /// session gets `languages` for the picker; a choice is saved to `config_file`.
+    fn attach(
+        &mut self,
+        speaker: Speaker,
+        mode: VoiceMode,
+        target: String,
+        own: Option<String>,
+        languages: Vec<Language>,
+        config_file: Option<PathBuf>,
+    ) {
         speaker.set_passthrough(mode == VoiceMode::Passthrough);
         self.speaker = Some(speaker);
         self.mode = mode;
         self.target = target;
         self.own = own;
+        self.languages = languages;
+        self.config_file = config_file;
         self.hub.dispatch(Action::SpeakEnabled { enabled: true });
         self.announce();
+        self.hub.dispatch(Action::SpeakLanguages {
+            languages: self.languages.iter().map(Language::listed).collect(),
+        });
     }
 
     fn announce(&self) {
@@ -1888,6 +1952,48 @@ impl Speaking {
             target: self.target.clone(),
             own: self.own.clone(),
         });
+    }
+
+    /// #115: the picker chose the language at `index`: the speaker takes it from its next
+    /// job (one in flight finishes in its own), the session shows it (the tag, the marker row,
+    /// the marks on later lines), and it is saved to `[speak].target` so the next run starts
+    /// with it. A file that cannot be written is the usual 5 s notice, not a stop: the run
+    /// speaks the chosen language either way. The same language again changes nothing.
+    fn choose(&mut self, index: usize) {
+        let Some(speaker) = &self.speaker else {
+            return;
+        };
+        let Some(language) = self.languages.get(index).cloned() else {
+            return;
+        };
+        if language.code == self.target {
+            return;
+        }
+        speaker.set_language(language.clone());
+        self.target = language.code.clone();
+        self.hub.dispatch(Action::SpeakTarget {
+            target: language.code.clone(),
+        });
+        let Some(path) = &self.config_file else {
+            return;
+        };
+        match Config::write_speak_target(path, &language.code) {
+            Ok(()) => tracing::info!(
+                code = %language.code,
+                config = %path.display(),
+                "speak: language saved as [speak].target"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, config = %path.display(), "speak: cannot save the language to the config");
+                self.hub.dispatch(Action::SpeakFailed {
+                    id: crate::speaker::STARTUP_NOTICE,
+                    reason: format!(
+                        "{NOT_SAVED}: {}",
+                        e.to_string().chars().take(40).collect::<String>()
+                    ),
+                });
+            }
+        }
     }
 
     /// #114: `l`: pass-through ↔ translate. Leaving translate mode drops the turns that wait
@@ -2063,6 +2169,10 @@ impl Speaking {
 
 /// #109: what the status line says when `t` is pressed before you have said anything.
 pub const NOTHING_TO_SPEAK: &str = "nothing to speak";
+
+/// #115: what the status line says for 5 s when the picker's choice could not be written to
+/// the config file (the run speaks the chosen language all the same).
+pub const NOT_SAVED: &str = "language not saved";
 
 /// #109: the language whisper runs one lane in. With `[speak]` on, the You lane keeps the
 /// user's own words: under `[stt].language = "auto"` or a code (#77), whisper's translate task
@@ -4492,16 +4602,37 @@ mod tests {
         tts: &dmn_tts::MockTtsProvider,
         mode: VoiceMode,
     ) -> (Speaking, crate::speaker::Fed, Arc<AtomicBool>) {
+        let (s, played, gate, _) = speaking_saved_to(hub, llm, tts, mode, None);
+        (s, played, gate)
+    }
+
+    /// [`speaking_in`], with the picker's choice saved to `config_file` (#115) and the
+    /// languages the test speaker lists.
+    fn speaking_saved_to(
+        hub: &Arc<SessionHub>,
+        llm: &dmn_llm::MockProvider,
+        tts: &dmn_tts::MockTtsProvider,
+        mode: VoiceMode,
+        config_file: Option<PathBuf>,
+    ) -> (
+        Speaking,
+        crate::speaker::Fed,
+        Arc<AtomicBool>,
+        Vec<Language>,
+    ) {
         let (setup, played, gate) =
             crate::speaker::setup_sink(Arc::new(llm.clone()), tts.clone(), true);
+        let languages = setup.languages.clone();
         let mut s = Speaking::new(Arc::clone(hub));
         s.attach(
             Speaker::start(setup, Arc::clone(hub)).unwrap(),
             mode,
             "es".into(),
             Some("en".into()),
+            languages.clone(),
+            config_file,
         );
-        (s, played, gate)
+        (s, played, gate, languages)
     }
 
     /// The interviewer's question, then your answer in two finals.
@@ -4886,6 +5017,141 @@ mod tests {
             llm.requests().is_empty() && tts.requests().is_empty(),
             "no key spoke"
         );
+    }
+
+    /// #115, the issue's criteria at the pipeline: `attach` lists the languages for the
+    /// picker; choosing one updates the session's target (the tag, the marker row), the next
+    /// translate and synthesize requests name the new language and voice, a press in flight
+    /// keeps the old one, the choice is written to `[speak].target` in place, and a config
+    /// file that cannot be written is the 5 s notice, not a stop.
+    #[test]
+    fn choosing_a_language_speaks_it_from_the_next_press_and_saves_it_to_the_config() {
+        const GERMAN: &str = "Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen.";
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "# mine\n[speak]\nenabled = true\ntarget = \"es\"   # #109\nlanguages = [{ code = \"es\", voice = \"me\" }, { code = \"de\", voice = \"voice-de\" }, { code = \"ru\", voice = \"voice-ru\" }]\n\n[ui]\nmouse = false\n",
+        )
+        .unwrap();
+        let hub = Arc::new(SessionHub::default());
+        let llm = spanish()
+            .then(vec![
+                dmn_llm::mock::Step::Text(GERMAN.into()),
+                dmn_llm::mock::Step::Done,
+            ])
+            .with_delay(Duration::from_millis(150));
+        let tts = dmn_tts::MockTtsProvider::new();
+        let (mut s, _, _, languages) = speaking_saved_to(
+            &hub,
+            &llm,
+            &tts,
+            VoiceMode::Passthrough,
+            Some(config.clone()),
+        );
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.languages,
+            languages.iter().map(Language::listed).collect::<Vec<_>>()
+        );
+        assert_eq!(snap.languages.len(), 3);
+        assert_eq!(snap.speak_target(), Some("es"));
+
+        // Press 1 in Spanish; German is chosen while it is in flight.
+        let log = your_answer(&hub);
+        s.press(&log);
+        assert!(hub.snapshot().speech.is_some());
+        s.choose(1);
+        let snap = hub.snapshot();
+        assert_eq!(
+            snap.speak_target(),
+            Some("de"),
+            "the session changes at once"
+        );
+        assert_eq!(snap.voice.as_ref().unwrap().target, "de");
+        assert_eq!(
+            snap.transcript.last().unwrap().text,
+            "— language: → de —",
+            "the marker row"
+        );
+        assert!(screen(&snap).contains("voice: you (en)"));
+        let after = drive(&mut s, &hub, "the first press played", |s| {
+            s.speech.is_none() && !tts.requests().is_empty()
+        });
+        assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+        let said = after
+            .transcript
+            .iter()
+            .filter(|l| l.speaker == dmn_session::Speaker::You)
+            .collect::<Vec<_>>();
+        assert!(
+            said.iter().all(|l| l.spoken_as.as_deref() == Some("es")),
+            "spoken in the language it started in: {said:?}"
+        );
+        // Press 2: German, in `de`'s voice.
+        s.press(&log);
+        drive(&mut s, &hub, "the second press played", |s| {
+            s.speech.is_none() && tts.requests().len() == 2
+        });
+        let asked = llm.requests();
+        assert!(asked[0].messages[0].content.contains("into Spanish (es)"));
+        assert!(asked[1].messages[0].content.contains("into German (de)"));
+        let spoken = tts.requests();
+        assert_eq!(
+            (spoken[0].voice.as_str(), spoken[0].language.as_deref()),
+            ("me", Some("es"))
+        );
+        assert_eq!(
+            (spoken[1].voice.as_str(), spoken[1].language.as_deref()),
+            ("voice-de", Some("de"))
+        );
+        assert_eq!(spoken[1].text, GERMAN);
+        // `l` afterwards announces the new target.
+        s.toggle();
+        let snap = hub.snapshot();
+        assert!(screen(&snap).contains("voice: → de"), "{}", screen(&snap));
+
+        // Saved in place: only the target line changed.
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            text.starts_with("# mine\n[speak]\nenabled = true\ntarget = \"de\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("# #109") && text.ends_with("[ui]\nmouse = false\n"),
+            "{text}"
+        );
+        assert_eq!(Config::load(&config).unwrap().speak.target, "de");
+
+        // The same language again changes nothing; an index past the list does nothing.
+        let before = hub.snapshot();
+        s.choose(1);
+        s.choose(7);
+        assert_eq!(hub.snapshot(), before);
+
+        // A config that cannot be written: the language still changes, said for 5 s.
+        std::fs::remove_file(&config).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        s.choose(2);
+        let snap = hub.snapshot();
+        assert_eq!(snap.speak_target(), Some("ru"));
+        let notice = snap.speak_failed.clone().expect("the notice");
+        assert_eq!(notice.id, crate::speaker::STARTUP_NOTICE);
+        assert!(notice.reason.starts_with(NOT_SAVED), "{}", notice.reason);
+        assert!(screen(&snap).contains(NOT_SAVED), "{}", screen(&snap));
+        let seen = Instant::now();
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(seen, 1.0);
+        s.tick(seen, &mut echo, &clock);
+        s.tick(
+            seen + SPEAK_FAILED_FOR - Duration::from_millis(1),
+            &mut echo,
+            &clock,
+        );
+        assert!(hub.snapshot().speak_failed.is_some());
+        s.tick(seen + SPEAK_FAILED_FOR, &mut echo, &clock);
+        assert_eq!(hub.snapshot().speak_failed, None, "taken down after 5 s");
+        s.finish();
     }
 
     /// The issue's criterion: two finalized You turns are two translate requests and two
@@ -5305,6 +5571,7 @@ mod tests {
         edit(&mut cfg);
         // No pass-through: a test never captures the real microphone.
         let setup = crate::speaker::setup(&cfg, &paths, None).unwrap();
+        let languages = setup.languages.clone();
         let hub = Arc::new(SessionHub::default());
         let mut s = Speaking::new(Arc::clone(&hub));
         s.attach(
@@ -5312,6 +5579,8 @@ mod tests {
             VoiceMode::Passthrough,
             target.into(),
             Some("en".into()),
+            languages,
+            None,
         );
 
         // The node is there before any press, for the call (here pw-record) to select.
@@ -5523,10 +5792,13 @@ mod tests {
         let controls = pipeline.controls();
         let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
         let (setup, played) = crate::speaker::setup_with(llm.clone(), tts.clone(), true);
+        let languages = setup.languages.clone();
         pipeline.attach_speaker(
             Speaker::start(setup, Arc::clone(&hub)).unwrap(),
             VoiceMode::Passthrough,
             "es".into(),
+            languages,
+            None,
         );
         let worker = std::thread::spawn(move || {
             pipeline.run(&mut Quiet, true);

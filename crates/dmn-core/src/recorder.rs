@@ -462,6 +462,11 @@ impl StoreWriter {
             | Action::SpeakDone { .. }
             | Action::SpeakFailed { .. }
             | Action::SpeakNoticeExpired { .. }
+            // #115: the language list, the picker and the chosen language are screen and
+            // pipeline state; the choice is saved to the config file, not the store.
+            | Action::SpeakLanguages { .. }
+            | Action::Picker { .. }
+            | Action::SpeakTarget { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

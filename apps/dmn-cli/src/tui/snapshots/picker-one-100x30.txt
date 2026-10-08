@@ -1,0 +1,30 @@
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+                        ┌ LANGUAGE ───────────────────────────────────────┐
+                        │ ▸ de   voice-de   ← now                         │
+Interviewer Let's move o│ one language enrolled; add another with         │yments migration.
+You         There were f│ dmn speak enroll --wav <clip> --language <code> │a product manager and me
+            leading the │ ↑↓ move · ⏎ choose · esc close                  │
+Interviewer How long did└─────────────────────────────────────────────────┘
+You         About four months, with the last three weeks running both systems side by side and
+            comparing every ledger entry.
+Interviewer And did anything go wrong on the day?
+You         One batch job still pointed at the old database, so we paused it and replayed its
+            writes.
+Interviewer Good. Let's talk about how you would test that.
+Interviewer And what about the▍
+— translate mode on: → de —
+You → de    I'd start with a token bucket per API key and keep the counters in regional Redis.
+            » Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und die Zähler in einem
+            regionalen Redis halten.
+ voice: → de  ● mic  ● system  ● model  es→en         assist off · C-S-a on · t speak · l own voice

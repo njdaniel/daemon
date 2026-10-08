@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-pub use dmn_session::{CodingSolutions, VoiceMode};
+pub use dmn_session::{CodingSolutions, SpeakLanguage, VoiceMode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -514,25 +514,81 @@ pub struct Speak {
     /// own voice, live; `t` speaks one turn translated over it) or `translate` (every turn you
     /// finish is translated into `target` and spoken instead). `l` switches during the run.
     pub mode: VoiceMode,
+    /// #115: the languages the picker offers in `dmn run`, each with the voice enrolled for it
+    /// (`languages = [{ code = "de", voice = "voice-de" }, ...]`; `dmn speak enroll --language
+    /// de` adds or updates an entry). With the list present `target` must be one of its codes
+    /// and names the language at start; left out, `target` and the single `voice_ref` are the
+    /// one language, as before #115.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "language_list"
+    )]
+    pub languages: Vec<SpeakLanguage>,
 }
 
 /// `[speak].temperature`'s default (#113).
 pub const SPEAK_TEMPERATURE: f64 = 0.6;
 
-/// `[speak].target`: "" (unset) or a code of the shape `[stt].language` takes, two or three
-/// lowercase letters. Whether whisper and the TTS server know it is checked when `dmn run`
+/// The shape `[speak].target` and a `languages` code take, as `[stt].language` does: two or
+/// three lowercase letters. Whether whisper and the TTS server know it is checked when `dmn run`
 /// starts.
+pub fn is_language_code(code: &str) -> bool {
+    (2..=3).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// `[speak].target`: "" (unset) or a code of the shape [`is_language_code`] takes.
 fn language_code<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let raw = String::deserialize(d)?;
     let code = raw.trim();
-    if code.is_empty()
-        || ((2..=3).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase()))
-    {
+    if code.is_empty() || is_language_code(code) {
         return Ok(code.to_owned());
     }
     Err(serde::de::Error::custom(format!(
         "[speak].target {raw:?} is not a two- or three-letter language code such as \"es\""
     )))
+}
+
+/// `[speak].languages` (#115): every code of the shape [`is_language_code`] takes, every voice
+/// a name, no code twice.
+fn language_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<SpeakLanguage>, D::Error> {
+    let raw: Vec<SpeakLanguage> = Vec::deserialize(d)?;
+    let mut list = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let code = entry.code.trim();
+        if !is_language_code(code) {
+            return Err(serde::de::Error::custom(format!(
+                "[speak].languages: code {:?} is not a two- or three-letter language code such as \"es\"",
+                entry.code
+            )));
+        }
+        let voice = entry.voice.trim();
+        if voice.is_empty() {
+            return Err(serde::de::Error::custom(format!(
+                "[speak].languages: the entry for {code:?} needs `voice`, the name of the voice enrolled for it (dmn speak enroll --wav <clip> --language {code})"
+            )));
+        }
+        if list.iter().any(|l: &SpeakLanguage| l.code == code) {
+            return Err(serde::de::Error::custom(format!(
+                "[speak].languages lists {code:?} twice; one voice per language"
+            )));
+        }
+        list.push(SpeakLanguage {
+            code: code.to_owned(),
+            voice: voice.to_owned(),
+        });
+    }
+    Ok(list)
+}
+
+/// The voice name the TTS server knows a `voice_ref` clip by: its file stem (#107: the
+/// clip is stored as `<data dir>/<name>.wav`), `voice` when the path has none.
+pub fn voice_ref_name(voice_ref: &str) -> String {
+    Path::new(voice_ref)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "voice".to_owned())
 }
 
 impl Speak {
@@ -541,6 +597,30 @@ impl Speak {
     /// SPEC § Privacy promises they do not.
     pub fn is_local(&self) -> bool {
         is_loopback_url(self.tts_url.trim())
+    }
+
+    /// #115: the languages a run can speak, each with its voice: `languages` when the list is
+    /// present, else the one `target` + `voice_ref` pair (the shape before #115); empty while
+    /// `target` is unset.
+    pub fn voices(&self) -> Vec<SpeakLanguage> {
+        if !self.languages.is_empty() {
+            return self.languages.clone();
+        }
+        if self.target.is_empty() {
+            return Vec::new();
+        }
+        vec![SpeakLanguage {
+            code: self.target.clone(),
+            voice: voice_ref_name(&self.voice_ref),
+        }]
+    }
+
+    /// #115: the voice enrolled for `code`, from [`Speak::voices`].
+    pub fn voice_for(&self, code: &str) -> Option<String> {
+        self.voices()
+            .into_iter()
+            .find(|l| l.code == code)
+            .map(|l| l.voice)
     }
 }
 
@@ -557,6 +637,7 @@ impl Default for Speak {
             cfg_weight: None,
             exaggeration: None,
             mode: VoiceMode::Passthrough,
+            languages: Vec::new(),
         }
     }
 }
@@ -691,6 +772,7 @@ temperature = 0.6                    # the TTS model's sampling temperature (ser
 # cfg_weight = 0.5                   # the TTS model's pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # the TTS model's emotion intensity, 0.25-2.0; left out: the server's
 mode = "passthrough"                 # dmn run: passthrough = your own voice live into dmn-voice, `t` speaks one turn translated; translate = every turn you finish goes out translated (`l` toggles, #114)
+# languages = [{ code = "de", voice = "voice-de" }, { code = "es", voice = "voice-es" }]   # dmn run: the languages `v` picks between, each with its enrolled voice (`enroll --language de` adds one); target must be one of them (#115)
 
 [ui]
 always_on_top = true
@@ -722,7 +804,7 @@ impl Config {
 
     /// Keys that are each valid but cannot go together. #109: `[speak].enabled = true` needs
     /// `target`, the language `t` speaks; it has no default, since it must be the language the
-    /// voice was enrolled with.
+    /// voice was enrolled with. #115: with `languages` listed, `target` is one of its codes.
     pub fn check(&self) -> Result<(), String> {
         if self.speak.enabled && self.speak.target.is_empty() {
             return Err(
@@ -731,6 +813,23 @@ impl Config {
                  (`dmn speak enroll --language es`)"
                     .into(),
             );
+        }
+        let target = &self.speak.target;
+        if !target.is_empty()
+            && !self.speak.languages.is_empty()
+            && !self.speak.languages.iter().any(|l| &l.code == target)
+        {
+            let listed: Vec<&str> = self
+                .speak
+                .languages
+                .iter()
+                .map(|l| l.code.as_str())
+                .collect();
+            return Err(format!(
+                "[speak].target = {target:?} is not one of [speak].languages ({}): set target to \
+                 one of them, or enroll a voice for it (dmn speak enroll --wav <clip> --language {target})",
+                listed.join(", ")
+            ));
         }
         // #113: the TTS server's own ranges; outside them it refuses every speech request.
         let s = &self.speak;
@@ -852,6 +951,65 @@ impl Config {
     /// write goes through a sibling temp file and a rename, keeping the file's permissions, so
     /// an interrupted enroll never leaves a truncated config.
     pub fn write_voice_ref(path: &Path, voice_ref: &str) -> Result<(), ConfigError> {
+        let value = toml::Value::String(voice_ref.to_owned()).to_string();
+        Self::edit_speak(
+            path,
+            |_| vec![("voice_ref", value.clone())],
+            |c| c.speak.voice_ref == voice_ref,
+        )
+    }
+
+    /// #115: set `[speak].target` to `code` in the config file at `path`, the same in-place
+    /// edit as [`Config::write_voice_ref`] (the picker saves its choice here, so the next run
+    /// starts with it).
+    pub fn write_speak_target(path: &Path, code: &str) -> Result<(), ConfigError> {
+        let value = toml::Value::String(code.to_owned()).to_string();
+        Self::edit_speak(
+            path,
+            |_| vec![("target", value.clone())],
+            |c| c.speak.target == code,
+        )
+    }
+
+    /// #115: add `{ code, voice }` to `[speak].languages` in the config file at `path`, or
+    /// update the entry for `code`, with the same in-place edit as [`Config::write_voice_ref`]
+    /// (`dmn speak enroll --language`). A file with no list yet gets one that also holds its
+    /// current `target` + `voice_ref` pair, so the target stays valid; a `target` still unset
+    /// is set to `code`, so turning `[speak]` on needs nothing more.
+    pub fn write_speak_language(path: &Path, code: &str, voice: &str) -> Result<(), ConfigError> {
+        let wanted = |current: &Config| -> Vec<SpeakLanguage> {
+            let mut list = current.speak.voices();
+            match list.iter_mut().find(|l| l.code == code) {
+                Some(entry) => entry.voice = voice.to_owned(),
+                None => list.push(SpeakLanguage {
+                    code: code.to_owned(),
+                    voice: voice.to_owned(),
+                }),
+            }
+            list
+        };
+        Self::edit_speak(
+            path,
+            |current| {
+                let list = wanted(current);
+                let mut edits = vec![("languages", inline_languages(&list))];
+                if current.speak.target.is_empty() {
+                    edits.push(("target", toml::Value::String(code.to_owned()).to_string()));
+                }
+                edits
+            },
+            |c| c.speak.languages == wanted(c) && !c.speak.target.is_empty(),
+        )
+    }
+
+    /// The in-place edit behind the three writers above: `edits` gives the `[speak]` keys to
+    /// set (each as its TOML value text) from the file as it is now, and `check` says whether
+    /// the edited file parses to what was meant.
+    fn edit_speak(
+        path: &Path,
+        edits: impl Fn(&Config) -> Vec<(&'static str, String)>,
+        check: impl Fn(&Config) -> bool,
+    ) -> Result<(), ConfigError> {
         let shown = path.display().to_string();
         if !path.exists() {
             Self::write_template(path, false)?;
@@ -864,13 +1022,19 @@ impl Config {
             path: shown.clone(),
             source,
         })?;
-        let edited = set_voice_ref(&text, voice_ref);
+        let current = Self::from_toml(&text, &shown)?;
+        let mut edited = text.clone();
+        let mut keys = Vec::new();
+        for (key, value) in edits(&current) {
+            edited = set_speak_key(&edited, key, &value);
+            keys.push(format!("{key} = {value}"));
+        }
         let parsed = Self::from_toml(&edited, &shown)?;
-        if parsed.speak.voice_ref != voice_ref {
+        if !check(&parsed) {
             return Err(ConfigError::Edit(format!(
-                "{shown}: cannot set [speak].voice_ref in place (is it a dotted key or an inline \
-                 table?); write voice_ref = {} under [speak] by hand",
-                toml::Value::String(voice_ref.to_owned())
+                "{shown}: cannot set [speak] keys in place (is one a dotted key or an inline \
+                 table?); write {} under [speak] by hand",
+                keys.join(" and ")
             )));
         }
         let write_err = |source| ConfigError::Write {
@@ -967,22 +1131,54 @@ fn is_loopback_url(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// `text` with `[speak].voice_ref` set to `value`: replace the key where it stands (keeping an
-/// inline comment), insert it under an existing `[speak]` header, or append a new section.
-/// The value is quoted through `toml::Value` so any path characters are escaped correctly.
-fn set_voice_ref(text: &str, value: &str) -> String {
-    let quoted = toml::Value::String(value.to_owned()).to_string();
+/// #115: `[speak].languages` as one inline line, `[{ code = "de", voice = "voice-de" }, ...]`,
+/// each string quoted through `toml::Value` so any name is escaped correctly.
+fn inline_languages(list: &[SpeakLanguage]) -> String {
+    let entries: Vec<String> = list
+        .iter()
+        .map(|l| {
+            format!(
+                "{{ code = {}, voice = {} }}",
+                toml::Value::String(l.code.clone()),
+                toml::Value::String(l.voice.clone())
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
+}
+
+/// `text` with `[speak].<key>` set to `quoted` (a TOML value as text): replace the key where it
+/// stands (keeping an inline comment, and uncommenting a template line `# key = …` that stands
+/// in for it), insert it under an existing `[speak]` header, or append a new section.
+fn set_speak_key(text: &str, key: &str, quoted: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_speak = false;
     let mut section_seen = false;
     let mut written = false;
     // Blank lines trailing a section are held back so the key lands before them, not after.
     let mut blanks: Vec<String> = Vec::new();
+    // `key = value`, or the template's commented-out `# key = value` standing in for it; the
+    // commented line is only used when the section has no real one.
+    let is_key = |candidate: &str| {
+        candidate
+            .strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    };
+    let has_real_key = {
+        let mut in_speak = false;
+        text.lines().map(str::trim_start).any(|trimmed| {
+            if trimmed.starts_with('[') {
+                in_speak = split_comment(trimmed).0.trim_end() == "[speak]";
+                return false;
+            }
+            in_speak && is_key(trimmed)
+        })
+    };
     for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') {
             if in_speak && !written {
-                out.push(format!("voice_ref = {quoted}"));
+                out.push(format!("{key} = {quoted}"));
                 written = true;
             }
             out.append(&mut blanks);
@@ -996,12 +1192,16 @@ fn set_voice_ref(text: &str, value: &str) -> String {
             continue;
         }
         out.append(&mut blanks);
-        let is_voice_ref = trimmed
-            .strip_prefix("voice_ref")
-            .is_some_and(|rest| rest.trim_start().starts_with('='));
-        if in_speak && is_voice_ref {
-            let (_, comment) = split_comment(line);
-            let mut new_line = format!("voice_ref = {quoted}");
+        let commented_out = !has_real_key
+            && trimmed
+                .strip_prefix('#')
+                .map(str::trim_start)
+                .is_some_and(is_key);
+        if in_speak && !written && (is_key(trimmed) || commented_out) {
+            // A commented template line's own comment is what follows its value.
+            let code = if commented_out { &trimmed[1..] } else { line };
+            let (_, comment) = split_comment(code);
+            let mut new_line = format!("{key} = {quoted}");
             if !comment.is_empty() {
                 // The template's comment column, and at least one space before the `#`.
                 new_line.push(' ');
@@ -1017,13 +1217,13 @@ fn set_voice_ref(text: &str, value: &str) -> String {
         out.push(line.to_owned());
     }
     if in_speak && !written {
-        out.push(format!("voice_ref = {quoted}"));
+        out.push(format!("{key} = {quoted}"));
     }
     out.append(&mut blanks);
     if !section_seen {
         out.push(String::new());
         out.push("[speak]".to_owned());
-        out.push(format!("voice_ref = {quoted}"));
+        out.push(format!("{key} = {quoted}"));
     }
     let mut joined = out.join("\n");
     if text.ends_with('\n') {
@@ -1109,6 +1309,7 @@ temperature = 0.6                    # TTS sampling temperature (#113); lower = 
 # cfg_weight = 0.5                   # TTS pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
 mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114)
+# languages = [{ code = "de", voice = "voice-de" }]   # `v` picks between these (#115); `enroll --language` adds one; target must be one
 
 [ui]
 always_on_top = true
@@ -1489,6 +1690,13 @@ keep_transcripts = true
 
     #[test]
     fn set_voice_ref_appends_a_section_when_there_is_none_and_escapes_values() {
+        let set_voice_ref = |text: &str, value: &str| {
+            set_speak_key(
+                text,
+                "voice_ref",
+                &toml::Value::String(value.to_owned()).to_string(),
+            )
+        };
         let edited = set_voice_ref("[llm]\nmodel = \"m\"\n", "/tmp/we\"ird.wav");
         let cfg = Config::from_toml(&edited, "edited").unwrap();
         assert_eq!(cfg.speak.voice_ref, "/tmp/we\"ird.wav");
@@ -1577,6 +1785,248 @@ mouse = false
             "{after}"
         );
         assert!(Config::load(&path).unwrap().lookup.enabled);
+    }
+
+    // --- #115: [speak].languages, the picker's list ------------------------------------------
+
+    fn lang(code: &str, voice: &str) -> SpeakLanguage {
+        SpeakLanguage {
+            code: code.into(),
+            voice: voice.into(),
+        }
+    }
+
+    /// #115: the list parses from inline tables and from `[[speak.languages]]` tables, round
+    /// trips, and is left out of the TOML while empty; a bad code, a missing voice or a code
+    /// listed twice is a config error naming it.
+    #[test]
+    fn speak_languages_parse_and_round_trip() {
+        assert!(Config::default().speak.languages.is_empty());
+        assert!(!Config::default().to_toml().unwrap().contains("languages"));
+        let c = Config::from_toml(
+            "[speak]\ntarget = \"es\"\nlanguages = [{ code = \"de\", voice = \"voice-de\" }, { code = \" es \", voice = \"me\" }]\n",
+            "inline",
+        )
+        .unwrap();
+        assert_eq!(
+            c.speak.languages,
+            [lang("de", "voice-de"), lang("es", "me")],
+            "codes are trimmed"
+        );
+        assert_eq!(
+            c.speak.voices(),
+            c.speak.languages,
+            "the list is the voices"
+        );
+        assert_eq!(c.speak.voice_for("es").as_deref(), Some("me"));
+        assert_eq!(c.speak.voice_for("ru"), None);
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("[[speak.languages]]"), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+        let tables = Config::from_toml(
+            "[speak]\ntarget = \"de\"\n[[speak.languages]]\ncode = \"de\"\nvoice = \"voice-de\"\n",
+            "tables",
+        )
+        .unwrap();
+        assert_eq!(tables.speak.languages, [lang("de", "voice-de")]);
+
+        for (bad, names) in [
+            (
+                "languages = [{ code = \"German\", voice = \"v\" }]",
+                "code \"German\" is not",
+            ),
+            ("languages = [{ code = \"de\" }]", "missing field `voice`"),
+            (
+                "languages = [{ code = \"de\", voice = \" \" }]",
+                "the entry for \"de\" needs `voice`",
+            ),
+            (
+                "languages = [{ code = \"de\", voice = \"a\" }, { code = \"de\", voice = \"b\" }]",
+                "lists \"de\" twice",
+            ),
+            (
+                "languages = [{ code = \"de\", voice = \"v\", clip = \"x\" }]",
+                "unknown field `clip`",
+            ),
+        ] {
+            let err = Config::from_toml(&format!("[speak]\n{bad}\n"), "bad")
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains(names), "{bad}: {err}");
+        }
+    }
+
+    /// #115: with the list present `target` is one of its codes; the error names both. Left
+    /// out, `target` + `voice_ref` are the one language, as the owner's config has them.
+    #[test]
+    fn speak_target_must_be_one_of_the_listed_languages() {
+        let err = Config::from_toml(
+            "[speak]\ntarget = \"ru\"\nlanguages = [{ code = \"de\", voice = \"voice-de\" }, { code = \"es\", voice = \"voice-es\" }]\n",
+            "ru",
+        )
+        .expect_err("ru is not listed")
+        .to_string();
+        assert!(
+            err.contains("[speak].target = \"ru\" is not one of [speak].languages (de, es)"),
+            "{err}"
+        );
+        assert!(
+            err.contains("dmn speak enroll --wav <clip> --language ru"),
+            "{err}"
+        );
+        // An unset target with a list is fine while speak is off (the enabled check names it).
+        let off = Config::from_toml(
+            "[speak]\nlanguages = [{ code = \"de\", voice = \"voice-de\" }]\n",
+            "off",
+        )
+        .unwrap();
+        assert_eq!(off.speak.voices(), [lang("de", "voice-de")]);
+        // The owner's shape: no list, the voice from `voice_ref`'s file stem.
+        let owner = Config::from_toml(
+            "[speak]\nenabled = true\ntarget = \"ru\"\nvoice_ref = \"/home/u/.local/share/dmn/voice-ru.wav\"\nmodel = \"llama3.1:8b\"\ntemperature = 0.6\n",
+            "owner",
+        )
+        .unwrap();
+        assert!(owner.speak.languages.is_empty());
+        assert_eq!(owner.speak.voices(), [lang("ru", "voice-ru")]);
+        assert_eq!(owner.speak.voice_for("ru").as_deref(), Some("voice-ru"));
+        assert_eq!(voice_ref_name(""), "voice");
+        assert_eq!(voice_ref_name("/x/narrator.wav"), "narrator");
+        let unset = Config::from_toml("[speak]\nvoice_ref = \"/v.wav\"\n", "unset").unwrap();
+        assert!(unset.speak.voices().is_empty(), "no target, no language");
+    }
+
+    /// #115: `dmn speak enroll --language` adds or updates one entry in place, the user's
+    /// comments and other sections untouched; a file with no list gets one holding the
+    /// current `target` + `voice_ref` too, so `target` stays valid.
+    #[test]
+    fn write_speak_language_adds_or_updates_one_entry_and_changes_nothing_else() {
+        let user = "\
+# my dmn config; keep these notes
+[llm]
+model = \"qwen3.6:35b-a3b\"   # measured
+num_ctx = 8192
+
+[speak]   # added by hand
+enabled = true
+target = \"ru\"
+voice_ref = \"/home/u/.local/share/dmn/voice-ru.wav\"   # set by dmn speak enroll
+model = \"llama3.1:8b\"
+
+[ui]
+mouse = false
+";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, user).unwrap();
+        Config::write_speak_language(&path, "de", "voice-de").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let added: Vec<&str> = after.lines().filter(|l| !user.contains(l)).collect();
+        assert_eq!(
+            added,
+            [
+                "languages = [{ code = \"ru\", voice = \"voice-ru\" }, { code = \"de\", voice = \"voice-de\" }]"
+            ],
+            "{after}"
+        );
+        assert_eq!(after.lines().count(), user.lines().count() + 1);
+        assert!(
+            after.contains("model = \"llama3.1:8b\"\nlanguages = ["),
+            "at the end of the section body:\n{after}"
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.speak.target, "ru", "the target is kept");
+        assert_eq!(
+            cfg.speak.languages,
+            [lang("ru", "voice-ru"), lang("de", "voice-de")]
+        );
+        assert_eq!(cfg.llm.num_ctx, 8192);
+        assert!(!cfg.ui.mouse);
+
+        // A second language appends; the same language again updates its voice in place.
+        Config::write_speak_language(&path, "es", "voice-es").unwrap();
+        Config::write_speak_language(&path, "de", "narrator").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after.matches("languages").count(), 1, "{after}");
+        assert_eq!(
+            Config::load(&path).unwrap().speak.languages,
+            [
+                lang("ru", "voice-ru"),
+                lang("de", "narrator"),
+                lang("es", "voice-es")
+            ]
+        );
+        assert_eq!(after.lines().count(), user.lines().count() + 1);
+
+        // From the template: the commented `# languages = …` line is the one that is set, its
+        // comment kept, and an unset target takes the enrolled language.
+        let path = dir.path().join("fresh.toml");
+        Config::write_template(&path, false).unwrap();
+        Config::write_speak_language(&path, "es", "voice-es").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("\nlanguages = [{ code = \"es\", voice = \"voice-es\" }] # dmn run: the languages `v` picks"),
+            "{after}"
+        );
+        assert!(!after.contains("# languages ="), "{after}");
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.speak.target, "es");
+        assert_eq!(cfg.speak.languages, [lang("es", "voice-es")]);
+        assert_eq!(cfg.llm, Config::default().llm);
+    }
+
+    /// #115: the picker's choice is written to `target` in place; a file that cannot be
+    /// written is an error, not a panic (the pipeline shows it as a 5 s notice).
+    #[test]
+    fn write_speak_target_sets_the_one_line_and_a_read_only_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let user = "[speak]\nenabled = true\ntarget = \"de\"   # #109\nlanguages = [{ code = \"de\", voice = \"voice-de\" }, { code = \"es\", voice = \"voice-es\" }]\n\n[ui]\nmouse = false\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, user).unwrap();
+        Config::write_speak_target(&path, "es").unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let changed: Vec<(&str, &str)> = user
+            .lines()
+            .zip(after.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        assert_eq!(changed.len(), 1, "{after}");
+        assert_eq!(changed[0].0, "target = \"de\"   # #109");
+        let (code, comment) = split_comment(changed[0].1);
+        assert_eq!((code.trim_end(), comment), ("target = \"es\"", "# #109"));
+        assert_eq!(after.lines().count(), user.lines().count());
+        assert_eq!(Config::load(&path).unwrap().speak.target, "es");
+        // A code the list does not have is refused before anything is written.
+        let err = Config::write_speak_target(&path, "ru").unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+
+        // Read-only directory: the temp file cannot be made.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = Config::write_speak_target(&path, "de");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if nix_is_root() {
+            return;
+        }
+        let err = result.expect_err("a read-only config dir");
+        assert!(matches!(err, ConfigError::Write { .. }), "{err}");
+        assert!(err.to_string().contains("cannot write"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            after,
+            "nothing changed"
+        );
+    }
+
+    /// Root ignores file permissions, so the read-only check cannot run as root (CI does not).
+    fn nix_is_root() -> bool {
+        std::fs::metadata("/proc/self")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.uid() == 0
+            })
+            .unwrap_or(false)
     }
 
     /// A dotfiles-managed config is a symlink: the file it points to is edited, the link stays,

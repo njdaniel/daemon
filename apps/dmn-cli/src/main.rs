@@ -344,13 +344,15 @@ enum Command {
 #[derive(Subcommand, Debug)]
 enum SpeakAction {
     /// Enroll a reference clip: validate it, register it with the TTS server, store a copy
-    /// under the data dir and record it as [speak].voice_ref
+    /// under the data dir and record it as [speak].voice_ref (and, with --language, as that
+    /// language's entry in [speak].languages, the list `v` picks from in dmn run)
     Enroll {
         /// The reference clip: a WAV of your voice, at least 6 s, mono 16 kHz+ preferred
         #[arg(long)]
         wav: std::path::PathBuf,
         /// Voice name on the server and for the stored clip (letters, digits, - and _);
-        /// default "voice". Enrolling a name again replaces that voice
+        /// default "voice", or "voice-<code>" with --language. Enrolling a name again
+        /// replaces that voice
         #[arg(long)]
         name: Option<String>,
         /// The language this voice will speak (en, es, fr, ...); default: the server's (en).

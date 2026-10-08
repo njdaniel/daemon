@@ -7,7 +7,7 @@
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
 //! what the asking lane last said (the interviewer, by default) when the detector missed the
 //! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
-//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `l` switch `dmn-voice` between your own voice live and every turn translated (#114), `q` (or Ctrl-C) quit. Nothing
+//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `l` switch `dmn-voice` between your own voice live and every turn translated (#114), `v` open the language picker, where `↑ ↓` move, Enter chooses the language from the next utterance on and Esc closes (#115), `q` (or Ctrl-C) quit. Nothing
 //! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal, mouse capture included, is restored on the
 //! way out, on an error, and (through ratatui's panic hook and ours) on a panic.
@@ -29,7 +29,7 @@ use std::time::Duration;
 use dmn_audio::CaptureTarget;
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths};
-use dmn_session::{CodingSolutions, Section, Session};
+use dmn_session::{CodingSolutions, PickerOp, Section, Session};
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -119,6 +119,14 @@ pub enum Key {
     /// finish, translated (translate mode). `l` for language: the letters a speech key would
     /// want (`v`oice, `t`ranslate) are either `t`'s or too close to `q`; `l` was free.
     Voice,
+    /// `v` (#115): open the language picker, an overlay listing `[speak].languages` with each
+    /// voice; `↑ ↓` move, Enter chooses, Esc (or `v` again) closes. `v` for voice: the picker
+    /// lists the enrolled voices by language, and `v` was free (#114 passed it over for the
+    /// mode toggle, which must not be hit blind; the picker changes nothing until Enter, and
+    /// Enter on the entry it opens on, the current one, changes nothing either).
+    Language,
+    /// Esc: close the picker while it is open (#115); otherwise quit, as it always has.
+    Escape,
     Quit,
 }
 
@@ -143,6 +151,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('w' | 'W') => Some(Key::Swap),
         KeyCode::Char('t' | 'T') => Some(Key::Speak),
         KeyCode::Char('l' | 'L') => Some(Key::Voice),
+        KeyCode::Char('v' | 'V') => Some(Key::Language),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -155,14 +164,33 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Down => Some(Key::Scroll(tui::Scroll::Down)),
         KeyCode::PageUp => Some(Key::Scroll(tui::Scroll::PageUp)),
         KeyCode::PageDown => Some(Key::Scroll(tui::Scroll::PageDown)),
-        KeyCode::Char('q' | 'Q') | KeyCode::Esc => Some(Key::Quit),
+        KeyCode::Char('q' | 'Q') => Some(Key::Quit),
+        KeyCode::Esc => Some(Key::Escape),
         _ => None,
     }
 }
 
 /// Act on one key on a pane of `pane`, which decides how far a scroll key goes (#94). Returns
 /// `true` when the TUI should close.
+///
+/// While the language picker is open (#115) the keys are its own: `↑ ↓` move its cursor,
+/// Enter chooses, Esc and `v` close it, `q` (and Ctrl+C) still quit, and every other key does
+/// nothing, so a stray press cannot pin, ask or speak behind the overlay.
 pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
+    if controls.picker_open() {
+        match k {
+            Key::Scroll(tui::Scroll::Up) => controls.picker(PickerOp::Up),
+            Key::Scroll(tui::Scroll::Down) => controls.picker(PickerOp::Down),
+            Key::Ask => controls.choose_language(),
+            Key::Escape | Key::Language => controls.picker(PickerOp::Close),
+            Key::Quit => {
+                controls.quit();
+                return true;
+            }
+            _ => {}
+        }
+        return false;
+    }
     match k {
         Key::Pin => controls.toggle_pin(),
         Key::Regenerate => controls.regenerate(),
@@ -177,7 +205,8 @@ pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
         Key::Scroll(by) => controls.scroll(|session| tui::scroll_to(session, pane, by)),
         Key::Speak => controls.speak(),
         Key::Voice => controls.toggle_voice(),
-        Key::Quit => {
+        Key::Language => controls.picker(PickerOp::Open),
+        Key::Escape | Key::Quit => {
             controls.quit();
             return true;
         }
@@ -188,8 +217,12 @@ pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
 /// Act on one mouse event on a pane of `pane` (#95): the wheel scrolls the open section by
 /// [`tui::Scroll::WheelUp`] / `WheelDown` when the pointer is on the left column, a left press on
 /// a section row does what its number key does. Everything else (drag, other buttons, hover,
-/// clicks elsewhere) does nothing. Returns whether it acted, so the screen redraws.
+/// clicks elsewhere) does nothing. Returns whether it acted, so the screen redraws. While the
+/// language picker is open (#115) the mouse does nothing: the overlay has no click targets.
 pub fn mouse(ev: MouseEvent, controls: &Controls, pane: Rect) -> bool {
+    if controls.picker_open() {
+        return false;
+    }
     let (x, y) = (ev.column, ev.row);
     match ev.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -297,10 +330,14 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         },
     )?;
     if let Some(setup) = speak {
+        // #115: the picker's list, and where its choice is saved.
+        let languages = setup.languages.clone();
         pipeline.attach_speaker(
             Speaker::start(setup, pipeline.hub())?,
             cfg.speak.mode,
             cfg.speak.target.clone(),
+            languages,
+            Some(paths.config_file.clone()),
         );
     }
     let audio = pipeline.info().audio;
@@ -587,7 +624,7 @@ fn headless(
 mod tests {
     use super::*;
     use crate::pipeline::Command;
-    use dmn_session::{Action, Health};
+    use dmn_session::{Action, Dot, Health};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -655,10 +692,14 @@ mod tests {
             assert_eq!(key(ev), Some(Key::Assist), "{mods:?} {code}");
         }
         assert_eq!(key(press_key('q')), Some(Key::Quit));
+        // #115: Esc is its own key, so it can close the picker; with it closed it quits.
         assert_eq!(
             key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            Some(Key::Quit)
+            Some(Key::Escape)
         );
+        let (controls, _) = Controls::for_test();
+        assert!(press(Key::Escape, &controls), "Esc quits with no picker");
+        assert!(controls.is_stopped());
         assert_eq!(
             key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Key::Quit)
@@ -816,6 +857,81 @@ mod tests {
         assert!(!press(key(press_key('l')).unwrap(), &controls));
         assert_eq!(commands.try_recv(), Ok(crate::pipeline::Command::Voice));
         assert_eq!(controls.hub().snapshot(), before);
+    }
+
+    /// #115: `v` opens the picker (the reducer owns it, so the session changes at once); while
+    /// it is open `↑ ↓` move, Enter closes it and sends the choice to the pipeline thread, Esc
+    /// and `v` close it with nothing sent, `q` still quits, and the other keys do nothing.
+    #[test]
+    fn v_opens_the_picker_whose_keys_move_choose_and_close_it() {
+        assert_eq!(key(press_key('v')), Some(Key::Language));
+        assert_eq!(key(press_key('V')), Some(Key::Language));
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        // Nothing listed: the key does nothing.
+        press(Key::Language, &controls);
+        assert_eq!(hub.snapshot().picker, None);
+        hub.dispatch(Action::SpeakEnabled { enabled: true });
+        hub.dispatch(Action::Voice {
+            mode: dmn_session::VoiceMode::Translate,
+            target: "de".into(),
+            own: Some("en".into()),
+        });
+        hub.dispatch(Action::SpeakLanguages {
+            languages: ["de", "es", "ru"]
+                .into_iter()
+                .map(|code| dmn_session::SpeakLanguage {
+                    code: code.into(),
+                    voice: format!("voice-{code}"),
+                })
+                .collect(),
+        });
+        hub.dispatch(Action::Status {
+            dot: Dot::Mic,
+            health: Health::Ok,
+        });
+        press(Key::Language, &controls);
+        assert_eq!(
+            hub.snapshot().picker,
+            Some(dmn_session::Picker { cursor: 0 }),
+            "open on the current language"
+        );
+        assert!(controls.picker_open());
+        let shown = screen(&hub.snapshot());
+        assert!(
+            shown.contains("LANGUAGE") && shown.contains("voice-es"),
+            "{shown}"
+        );
+        // The arrows move the cursor, not a section.
+        press(named(KeyCode::Down), &controls);
+        press(named(KeyCode::Down), &controls);
+        press(named(KeyCode::Up), &controls);
+        assert_eq!(hub.snapshot().picker.map(|p| p.cursor), Some(1));
+        // Other keys are inert behind the overlay.
+        for k in [Key::Pin, Key::Speak, Key::Voice, Key::Regenerate, Key::Mute] {
+            assert!(!press(k, &controls), "{k:?}");
+        }
+        assert_eq!(commands.try_recv().ok(), None, "nothing sent");
+        assert!(!controls.is_muted());
+        // Esc closes with nothing chosen; `v` again does too.
+        assert!(!press(Key::Escape, &controls), "Esc does not quit the run");
+        assert_eq!(hub.snapshot().picker, None);
+        assert!(!controls.is_stopped());
+        press(Key::Language, &controls);
+        press(Key::Language, &controls);
+        assert_eq!(hub.snapshot().picker, None);
+        assert_eq!(commands.try_recv().ok(), None);
+        // Enter chooses: the overlay closes at once and the pipeline thread is told which.
+        press(Key::Language, &controls);
+        press(named(KeyCode::Down), &controls);
+        press(named(KeyCode::Down), &controls);
+        assert!(!press(named(KeyCode::Enter), &controls));
+        assert_eq!(hub.snapshot().picker, None);
+        assert_eq!(commands.try_recv(), Ok(Command::SpeakTarget { index: 2 }));
+        // `q` quits even with the picker open.
+        press(Key::Language, &controls);
+        assert!(press(Key::Quit, &controls));
+        assert!(controls.is_stopped());
     }
 
     #[test]
