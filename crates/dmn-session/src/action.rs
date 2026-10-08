@@ -84,6 +84,7 @@ impl VoiceMode {
 /// name of the voice enrolled for it in the TTS server's library (`[speak].languages`, one
 /// entry per `dmn speak enroll --language`). The picker lists them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpeakLanguage {
     /// The language code (`de`), as `[speak].target` spells it.
     pub code: String,
