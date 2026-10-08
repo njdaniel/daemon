@@ -510,6 +510,104 @@ fn searxng(at: &str, h: &dyn Http) -> Check {
     }
 }
 
+/// `[speak]` (#113): the model `t` translates with and whether Ollama has it, and the TTS
+/// server's device from its `/health`. One informational line while speak is off.
+pub fn speak(cfg: &Config, h: &dyn Http) -> Vec<Check> {
+    if !cfg.speak.enabled {
+        return vec![Check::pass("speak", "off ([speak].enabled = false)").optional()];
+    }
+    vec![translator(cfg, h), tts_server(cfg, h)]
+}
+
+/// The translator model: `[speak].model`, or `[llm].model` when it is left out.
+fn translator(cfg: &Config, h: &dyn Http) -> Check {
+    let model = cfg.translator_model();
+    let whose = if cfg.translator_is_separate() {
+        format!(
+            "[speak].model; [llm].model {} is not loaded while assistance is off",
+            cfg.llm.model
+        )
+    } else {
+        "[llm].model; a small [speak].model (llama3.1:8b) keeps the answer model out of VRAM with assistance off".to_owned()
+    };
+    if cfg.llm.provider != Provider::Ollama {
+        return Check::pass(
+            "translator",
+            format!("{model} on {} ({whose})", cfg.llm.provider.as_str()),
+        );
+    }
+    let url = format!("{}/api/tags", cfg.llm.base_url.trim_end_matches('/'));
+    let names = match h.get(&url) {
+        Ok(body) => ollama_model_names(&body),
+        Err(e) => {
+            return Check::fail(
+                "translator",
+                format!("{model}: cannot ask Ollama at {url}: {e}"),
+                "start Ollama: `ollama serve`",
+            );
+        }
+    };
+    match names {
+        Some(names)
+            if names
+                .iter()
+                .any(|n| n == model || n.strip_suffix(":latest") == Some(model)) =>
+        {
+            Check::pass("translator", format!("{model} present ({whose})"))
+        }
+        Some(_) => Check::fail(
+            "translator",
+            format!("{model} not pulled: `t` cannot translate"),
+            format!("ollama pull {model}"),
+        ),
+        None => Check::fail(
+            "translator",
+            format!("{model}: unexpected response from {url}"),
+            "check [llm].base_url points at Ollama",
+        ),
+    }
+}
+
+/// The TTS server's `/health`: up, and on `cuda` or `cpu`. A CPU server works but renders
+/// about 4-5× slower than real time, so it is a warning with the way to the GPU.
+fn tts_server(cfg: &Config, h: &dyn Http) -> Check {
+    let at = cfg.speak.tts_url.trim().trim_end_matches('/');
+    if !cfg.speak.is_local() {
+        return Check::fail(
+            "tts server",
+            format!("{at} is not on this machine; dmn sends text and your voice only to localhost"),
+            "set [speak].tts_url to http://localhost:4123",
+        );
+    }
+    let body = match h.get(&format!("{at}/health")) {
+        Ok(body) => body,
+        Err(e) => {
+            return Check::fail(
+                "tts server",
+                format!("{at} is not answering ({e}); `dmn run` with [speak] on will not start"),
+                "start chatterbox-tts-api (README § Speak)",
+            );
+        }
+    };
+    let health: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let status = health["status"].as_str().unwrap_or("unknown");
+    match health["device"].as_str() {
+        Some("cpu") => Check::fail(
+            "tts server",
+            format!(
+                "{at} {status}, device cpu: about 4-5x slower than real time, 8-18 s to the first sound of a sentence"
+            ),
+            "run it on the GPU (1.9 s for a sentence): README § Speak, docker/docker-compose.gpu.yml",
+        )
+        .optional(),
+        Some(device) => Check::pass("tts server", format!("{at} {status}, device {device}")),
+        None => Check::pass(
+            "tts server",
+            format!("{at} answering; its /health names no device"),
+        ),
+    }
+}
+
 /// Informational: which GPU features this binary carries and which GPU tools exist.
 pub fn gpu_backend(r: &dyn Runner) -> Check {
     let mut built = Vec::new();
@@ -738,6 +836,7 @@ pub fn run_all(
         }
     }
     checks.push(web_lookup(cfg, h, |name| std::env::var(name).ok()));
+    checks.extend(speak(cfg, h));
     checks.push(gpu_backend(r));
     checks.push(whisper_device(cfg.stt.device, &dmn_stt::gpu_devices()));
     Report { header, checks }
@@ -1123,6 +1222,98 @@ mod tests {
         assert!(
             line.contains("go to your SearXNG at localhost, which forwards it"),
             "{line}"
+        );
+    }
+
+    /// An `Http` that answers by URL suffix; anything else is unreachable.
+    struct RoutedHttp(Vec<(&'static str, Result<String, String>)>);
+
+    impl Http for RoutedHttp {
+        fn get(&self, url: &str) -> Result<String, String> {
+            self.0
+                .iter()
+                .find(|(suffix, _)| url.ends_with(suffix))
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| Err("connection refused".into()))
+        }
+    }
+
+    fn health(device: &str) -> String {
+        format!(r#"{{"status":"healthy","model_loaded":true,"device":"{device}"}}"#)
+    }
+
+    /// #113: doctor names the model `t` translates with and whether Ollama has it, and the TTS
+    /// server's device, with the way to the GPU when it is the CPU.
+    #[test]
+    fn doctor_names_the_translator_and_the_tts_device() {
+        let mut cfg = Config::default();
+        let off = speak(&cfg, &RoutedHttp(vec![]));
+        assert_eq!(off.len(), 1);
+        assert!(off[0].ok && !off[0].required, "{off:?}");
+
+        cfg.speak.enabled = true;
+        cfg.speak.target = "de".into();
+        cfg.speak.model = Some("llama3.1:8b".into());
+        let tags = r#"{"models":[{"name":"qwen3.6:35b-a3b"},{"name":"llama3.1:8b"}]}"#;
+        let gpu = RoutedHttp(vec![
+            ("/api/tags", Ok(tags.into())),
+            ("/health", Ok(health("cuda"))),
+        ]);
+        let checks = speak(&cfg, &gpu);
+        let report = Report {
+            header: String::new(),
+            checks: checks.clone(),
+        }
+        .render();
+        assert!(checks.iter().all(|c| c.ok), "{report}");
+        assert!(report.contains("translator"), "{report}");
+        assert!(
+            report.contains("llama3.1:8b present ([speak].model"),
+            "{report}"
+        );
+        assert!(
+            report.contains("qwen3.6:35b-a3b is not loaded while assistance is off"),
+            "{report}"
+        );
+        assert!(
+            report.contains("http://localhost:4123 healthy, device cuda"),
+            "{report}"
+        );
+
+        let cpu = RoutedHttp(vec![
+            (
+                "/api/tags",
+                Ok(r#"{"models":[{"name":"qwen3.6:35b-a3b"}]}"#.into()),
+            ),
+            ("/health", Ok(health("cpu"))),
+        ]);
+        let checks = speak(&cfg, &cpu);
+        let report = Report {
+            header: String::new(),
+            checks: checks.clone(),
+        }
+        .render();
+        assert!(report.contains("FAIL translator"), "{report}");
+        assert!(report.contains("fix: ollama pull llama3.1:8b"), "{report}");
+        assert!(report.contains("warn tts server"), "{report}");
+        assert!(report.contains("device cpu"), "{report}");
+        assert!(report.contains("docker-compose.gpu.yml"), "{report}");
+        assert!(!checks[1].required, "a CPU server works: a warning");
+
+        // Left out, the translator is [llm].model; a server that is down is a failure.
+        cfg.speak.model = None;
+        let checks = speak(&cfg, &RoutedHttp(vec![("/api/tags", Ok(tags.into()))]));
+        assert!(
+            checks[0].ok
+                && checks[0]
+                    .detail
+                    .contains("qwen3.6:35b-a3b present ([llm].model")
+        );
+        assert!(!checks[1].ok && checks[1].required, "{:?}", checks[1]);
+        assert!(
+            checks[1].detail.contains("not answering"),
+            "{:?}",
+            checks[1]
         );
     }
 

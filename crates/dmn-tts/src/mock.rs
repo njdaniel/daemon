@@ -1,13 +1,15 @@
 //! [`MockTtsProvider`]: synthesizes a generated sine WAV and records every request, mirroring
-//! `dmn-llm`'s `MockProvider`, so this crate's consumers need no live server.
+//! `dmn-llm`'s `MockProvider`, so this crate's consumers need no live server. Its answer goes
+//! through the same trailing-silence cut as the real client's (#113), as one generation: the
+//! mock does not split the text into sentences.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures_util::future::BoxFuture;
 
-use crate::decode::decode_reader;
 use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
+use crate::tail::decode_cut;
 
 /// One enrollment the mock received.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +54,12 @@ impl MockTtsProvider {
         }
     }
 
+    /// Synthesize `samples` (mono, at `rate`, as a 16-bit WAV) on every request: speech,
+    /// silence and noise in one answer, for the trailing-silence cut (#113).
+    pub fn with_samples(rate: u32, samples: &[f32]) -> Self {
+        Self::with_wav(crate::decode::wav_of(rate, samples))
+    }
+
     /// List `voices` as the server's library, each `(name, enrolled language)`; enrollments
     /// are listed after them. `None` stands for a server with no library to list.
     pub fn with_voices(mut self, voices: Option<&[(&str, Option<&str>)]>) -> Self {
@@ -93,7 +101,7 @@ impl TtsProvider for MockTtsProvider {
             }
             let mut rate = None;
             let mut chunks: Vec<Result<PcmChunk, TtsError>> = Vec::new();
-            decode_reader(
+            decode_cut(
                 std::io::Cursor::new(self.wav.as_slice()),
                 |r| rate = Some(r),
                 |chunk| {
@@ -177,6 +185,35 @@ mod tests {
         let samples: usize = stream.map(|c| c.unwrap().samples.len()).sum();
         assert_eq!(samples, 12_000, "0.5 s at 24 kHz");
         assert_eq!(mock.requests(), vec![req]);
+    }
+
+    /// #113: speech, a second of silence, then the model's burst: what the mock answers stops
+    /// at the silence, as the real client's does.
+    #[tokio::test]
+    async fn the_burst_after_a_trailing_silence_never_reaches_the_stream() {
+        let rate = 24_000;
+        let tone = |secs: f32, amp: f32| -> Vec<f32> {
+            (0..(rate as f32 * secs) as usize)
+                .map(|i| amp * (std::f32::consts::TAU * 220.0 * i as f32 / rate as f32).sin())
+                .collect()
+        };
+        let speech = tone(1.5, 0.2);
+        let samples = [speech.clone(), vec![0.0; rate as usize], tone(0.5, 0.73)].concat();
+        let mock = MockTtsProvider::with_samples(rate, &samples);
+        let stream = mock
+            .synthesize(SpeakRequest::new("x", "voice"))
+            .await
+            .unwrap();
+        let got: Vec<f32> = stream.flat_map(|c| c.unwrap().samples).collect();
+        let peak = got[speech.len()..]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(peak < crate::tail::QUIET, "the burst was cut: peak {peak}");
+        assert!(
+            got.len() < speech.len() + rate as usize / 2,
+            "{} samples",
+            got.len()
+        );
     }
 
     #[tokio::test]

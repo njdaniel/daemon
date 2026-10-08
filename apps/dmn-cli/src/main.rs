@@ -22,6 +22,8 @@ mod sources;
 mod speak;
 mod speaker;
 mod suggest;
+#[cfg(test)]
+mod testollama;
 mod today;
 mod tui;
 
@@ -191,7 +193,8 @@ enum Command {
         solutions: Option<String>,
         /// Start with interview assistance off: transcribe (and translate) only, no question
         /// detection and no LLM request, the transcript on the whole screen; a local Ollama model
-        /// is unloaded so whisper can have the GPU. Overrides [assist].enabled; Ctrl+Shift+A turns it on
+        /// is unloaded so whisper can have the GPU (with [speak] on, kept for `t` unless
+        /// [speak].model names a translator of its own). Overrides [assist].enabled; Ctrl+Shift+A turns it on
         #[arg(long)]
         no_assist: bool,
     },

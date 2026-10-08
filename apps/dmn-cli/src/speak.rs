@@ -314,7 +314,7 @@ pub fn speak(
         None => Some(open_vmic()?),
     };
     let voice = voice_name(&cfg.speak.voice_ref);
-    let req = SpeakRequest::new(text.trim(), voice.clone());
+    let req = SpeakRequest::new(text.trim(), voice.clone()).with_tuning(tuning(cfg));
     let stream = rt()?
         .block_on(provider.synthesize(req))
         .map_err(|e| match e {
@@ -376,8 +376,23 @@ pub(crate) fn open_vmic() -> Result<(Arc<PipeWireContext>, VirtualMic), SpeakErr
     Ok((ctx, mic))
 }
 
+/// #113: `[speak]`'s TTS knobs for the speech request: the temperature always (0.6 by
+/// default, under the server's 0.8), `cfg_weight` and `exaggeration` only when set.
+pub(crate) fn tuning(cfg: &Config) -> dmn_tts::Tuning {
+    dmn_tts::Tuning {
+        temperature: Some(cfg.speak.temperature),
+        cfg_weight: cfg.speak.cfg_weight,
+        exaggeration: cfg.speak.exaggeration,
+    }
+}
+
 /// Where the speech goes when it is not a file: `VirtualMic`, or a test's sink.
 pub(crate) trait SpeechSink {
+    /// #113: whether something is linked to the node and pulling from it now; `None` for a
+    /// sink that cannot tell (a file).
+    fn linked(&self) -> Option<bool> {
+        None
+    }
     fn rate(&self) -> u32;
     fn write(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), AudioError>;
     /// Wait for the queued audio to play; `Ok(false)` when it did not within `timeout`.

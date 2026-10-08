@@ -3,9 +3,10 @@
 //! played into the `dmn-voice` virtual microphone (#108) the call has selected.
 //!
 //! [`Speaker`] owns one worker thread with its own current-thread tokio runtime, so a press never
-//! waits on the pipeline thread or the suggester: the translation is one more request on the
-//! `[llm]` provider (the same one the fast phase uses, `think: false` included), run whether
-//! interview assistance is on or off. One press at a time: the pipeline sends a job only while
+//! waits on the pipeline thread or the suggester: the translation is one request on the `[llm]`
+//! provider (`think: false` included) with `[speak].model` as the model when it is set (#113: a
+//! small translator, so the answer model need not be loaded for it), run whether interview
+//! assistance is on or off. One press at a time: the pipeline sends a job only while
 //! the session has none in flight, and the worker does the three steps in order, dispatching
 //! [`Action::SpeakTranslated`] between them and [`Action::SpeakDone`] or
 //! [`Action::SpeakFailed`] at the end. A failure is a status notice, never a panic.
@@ -17,6 +18,19 @@
 //! mic). If it cannot be opened (no PipeWire), the next press tries again and says so. A
 //! playback nothing pulled is reported, and the node is closed and opened again, so speech
 //! nobody heard is not left in its ring to play at the next press.
+//!
+//! **Warm-up (#113).** At start the worker loads the translator (as the suggester warms its
+//! model) and, on a thread of its own so a first press never waits for it, asks the TTS server
+//! for one word whose audio is thrown away: the first request after the server starts pays for
+//! CUDA's warm-up (8.9 s measured, against 1.9 s warm).
+//!
+//! **Nothing linked (#113).** A call that selected `dmn-voice` loses it when dmn restarts: the
+//! node is a new one, and PipeWire relinks only a stream that names its target by name in its
+//! own properties (`pw-record --target dmn-voice` does), and only if no other stream came or went
+//! meanwhile; Discord's, which asks not to be moved, and a stream moved by hand, which the
+//! session manager keeps by serial, never. So a moment
+//! after start, if nothing is linked to the node, the status line says [`NOT_LINKED`] for 5 s
+//! (and the log says why); a press that nothing heard says the same.
 //!
 //! **Echo window.** When PipeWire first pulls a press's speech the worker sends
 //! [`Window::From`], and when the last sample has played [`Window::Until`]; the pipeline turns
@@ -30,12 +44,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use dmn_audio::{AudioError, VMIC_NODE_NAME};
+use dmn_audio::{AudioError, VMIC_NODE_NAME, VmicState};
 use dmn_core::config::Config;
 use dmn_core::{Paths, wire};
 use dmn_llm::{CancellationToken, LlmError, Provider};
 use dmn_session::{Action, SessionHub};
-use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider};
+use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider, Tuning};
 
 use crate::speak::{self, DRAIN_MARGIN, SpeakError, SpeechSink};
 
@@ -45,11 +59,24 @@ pub type OpenSink = Box<dyn FnMut() -> Result<Box<dyn SpeechSink + Send>, String
 
 /// How often the worker looks at the playback while it drains, and at the stop flag.
 const DRAIN_TICK: Duration = Duration::from_millis(50);
+/// #113: how long after opening `dmn-voice` the worker looks whether anything is linked to it.
+/// The session manager relinks a stream that names it within a few hundred milliseconds.
+pub const LINK_GRACE: Duration = Duration::from_secs(2);
+/// #113: what the status line says when nothing is linked to `dmn-voice`, at start or after a
+/// press nobody heard. Discord is the call app that loses it across a restart.
+pub const NOT_LINKED: &str = "Discord: re-select dmn-voice as the microphone";
+/// #113: the start-up notice's id: no press has it (presses count from 1).
+pub const STARTUP_NOTICE: u64 = 0;
+/// #113: what the TTS warm-up says; its audio is thrown away.
+pub const WARM_UP_TEXT: &str = "OK.";
 
 /// Everything a session's speaker needs, built and checked by [`setup`] before the run starts.
 pub struct SpeakSetup {
+    /// The translator: `[llm]` with `[speak].model` as the model (#113).
     pub provider: Arc<dyn Provider>,
-    pub tts: Box<dyn TtsProvider>,
+    /// Its model's name, for the log.
+    pub model: String,
+    pub tts: Arc<dyn TtsProvider>,
     pub open_sink: OpenSink,
     /// `[speak].target`, sent to the TTS server with the text.
     pub target: String,
@@ -59,6 +86,10 @@ pub struct SpeakSetup {
     pub voice: String,
     /// The translation's budget: the fast phase's.
     pub timeout: Duration,
+    /// #113: `[speak]`'s TTS knobs, sent with every speech request.
+    pub tuning: Tuning,
+    /// #113: warm the TTS server up at start (off in tests, whose mock would record it).
+    pub warm_tts: bool,
 }
 
 /// When a press's speech played, on the wall clock, for the echo guard's window.
@@ -171,13 +202,42 @@ struct Worker {
 impl Worker {
     fn run(mut self, jobs: &crossbeam_channel::Receiver<Job>) {
         self.open_sink();
-        // The model loads before the first press needs it, not during it (a cold 35B model
-        // takes longer than the translation's budget). A failure shows on that press.
-        let provider = Arc::clone(&self.setup.provider);
-        if let Err(e) = self.rt.block_on(provider.warm_up()) {
-            tracing::warn!(error = %e, "speak: the model's warm-up failed");
+        let opened = Instant::now();
+        // #113: the TTS server's first request pays for its warm-up; on its own thread, so a
+        // first press never queues behind it.
+        if self.setup.warm_tts {
+            self.warm_tts();
         }
-        while let Ok(job) = jobs.recv() {
+        // The model loads before the first press needs it, not during it (a cold model takes
+        // longer than the translation's budget). A failure shows on that press.
+        let provider = Arc::clone(&self.setup.provider);
+        let t = Instant::now();
+        match self.rt.block_on(provider.warm_up()) {
+            Ok(()) => tracing::info!(
+                model = %self.setup.model,
+                ms = t.elapsed().as_millis() as u64,
+                "speak: translator loaded"
+            ),
+            Err(e) => tracing::warn!(error = %e, "speak: the model's warm-up failed"),
+        }
+        // #113: whether the call still has `dmn-voice`, once the session manager has had its
+        // moment to relink it; a press before then answers that itself.
+        let mut look_at = Some(opened + LINK_GRACE);
+        loop {
+            let next = match look_at {
+                Some(at) => jobs.recv_deadline(at).map_err(|e| e.is_timeout()),
+                None => jobs.recv().map_err(|_| false),
+            };
+            let job = match next {
+                Ok(job) => job,
+                Err(true) => {
+                    look_at = None;
+                    self.check_linked();
+                    continue;
+                }
+                Err(false) => break,
+            };
+            look_at = None;
             if self.stopped() {
                 break;
             }
@@ -196,6 +256,74 @@ impl Worker {
 
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    /// #113: one word to the TTS server, its audio thrown away, on a thread of its own that
+    /// nothing waits for. Logs how long the server took; a failure is only logged (the first
+    /// press says it).
+    fn warm_tts(&self) {
+        let tts = Arc::clone(&self.setup.tts);
+        let req = SpeakRequest::new(WARM_UP_TEXT, self.setup.voice.clone())
+            .with_language(self.setup.target.clone())
+            .with_tuning(self.setup.tuning);
+        let stop = Arc::clone(&self.stop);
+        let spawned = std::thread::Builder::new()
+            .name("dmn-speak-warm".to_owned())
+            .spawn(move || {
+                let t = Instant::now();
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        return tracing::warn!(error = %e, "speak: no runtime for the TTS warm-up");
+                    }
+                };
+                let warmed = rt.block_on(tts.synthesize(req)).map(|stream| {
+                    let mut samples = 0usize;
+                    for chunk in stream {
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        samples += chunk.map(|c| c.samples.len()).unwrap_or(0);
+                    }
+                    samples
+                });
+                match warmed {
+                    Ok(samples) => tracing::info!(
+                        ms = t.elapsed().as_millis() as u64,
+                        samples,
+                        "speak: TTS server warmed up (audio discarded)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        ms = t.elapsed().as_millis() as u64,
+                        error = %e,
+                        "speak: the TTS warm-up failed"
+                    ),
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "speak: cannot spawn the TTS warm-up");
+        }
+    }
+
+    /// #113: nothing linked to `dmn-voice` a moment after start: the call does not have it
+    /// (after a dmn restart, Discord keeps the old node's selection), so say so before the
+    /// first press finds out.
+    fn check_linked(&self) {
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        if sink.linked() == Some(false) {
+            tracing::warn!(
+                "speak: nothing is linked to {VMIC_NODE_NAME}; a call that had it before a restart needs it selected again"
+            );
+            self.hub.dispatch(Action::SpeakFailed {
+                id: STARTUP_NOTICE,
+                reason: NOT_LINKED.to_owned(),
+            });
+        }
     }
 
     fn open_sink(&mut self) -> Option<String> {
@@ -242,7 +370,8 @@ impl Worker {
             return Err(format!("no {VMIC_NODE_NAME}: {why}"));
         }
         let req = SpeakRequest::new(translated.text, self.setup.voice.clone())
-            .with_language(self.setup.target.clone());
+            .with_language(self.setup.target.clone())
+            .with_tuning(self.setup.tuning);
         let tts = &self.setup.tts;
         let cancel = self.cancel.clone();
         let stream = self
@@ -331,7 +460,12 @@ impl Worker {
         let unheard = match drained {
             Ok(true) => return Ok(first),
             Ok(false) if self.stopped() => return Ok(first),
-            Ok(false) => format!("nobody hears {VMIC_NODE_NAME}: select it as the call's mic"),
+            Ok(false) => {
+                tracing::warn!(
+                    "speak: nothing pulled from {VMIC_NODE_NAME}; is it the call's microphone?"
+                );
+                NOT_LINKED.to_owned()
+            }
             Err(why) => why,
         };
         // Whatever is still queued would play at the next press: start from an empty node.
@@ -358,7 +492,7 @@ fn tts_failure(e: &TtsError) -> String {
 fn playback_failure(e: &AudioError) -> String {
     let text = e.to_string();
     if text.contains("nothing pulled") {
-        format!("nobody hears {VMIC_NODE_NAME}: select it as the call's mic")
+        NOT_LINKED.to_owned()
     } else {
         format!(
             "playback failed: {}",
@@ -425,22 +559,25 @@ pub fn check(cfg: &Config, paths: &Paths, tts: &dyn TtsProvider) -> Result<Strin
     }
 }
 
-/// The session's speaker for `dmn run`, after [`check`]: the `[llm]` provider for the
-/// translation, the TTS server's streaming route, and `dmn-voice`.
+/// The session's speaker for `dmn run`, after [`check`]: the translator (`[llm]` with
+/// `[speak].model`, #113), the TTS server's streaming route, and `dmn-voice`.
 pub fn setup(cfg: &Config, paths: &Paths) -> Result<SpeakSetup, SpeakError> {
     let tts = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url).streaming();
     let voice = check(cfg, paths, &tts)?;
-    let provider =
-        wire::provider(&cfg.llm).map_err(|e: LlmError| SpeakError::Llm(e.to_string()))?;
+    let provider = wire::provider(&cfg.translator_llm())
+        .map_err(|e: LlmError| SpeakError::Llm(e.to_string()))?;
     let target = cfg.speak.target.clone();
     Ok(SpeakSetup {
         provider,
-        tts: Box::new(tts),
+        model: cfg.translator_model().to_owned(),
+        tts: Arc::new(tts),
         open_sink: Box::new(open_dmn_voice),
         target_name: target_name(&target).unwrap_or_else(|| target.clone()),
         target,
         voice,
         timeout: Duration::from_millis(cfg.llm.fast_timeout_ms),
+        tuning: speak::tuning(cfg),
+        warm_tts: true,
     })
 }
 
@@ -464,6 +601,10 @@ struct SessionMic {
 }
 
 impl SpeechSink for SessionMic {
+    fn linked(&self) -> Option<bool> {
+        Some(self.mic.status().state() == VmicState::Streaming)
+    }
+
     fn rate(&self) -> u32 {
         self.mic.rate()
     }
@@ -516,6 +657,10 @@ impl MemorySink {
 
 #[cfg(test)]
 impl SpeechSink for MemorySink {
+    fn linked(&self) -> Option<bool> {
+        Some(self.plays)
+    }
+
     fn rate(&self) -> u32 {
         self.rate
     }
@@ -552,6 +697,16 @@ pub fn setup_with(
     tts: dmn_tts::MockTtsProvider,
     plays: bool,
 ) -> (SpeakSetup, Fed) {
+    setup_on(Arc::new(llm), tts, plays)
+}
+
+/// [`setup_with`] over any provider (#113: a real Ollama client on a stand-in server).
+#[cfg(test)]
+pub fn setup_on(
+    llm: Arc<dyn Provider>,
+    tts: dmn_tts::MockTtsProvider,
+    plays: bool,
+) -> (SpeakSetup, Fed) {
     let (sink, log) = MemorySink::new(plays);
     let mut sink = Some(sink);
     let open: OpenSink = Box::new(move || match sink.take() {
@@ -563,13 +718,16 @@ pub fn setup_with(
     });
     (
         SpeakSetup {
-            provider: Arc::new(llm),
-            tts: Box::new(tts),
+            provider: llm,
+            model: "mock".into(),
+            tts: Arc::new(tts),
             open_sink: open,
             target: "es".into(),
             target_name: "Spanish (es)".into(),
             voice: "me".into(),
             timeout: Duration::from_secs(4),
+            tuning: Tuning::default(),
+            warm_tts: false,
         },
         log,
     )
@@ -703,6 +861,81 @@ pub(crate) mod tests {
         speaker.stop();
     }
 
+    /// #113: at start the TTS server gets one word, whose audio goes nowhere, on a thread of
+    /// its own: a press made at once is not held up by it, and its request carries `[speak]`'s
+    /// knobs as the warm-up's does.
+    #[test]
+    fn the_tts_server_is_warmed_up_at_start_and_a_first_press_does_not_wait_for_it() {
+        let llm = MockProvider::new(vec![Step::Text(SPANISH.into()), Step::Done]);
+        let tts = MockTtsProvider::new();
+        let (mut setup, played) = setup_with(llm, tts.clone(), true);
+        setup.warm_tts = true;
+        setup.tuning = Tuning {
+            temperature: Some(0.6),
+            cfg_weight: Some(0.4),
+            exaggeration: None,
+        };
+        let hub = Arc::new(SessionHub::default());
+        let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+        hub.dispatch(Action::SpeakStarted { id: 1 });
+        assert!(speaker.speak(1, SAID.into()));
+        let s = settled(&hub);
+        assert_eq!(s.speak_failed, None, "{:?}", s.speak_failed);
+        let t = Instant::now();
+        while tts.requests().len() < 2 && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let spoken = tts.requests();
+        assert_eq!(spoken.len(), 2, "the warm-up and the press: {spoken:?}");
+        let warm = spoken
+            .iter()
+            .find(|r| r.text == WARM_UP_TEXT)
+            .expect("a warm-up");
+        assert_eq!(
+            (warm.voice.as_str(), warm.language.as_deref()),
+            ("me", Some("es"))
+        );
+        let press = spoken
+            .iter()
+            .find(|r| r.text == SPANISH)
+            .expect("the press");
+        for req in [warm, press] {
+            assert_eq!(req.tuning.temperature, Some(0.6));
+            assert_eq!(req.tuning.cfg_weight, Some(0.4));
+            assert_eq!(req.tuning.exaggeration, None);
+        }
+        let fed: usize = played.lock().unwrap().iter().map(|(n, _)| n).sum();
+        assert_eq!(
+            fed, 12_000,
+            "only the press reached the sink, not the warm-up"
+        );
+        speaker.stop();
+    }
+
+    /// #113: a moment after start, nothing linked to `dmn-voice` (a call that had it before
+    /// a restart) is said on the status line, under no press's id; a linked one says nothing.
+    #[test]
+    fn nothing_linked_a_moment_after_start_is_said_once() {
+        let started = |plays: bool| {
+            let llm = MockProvider::new(vec![Step::Done]);
+            let (setup, _) = setup_with(llm, MockTtsProvider::new(), plays);
+            let hub = Arc::new(SessionHub::default());
+            let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
+            (hub, speaker)
+        };
+        let (unheard, a) = started(false);
+        let (heard, b) = started(true);
+        std::thread::sleep(LINK_GRACE + Duration::from_millis(300));
+        let notice = unheard.snapshot().speak_failed.expect("a notice");
+        assert_eq!(
+            (notice.id, notice.reason.as_str()),
+            (STARTUP_NOTICE, NOT_LINKED)
+        );
+        assert_eq!(heard.snapshot().speak_failed, None);
+        a.stop();
+        b.stop();
+    }
+
     #[test]
     fn failures_end_the_press_with_a_reason_never_a_panic() {
         // The model fails: nothing is synthesized.
@@ -745,7 +978,7 @@ pub(crate) mod tests {
         let s = settled(&hub);
         assert_eq!(
             s.speak_failed.map(|n| n.reason).as_deref(),
-            Some("nobody hears dmn-voice: select it as the call's mic")
+            Some(NOT_LINKED)
         );
         assert!(speaker.windows().is_empty(), "nothing played: no window");
         hub.dispatch(Action::SpeakStarted { id: 4 });

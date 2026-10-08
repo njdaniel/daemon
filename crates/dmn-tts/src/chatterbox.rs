@@ -34,8 +34,9 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 
-use crate::decode::decode_reader;
 use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
+use crate::sentences::sentences;
+use crate::tail::decode_cut;
 
 const NAME: &str = "chatterbox";
 const SPEECH: &str = "/v1/audio/speech";
@@ -316,23 +317,47 @@ impl ChatterboxProvider {
         if let Some(language) = &req.language {
             body["language"] = language.clone().into();
         }
+        // #113: each only when set, so the server's own default stands otherwise.
+        let tuning = [
+            ("temperature", req.tuning.temperature),
+            ("cfg_weight", req.tuning.cfg_weight),
+            ("exaggeration", req.tuning.exaggeration),
+        ];
+        for (key, value) in tuning {
+            if let Some(v) = value {
+                body[key] = v.into();
+            }
+        }
         body
     }
 }
 
-/// The decoder thread: check the voice, POST the speech request, then decode the WAV body
-/// chunk by chunk into `chunks`. Every failure up to the WAV header goes out on `ready` (so
-/// `synthesize`'s future fails before returning); a later one is one `Err` chunk.
+/// The decoder thread: check the voice, then for each sentence (#113) POST the speech request
+/// and decode its WAV body chunk by chunk, through the trailing-silence cut, into `chunks`.
+/// Every failure up to the first WAV header goes out on `ready` (so `synthesize`'s future fails
+/// before returning); a later one is one `Err` chunk, and the end.
 fn speech_job(
     base: String,
     route: &'static str,
     body: serde_json::Value,
+    sentences: Vec<String>,
     voice: String,
     ready: crossbeam_channel::Sender<Result<u32, TtsError>>,
     chunks: crossbeam_channel::Sender<Result<PcmChunk, TtsError>>,
 ) {
+    let ready = std::cell::RefCell::new(Some(ready));
+    let failed = std::cell::Cell::new(false);
+    // Before the first header the failure is `synthesize`'s; after it, the stream's last item.
     let fail = |e: TtsError| {
-        let _ = ready.send(Err(e));
+        failed.set(true);
+        match ready.borrow_mut().take() {
+            Some(tx) => {
+                let _ = tx.send(Err(e));
+            }
+            None => {
+                let _ = chunks.send(Err(e));
+            }
+        }
     };
     let url = format!("{base}{route}");
     let client = match blocking_client(&url) {
@@ -342,23 +367,46 @@ fn speech_job(
     if let Err(e) = check_voice(&client, &base, &voice) {
         return fail(e);
     }
-    let resp = match client.post(&url).json(&body).send() {
-        Ok(r) => r,
-        Err(e) => return fail(unreachable(&url, &e)),
-    };
-    if !resp.status().is_success() {
-        return fail(status_error(resp));
+    let count = sentences.len();
+    for (i, sentence) in sentences.into_iter().enumerate() {
+        let mut body = body.clone();
+        body["input"] = sentence.into();
+        let resp = match client.post(&url).json(&body).send() {
+            Ok(r) => r,
+            Err(e) => return fail(unreachable(&url, &e)),
+        };
+        if !resp.status().is_success() {
+            return fail(status_error(resp));
+        }
+        tracing::debug!(url = %url, voice = %voice, sentence = i + 1, of = count, "tts answer arriving");
+        let gone = std::cell::Cell::new(false);
+        let cut = decode_cut(
+            resp,
+            |rate| match rate {
+                Ok(rate) => {
+                    if let Some(tx) = ready.borrow_mut().take() {
+                        let _ = tx.send(Ok(rate));
+                    }
+                }
+                Err(e) => fail(e),
+            },
+            // A full channel blocks here until the caller drains it: that is the backpressure.
+            // A send to a dropped stream fails, and the decoder stops reading.
+            |chunk| {
+                let failure = chunk.is_err();
+                let sent = chunks.send(chunk).is_ok();
+                gone.set(gone.get() || !sent);
+                failed.set(failed.get() || failure);
+                sent
+            },
+        );
+        if cut {
+            tracing::debug!(sentence = i + 1, "tts: cut at the trailing silence");
+        }
+        if gone.get() || failed.get() {
+            return;
+        }
     }
-    tracing::debug!(url = %url, voice = %voice, "tts answer arriving");
-    decode_reader(
-        resp,
-        |rate| {
-            let _ = ready.send(rate);
-        },
-        // A full channel blocks here until the caller drains it: that is the backpressure.
-        // A send to a dropped stream fails, and the decoder stops reading.
-        |chunk| chunks.send(chunk).is_ok(),
-    );
 }
 
 /// The `multipart/form-data` body for `POST /v1/voices`, built by hand (three fields) rather
@@ -472,10 +520,15 @@ impl TtsProvider for ChatterboxProvider {
             let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
             let (chunk_tx, chunk_rx) = crossbeam_channel::bounded(CHANNEL_CAP);
             let body = self.build_speech_body(&req);
+            let mut parts = sentences(&req.text);
+            if parts.is_empty() {
+                // Blank text: the server says what it thinks of it.
+                parts.push(req.text.clone());
+            }
             let (base, route, voice) = (self.base_url.clone(), self.route, req.voice);
             std::thread::Builder::new()
                 .name("dmn-tts-decode".to_owned())
-                .spawn(move || speech_job(base, route, body, voice, ready_tx, chunk_tx))
+                .spawn(move || speech_job(base, route, body, parts, voice, ready_tx, chunk_tx))
                 .map_err(|e| TtsError::Worker(format!("cannot spawn the decoder thread: {e}")))?;
             let ready = tokio::task::spawn_blocking(move || ready_rx.recv())
                 .await
@@ -571,6 +624,109 @@ mod tests {
             p.build_speech_body(&speak_req())["model"],
             "chatterbox-multilingual"
         );
+    }
+
+    /// #113: `[speak].temperature`, `cfg_weight` and `exaggeration` go in the body when set,
+    /// and only then, so the server's defaults stand otherwise.
+    #[test]
+    fn speech_body_carries_the_tuning_that_is_set() {
+        let p = ChatterboxProvider::new("http://localhost:4123");
+        let tuned = speak_req().with_tuning(crate::Tuning {
+            temperature: Some(0.6),
+            cfg_weight: Some(0.3),
+            exaggeration: Some(0.7),
+        });
+        let body = p.build_speech_body(&tuned);
+        assert_eq!(body["temperature"], 0.6);
+        assert_eq!(body["cfg_weight"], 0.3);
+        assert_eq!(body["exaggeration"], 0.7);
+        let only = speak_req().with_tuning(crate::Tuning {
+            temperature: Some(0.6),
+            ..crate::Tuning::default()
+        });
+        let body = p.build_speech_body(&only);
+        assert_eq!(body["temperature"], 0.6);
+        assert!(
+            body.get("cfg_weight").is_none() && body.get("exaggeration").is_none(),
+            "{body}"
+        );
+        let plain = p.build_speech_body(&speak_req());
+        for key in ["temperature", "cfg_weight", "exaggeration"] {
+            assert!(plain.get(key).is_none(), "{plain}");
+        }
+    }
+
+    /// #113: each sentence is its own request, in order, with the same voice, language and
+    /// tuning; the audio comes back as one stream.
+    #[tokio::test]
+    async fn each_sentence_is_asked_for_on_its_own_and_played_in_order() {
+        let server = serve(vec![
+            Reply::voices(&["voice"]),
+            Reply::wav(sine_wav()).in_pieces_of(101),
+            Reply::wav(crate::decode::sine_wav(24_000, &[0.5], 220.0, 0.25)),
+        ])
+        .unwrap();
+        let p = ChatterboxProvider::new(&server.url).streaming();
+        let req = SpeakRequest::new(
+            "Zuerst würde ich die Anforderungen klären. Dann nehme ich einen Token-Bucket.",
+            "voice",
+        )
+        .with_language("de")
+        .with_tuning(crate::Tuning {
+            temperature: Some(0.6),
+            ..crate::Tuning::default()
+        });
+        let samples = drain(p.synthesize(req).await.unwrap());
+        assert_eq!(samples.len(), 12_000 + 6_000, "both sentences, whole");
+        assert_eq!(
+            server.request_lines(),
+            [
+                "GET /v1/voices",
+                "POST /v1/audio/speech/stream",
+                "POST /v1/audio/speech/stream"
+            ]
+        );
+        let (first, second) = (body_json(&server, 1), body_json(&server, 2));
+        assert_eq!(first["input"], "Zuerst würde ich die Anforderungen klären.");
+        assert_eq!(second["input"], "Dann nehme ich einen Token-Bucket.");
+        for json in [&first, &second] {
+            assert_eq!(json["voice"], "voice");
+            assert_eq!(json["language"], "de");
+            assert_eq!(json["temperature"], 0.6);
+        }
+    }
+
+    /// #113: a sentence that ends in a long silence and a burst: the burst never reaches the
+    /// stream, and the next sentence still plays.
+    #[tokio::test]
+    async fn a_burst_after_a_sentence_is_cut_and_the_next_sentence_plays() {
+        let rate = 24_000u32;
+        let tone = |secs: f32, amp: f32| -> Vec<f32> {
+            (0..(rate as f32 * secs) as usize)
+                .map(|i| amp * (std::f32::consts::TAU * 220.0 * i as f32 / rate as f32).sin())
+                .collect()
+        };
+        let first = [tone(1.0, 0.2), vec![0.0; rate as usize], tone(0.5, 0.73)].concat();
+        let server = serve(vec![
+            Reply::voices(&["voice"]),
+            Reply::wav(crate::decode::wav_of(rate, &first)).in_pieces_of(4096),
+            Reply::wav(crate::decode::wav_of(rate, &tone(0.5, 0.2))),
+        ])
+        .unwrap();
+        let p = ChatterboxProvider::new(&server.url);
+        let req = SpeakRequest::new(
+            "Zuerst würde ich die Anforderungen klären. Dann nehme ich einen Token-Bucket.",
+            "voice",
+        );
+        let samples = drain(p.synthesize(req).await.unwrap());
+        let keep = (rate as f32 * crate::tail::KEEP_TAIL_SECS) as usize;
+        let (one, two) = samples.split_at(rate as usize + keep);
+        let gap_peak = one[rate as usize..]
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(gap_peak < crate::tail::QUIET, "no burst: {gap_peak}");
+        assert_eq!(two.len(), rate as usize / 2, "the second sentence, whole");
+        assert_eq!(server.request_lines().len(), 3);
     }
 
     #[tokio::test]

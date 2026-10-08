@@ -496,7 +496,24 @@ pub struct Speak {
     /// default: "" is unset, and `enabled = true` without it is a config error naming the key.
     #[serde(deserialize_with = "language_code")]
     pub target: String,
+    /// #113: the Ollama model `t` translates with, under `[llm]`'s provider, endpoint and
+    /// timeouts. Left out (or blank), `[llm].model`. A small one (`llama3.1:8b`, 4.6 GB) keeps
+    /// the answer model out of memory while assistance is off ([`Config::translator_llm`]).
+    pub model: Option<String>,
+    /// #113: the TTS model's sampling temperature, sent with every speech request. 0.6 by
+    /// default (the server's own is 0.8): lower makes its end-of-text noise burst rarer. The
+    /// server takes 0.05–5.0.
+    pub temperature: f64,
+    /// #113: the TTS model's classifier-free guidance weight (pace), 0.0–1.0; sent only when
+    /// set (the server's default is 0.5).
+    pub cfg_weight: Option<f64>,
+    /// #113: the TTS model's emotion intensity, 0.25–2.0; sent only when set (the server's
+    /// default is 0.5).
+    pub exaggeration: Option<f64>,
 }
+
+/// `[speak].temperature`'s default (#113).
+pub const SPEAK_TEMPERATURE: f64 = 0.6;
 
 /// `[speak].target`: "" (unset) or a code of the shape `[stt].language` takes, two or three
 /// lowercase letters. Whether whisper and the TTS server know it is checked when `dmn run`
@@ -531,6 +548,10 @@ impl Default for Speak {
             voice_ref: String::new(),
             device: "cpu".into(),
             target: String::new(),
+            model: None,
+            temperature: SPEAK_TEMPERATURE,
+            cfg_weight: None,
+            exaggeration: None,
         }
     }
 }
@@ -660,6 +681,10 @@ tts_url = "http://localhost:4123"    # chatterbox-tts-api on this machine (no ot
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
 target = ""                          # dmn run: `t` speaks your last turn in this language (es, de, ...); the voice's enroll --language; needed with enabled = true
+# model = "llama3.1:8b"              # the Ollama model `t` translates with; left out: [llm].model. A small one keeps the answer model out of VRAM with assistance off
+temperature = 0.6                    # the TTS model's sampling temperature (server default 0.8); lower = fewer noise bursts after a sentence
+# cfg_weight = 0.5                   # the TTS model's pace, 0.0-1.0; left out: the server's
+# exaggeration = 0.5                 # the TTS model's emotion intensity, 0.25-2.0; left out: the server's
 
 [ui]
 always_on_top = true
@@ -701,7 +726,46 @@ impl Config {
                     .into(),
             );
         }
+        // #113: the TTS server's own ranges; outside them it refuses every speech request.
+        let s = &self.speak;
+        for (key, value, lo, hi) in [
+            ("temperature", Some(s.temperature), 0.05, 5.0),
+            ("cfg_weight", s.cfg_weight, 0.0, 1.0),
+            ("exaggeration", s.exaggeration, 0.25, 2.0),
+        ] {
+            if let Some(v) = value
+                && !(lo..=hi).contains(&v)
+            {
+                return Err(format!(
+                    "[speak].{key} = {v} is outside {lo}-{hi}, the range the TTS server takes"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// #113: the model `t` translates with: `[speak].model`, or `[llm].model` when it is left
+    /// out or blank.
+    pub fn translator_model(&self) -> &str {
+        match self.speak.model.as_deref().map(str::trim) {
+            Some(m) if !m.is_empty() => m,
+            _ => &self.llm.model,
+        }
+    }
+
+    /// #113: whether translation has a model of its own, different from `[llm].model`: then a
+    /// run that starts with assistance off loads only that one.
+    pub fn translator_is_separate(&self) -> bool {
+        self.translator_model() != self.llm.model
+    }
+
+    /// #113: `[llm]` as the translator uses it: the same provider, endpoint, key and timeouts,
+    /// with [`Config::translator_model`] as the model.
+    pub fn translator_llm(&self) -> Llm {
+        Llm {
+            model: self.translator_model().to_owned(),
+            ..self.llm.clone()
+        }
     }
 
     /// Load `path`. A missing file is the default config, not an error.
@@ -757,11 +821,14 @@ impl Config {
     }
 
     /// This config with every value that depends on another written out as it takes effect
-    /// (#102: `[lookup].timeout_ms` left out is the provider's own): what `dmn config show`
+    /// (#102: `[lookup].timeout_ms` left out is the provider's own; #113: `[speak].model` left
+    /// out is `[llm].model`): what `dmn config show`
     /// prints, so it shows what runs.
     pub fn effective(&self) -> Self {
         let mut cfg = self.clone();
         cfg.lookup.timeout_ms = Some(self.lookup.timeout_ms());
+        // #113: the model `t` translates with, `[llm].model` when `[speak].model` is left out.
+        cfg.speak.model = Some(self.translator_model().to_owned());
         cfg
     }
 
@@ -1031,6 +1098,10 @@ tts_url = "http://localhost:4123"    # chatterbox-tts-api (OpenAI-compatible); t
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
 target = ""                          # `t` (#109) speaks in this language (es, de, ...): the voice's enroll --language
+# model = "llama3.1:8b"              # `t`'s translator (#113); left out: [llm].model
+temperature = 0.6                    # TTS sampling temperature (#113); lower = fewer noise bursts
+# cfg_weight = 0.5                   # TTS pace, 0.0-1.0; left out: the server's
+# exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
 
 [ui]
 always_on_top = true
@@ -1132,7 +1203,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 40, "spec example has 40 keys: {keys:?}");
+        assert_eq!(keys.len(), 41, "spec example has 41 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 
@@ -1203,6 +1274,100 @@ keep_transcripts = true
         assert!(toml.contains("[speak]"), "{toml}");
         assert!(toml.contains("target = \"es\""), "{toml}");
         assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+    }
+
+    /// #113: `[speak].model` is optional and stands in for `[llm].model` in translation only;
+    /// `dmn config show` prints the one in effect; the TTS knobs round-trip and are range-checked.
+    #[test]
+    fn speak_model_and_tuning_parse_round_trip_and_show() {
+        let d = Config::default();
+        assert_eq!(d.speak.model, None);
+        assert_eq!(
+            d.translator_model(),
+            "qwen3.6:35b-a3b",
+            "unset: [llm].model"
+        );
+        assert!(!d.translator_is_separate());
+        assert_eq!(d.speak.temperature, 0.6);
+        assert_eq!((d.speak.cfg_weight, d.speak.exaggeration), (None, None));
+        let plain = d.to_toml().unwrap();
+        assert!(
+            !plain.contains("cfg_weight") && !plain.contains("exaggeration"),
+            "{plain}"
+        );
+        let shown = d.effective().to_toml().unwrap();
+        let speak = &shown[shown.find("[speak]").expect(&shown)..];
+        assert!(speak.contains("model = \"qwen3.6:35b-a3b\""), "{shown}");
+        assert!(speak.contains("temperature = 0.6"), "{shown}");
+
+        let c = Config::from_toml(
+            "[speak]\nmodel = \"llama3.1:8b\"\ntemperature = 0.5\ncfg_weight = 0.3\nexaggeration = 0.7\n",
+            "speak",
+        )
+        .unwrap();
+        assert_eq!(c.speak.model.as_deref(), Some("llama3.1:8b"));
+        assert_eq!(c.translator_model(), "llama3.1:8b");
+        assert!(c.translator_is_separate());
+        let llm = c.translator_llm();
+        assert_eq!(llm.model, "llama3.1:8b");
+        assert_eq!(
+            Llm {
+                model: c.llm.model.clone(),
+                ..llm
+            },
+            c.llm,
+            "everything else is [llm]'s"
+        );
+        assert_eq!(
+            (
+                c.speak.temperature,
+                c.speak.cfg_weight,
+                c.speak.exaggeration
+            ),
+            (0.5, Some(0.3), Some(0.7))
+        );
+        let toml = c.to_toml().unwrap();
+        for line in [
+            "model = \"llama3.1:8b\"",
+            "temperature = 0.5",
+            "cfg_weight = 0.3",
+            "exaggeration = 0.7",
+        ] {
+            assert!(toml.contains(line), "{line}: {toml}");
+        }
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+        assert!(
+            c.effective()
+                .to_toml()
+                .unwrap()
+                .contains("model = \"llama3.1:8b\""),
+            "config show prints it"
+        );
+
+        // Blank, or the answer model itself, is no separate translator.
+        let blank = Config::from_toml("[speak]\nmodel = \" \"\n", "b").unwrap();
+        assert_eq!(blank.translator_model(), "qwen3.6:35b-a3b");
+        let same = Config::from_toml("[speak]\nmodel = \"qwen3.6:35b-a3b\"\n", "s").unwrap();
+        assert!(!same.translator_is_separate());
+
+        for (bad, key) in [
+            (
+                "temperature = 0.0",
+                "[speak].temperature = 0 is outside 0.05-5",
+            ),
+            (
+                "cfg_weight = 1.5",
+                "[speak].cfg_weight = 1.5 is outside 0-1",
+            ),
+            (
+                "exaggeration = 0.1",
+                "[speak].exaggeration = 0.1 is outside 0.25-2",
+            ),
+        ] {
+            let err = Config::from_toml(&format!("[speak]\n{bad}\n"), "r").unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]

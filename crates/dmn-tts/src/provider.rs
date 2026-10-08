@@ -34,7 +34,7 @@ pub enum TtsError {
 
 /// One synthesis job. `voice` is the name the server's voice library knows the enrolled clip
 /// by (the CLI derives it from `[speak].voice_ref`'s file name).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpeakRequest {
     pub text: String,
     pub voice: String,
@@ -42,6 +42,8 @@ pub struct SpeakRequest {
     /// chatterbox-tts-api ignores it and speaks in the language the voice was enrolled with
     /// (see [`TtsProvider::enroll`]). The translation step that picks it is #109's.
     pub language: Option<String>,
+    /// The model's sampling knobs (#113), each sent only when set.
+    pub tuning: Tuning,
 }
 
 impl SpeakRequest {
@@ -50,6 +52,7 @@ impl SpeakRequest {
             text: text.into(),
             voice: voice.into(),
             language: None,
+            tuning: Tuning::default(),
         }
     }
 
@@ -57,6 +60,24 @@ impl SpeakRequest {
         self.language = Some(language.into());
         self
     }
+
+    pub fn with_tuning(mut self, tuning: Tuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
+}
+
+/// Chatterbox's sampling knobs (#113), from `[speak]`. `None` leaves the server's own default
+/// (chatterbox-tts-api: temperature 0.8, cfg_weight 0.5, exaggeration 0.5); a lower
+/// temperature makes the model's end-of-text noise burst rarer.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Tuning {
+    /// Sampling temperature; the server takes 0.05–5.0.
+    pub temperature: Option<f64>,
+    /// Classifier-free guidance weight, which sets the pace; 0.0–1.0.
+    pub cfg_weight: Option<f64>,
+    /// Emotion intensity; 0.25–2.0.
+    pub exaggeration: Option<f64>,
 }
 
 /// What [`TtsProvider::enroll`] registered.

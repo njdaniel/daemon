@@ -424,6 +424,30 @@ pub(crate) fn sine_wav(rate: u32, amps: &[f32], hz: f32, secs: f32) -> Vec<u8> {
     build(rate, amps, hz, secs).unwrap_or_default()
 }
 
+/// An in-memory 16-bit mono WAV of `samples` (clamped to ±1): a test's speech, silence and
+/// noise in one answer ([`crate::MockTtsProvider::with_samples`]). Empty on a hound error, as
+/// [`sine_wav`].
+pub(crate) fn wav_of(rate: u32, samples: &[f32]) -> Vec<u8> {
+    fn build(rate: u32, samples: &[f32]) -> Result<Vec<u8>, hound::Error> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec)?;
+            for &s in samples {
+                w.write_sample((s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)?;
+            }
+            w.finalize()?;
+        }
+        Ok(buf)
+    }
+    build(rate, samples).unwrap_or_default()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
