@@ -28,6 +28,21 @@
 //! seconds the server takes to render, and closes it when the process ends; nothing lingers in
 //! the audio settings between runs. A session that speaks many times (#109) opens one and
 //! keeps it, which is what keeps a call's microphone selection stable.
+//!
+//! **Pass-through (#114).** With [`Passthrough`] the node also carries the user's own
+//! microphone, so a call that selected `dmn-voice` hears them live until translate mode is on.
+//! The microphone is a second capture stream (`LoopTap`, `dmn.passthrough`) on the same loop,
+//! at the graph rate, so the call gets the microphone's full bandwidth, not the 16 kHz the
+//! whisper lane runs at; its process callback pushes the samples into a second lock-free ring
+//! ([`tap_ring`]) from PipeWire's data thread, and the playback callback's [`Mixer`] pops them
+//! into the output under the speech: nothing in between, no thread to wake, about one quantum
+//! of latency. The mixer gates the microphone with a per-sample gain that ramps over
+//! [`PASSTHROUGH_FADE_MS`] whenever the switch flips, so neither the mode key nor a sentence
+//! starting clicks, and the gate is shut whenever speech is in the ring, whatever the mode: the
+//! call never hears both voices. A microphone backlog over [`TAP_MAX_BACKLOG_MS`] (the mic's
+//! clock and the call's drifting apart, or nothing pulling for a while) is skipped down to
+//! [`TAP_TARGET_BACKLOG_MS`] so the pass-through never lags; a full ring drops the newest
+//! microphone samples, never the speech. Both callbacks still allocate, lock and log nothing.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,9 +77,301 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Writer and drain poll interval while waiting on the real-time side.
 const WAIT_TICK: Duration = Duration::from_millis(5);
+/// #114: how long the microphone's gain takes to open or shut at a switch (the issue asks for
+/// 5–10 ms): long enough not to click, short enough that a sentence starting over it is not
+/// heard twice.
+pub const PASSTHROUGH_FADE_MS: u32 = 8;
+/// #114: microphone samples queued beyond this are skipped (the mic's clock and the call's
+/// drift apart, or nothing pulled from the node for a while): the pass-through must not lag.
+pub const TAP_MAX_BACKLOG_MS: u32 = 60;
+/// #114: what the backlog is cut down to when it is skipped.
+pub const TAP_TARGET_BACKLOG_MS: u32 = 20;
+/// #114: the microphone ring's depth, 250 ms: well over the backlog it is trimmed to, so the
+/// trimming (the playback side) and not the ring (the capture side) decides what is dropped.
+const TAP_RING_MS: u32 = 250;
+/// #114: a sample at or over this is sound, for the first-sound timestamps the latency test
+/// reads (the ring's silence floor is 0).
+const LOUD: f32 = 0.05;
+/// #114: `node.name` of the pass-through's capture stream.
+pub const TAP_NODE_NAME: &str = "dmn.passthrough";
 
 type Prod = <HeapRb<f32> as Split>::Prod;
 type Cons = <HeapRb<f32> as Split>::Cons;
+
+/// Nanoseconds since `epoch`, for a first-sample timestamp from a real-time callback:
+/// `Instant::elapsed` is a monotonic clock read (vDSO, no syscall). Never 0 in practice, and 0
+/// would only mean "measure again next time".
+fn stamp(epoch: Instant) -> u64 {
+    epoch.elapsed().as_nanos() as u64
+}
+
+fn instant_of(epoch: Instant, ns: &AtomicU64) -> Option<Instant> {
+    let ns = ns.load(Ordering::Relaxed);
+    (ns != 0).then(|| epoch + Duration::from_nanos(ns))
+}
+
+/// #114: the microphone ring's counters, shared by its two ends and read by whoever reports.
+/// Relaxed atomics only, on both real-time sides.
+#[derive(Debug)]
+pub struct TapStats {
+    /// Samples the capture callback pushed.
+    pushed: AtomicU64,
+    /// Samples the capture callback found no room for (nothing pulled from the node, or the
+    /// playback side fell behind the trim): the newest microphone samples, never speech.
+    dropped: AtomicU64,
+    /// Samples the playback side skipped to cut a backlog down ([`TAP_MAX_BACKLOG_MS`]).
+    skipped: AtomicU64,
+    /// Samples the playback side pulled (mixed in or discarded under a shut gate).
+    popped: AtomicU64,
+    /// Nanoseconds after `epoch` when the first sample at or over [`LOUD`] was pushed; 0 until
+    /// then. With `first_out_ns`, the microphone's dwell in dmn.
+    first_in_ns: AtomicU64,
+    /// Nanoseconds after `epoch` when the first such sample went out with the gate open.
+    first_out_ns: AtomicU64,
+    epoch: Instant,
+}
+
+impl TapStats {
+    fn new() -> Self {
+        Self {
+            pushed: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            skipped: AtomicU64::new(0),
+            popped: AtomicU64::new(0),
+            first_in_ns: AtomicU64::new(0),
+            first_out_ns: AtomicU64::new(0),
+            epoch: Instant::now(),
+        }
+    }
+
+    pub fn pushed(&self) -> u64 {
+        self.pushed.load(Ordering::Relaxed)
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn skipped(&self) -> u64 {
+        self.skipped.load(Ordering::Relaxed)
+    }
+
+    pub fn popped(&self) -> u64 {
+        self.popped.load(Ordering::Relaxed)
+    }
+
+    /// When the first sound reached the ring from the microphone, if any has.
+    pub fn first_in(&self) -> Option<Instant> {
+        instant_of(self.epoch, &self.first_in_ns)
+    }
+
+    /// When the first sound left the ring for the call, if any has.
+    pub fn first_out(&self) -> Option<Instant> {
+        instant_of(self.epoch, &self.first_out_ns)
+    }
+
+    /// The microphone's dwell in dmn: from its first sound reaching the ring to that sound
+    /// leaving it for the call. What this crate adds to PipeWire's own capture and playback
+    /// latency.
+    pub fn dwell(&self) -> Option<Duration> {
+        Some(
+            self.first_out()?
+                .saturating_duration_since(self.first_in()?),
+        )
+    }
+
+    /// Stamp `first` once, when `samples` hold the first sound.
+    fn note_loud(&self, first: &AtomicU64, samples: &[f32]) {
+        if first.load(Ordering::Relaxed) == 0 && samples.iter().any(|s| s.abs() >= LOUD) {
+            first.store(stamp(self.epoch), Ordering::Relaxed);
+        }
+    }
+}
+
+/// #114: the microphone ring's producer end, held by the capture callback. `push` is safe to
+/// call from a real-time callback: no allocation, no lock, no logging, bounded time.
+pub struct TapWriter {
+    prod: Prod,
+    stats: Arc<TapStats>,
+}
+
+impl TapWriter {
+    /// Push as many of `samples` as fit and return that count; the rest are dropped and
+    /// counted (a full ring is a call that is not pulling, or a backlog the other side is about
+    /// to trim; either way the newest microphone samples are the ones to lose).
+    pub fn push(&mut self, samples: &[f32]) -> usize {
+        let n = self.prod.push_slice(samples);
+        self.stats.pushed.fetch_add(n as u64, Ordering::Relaxed);
+        if n < samples.len() {
+            self.stats
+                .dropped
+                .fetch_add((samples.len() - n) as u64, Ordering::Relaxed);
+        }
+        self.stats.note_loud(&self.stats.first_in_ns, &samples[..n]);
+        n
+    }
+
+    pub fn stats(&self) -> Arc<TapStats> {
+        Arc::clone(&self.stats)
+    }
+}
+
+/// #114: the microphone ring's consumer end, held by the playback callback's [`Mixer`]. Every
+/// method is safe in a real-time callback.
+pub struct TapReader {
+    cons: Cons,
+    stats: Arc<TapStats>,
+}
+
+impl TapReader {
+    /// Fill `out` from the ring and zero the rest (an empty ring is silence). Returns how many
+    /// real samples it had.
+    pub fn pop(&mut self, out: &mut [f32]) -> usize {
+        let got = self.cons.pop_slice(out);
+        out[got..].fill(0.0);
+        self.stats.popped.fetch_add(got as u64, Ordering::Relaxed);
+        got
+    }
+
+    /// Discard up to `n` queued samples (the gate is shut: the microphone keeps flowing so
+    /// what comes through when it opens is current).
+    pub fn skip(&mut self, n: usize) -> usize {
+        let n = self.cons.skip(n);
+        self.stats.popped.fetch_add(n as u64, Ordering::Relaxed);
+        n
+    }
+
+    /// Cut a backlog over `max` samples down to `target`, counting what went.
+    pub fn trim(&mut self, max: usize, target: usize) {
+        let queued = self.cons.occupied_len();
+        if queued > max {
+            let n = self.cons.skip(queued - target.min(max));
+            self.stats.skipped.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Samples queued.
+    pub fn queued(&self) -> usize {
+        self.cons.occupied_len()
+    }
+
+    pub fn stats(&self) -> Arc<TapStats> {
+        Arc::clone(&self.stats)
+    }
+}
+
+/// #114: build the microphone ring of `capacity` samples and split it into its two ends.
+pub fn tap_ring(capacity: usize) -> (TapWriter, TapReader) {
+    let (prod, cons) = HeapRb::<f32>::new(capacity.max(1)).split();
+    let stats = Arc::new(TapStats::new());
+    (
+        TapWriter {
+            prod,
+            stats: Arc::clone(&stats),
+        },
+        TapReader { cons, stats },
+    )
+}
+
+/// #114: what the playback callback reads: the speech ring, and under it the microphone ring
+/// behind a gain that ramps rather than steps. Owned by the callback; everything in `fill` is
+/// safe in real time: two lock-free rings, relaxed atomics, a fixed scratch block, one pass
+/// over the buffer.
+///
+/// The gate is open only while pass-through is on (the mode, an atomic the feeding thread
+/// flips) *and* no speech is in flight (`speaking`, set by the writer from a sentence's first
+/// sample to its last). It opens and shuts over [`PASSTHROUGH_FADE_MS`]: a sentence starting
+/// over the microphone fades it out under its first 8 ms rather than cutting it, and the mode
+/// key is a fade either way. Shut, the microphone is still pulled and discarded, so the ring
+/// never fills and what comes through when the gate opens is live.
+pub struct Mixer {
+    speech: VoiceReader,
+    /// The microphone, with the mode switch; `None` for a node with no pass-through.
+    tap: Option<(TapReader, Arc<AtomicBool>)>,
+    /// The microphone's gain now, 0.0 (shut) to 1.0 (open).
+    gain: f32,
+    /// How far the gain moves per sample: one fade in [`PASSTHROUGH_FADE_MS`].
+    step: f32,
+    max_backlog: usize,
+    target_backlog: usize,
+    scratch: Box<[f32]>,
+}
+
+impl Mixer {
+    /// A mixer at `rate` Hz over `speech`, with the microphone when `tap` is given.
+    pub fn new(speech: VoiceReader, tap: Option<(TapReader, Arc<AtomicBool>)>, rate: u32) -> Self {
+        let rate = rate.max(1);
+        let fade_samples = (rate * PASSTHROUGH_FADE_MS / 1000).max(1);
+        // The gate starts where the mode says, so a session that starts in pass-through is
+        // heard from its first buffer, not after a fade from silence that nobody asked for.
+        let gain = match &tap {
+            Some((_, on)) if on.load(Ordering::Relaxed) => 1.0,
+            _ => 0.0,
+        };
+        Self {
+            speech,
+            tap,
+            gain,
+            step: 1.0 / fade_samples as f32,
+            max_backlog: (rate * TAP_MAX_BACKLOG_MS / 1000) as usize,
+            target_backlog: (rate * TAP_TARGET_BACKLOG_MS / 1000) as usize,
+            scratch: vec![0.0; SCRATCH_FRAMES].into_boxed_slice(),
+        }
+    }
+
+    /// Fill `out`: the speech (silence where the ring had none), plus the microphone under its
+    /// gain. Returns how many real speech samples it had, as [`VoiceReader::fill`] does.
+    pub fn fill(&mut self, out: &mut [f32]) -> usize {
+        let got = self.speech.fill(out);
+        let Some((tap, on)) = self.tap.as_mut() else {
+            return got;
+        };
+        let speaking = self.speech.stats.speaking.load(Ordering::Relaxed);
+        let target = if on.load(Ordering::Relaxed) && !speaking {
+            1.0
+        } else {
+            0.0
+        };
+        tap.trim(self.max_backlog, self.target_backlog);
+        if self.gain == 0.0 && target == 0.0 {
+            // Shut and staying shut: keep the microphone flowing past, hear none of it.
+            tap.skip(out.len());
+            return got;
+        }
+        let mut done = 0;
+        while done < out.len() {
+            let n = (out.len() - done).min(self.scratch.len());
+            tap.pop(&mut self.scratch[..n]);
+            let mut heard_from = n;
+            for (i, (slot, &mic)) in out[done..done + n]
+                .iter_mut()
+                .zip(&self.scratch[..n])
+                .enumerate()
+            {
+                if self.gain < target {
+                    self.gain = (self.gain + self.step).min(target);
+                } else if self.gain > target {
+                    self.gain = (self.gain - self.step).max(target);
+                }
+                if self.gain > 0.0 {
+                    *slot += mic * self.gain;
+                    heard_from = heard_from.min(i);
+                }
+            }
+            if heard_from < n {
+                tap.stats
+                    .note_loud(&tap.stats.first_out_ns, &self.scratch[heard_from..n]);
+            }
+            done += n;
+        }
+        got
+    }
+
+    /// The microphone's gain now, for tests.
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+}
 
 /// Counters shared by the ring's two ends and read by whoever reports. The real-time side
 /// only does relaxed atomic loads, stores and adds on these.
@@ -368,11 +675,22 @@ pub(crate) struct VmicSpec {
     pub(crate) description: String,
     pub(crate) rate: u32,
     pub(crate) status: Arc<VmicStatus>,
+    /// #114: the pass-through's capture stream, with the ring end its callback fills.
+    pub(crate) tap: Option<(TapSpec, TapWriter)>,
 }
 
-/// The real-time side's state: the ring's consumer and a fixed scratch block.
+/// #114: what the loop thread needs to create the pass-through's capture stream.
+pub(crate) struct TapSpec {
+    /// `target.object`: the microphone's `node.name` (or a stream's, in tests); `None` follows
+    /// PipeWire's default source.
+    pub(crate) target: Option<String>,
+    pub(crate) rate: u32,
+    pub(crate) status: Arc<VmicStatus>,
+}
+
+/// The real-time side's state: the mixer over the rings and a fixed scratch block.
 struct Outlet {
-    reader: VoiceReader,
+    mixer: Mixer,
     scratch: Box<[f32]>,
     status: Arc<VmicStatus>,
 }
@@ -380,10 +698,11 @@ struct Outlet {
 /// REAL-TIME CALLBACK (runs on PipeWire's data thread; `RT_PROCESS`).
 /// Rules (CLAUDE.md, SPEC § Threading rules), reviewed call by call:
 /// - no allocation: `dequeue_buffer` wraps a pointer, `datas_mut`/`data`/`chunk_mut` borrow
-///   the mapped buffer, `VoiceReader::fill` pops into the preallocated `scratch`, and the
-///   samples are copied from there into the buffer as little-endian bytes;
-/// - no locks: the ring is lock-free SPSC, counters and the format gate are relaxed atomics;
-/// - no logging, no syscalls (one monotonic clock read for the first-sample timestamp,
+///   the mapped buffer, `Mixer::fill` pops both rings into preallocated scratch blocks, and
+///   the samples are copied from there into the buffer as little-endian bytes;
+/// - no locks: the rings are lock-free SPSC, counters, the format gate and the pass-through
+///   switch are relaxed atomics;
+/// - no logging, no syscalls (one monotonic clock read for each first-sample timestamp,
 ///   which is a vDSO call), bounded time (one pass over the buffer).
 ///
 /// Dequeue, fill, requeue (the `Buffer` guard requeues on drop). An empty ring fills the
@@ -412,7 +731,7 @@ fn process(stream: &pw::stream::Stream, out: &mut Outlet) {
         let mut done = 0;
         while done < frames {
             let n = (frames - done).min(out.scratch.len());
-            out.reader.fill(&mut out.scratch[..n]);
+            out.mixer.fill(&mut out.scratch[..n]);
             let dst = &mut bytes[done * STRIDE..(done + n) * STRIDE];
             for (slot, sample) in dst.chunks_exact_mut(STRIDE).zip(&out.scratch[..n]) {
                 slot.copy_from_slice(&sample.to_le_bytes());
@@ -426,11 +745,182 @@ fn process(stream: &pw::stream::Stream, out: &mut Outlet) {
     *chunk.size_mut() = (frames * STRIDE) as u32;
 }
 
+/// #114: the pass-through's real-time side: the microphone ring's producer and a fixed block
+/// the buffer's bytes are decoded into.
+struct TapInlet {
+    writer: TapWriter,
+    scratch: Box<[f32]>,
+    status: Arc<VmicStatus>,
+}
+
+/// REAL-TIME CALLBACK (runs on PipeWire's data thread; `RT_PROCESS`): the pass-through's
+/// capture. Rules (CLAUDE.md, SPEC § Threading rules), reviewed call by call:
+/// - no allocation: `dequeue_buffer` wraps a pointer, `datas_mut`/`chunk`/`data` borrow the
+///   mapped buffer, the samples are decoded into the preallocated `scratch` and pushed into
+///   the preallocated ring;
+/// - no locks: the ring is lock-free SPSC, counters and the format gate are relaxed atomics;
+/// - no logging, no syscalls (one monotonic clock read for the first-sound timestamp, a vDSO
+///   call), bounded time (one pass over the buffer).
+///
+/// Dequeue, copy, requeue (the `Buffer` guard requeues on drop). Until the format is settled
+/// at the graph rate, mono F32, the bytes are not what the ring expects and are not copied.
+fn tap_process(stream: &pw::stream::Stream, inlet: &mut TapInlet) {
+    let Some(mut buffer) = stream.dequeue_buffer() else {
+        return;
+    };
+    if !inlet.status.format_ok.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(data) = buffer.datas_mut().first_mut() else {
+        return;
+    };
+    let offset = data.chunk().offset() as usize;
+    let size = data.chunk().size() as usize;
+    let Some(bytes) = data.data() else {
+        return;
+    };
+    let end = offset.saturating_add(size).min(bytes.len());
+    let start = offset.min(end);
+    for pass in bytes[start..end].chunks(STRIDE * inlet.scratch.len()) {
+        let mut n = 0;
+        for (slot, c) in inlet.scratch.iter_mut().zip(pass.chunks_exact(STRIDE)) {
+            *slot = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            n += 1;
+        }
+        inlet.writer.push(&inlet.scratch[..n]);
+    }
+}
+
+/// A stream's state and format events into `status`, gating its callback on `want_rate` Hz
+/// mono F32LE. Shared by the node and its pass-through capture: the same `VmicStatus` shape
+/// describes both.
+fn status_listener(
+    stream: &pw::stream::StreamRc,
+    status: &Arc<VmicStatus>,
+    want_rate: u32,
+) -> Result<pw::stream::StreamListener<()>, String> {
+    let state_status = Arc::clone(status);
+    let format_status = Arc::clone(status);
+    stream
+        .add_local_listener::<()>()
+        .state_changed(move |_, _, _old, new| match new {
+            pw::stream::StreamState::Streaming => state_status.set_state(VmicState::Streaming),
+            pw::stream::StreamState::Paused => state_status.set_state(VmicState::Ready),
+            pw::stream::StreamState::Connecting => state_status.set_state(VmicState::Connecting),
+            pw::stream::StreamState::Error(why) => state_status.set_error(why),
+            pw::stream::StreamState::Unconnected => {}
+        })
+        .param_changed(move |_, _, id, param| {
+            if id != spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Some(param) = param else {
+                format_status.format_ok.store(false, Ordering::Release);
+                return;
+            };
+            let mut info = spa::param::audio::AudioInfoRaw::new();
+            if info.parse(param).is_ok() {
+                format_status.rate.store(info.rate(), Ordering::Release);
+                let ok = info.rate() == want_rate
+                    && info.channels() == 1
+                    && info.format() == spa::param::audio::AudioFormat::F32LE;
+                format_status.format_ok.store(ok, Ordering::Release);
+                if !ok {
+                    format_status.set_error(format!(
+                        "negotiated {:?} {} Hz × {} ch, need F32LE {want_rate} Hz mono",
+                        info.format(),
+                        info.rate(),
+                        info.channels()
+                    ));
+                }
+            } else {
+                format_status.format_ok.store(false, Ordering::Release);
+            }
+        })
+        .register()
+        .map_err(|e| e.to_string())
+}
+
+/// #114: the pass-through's capture stream and its listeners, owned by the PipeWire loop
+/// thread beside the node it feeds. Like a `LoopCapture` but at the graph rate, and its
+/// callback fills the microphone ring rather than a 20 ms frame channel.
+pub(crate) struct LoopTap {
+    // Field order is drop order: listeners before the stream they are attached to.
+    _process: pw::stream::StreamListener<TapInlet>,
+    _events: pw::stream::StreamListener<()>,
+    stream: pw::stream::StreamRc,
+    status: Arc<VmicStatus>,
+}
+
+impl LoopTap {
+    fn open(core: &pw::core::CoreRc, spec: TapSpec, writer: TapWriter) -> Result<Self, String> {
+        let mut props = pw::properties::PropertiesBox::new();
+        props.insert(*pw::keys::MEDIA_TYPE, "Audio");
+        props.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
+        props.insert(*pw::keys::MEDIA_ROLE, "Communication");
+        props.insert(*pw::keys::NODE_NAME, TAP_NODE_NAME);
+        // A 10 ms quantum, as the whisper lanes ask for: the pass-through's latency is quanta.
+        let latency = format!("{}/{}", spec.rate / 100, spec.rate);
+        props.insert(*pw::keys::NODE_LATENCY, latency.as_str());
+        if let Some(target) = &spec.target {
+            // A named microphone that is absent falls back to the default source, as the
+            // whisper lane does (`Reattach`): the call hears the microphone whisper hears.
+            // (`node.dont-fallback` would put the stream in error instead: "defined target
+            // not found".)
+            props.insert("target.object", target.as_str());
+        }
+        let stream = pw::stream::StreamRc::new(core.clone(), TAP_NODE_NAME, props)
+            .map_err(|e| e.to_string())?;
+        let inlet = TapInlet {
+            writer,
+            scratch: vec![0.0; SCRATCH_FRAMES].into_boxed_slice(),
+            status: Arc::clone(&spec.status),
+        };
+        let process_listener = stream
+            .add_local_listener_with_user_data(inlet)
+            .process(tap_process)
+            .register()
+            .map_err(|e| e.to_string())?;
+        let events_listener = status_listener(&stream, &spec.status, spec.rate)?;
+        let pod = enum_format_pod(spec.rate)?;
+        let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or("bad EnumFormat pod")?];
+        stream
+            .connect(
+                spa::utils::Direction::Input,
+                None,
+                pw::stream::StreamFlags::AUTOCONNECT
+                    | pw::stream::StreamFlags::MAP_BUFFERS
+                    | pw::stream::StreamFlags::RT_PROCESS,
+                &mut params,
+            )
+            .map_err(|e| e.to_string())?;
+        spec.status.set_state(VmicState::Connecting);
+        Ok(Self {
+            _process: process_listener,
+            _events: events_listener,
+            stream,
+            status: spec.status,
+        })
+    }
+}
+
+impl Drop for LoopTap {
+    fn drop(&mut self) {
+        self.status.format_ok.store(false, Ordering::Release);
+        // After this returns the data thread no longer calls `tap_process`.
+        let _ = self.stream.disconnect();
+        self.status.set_state(VmicState::Idle);
+    }
+}
+
 /// The stream and its two listeners, owned by the PipeWire loop thread. The process listener
 /// is the only one holding the [`Outlet`]; state and format events go to a second listener
 /// with no user data, so the real-time thread and the loop thread never share a `&mut`.
+/// #114: with pass-through, the microphone's capture stream lives and dies with it.
 pub(crate) struct LoopVmic {
-    // Field order is drop order: listeners before the stream they are attached to.
+    // Field order is drop order: the capture first (its ring's reader is in the outlet), then
+    // listeners before the stream they are attached to.
+    _tap: Option<LoopTap>,
     _process: pw::stream::StreamListener<Outlet>,
     _events: pw::stream::StreamListener<()>,
     stream: pw::stream::StreamRc,
@@ -438,11 +928,13 @@ pub(crate) struct LoopVmic {
 }
 
 impl LoopVmic {
-    /// Create and connect the stream on the loop thread.
+    /// Create and connect the stream on the loop thread, and the pass-through's capture when
+    /// the spec has one. A capture that PipeWire refuses is reported on its own status and the
+    /// node still plays speech.
     pub(crate) fn open(
         core: &pw::core::CoreRc,
         spec: VmicSpec,
-        reader: VoiceReader,
+        mixer: Mixer,
     ) -> Result<Self, String> {
         let mut props = pw::properties::PropertiesBox::new();
         props.insert(*pw::keys::MEDIA_TYPE, "Audio");
@@ -462,7 +954,7 @@ impl LoopVmic {
             .map_err(|e| e.to_string())?;
 
         let outlet = Outlet {
-            reader,
+            mixer,
             scratch: vec![0.0; SCRATCH_FRAMES].into_boxed_slice(),
             status: Arc::clone(&spec.status),
         };
@@ -471,50 +963,7 @@ impl LoopVmic {
             .process(process)
             .register()
             .map_err(|e| e.to_string())?;
-
-        let state_status = Arc::clone(&spec.status);
-        let format_status = Arc::clone(&spec.status);
-        let want_rate = spec.rate;
-        let events_listener = stream
-            .add_local_listener::<()>()
-            .state_changed(move |_, _, _old, new| match new {
-                pw::stream::StreamState::Streaming => state_status.set_state(VmicState::Streaming),
-                pw::stream::StreamState::Paused => state_status.set_state(VmicState::Ready),
-                pw::stream::StreamState::Connecting => {
-                    state_status.set_state(VmicState::Connecting)
-                }
-                pw::stream::StreamState::Error(why) => state_status.set_error(why),
-                pw::stream::StreamState::Unconnected => {}
-            })
-            .param_changed(move |_, _, id, param| {
-                if id != spa::param::ParamType::Format.as_raw() {
-                    return;
-                }
-                let Some(param) = param else {
-                    format_status.format_ok.store(false, Ordering::Release);
-                    return;
-                };
-                let mut info = spa::param::audio::AudioInfoRaw::new();
-                if info.parse(param).is_ok() {
-                    format_status.rate.store(info.rate(), Ordering::Release);
-                    let ok = info.rate() == want_rate
-                        && info.channels() == 1
-                        && info.format() == spa::param::audio::AudioFormat::F32LE;
-                    format_status.format_ok.store(ok, Ordering::Release);
-                    if !ok {
-                        format_status.set_error(format!(
-                            "negotiated {:?} {} Hz × {} ch, need F32LE {want_rate} Hz mono",
-                            info.format(),
-                            info.rate(),
-                            info.channels()
-                        ));
-                    }
-                } else {
-                    format_status.format_ok.store(false, Ordering::Release);
-                }
-            })
-            .register()
-            .map_err(|e| e.to_string())?;
+        let events_listener = status_listener(&stream, &spec.status, spec.rate)?;
 
         let pod = enum_format_pod(spec.rate)?;
         let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or("bad EnumFormat pod")?];
@@ -529,7 +978,19 @@ impl LoopVmic {
             .map_err(|e| e.to_string())?;
         spec.status.set_state(VmicState::Connecting);
 
+        let tap = spec.tap.and_then(|(tap_spec, writer)| {
+            let status = Arc::clone(&tap_spec.status);
+            match LoopTap::open(core, tap_spec, writer) {
+                Ok(tap) => Some(tap),
+                Err(why) => {
+                    status.set_error(why);
+                    None
+                }
+            }
+        });
+
         Ok(Self {
+            _tap: tap,
             _process: process_listener,
             _events: events_listener,
             stream,
@@ -561,6 +1022,41 @@ pub struct VmicStats {
     pub first_pull: Option<Instant>,
 }
 
+/// #114: the pass-through a node is opened with: the user's own microphone into `dmn-voice`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Passthrough {
+    /// The microphone's `node.name` (`target.object`; a stream's name works too, which is what
+    /// the live test plays a tone through), or `None` for PipeWire's default source. A named
+    /// one that is absent falls back to the default source, as the whisper lane does.
+    pub target: Option<String>,
+    /// Whether the microphone is heard from the first buffer (pass-through mode) or the gate
+    /// starts shut (translate mode); [`VirtualMic::set_passthrough`] flips it later.
+    pub on: bool,
+}
+
+/// #114: what the pass-through has done so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassthroughStats {
+    /// The capture stream's state: `Streaming` once the microphone is linked to it.
+    pub state: VmicState,
+    /// Microphone samples its callback pushed into the ring.
+    pub pushed: u64,
+    /// Samples that found no room (nothing pulling from the node, or a backlog about to be
+    /// trimmed).
+    pub dropped: u64,
+    /// Samples the playback side skipped to cut a backlog down.
+    pub skipped: u64,
+    /// Samples the playback side pulled, heard or discarded.
+    pub popped: u64,
+    /// From the first sound reaching the ring to that sound leaving it for the call: what dmn
+    /// adds to PipeWire's own latency.
+    pub dwell: Option<Duration>,
+    /// When the first sound reached the ring from the microphone.
+    pub first_in: Option<Instant>,
+    /// When the first sound left the ring for the call.
+    pub first_out: Option<Instant>,
+}
+
 /// The virtual microphone, from the feeding thread's side. See the module doc for the node's
 /// lifetime and the ring's rules.
 pub struct VirtualMic {
@@ -572,6 +1068,8 @@ pub struct VirtualMic {
     resampler: Option<LinearResampler>,
     scratch: Vec<f32>,
     written: u64,
+    /// #114: the pass-through's switch, its capture's status and its ring's counters.
+    passthrough: Option<(Arc<AtomicBool>, Arc<VmicStatus>, Arc<TapStats>)>,
 }
 
 impl VirtualMic {
@@ -588,9 +1086,50 @@ impl VirtualMic {
         rate: u32,
         ring_capacity: usize,
     ) -> Result<Self, AudioError> {
+        Self::open_full(ctx, rate, ring_capacity, None)
+    }
+
+    /// #114: [`Self::open`] with the user's own microphone passing through the node.
+    pub fn open_passthrough(
+        ctx: Arc<PipeWireContext>,
+        rate: u32,
+        passthrough: Passthrough,
+    ) -> Result<Self, AudioError> {
+        Self::open_full(
+            ctx,
+            rate,
+            (rate * DEFAULT_RING_SECS) as usize,
+            Some(passthrough),
+        )
+    }
+
+    fn open_full(
+        ctx: Arc<PipeWireContext>,
+        rate: u32,
+        ring_capacity: usize,
+        passthrough: Option<Passthrough>,
+    ) -> Result<Self, AudioError> {
         let (writer, reader) = voice_ring(ring_capacity);
         let status = Arc::new(VmicStatus::default());
         let key = ctx.next_key();
+        let mut tap = None;
+        let mut tap_reader = None;
+        let mut handle = None;
+        if let Some(p) = passthrough {
+            let (tap_writer, reader) = tap_ring((rate * TAP_RING_MS / 1000).max(1) as usize);
+            let on = Arc::new(AtomicBool::new(p.on));
+            let tap_status = Arc::new(VmicStatus::default());
+            handle = Some((Arc::clone(&on), Arc::clone(&tap_status), tap_writer.stats()));
+            tap_reader = Some((reader, on));
+            tap = Some((
+                TapSpec {
+                    target: p.target,
+                    rate,
+                    status: tap_status,
+                },
+                tap_writer,
+            ));
+        }
         ctx.send(Command::OpenVmic {
             key,
             spec: VmicSpec {
@@ -598,8 +1137,9 @@ impl VirtualMic {
                 description: VMIC_DESCRIPTION.to_owned(),
                 rate,
                 status: Arc::clone(&status),
+                tap,
             },
-            reader,
+            mixer: Mixer::new(reader, tap_reader, rate),
         })?;
         let mut mic = Self {
             ctx,
@@ -610,6 +1150,7 @@ impl VirtualMic {
             resampler: None,
             scratch: Vec::new(),
             written: 0,
+            passthrough: handle,
         };
         let t = Instant::now();
         loop {
@@ -653,6 +1194,43 @@ impl VirtualMic {
             stalls: s.stalls(),
             first_pull: s.first_pull(),
         }
+    }
+
+    /// #114: open or shut the microphone's gate (pass-through mode on or off). The playback
+    /// callback fades over [`PASSTHROUGH_FADE_MS`] from its next buffer; speech in flight keeps
+    /// the gate shut whatever this says. Nothing without a pass-through.
+    pub fn set_passthrough(&self, on: bool) {
+        if let Some((switch, ..)) = &self.passthrough {
+            switch.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// #114: whether the microphone's gate is set open; `None` for a node with no pass-through.
+    pub fn passthrough(&self) -> Option<bool> {
+        self.passthrough
+            .as_ref()
+            .map(|(switch, ..)| switch.load(Ordering::Relaxed))
+    }
+
+    /// #114: what the pass-through has done so far; `None` for a node without one.
+    pub fn passthrough_stats(&self) -> Option<PassthroughStats> {
+        let (_, status, stats) = self.passthrough.as_ref()?;
+        Some(PassthroughStats {
+            state: status.state(),
+            pushed: stats.pushed(),
+            dropped: stats.dropped(),
+            skipped: stats.skipped(),
+            popped: stats.popped(),
+            dwell: stats.dwell(),
+            first_in: stats.first_in(),
+            first_out: stats.first_out(),
+        })
+    }
+
+    /// #114: why the pass-through's capture is in error, if it is.
+    pub fn passthrough_error(&self) -> Option<String> {
+        let (_, status, _) = self.passthrough.as_ref()?;
+        (status.state() == VmicState::Error).then(|| status.last_error().unwrap_or_default())
     }
 
     /// Queue `samples` (mono f32 at `sample_rate`) for playback, resampled to the node's rate.
@@ -916,6 +1494,198 @@ mod tests {
         assert_eq!(st.last_error().as_deref(), Some("refused"));
     }
 
+    // ---- #114: the pass-through's ring and the mixer -------------------------------------
+
+    /// A test rate: 8 ms of fade is 8 samples, the backlog limits 60 and 20 samples.
+    const RATE: u32 = 1_000;
+    const FADE: usize = (RATE * PASSTHROUGH_FADE_MS / 1000) as usize;
+
+    /// A mixer at [`RATE`] over a speech ring and a mic ring, with the switch.
+    fn mixer(on: bool) -> (Mixer, VoiceWriter, TapWriter, Arc<AtomicBool>) {
+        let (speech, speech_reader) = voice_ring(1_000);
+        let (mic, mic_reader) = tap_ring(1_000);
+        let switch = Arc::new(AtomicBool::new(on));
+        let m = Mixer::new(speech_reader, Some((mic_reader, Arc::clone(&switch))), RATE);
+        (m, speech, mic, switch)
+    }
+
+    #[test]
+    fn the_tap_ring_drops_the_newest_mic_samples_when_full_and_counts_them() {
+        let (mut w, mut r) = tap_ring(8);
+        assert_eq!(w.push(&[0.1; 6]), 6);
+        let t = Instant::now();
+        assert_eq!(w.push(&[0.2; 6]), 2, "two slots were free");
+        assert!(t.elapsed() < Duration::from_millis(5), "never blocks");
+        let stats = w.stats();
+        assert_eq!((stats.pushed(), stats.dropped()), (8, 4));
+        assert!(stats.first_in().is_some(), "0.1 is sound");
+        // The oldest come out first; an empty ring is silence.
+        let mut out = [1.0f32; 10];
+        assert_eq!(r.pop(&mut out), 8);
+        assert_eq!(&out[..6], &[0.1; 6]);
+        assert_eq!(&out[6..8], &[0.2; 2]);
+        assert_eq!(&out[8..], &[0.0; 2]);
+        assert_eq!(stats.popped(), 8);
+        // Silence is not sound: the stamp waits for it.
+        let (w2, _) = tap_ring(8);
+        let mut w2 = w2;
+        w2.push(&[0.0; 4]);
+        assert!(w2.stats().first_in().is_none());
+    }
+
+    #[test]
+    fn a_mic_backlog_is_skipped_down_so_pass_through_never_lags() {
+        let (mut w, mut r) = tap_ring(1_000);
+        let ramp: Vec<f32> = (0..200).map(|i| i as f32 / 1000.0).collect();
+        w.push(&ramp);
+        r.trim(60, 20);
+        assert_eq!(r.queued(), 20);
+        assert_eq!(r.stats().skipped(), 180);
+        let mut out = [0.0; 20];
+        r.pop(&mut out);
+        assert_eq!(out[0], 0.180, "the newest 20 ms are what is left");
+        // Under the limit nothing is touched.
+        w.push(&ramp[..50]);
+        r.trim(60, 20);
+        assert_eq!(r.queued(), 50);
+    }
+
+    #[test]
+    fn the_mixer_passes_the_mic_through_when_the_gate_is_open_and_fades_it_in_when_it_opens() {
+        // Open from the start: the first buffer is the microphone, whole.
+        let (mut m, _speech, mut mic, _) = mixer(true);
+        assert_eq!(m.gain(), 1.0);
+        mic.push(&[0.5; 40]);
+        let mut out = [1.0f32; 40];
+        assert_eq!(m.fill(&mut out), 0, "no speech");
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "{out:?}");
+        assert!(mic.stats().first_out().is_some());
+
+        // Shut at the start (translate mode), then opened: a fade of FADE samples, no step.
+        let (mut m, _speech, mut mic, switch) = mixer(false);
+        assert_eq!(m.gain(), 0.0);
+        mic.push(&[0.5; 40]);
+        let mut out = [1.0f32; 20];
+        m.fill(&mut out);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "shut: silence, mic discarded"
+        );
+        assert_eq!(mic.stats().popped(), 20, "the mic kept flowing past");
+        switch.store(true, Ordering::Relaxed);
+        let mut out = [0.0f32; 20];
+        m.fill(&mut out);
+        for (i, s) in out.iter().enumerate() {
+            let want = 0.5 * ((i + 1) as f32 / FADE as f32).min(1.0);
+            assert!((s - want).abs() < 1e-5, "sample {i}: {s} ≠ {want}");
+        }
+        assert_eq!(m.gain(), 1.0);
+    }
+
+    /// The acceptance criterion: no microphone sample reaches the output while speech plays,
+    /// whatever the mode; the hand-over is a fade, and the microphone is back after the drain.
+    #[test]
+    fn no_mic_sample_reaches_the_output_while_speech_plays_whatever_the_mode() {
+        // The microphone is pushed a buffer at a time, as its callback does; a pile pushed at
+        // once would be a backlog and trimmed.
+        let (mut m, mut speech, mut mic, switch) = mixer(true);
+        mic.push(&[0.5; 10]);
+        let mut out = [0.0f32; 10];
+        m.fill(&mut out);
+        assert!(
+            out.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "mic alone first"
+        );
+
+        // A sentence arrives: the writer sets `speaking` with its first push.
+        speech.set_speaking(true);
+        assert_eq!(speech.push(&[0.25; 100]), 100);
+        mic.push(&[0.5; 30]);
+        let mut out = [0.0f32; 30];
+        assert_eq!(m.fill(&mut out), 30);
+        for (i, s) in out.iter().enumerate() {
+            let mic_gain = (1.0 - (i + 1) as f32 / FADE as f32).max(0.0);
+            let want = 0.25 + 0.5 * mic_gain;
+            assert!((s - want).abs() < 1e-5, "sample {i}: {s} ≠ {want}");
+        }
+        assert!(
+            out[FADE..].iter().all(|&s| (s - 0.25).abs() < 1e-6),
+            "after the fade only the speech is heard"
+        );
+        // The next buffer, still speaking: speech only, the mic flowing past unheard.
+        let popped = mic.stats().popped();
+        mic.push(&[0.5; 20]);
+        let mut out = [0.0f32; 20];
+        m.fill(&mut out);
+        assert!(out.iter().all(|&s| (s - 0.25).abs() < 1e-6), "{out:?}");
+        assert_eq!(mic.stats().popped(), popped + 20);
+        // The speech ring runs dry mid-sentence (the server is slow): still no microphone.
+        mic.push(&[0.5; 60]);
+        let mut out = [0.0f32; 60];
+        assert_eq!(m.fill(&mut out), 50, "the sentence's last 50 samples");
+        assert!(out[..50].iter().all(|&s| (s - 0.25).abs() < 1e-6));
+        assert!(
+            out[50..].iter().all(|&s| s == 0.0),
+            "then silence, not the mic"
+        );
+
+        // Translate mode (the switch off): speech, never the mic.
+        switch.store(false, Ordering::Relaxed);
+        speech.push(&[0.25; 20]);
+        mic.push(&[0.5; 20]);
+        let mut out = [0.0f32; 20];
+        m.fill(&mut out);
+        assert!(out.iter().all(|&s| (s - 0.25).abs() < 1e-6));
+        speech.set_speaking(false);
+        mic.push(&[0.5; 20]);
+        let mut out = [0.0f32; 20];
+        m.fill(&mut out);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "translate mode: the mic stays out"
+        );
+
+        // Back in pass-through mode after the drain: the mic fades back in.
+        switch.store(true, Ordering::Relaxed);
+        mic.push(&[0.5; 20]);
+        let mut out = [0.0f32; 20];
+        m.fill(&mut out);
+        assert!(out[0] > 0.0 && out[0] < 0.5 && out[FADE] == 0.5, "{out:?}");
+    }
+
+    #[test]
+    fn a_switch_is_a_fade_not_a_step() {
+        let (mut m, _speech, mut mic, switch) = mixer(true);
+        mic.push(&[0.5; 10]);
+        let mut out = [0.0f32; 10];
+        m.fill(&mut out);
+        switch.store(false, Ordering::Relaxed);
+        mic.push(&[0.5; 20]);
+        let mut out = [0.0f32; 20];
+        m.fill(&mut out);
+        let max_step = out
+            .windows(2)
+            .map(|w| (w[0] - w[1]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_step <= 0.5 / FADE as f32 + 1e-5,
+            "largest step {max_step} over a fade of {FADE} samples"
+        );
+        assert_eq!(out[FADE], 0.0, "shut after the fade");
+        assert_eq!(m.gain(), 0.0);
+    }
+
+    #[test]
+    fn a_node_without_pass_through_mixes_speech_alone() {
+        let (mut speech, reader) = voice_ring(100);
+        let mut m = Mixer::new(reader, None, RATE);
+        speech.push(&[0.25; 10]);
+        let mut out = [1.0f32; 20];
+        assert_eq!(m.fill(&mut out), 10);
+        assert!(out[..10].iter().all(|&s| s == 0.25));
+        assert!(out[10..].iter().all(|&s| s == 0.0));
+    }
+
     // ---- Live tests: need a running PipeWire server and pw-record. `just probe`.
 
     mod live {
@@ -1165,6 +1935,188 @@ mod tests {
                 (true, false),
                 "if this now relinks, PipeWire keeps a call's choice across a restart and the \
                  start-up notice in dmn-cli's speaker can go"
+            );
+        }
+
+        /// #114, the issue's first criterion: a 440 Hz tone played by `pw-play` as a stream
+        /// named `dmn-test-114-tone` (nothing on disk: raw samples on its stdin), captured by
+        /// the pass-through's stream through the same PipeWire capture path the mic lane uses
+        /// (`target.object` naming the node, as the Interviewer lane names an app's stream),
+        /// written through the mixer into `dmn-voice`, and recorded there with `pw-record
+        /// --target dmn-voice`: the right length, the right pitch at the graph rate, loud. The
+        /// real microphone is never used: the tap names the tone's node and does not fall back.
+        /// Prints the latency: the microphone's dwell in dmn (its first sound reaching the ring
+        /// to that sound leaving it, both stamped in the callbacks) and the same sound reaching
+        /// `pw-record`'s pipe (which adds `pw-record`'s own quantum and the pipe). The dwell
+        /// must be under the issue's 50 ms.
+        #[test]
+        #[ignore]
+        fn live_passthrough_carries_a_tone_from_a_capture_into_dmn_voice_within_50_ms() {
+            let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            const TONE_NODE: &str = "dmn-test-114-tone";
+            let ctx = connect();
+            let rate = ctx.nodes().graph_rate();
+
+            // The microphone: a stream playing silence until `go`, then 1.5 s of tone and 0.3 s
+            // of silence, at the graph rate so nothing resamples it on the way. It is in the
+            // graph before the tap opens, so the tap can only ever link to it (a named target
+            // that is absent falls back to the default source, which here would be the real
+            // microphone).
+            let secs = 1.5f32;
+            let mut play = Proc::new("pw-play")
+                .args(["--raw", "--rate", &rate.to_string(), "--channels", "1"])
+                .args(["--format", "f32", "-P"])
+                .arg(format!("{{ node.name = \"{TONE_NODE}\" }}"))
+                .arg("-")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("pw-play on PATH");
+            let mut stdin = play.stdin.take().unwrap();
+            let go = Arc::new(AtomicBool::new(false));
+            let feeder = {
+                let go = Arc::clone(&go);
+                std::thread::spawn(move || {
+                    use std::io::Write as _;
+                    let silence = vec![0u8; rate as usize / 10 * STRIDE];
+                    while !go.load(Ordering::Acquire) {
+                        if stdin.write_all(&silence).is_err() {
+                            return;
+                        }
+                    }
+                    let n = (rate as f32 * secs) as usize;
+                    let tone: Vec<u8> = (0..n)
+                        .map(|i| {
+                            0.5 * (std::f32::consts::TAU * TONE_HZ * i as f32 / rate as f32).sin()
+                        })
+                        .chain(std::iter::repeat_n(0.0, (rate as f32 * 0.3) as usize))
+                        .flat_map(f32::to_le_bytes)
+                        .collect();
+                    let _ = stdin.write_all(&tone);
+                })
+            };
+            let t = Instant::now();
+            while !String::from_utf8_lossy(&Proc::new("pw-dump").output().unwrap().stdout)
+                .contains(&format!("\"node.name\": \"{TONE_NODE}\""))
+            {
+                assert!(
+                    t.elapsed() < Duration::from_secs(3),
+                    "the tone's node never came"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+
+            let mic = VirtualMic::open_passthrough(
+                Arc::clone(&ctx),
+                rate,
+                Passthrough {
+                    target: Some(TONE_NODE.to_owned()),
+                    on: true,
+                },
+            )
+            .expect("vmic opens");
+            assert_eq!(mic.passthrough(), Some(true));
+
+            // The call: pw-record on dmn-voice, each loud read stamped when it arrives.
+            let mut rec = record(rate);
+            let mut stdout = rec.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                let (mut raw, mut first_loud, mut buf) = (Vec::new(), None, [0u8; 4096]);
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    if first_loud.is_none()
+                        && buf[..n]
+                            .chunks_exact(4)
+                            .any(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() >= LOUD)
+                    {
+                        first_loud = Some(Instant::now());
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                (raw, first_loud)
+            });
+            let t = Instant::now();
+            loop {
+                let linked = mic.status().state() == VmicState::Streaming
+                    && mic
+                        .passthrough_stats()
+                        .is_some_and(|s| s.state == VmicState::Streaming);
+                if linked {
+                    break;
+                }
+                assert!(
+                    t.elapsed() < Duration::from_secs(3),
+                    "pw-record or the tap never linked: {:?} / {:?}",
+                    mic.status().state(),
+                    mic.passthrough_error()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Both links settled, and the silence has been flowing for a moment.
+            std::thread::sleep(Duration::from_millis(300));
+            go.store(true, Ordering::Release);
+            let _ = feeder.join();
+            let _ = play.wait();
+            // The tail of the tone is still in the rings and pw-record's quantum.
+            std::thread::sleep(Duration::from_millis(500));
+            let stats = mic.passthrough_stats().expect("a pass-through");
+            let _ = rec.kill();
+            let _ = rec.wait();
+            let (raw, heard_at) = reader.join().unwrap();
+            let tap_error = mic.passthrough_error();
+            mic.close().expect("close");
+
+            assert_eq!(tap_error, None);
+            assert!(stats.pushed > 0, "the capture pushed samples");
+            let heard: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let loud: Vec<usize> = heard
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.abs() > LOUD)
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                !loud.is_empty(),
+                "pw-record heard the tone through dmn-voice"
+            );
+            let (first, last) = (loud[0], *loud.last().unwrap());
+            let length = (last - first) as f32 / rate as f32;
+            assert!(
+                (length - secs).abs() <= secs * 0.1,
+                "heard {length:.3} s of tone, expected {secs} ± 10 %"
+            );
+            let tone = &heard[first..=last];
+            let rms = (tone.iter().map(|s| s * s).sum::<f32>() / tone.len() as f32).sqrt();
+            assert!(rms > 0.2, "rms {rms} (a 0.5 sine is 0.354)");
+            let on = goertzel(tone, TONE_HZ, rate as f32);
+            let off = goertzel(tone, 880.0, rate as f32).max(goertzel(tone, 220.0, rate as f32));
+            assert!(on / off.max(1e-9) > 100.0, "440 Hz dominates: {}", on / off);
+
+            let dwell = stats.dwell.expect("the tone went in and out");
+            let to_recorder = heard_at
+                .zip(stats.first_in)
+                .map(|(heard, entered)| heard.saturating_duration_since(entered));
+            eprintln!(
+                "pass-through latency: in dmn (capture callback → playback callback) {:.1} ms; \
+                 capture callback → pw-record's pipe {}; {} samples pushed, {} dropped, {} skipped",
+                dwell.as_secs_f64() * 1000.0,
+                to_recorder.map_or("unknown".to_owned(), |d| format!(
+                    "{:.1} ms",
+                    d.as_secs_f64() * 1000.0
+                )),
+                stats.pushed,
+                stats.dropped,
+                stats.skipped
+            );
+            assert!(
+                dwell < Duration::from_millis(50),
+                "mic → dmn-voice took {dwell:?}, over the 50 ms target"
             );
         }
 
