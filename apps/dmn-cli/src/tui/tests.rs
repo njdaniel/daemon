@@ -12,9 +12,9 @@
 use std::path::{Path, PathBuf};
 
 use dmn_session::{
-    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason,
-    QuestionSource, Section, Session, SlowEnd, SlowField, Speaker, StarCards, TradeoffItem,
-    VoiceMode,
+    Action, Citation, CodeBlock, CodingSolutions, DeeperItem, Dot, Health, IgnoreReason, PickerOp,
+    QuestionSource, Section, Session, SlowEnd, SlowField, SpeakLanguage, Speaker, StarCards,
+    TradeoffItem, VoiceMode,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 41] = [
+const STATES: [&str; 44] = [
     "listening",
     "live",
     "pinned",
@@ -84,6 +84,12 @@ const STATES: [&str; 41] = [
     "voice-translate",
     "voice-you-assist-off",
     "voice-translate-assist-off",
+    // #115: three languages listed and the picker closed (the screen as without it); the
+    // picker open over translate mode with the cursor moved to the second row; and open with
+    // one language, on the transcript-first screen, with the hint to enroll more.
+    "picker-closed",
+    "picker",
+    "picker-one",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -937,6 +943,26 @@ fn actions(state: &str) -> Vec<Action> {
             a.extend(spoken_turn(1, 92.5, 97.0, YOUR_ANSWER, YOUR_ANSWER_DE));
             return a;
         }
+        // #115: the languages listed, the picker closed: nothing on screen changes.
+        "picker-closed" => {
+            let mut a = actions("voice-translate");
+            a.push(languages(&["de", "es", "ru"]));
+            return a;
+        }
+        // #115: `v`, then `↓`: the cursor on Spanish, German marked as the current language.
+        "picker" => {
+            let mut a = actions("picker-closed");
+            a.push(Action::Picker { op: PickerOp::Open });
+            a.push(Action::Picker { op: PickerOp::Down });
+            return a;
+        }
+        // #115: one language enrolled: the picker opens on it, with the hint to enroll more.
+        "picker-one" => {
+            let mut a = actions("voice-translate-assist-off");
+            a.push(languages(&["de"]));
+            a.push(Action::Picker { op: PickerOp::Open });
+            return a;
+        }
         "long-items" => {
             a.extend(long_items());
             a.push(Action::ToggleSection {
@@ -961,6 +987,20 @@ const YOUR_FAILOVER: &str = "If Redis goes down, I'd fail open with a local limi
 const YOUR_FAILOVER_DE: &str = "Wenn Redis ausfällt, würde ich mit einem lokalen Limit \
                                 durchlassen.";
 const YOUR_SHARDING: &str = "Then I'd shard the counters by key.";
+
+/// #115: the languages `dmn run` lists for the picker, each with the voice `enroll --language`
+/// names for it.
+fn languages(codes: &[&str]) -> Action {
+    Action::SpeakLanguages {
+        languages: codes
+            .iter()
+            .map(|code| SpeakLanguage {
+                code: (*code).to_owned(),
+                voice: format!("voice-{code}"),
+            })
+            .collect(),
+    }
+}
 
 /// #114: the voice state `dmn run` dispatches: into German, the user speaking English.
 fn voice(mode: VoiceMode) -> Action {
@@ -1850,6 +1890,99 @@ fn tui_the_voice_tag_leads_the_status_line_and_the_transcript_marks_what_went_ou
         let (x, y) = row_containing(&buf, "» Ich würde");
         assert_eq!(buf[(x, y)].fg, Color::DarkGray);
     }
+}
+
+/// #115: the picker is a centred box over the three areas, which keep their layout: closed,
+/// the screen is the one without it; open, every language is a row with its voice, the cursor
+/// row is highlighted, the current language is marked, and the keys are named; with one
+/// language the hint says how to enroll more. Choosing updates the tag and writes a marker.
+#[test]
+fn tui_the_picker_lists_the_languages_over_an_unchanged_layout_and_a_choice_updates_the_tag() {
+    for size in SIZES {
+        // Closed: nothing but the session's list differs from #114's screen.
+        assert_eq!(
+            text(&render(&load("picker-closed"), size)),
+            text(&render(&load("voice-translate"), size)),
+            "{size:?}: a closed picker changes nothing"
+        );
+        let buf = render(&load("picker"), size);
+        let screen = text(&buf);
+        let (x, y) = row_containing(&buf, "LANGUAGE");
+        assert!(
+            x > 20 && y > 5,
+            "centred, not in a corner: ({x}, {y})\n{screen}"
+        );
+        assert!(screen.contains("de   voice-de   ← now"), "{screen}");
+        assert!(screen.contains("▸ es   voice-es"), "{screen}");
+        assert!(screen.contains("  ru   voice-ru"), "{screen}");
+        assert!(
+            screen.contains("↑↓ move · ⏎ choose · esc close"),
+            "{screen}"
+        );
+        assert!(!screen.contains("one language enrolled"), "{screen}");
+        let (x, y) = row_containing(&buf, "▸ es");
+        assert_eq!(
+            (buf[(x, y)].bg, buf[(x, y)].fg),
+            (Color::Cyan, Color::Black)
+        );
+        let (x, y) = row_containing(&buf, "de   voice-de");
+        assert!(
+            buf[(x, y)].modifier.contains(Modifier::BOLD),
+            "the current one is bold"
+        );
+        // The areas under it are where they were: the status line and the question's title.
+        let last = usize::from(size.1) - 1;
+        let row = screen.lines().nth(last).unwrap();
+        assert!(row.starts_with(" voice: → de "), "{row}");
+        assert!(screen.contains("LIVE QUESTION"), "{screen}");
+
+        // One language, on the transcript-first screen: the row, the hint, the keys.
+        let buf = render(&load("picker-one"), size);
+        let screen = text(&buf);
+        assert!(screen.contains("▸ de   voice-de   ← now"), "{screen}");
+        assert!(
+            screen.contains("one language enrolled; add another with"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("dmn speak enroll --wav <clip> --language <code>"),
+            "{screen}"
+        );
+        let (x, y) = row_containing(&buf, "one language enrolled");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the hint is dim");
+        assert!(
+            screen.contains("You → de"),
+            "the transcript stays:\n{screen}"
+        );
+    }
+    // Enter on Spanish: the picker closes, the tag says `→ es`, the transcript has the marker,
+    // and the press in flight (German) keeps its language when it is done.
+    let mut chosen = actions("picker");
+    chosen.push(Action::SpeakTarget {
+        target: "es".into(),
+    });
+    let session = Session::replay(&chosen);
+    assert_eq!(session.picker, None);
+    let buf = render(&session, (100, 30));
+    let screen = text(&buf);
+    assert!(!screen.contains("LANGUAGE"), "{screen}");
+    assert!(
+        screen.lines().nth(29).unwrap().starts_with(" voice: → es "),
+        "{screen}"
+    );
+    let (x, y) = row_containing(&buf, "— language: → es —");
+    assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the marker is dim");
+    chosen.push(Action::SpeakTranslated {
+        id: 2,
+        text: "Dann würde ich die Zähler nach Schlüssel sharden.".into(),
+    });
+    chosen.push(Action::SpeakDone { id: 2 });
+    let screen = text(&render(&Session::replay(&chosen), (140, 30)));
+    assert!(
+        screen.contains("You → de    Then I'd shard"),
+        "spoken in the language it started in:\n{screen}"
+    );
+    assert!(!screen.contains("You → es"), "{screen}");
 }
 
 /// #109: `t speak` is offered while `[speak]` is on, assistance on or off, and never otherwise;

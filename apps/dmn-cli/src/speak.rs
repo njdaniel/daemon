@@ -107,6 +107,37 @@ pub enum SpeakError {
         "[speak].target = {target:?} in {config} is not a language whisper knows; use a code such as \"es\", \"de\" or \"fr\""
     )]
     UnknownTarget { target: String, config: String },
+    /// #115: a `[speak].languages` entry whose voice the server's library does not have.
+    #[error(
+        "[speak].languages in {config} names the voice {voice:?} for {code:?}, but the TTS server has no such voice; enroll it: dmn speak enroll --wav <clip> --language {code} --name {voice}"
+    )]
+    LanguageVoiceGone {
+        code: String,
+        voice: String,
+        config: String,
+    },
+    /// #115: a `[speak].languages` entry whose voice was enrolled for another language.
+    #[error(
+        "[speak].languages in {config} says the voice {voice:?} speaks {code:?}, but the TTS server has it enrolled for {speaks:?}; re-enroll it: dmn speak enroll --wav {clip} --language {code} --name {voice}"
+    )]
+    LanguageVoiceMismatch {
+        code: String,
+        speaks: String,
+        voice: String,
+        clip: String,
+        config: String,
+    },
+    /// #115: a `[speak].languages` code whisper does not know.
+    #[error(
+        "[speak].languages in {config} has the code {code:?}, which is not a language whisper knows; use a code such as \"es\", \"de\" or \"fr\""
+    )]
+    UnknownLanguage { code: String, config: String },
+    /// #115: `enroll --language` takes the shape `[speak].target` takes, so the entry it
+    /// writes parses.
+    #[error(
+        "--language {code:?} is not a two- or three-letter language code such as \"es\" (the code whisper and [speak].target use)"
+    )]
+    BadLanguage { code: String },
     #[error("cannot reach the [llm] provider for translation: {0}")]
     Llm(String),
     #[error(transparent)]
@@ -162,11 +193,7 @@ pub(crate) fn tts_error(e: TtsError, paths: &Paths) -> SpeakError {
 /// The voice name the server knows the clip by is the stored clip's file stem, so `dmn speak`
 /// finds it from `[speak].voice_ref` alone (the config keeps no separate name).
 pub(crate) fn voice_name(voice_ref: &str) -> String {
-    Path::new(voice_ref)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_NAME.to_owned())
+    dmn_core::config::voice_ref_name(voice_ref)
 }
 
 fn check_name(name: &str) -> Result<(), SpeakError> {
@@ -244,7 +271,9 @@ fn store_clip(from: &Path, to: &Path) -> Result<(), SpeakError> {
 
 /// Enroll: validate the clip, register it with the server, then copy it under the data dir and
 /// record it as `[speak].voice_ref`. The server goes first, so a refused or failed
-/// registration changes nothing on disk.
+/// registration changes nothing on disk. #115: with `--language <code>` the voice is named
+/// `voice-<code>` unless `--name` says otherwise, and the pair is added to (or updated in)
+/// `[speak].languages`, so enrolling German and Spanish gives the picker a two-entry list.
 pub fn enroll(
     cfg: &Config,
     paths: &Paths,
@@ -252,14 +281,32 @@ pub fn enroll(
     provider: &dyn TtsProvider,
 ) -> Result<String, SpeakError> {
     check_gates(cfg, paths)?;
-    let name = args.name.as_deref().unwrap_or(DEFAULT_NAME);
+    let language = args.language.as_deref().map(str::trim);
+    if let Some(code) = language
+        && !dmn_core::config::is_language_code(code)
+    {
+        return Err(SpeakError::BadLanguage {
+            code: code.to_owned(),
+        });
+    }
+    let default_name = language.map(|code| format!("voice-{code}"));
+    let name = args
+        .name
+        .as_deref()
+        .or(default_name.as_deref())
+        .unwrap_or(DEFAULT_NAME);
     check_name(name)?;
     let note = validate_clip(&args.wav)?;
     let enrolled = rt()?
-        .block_on(provider.enroll(name, &args.wav, args.language.as_deref()))
+        .block_on(provider.enroll(name, &args.wav, language))
         .map_err(|e| tts_error(e, paths))?;
     let dest = paths.data_dir.join(format!("{name}.wav"));
     store_clip(&args.wav, &dest)?;
+    // The list first: a file with no list yet is seeded from its current `target` +
+    // `voice_ref` pair, which must be the pair as it was before this enroll.
+    if let Some(code) = language {
+        Config::write_speak_language(&paths.config_file, code, name)?;
+    }
     Config::write_voice_ref(&paths.config_file, &dest.display().to_string())?;
     tracing::info!(voice = %enrolled.name, clip = %dest.display(), replaced = enrolled.replaced, "voice enrolled");
     let mut out = String::new();
@@ -276,13 +323,17 @@ pub fn enroll(
             ""
         },
         cfg.speak.tts_url,
-        args.language
-            .as_deref()
+        language
             .map(|l| format!(", speaking {l}"))
             .unwrap_or_default(),
         dest.display(),
         paths.config_file.display()
     ));
+    if let Some(code) = language {
+        out.push_str(&format!(
+            "set {{ code = {code:?}, voice = {name:?} }} in [speak].languages (the picker's list, `v` in dmn run)\n"
+        ));
+    }
     Ok(out)
 }
 
@@ -664,13 +715,14 @@ target = \"es\"           # #109
     }
 
     /// The whole enroll against the HTTP mock: one upload, the clip stored byte for byte as
-    /// `<data>/voice.wav`, and `voice_ref` set in the user's file with its comments kept.
+    /// `<data>/voice-es.wav` (#115: `--language es` names the voice `voice-es`), `voice_ref`
+    /// set in the user's file with its comments kept, and the pair added to `languages`.
     #[test]
     fn enroll_registers_stores_and_records_the_clip() {
         let server = serve(vec![Reply::new(
             "201 Created",
             "application/json",
-            r#"{"voice":{"name":"voice","language":"es"}}"#,
+            r#"{"voice":{"name":"voice-es","language":"es"}}"#,
         )])
         .unwrap();
         let (dir, paths, cfg) = setup(&server.url);
@@ -687,20 +739,24 @@ target = \"es\"           # #109
             &dmn_tts::ChatterboxProvider::new(&server.url),
         )
         .unwrap();
-        assert!(out.contains("enrolled \"voice\""), "{out}");
+        assert!(out.contains("enrolled \"voice-es\""), "{out}");
         assert!(out.contains("speaking es"), "{out}");
+        assert!(
+            out.contains("set { code = \"es\", voice = \"voice-es\" } in [speak].languages"),
+            "{out}"
+        );
 
         assert_eq!(server.request_lines(), ["POST /v1/voices"]);
         let requests = server.requests();
         let (_, body) = MockServer::head_and_body(&requests[0]);
         let text = String::from_utf8_lossy(body);
         assert!(
-            text.contains("name=\"voice_name\"\r\n\r\nvoice\r\n"),
+            text.contains("name=\"voice_name\"\r\n\r\nvoice-es\r\n"),
             "{text}"
         );
         assert!(text.contains("name=\"language\"\r\n\r\nes\r\n"), "{text}");
 
-        let stored = paths.data_dir.join("voice.wav");
+        let stored = paths.data_dir.join("voice-es.wav");
         assert_eq!(
             std::fs::read(&stored).unwrap(),
             std::fs::read(&wav).unwrap()
@@ -712,7 +768,97 @@ target = \"es\"           # #109
         );
         let cfg = Config::load(&paths.config_file).unwrap();
         assert_eq!(cfg.speak.voice_ref, stored.display().to_string());
+        assert_eq!(
+            cfg.speak.languages,
+            [dmn_core::config::SpeakLanguage {
+                code: "es".into(),
+                voice: "voice-es".into(),
+            }]
+        );
+        assert_eq!(cfg.speak.target, "es", "kept");
         assert!(cfg.lookup.enabled);
+    }
+
+    /// #115: the issue's criterion. The owner's shape of config (comments, other sections, a
+    /// `target` + `voice_ref` pair and no list): enrolling German adds a two-entry list that
+    /// keeps the Russian voice, enrolling Spanish makes it three, enrolling German again
+    /// updates its entry, and only the `voice_ref` and `languages` lines change.
+    #[test]
+    fn enroll_with_a_language_adds_or_updates_that_languages_entry_and_nothing_else() {
+        let owner = "\
+# nick's config
+[llm]
+model = \"qwen3.6:35b-a3b\"      # measured
+
+[speak]
+enabled = true
+tts_url = \"http://localhost:4123\"
+voice_ref = \"/home/u/.local/share/dmn/voice-ru.wav\"   # enrolled 2026-10-07
+target = \"ru\"
+model = \"llama3.1:8b\"
+temperature = 0.6
+
+[ui]
+mouse = false
+";
+        let (dir, paths, cfg) = setup("http://localhost:4123");
+        std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config_file, owner).unwrap();
+        let wav = dir.path().join("me.wav");
+        clip(&wav, 1, 16_000, 7.0);
+        let mock = MockTtsProvider::new();
+        let mut a = args(&wav, None);
+        a.language = Some("de".into());
+        enroll(&cfg, &paths, &a, &mock).unwrap();
+        a.language = Some("es".into());
+        enroll(&cfg, &paths, &a, &mock).unwrap();
+        a.language = Some("de".into());
+        a.name = Some("narrator".into());
+        enroll(&cfg, &paths, &a, &mock).unwrap();
+        let names: Vec<(String, Option<String>)> = mock
+            .enrollments()
+            .iter()
+            .map(|e| (e.name.clone(), e.language.clone()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("voice-de".to_owned(), Some("de".to_owned())),
+                ("voice-es".to_owned(), Some("es".to_owned())),
+                ("narrator".to_owned(), Some("de".to_owned())),
+            ]
+        );
+        for clip in ["voice-de.wav", "voice-es.wav", "narrator.wav"] {
+            assert!(paths.data_dir.join(clip).is_file(), "{clip}");
+        }
+        let after = std::fs::read_to_string(&paths.config_file).unwrap();
+        let changed: Vec<&str> = after.lines().filter(|l| !owner.contains(l)).collect();
+        assert_eq!(changed.len(), 2, "only voice_ref and languages:\n{after}");
+        assert!(
+            changed[0].starts_with("voice_ref = ") && changed[0].ends_with("# enrolled 2026-10-07"),
+            "{}",
+            changed[0]
+        );
+        assert_eq!(
+            changed[1],
+            "languages = [{ code = \"ru\", voice = \"voice-ru\" }, { code = \"de\", voice = \"narrator\" }, { code = \"es\", voice = \"voice-es\" }]"
+        );
+        assert_eq!(after.lines().count(), owner.lines().count() + 1);
+        let cfg = Config::load(&paths.config_file).unwrap();
+        assert_eq!(
+            cfg.speak.target, "ru",
+            "the target is not changed by an enroll"
+        );
+        assert_eq!(cfg.speak.voice_for("ru").as_deref(), Some("voice-ru"));
+        assert_eq!(cfg.speak.voice_for("de").as_deref(), Some("narrator"));
+        assert_eq!(cfg.speak.model.as_deref(), Some("llama3.1:8b"));
+        assert!(!cfg.ui.mouse);
+
+        // The code must have the shape the config takes, before anything reaches the server.
+        a.language = Some("German".into());
+        let err = enroll(&cfg, &paths, &a, &mock).unwrap_err();
+        assert!(matches!(err, SpeakError::BadLanguage { .. }), "{err}");
+        assert_eq!(mock.enrollments().len(), 3);
     }
 
     #[test]
