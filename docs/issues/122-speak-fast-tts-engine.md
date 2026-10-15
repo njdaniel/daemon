@@ -11,6 +11,19 @@ Candidates (free, local, voice cloning; figures are from secondary write-ups and
 - **CosyVoice 3** (Alibaba, Apache-2.0): Chinese, Russian, German among 9 languages; bi-streaming, ~150 ms reported. (CosyVoice 2 has no Russian or German.)
 - Kept as the fallback: Chatterbox, which is what `dmn-tts` speaks to today.
 
+## Measured 2026-10-14 (step 1)
+RTX 4090, the user's clip (`voice-ru.wav`, English speech, 20 s), four sentences each in zh/ru/de, one request per sentence as dmn sends them. "Correct" = Whisper large-v3-turbo transcribes the audio back to the line (minor spelling aside). Scripts and audio stayed in the session scratchpad; listening samples in the owner's `~/dmn-tests/2026-10-14-tts-122/`.
+
+| Engine | First audio | Whole sentence | Correct (zh / ru / de) | VRAM |
+|---|---|---|---|---|
+| Chatterbox (chatterbox-tts-api, `/v1/audio/speech/stream`) — baseline | 1.0–2.0 s (no audio until the sentence is done) | 1.0–2.0 s | 3 / 4 / 3 of 4 | 4.9 GB |
+| Qwen3-TTS 1.7B Base, `qwen-tts` Python package (no streaming) | = whole sentence | 1.6–3.7 s (RTF 0.73) | 1 / 4 / 4 (zh ran away to 14.8 s once) | 4.6 GB |
+| **Qwen3-TTS 1.7B Base, vLLM-Omni 0.30.0, streamed PCM, `x_vector_only_mode`** | **0.04–0.08 s** | 0.3–0.8 s (RTF ~0.13) | **4 / 4 / 4** | ~9 GB at the default 0.3 + 0.3 `gpu_memory_utilization` |
+| Qwen3-TTS 1.7B Base, vLLM-Omni, ICL (`ref_text` = the clip's English transcript) | 0.07 s | 0.3–0.8 s | 0–1 / 4 / 4 (zh garbled or looping) | same |
+| Fun-CosyVoice3 0.5B, vLLM-Omni, ICL | 0.55–0.58 s | 0.8–1.9 s | 1–2 / 1 / 1 | ~14 GB |
+
+Findings: Qwen3-TTS through vLLM-Omni is the engine; with an English reference clip it must run in `x_vector_only_mode` (speaker embedding only), because ICL mode continues from the English transcript and derails Chinese. Not yet judged: how close the x-vector voice sounds to the user (the README says cloning quality "may be reduced" without `ref_text`). vLLM-Omni needed `VLLM_USE_FLASHINFER_SAMPLER=0` here (FlashInfer JIT-compiles its sampler and there is no `ninja`/`nvcc` on the box). CosyVoice 3 may need a prompt format the test did not give it; not pursued, as Qwen3-TTS is ahead on both speed and accuracy.
+
 ## Goal
 With `[speak].engine` set to the new engine, a translated sentence starts playing in `dmn-voice` within ~1 s of the end of the user's speech (today 1.3–2.5 s) for zh, ru and de, in the user's cloned voice; Chatterbox still works when selected.
 
