@@ -19,6 +19,6 @@
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You → de    If Redis goes down, I'd fail open with a local limit.
-You         Then I'd shard the counters by key.
+You → de  If Redis goes down, I'd fail open with a local limit.
+You       Then I'd shard the counters by key.
  voice: → de  ● mic  ● system  ● model  translap pin · r redo · ⏎ ask · t speak

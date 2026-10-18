@@ -23,7 +23,7 @@ pub struct EnergyVadConfig {
     /// bridge real gaps and every hangover frame delays the utterance end by 20 ms.
     pub hangover_frames: u32,
     /// Where the floor starts. A prior, not the first frame: a stream that opens mid-sentence
-    /// (joining a call while the interviewer talks) must not learn speech as its floor and lose
+    /// (joining a call while the other person talks) must not learn speech as its floor and lose
     /// the first utterance.
     pub floor_prior_dbfs: f32,
     /// How fast the floor rises toward non-speech frames, in dB per second. It falls fast (it

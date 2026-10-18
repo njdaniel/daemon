@@ -25,6 +25,6 @@
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Per-region quotas, reconciled asynchronously, so a partition only over-admits.
-Interviewer Where would you put the limiter in the request path?
+You       Per-region quotas, reconciled asynchronously, so a partition only over-admits.
+Them      Where would you put the limiter in the request path?
  ● mic  ● system  ● model                                                  p unpin · r redo · ⏎ ask

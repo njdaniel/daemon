@@ -19,6 +19,6 @@
       the outage can be found and billed afterwards.
       ↑ 12
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                             ↑↓ scroll · p pin · ⏎ ask

@@ -402,10 +402,7 @@ fn score_fixture(
             Some(Noise::Fan) => " +fan",
         }
     );
-    for (speaker, source) in [
-        ("interviewer", Source::Interviewer),
-        ("candidate", Source::You),
-    ] {
+    for (speaker, source) in [("interviewer", Source::Them), ("candidate", Source::You)] {
         let path = wav(fixture, speaker)?;
         let mut vad: Box<dyn Vad> = match kind {
             Kind::Energy => Box::new(EnergyVad::default()),
@@ -588,8 +585,8 @@ fn drains_at_1x_with_the_default_ring_and_no_overruns() {
     let Some(path) = wav("sysdesign", "interviewer") else {
         return;
     };
-    let mut wav = WavSource::open(&path, Source::Interviewer, Speed::RealTime).unwrap();
-    let (sink, frames) = frame_channel(Source::Interviewer, DEFAULT_CAPACITY_FRAMES);
+    let mut wav = WavSource::open(&path, Source::Them, Speed::RealTime).unwrap();
+    let (sink, frames) = frame_channel(Source::Them, DEFAULT_CAPACITY_FRAMES);
     let (tx, rx) = event_channel(64);
     let worker = VadWorker::spawn(frames, &VadConfig::default(), tx).unwrap();
     wav.start(sink).unwrap();

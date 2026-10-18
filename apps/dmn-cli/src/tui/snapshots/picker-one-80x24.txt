@@ -4,21 +4,21 @@
 
 
 
-Interviewer Let's move on. Tell me about the team you worked with on the
-            payments migration.
-You         There were five of us: two backend engineers, a data engineer, a
-            pr┌ LANGUAGE ───────────────────────────────────────┐
-Interviewer Ho│ ▸ de   voice-de   ← now                         │
-You         Ab│ one language enrolled; add another with         │both systems
-            si│ dmn speak enroll --wav <clip> --language <code> │
-Interviewer An│ ↑↓ move · ⏎ choose · esc close                  │
-You         On└─────────────────────────────────────────────────┘e paused it and
-            replayed its writes.
-Interviewer Good. Let's talk about how you would test that.
-Interviewer And what about the▍
+Them      Let's move on. Tell me about the team you worked with on the payments
+          migration.
+You       There were five of us: two backend engineers, a data engineer, a
+          prod┌ LANGUAGE ───────────────────────────────────────┐
+Them      How │ ▸ de   voice-de   ← now                         │
+You       Abou│ one language enrolled; add another with         │th systems side
+          by s│ dmn speak enroll --wav <clip> --language <code> │
+Them      And │ ↑↓ move · ⏎ choose · esc close                  │
+You       One └─────────────────────────────────────────────────┘paused it and
+          replayed its writes.
+Them      Good. Let's talk about how you would test that.
+Them      And what about the▍
 — translate mode on: → de —
-You → de    I'd start with a token bucket per API key and keep the counters in
-            regional Redis.
-            » Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und
-            die Zähler in einem regionalen Redis halten.
+You → de  I'd start with a token bucket per API key and keep the counters in
+          regional Redis.
+          » Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und die
+          Zähler in einem regionalen Redis halten.
  voice: → de  ● mic  ● system  ● model  es→en   assist off · C-S-a on · t speak

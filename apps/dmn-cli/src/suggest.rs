@@ -1182,11 +1182,11 @@ fn request(job: &Job, current: Option<&CurrentQuestion>) -> FastRequest {
 }
 
 /// The candidate's lane as the prompt names it (#90). `Unknown` never reaches the detector, and
-/// the SPEC's single-stream fallback is the interviewer's side of the call.
+/// the SPEC's single-stream fallback is the other person's side of the call.
 fn asker(source: dmn_audio::Source) -> Asker {
     match source {
         dmn_audio::Source::You => Asker::You,
-        dmn_audio::Source::Interviewer | dmn_audio::Source::Unknown => Asker::Interviewer,
+        dmn_audio::Source::Them | dmn_audio::Source::Unknown => Asker::Them,
     }
 }
 
@@ -2298,7 +2298,7 @@ mod tests {
 
     fn candidate() -> Candidate {
         Candidate {
-            source: dmn_audio::Source::Interviewer,
+            source: dmn_audio::Source::Them,
             start: Duration::from_secs(1),
             end: Duration::from_secs(3),
             text: "How would you design a rate limiter?".into(),
@@ -2479,7 +2479,7 @@ mod tests {
         let job = Job {
             id: 1,
             candidate: candidate(),
-            transcript: "Interviewer: How would you design a rate limiter?".into(),
+            transcript: "Them: How would you design a rate limiter?".into(),
             regenerate: Some(CurrentQuestion {
                 question: "How would you design a rate limiter?".into(),
                 kind: dmn_llm::Kind::SystemDesign,
@@ -2783,10 +2783,10 @@ mod tests {
     #[test]
     fn a_you_question_keeps_its_lanes_rules_in_the_slow_phase() {
         // Copilot on PR #91: the slow request was rebuilt without the asker and fell back to
-        // the Interviewer's base rules.
+        // the other person's base rules.
         for (source, asker) in [
             (dmn_audio::Source::You, Asker::You),
-            (dmn_audio::Source::Interviewer, Asker::Interviewer),
+            (dmn_audio::Source::Them, Asker::Them),
         ] {
             let provider = dmn_llm::MockProvider::json(&fast_json_reply("Q1", "system_design"))
                 .then_json(&slow_json_reply());
@@ -3304,12 +3304,12 @@ mod tests {
             None,
         );
         hub.dispatch(wire::candidate(1, &candidate()));
-        s.submit(1, &candidate(), "Interviewer: So.".into());
+        s.submit(1, &candidate(), "Them: So.".into());
         assert_eq!(s.finish().shown, 1);
         // The M1 prompt, plus today's date (#101).
         let m1 = dmn_llm::fast::fast_chat_request(&FastRequest {
             today: TEST_TODAY.into(),
-            transcript: "Interviewer: So.".into(),
+            transcript: "Them: So.".into(),
             ..FastRequest::new(candidate().text, candidate().score)
         });
         assert_eq!(provider.requests(), [m1]);
@@ -3677,7 +3677,7 @@ mod tests {
     ]}"#;
     const GO: &str = "What is the latest stable major version of Go?";
     /// Said before the question: it must never reach the search.
-    const SAID_BEFORE: &str = "Interviewer: We moved project Bluebird off Java last spring.";
+    const SAID_BEFORE: &str = "Them: We moved project Bluebird off Java last spring.";
 
     fn search_on(url: &str, key: Option<&str>, timeout: Duration) -> Arc<dyn WebSearch> {
         Arc::new(
@@ -3742,11 +3742,7 @@ mod tests {
 
     fn ask_go(s: &Suggester, hub: &SessionHub, id: u64) {
         hub.dispatch(wire::candidate(id, &go_candidate()));
-        s.submit(
-            id,
-            &go_candidate(),
-            format!("{SAID_BEFORE}\nInterviewer: {GO}"),
-        );
+        s.submit(id, &go_candidate(), format!("{SAID_BEFORE}\nThem: {GO}"));
     }
 
     fn fresh(req: &dmn_llm::ChatRequest) -> bool {

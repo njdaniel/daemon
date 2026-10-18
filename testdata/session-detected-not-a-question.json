@@ -4,7 +4,7 @@
   "ended_at": null,
   "transcript": [
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 1.0,
       "end": 13.0,
       "text": "Hi, thanks for making the time today. This session is about an hour of system design."
@@ -22,14 +22,14 @@
       "text": "Okay, so first I'd want to know what we're limiting on."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 37.0,
       "end": 40.5,
       "text": "Sure. Take whichever you think matters most, right?"
     }
   ],
   "partials": [],
-  "last_interviewer": "Sure. Take whichever you think matters most, right?",
+  "last_them": "Sure. Take whichever you think matters most, right?",
   "live": {
     "candidate": 1,
     "text": "How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",

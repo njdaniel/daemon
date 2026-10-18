@@ -15,11 +15,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::StoreError;
 use crate::migrate;
 
-/// Which capture stream a segment came from. Stored as TEXT (`interviewer` / `you` / `unknown`).
+/// Which capture stream a segment came from. Stored as TEXT (`them` / `you` / `unknown`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
-    Interviewer,
+    Them,
     You,
     Unknown,
 }
@@ -27,7 +27,7 @@ pub enum Source {
 impl Source {
     pub fn as_str(self) -> &'static str {
         match self {
-            Source::Interviewer => "interviewer",
+            Source::Them => "them",
             Source::You => "you",
             Source::Unknown => "unknown",
         }
@@ -35,7 +35,8 @@ impl Source {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "interviewer" => Some(Source::Interviewer),
+            // `interviewer` is the name before #128. v9 rewrites stored rows; this reads any it missed.
+            "them" | "interviewer" => Some(Source::Them),
             "you" => Some(Source::You),
             "unknown" => Some(Source::Unknown),
             _ => None,
@@ -594,6 +595,11 @@ impl Store {
     /// Run raw SQL the typed API doesn't expose (constraint and cascade tests).
     pub(crate) fn execute_raw(&self, sql: &str, param: i64) -> Result<usize, StoreError> {
         Ok(self.conn.execute(sql, [param])?)
+    }
+
+    /// The connection itself, for pragma and constraint checks (v9's rebuild, #128).
+    pub(crate) fn conn_for_tests(&self) -> &Connection {
+        &self.conn
     }
 
     /// Table and index names in `sqlite_master`, for schema assertions.

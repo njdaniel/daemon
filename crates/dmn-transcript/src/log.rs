@@ -139,12 +139,12 @@ mod tests {
     fn the_final_replaces_every_partial_of_its_utterance() {
         let mut log = TranscriptLog::new();
         assert_eq!(
-            log.apply(seg(Source::Interviewer, 1_000, 2_000, "how would", false)),
+            log.apply(seg(Source::Them, 1_000, 2_000, "how would", false)),
             Applied::OpenedPartial
         );
         assert_eq!(
             log.apply(seg(
-                Source::Interviewer,
+                Source::Them,
                 1_000,
                 3_000,
                 "how would you design",
@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(log.open_partials().len(), 1, "one open utterance, not two");
         assert_eq!(
             log.apply(seg(
-                Source::Interviewer,
+                Source::Them,
                 1_000,
                 4_000,
                 "How would you design a rate limiter?",
@@ -173,11 +173,11 @@ mod tests {
     #[test]
     fn each_source_has_its_own_open_partial() {
         let mut log = TranscriptLog::new();
-        log.apply(seg(Source::Interviewer, 0, 1_000, "and how", false));
+        log.apply(seg(Source::Them, 0, 1_000, "and how", false));
         log.apply(seg(Source::You, 500, 1_500, "so the first", false));
         assert_eq!(log.open_partials().len(), 2);
         log.apply(seg(
-            Source::Interviewer,
+            Source::Them,
             0,
             2_000,
             "And how would you test it?",
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn the_window_keeps_the_last_sixty_seconds_and_merges_splits() {
         let mut log = TranscriptLog::new();
-        log.apply(seg(Source::Interviewer, 0, 2_000, "Old question?", true));
+        log.apply(seg(Source::Them, 0, 2_000, "Old question?", true));
         log.apply(seg(
             Source::You,
             70_000,
@@ -221,7 +221,7 @@ mod tests {
             true,
         ));
         log.apply(seg(
-            Source::Interviewer,
+            Source::Them,
             91_000,
             93_000,
             "And if Redis dies?",
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(w[0].text, "so I would start by sharding the counters.");
         assert_eq!(
             log.render_window(DEFAULT_WINDOW),
-            "You: so I would start by sharding the counters.\nInterviewer: And if Redis dies?"
+            "You: so I would start by sharding the counters.\nThem: And if Redis dies?"
         );
     }
 
@@ -242,7 +242,7 @@ mod tests {
         let mut log = TranscriptLog::new();
         // A long answer starts first and ends last; a short interjection starts later.
         log.apply(seg(Source::You, 1_000, 13_000, "a long answer", true));
-        log.apply(seg(Source::Interviewer, 2_000, 3_000, "mm-hm", true));
+        log.apply(seg(Source::Them, 2_000, 3_000, "mm-hm", true));
         assert_eq!(
             log.position(),
             Duration::from_millis(13_000),

@@ -73,7 +73,7 @@ pub struct PreviousAnswer {
 /// and the same context the fast phase had (re-retrieved with the question and its focus).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlowRequest {
-    /// Job requirements, retrieved chunks, transcript, and in `candidate` what the Interviewer
+    /// Job requirements, retrieved chunks, transcript, and in `candidate` what the other person
     /// said, rendered as the fast phase renders them. `current` and `regenerate` are ignored.
     pub context: FastRequest,
     /// The question on screen, as the fast phase extracted it.
@@ -702,11 +702,11 @@ mod tests {
         );
         assert_ne!(
             sent.messages[0].content,
-            prompt::system_prompt(None, prompt::Asker::Interviewer)
+            prompt::system_prompt(None, prompt::Asker::Them)
         );
         let user = &sent.messages[1].content;
         assert!(user.contains("## You just said\n"), "{user}");
-        assert!(!user.contains("## Interviewer just said"), "{user}");
+        assert!(!user.contains("## Them just said"), "{user}");
     }
 
     #[tokio::test]

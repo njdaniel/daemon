@@ -61,7 +61,7 @@ fn segment_key(speaker: Speaker, start: f64) -> (Speaker, u64) {
 /// Stored form of a session speaker.
 fn source(speaker: Speaker) -> dmn_store::Source {
     match speaker {
-        Speaker::Interviewer => dmn_store::Source::Interviewer,
+        Speaker::Them => dmn_store::Source::Them,
         Speaker::You => dmn_store::Source::You,
         Speaker::Unknown => dmn_store::Source::Unknown,
     }

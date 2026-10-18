@@ -19,6 +19,6 @@
       def allow(key, now):
       ↓ 7 more
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                             ↑↓ scroll · p pin · ⏎ ask

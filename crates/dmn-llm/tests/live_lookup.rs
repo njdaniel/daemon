@@ -41,7 +41,7 @@ fn request(facts: Option<FreshFacts>) -> FastRequest {
     FastRequest {
         today: TODAY.into(),
         transcript: format!(
-            "Interviewer: Great, let's move on to some quick technical questions.\nYou: Sounds good.\nInterviewer: {GO}"
+            "Them: Great, let's move on to some quick technical questions.\nYou: Sounds good.\nThem: {GO}"
         ),
         facts,
         ..FastRequest::new(GO, 6)
@@ -171,10 +171,10 @@ const SURVEY: [Case; 4] = [
 /// What was said before the question, one per run, so five runs at temperature 0 are five
 /// samples (as in `live_time_sensitive.rs`).
 const LEAD_INS: [&str; 5] = [
-    "Interviewer: Thanks for walking me through that project.\nYou: Sure, happy to.",
-    "Interviewer: Great, let's move on to some quick technical questions.\nYou: Sounds good.",
-    "You: And that's how we cut the deploy time in half.\nInterviewer: Nice. Switching gears a bit.",
-    "Interviewer: We use a mix of languages on the team.\nYou: Makes sense, I've worked in a few.",
+    "Them: Thanks for walking me through that project.\nYou: Sure, happy to.",
+    "Them: Great, let's move on to some quick technical questions.\nYou: Sounds good.",
+    "You: And that's how we cut the deploy time in half.\nThem: Nice. Switching gears a bit.",
+    "Them: We use a mix of languages on the team.\nYou: Makes sense, I've worked in a few.",
     "",
 ];
 
@@ -182,7 +182,7 @@ fn request_for(question: &str, run: usize, facts: Option<FreshFacts>) -> FastReq
     let lead = LEAD_INS[run % LEAD_INS.len()];
     FastRequest {
         today: TODAY.into(),
-        transcript: format!("{lead}\nInterviewer: {question}").trim().to_owned(),
+        transcript: format!("{lead}\nThem: {question}").trim().to_owned(),
         facts,
         ..FastRequest::new(question, 6)
     }
@@ -335,7 +335,7 @@ async fn end_to_end(
     let domain = fresh.domain().unwrap_or_default().to_owned();
     let second_req = request_for(case.question, run, Some(fresh));
     let prompt_chars = dmn_llm::prompt::user_message(&second_req).chars().count()
-        + dmn_llm::prompt::system_prompt(None, dmn_llm::Asker::Interviewer)
+        + dmn_llm::prompt::system_prompt(None, dmn_llm::Asker::Them)
             .chars()
             .count();
     let (second, first_line) = ask(p, &second_req).await;

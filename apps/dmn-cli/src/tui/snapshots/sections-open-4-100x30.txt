@@ -25,6 +25,6 @@
           b.tokens -= 1
           return True
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                                                   4 close · p pin · ⏎ ask

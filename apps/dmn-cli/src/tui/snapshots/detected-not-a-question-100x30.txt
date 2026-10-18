@@ -25,6 +25,6 @@
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Okay, so first I'd want to know what we're limiting on.
-Interviewer Sure. Take whichever you think matters most, right?
+You       Okay, so first I'd want to know what we're limiting on.
+Them      Sure. Take whichever you think matters most, right?
  ● mic  ● system  ● model                                                    p pin · r redo · ⏎ ask

@@ -5,7 +5,7 @@
 //! `watch` channel whenever it changes and turns keys into [`Controls`] calls: `p` pin / unpin,
 //! `r` regenerate, `m` mute the mic, `s` coding solutions hints ↔ full (#50), Ctrl+Shift+A
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
-//! what the asking lane last said (the interviewer, by default) when the detector missed the
+//! what the asking lane last said (the other person, by default) when the detector missed the
 //! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
 //! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `l` switch `dmn-voice` between your own voice live and every turn translated (#114), `v` open the language picker, where `↑ ↓` move, Enter chooses the language from the next utterance on and Esc closes (#115), `q` (or Ctrl-C) quit. Nothing
 //! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
@@ -13,7 +13,7 @@
 //! way out, on an error, and (through ratatui's panic hook and ours) on a panic.
 //!
 //! With no flags it captures the call live (#16): the mic as You and the call's app output as the
-//! Interviewer, from `[audio].mic` / `[audio].app_stream` or `--mic` / `--app` (`dmn devices`
+//! Them, from `[audio].mic` / `[audio].app_stream` or `--mic` / `--app` (`dmn devices`
 //! lists the names), until `q`. `--replay <interviewer.wav> <candidate.wav>` feeds the same
 //! pipeline from files at 1× instead (#15), and `--headless` runs a replay with no terminal and
 //! prints how long each scripted question took to reach the screen (#15's latency criterion).
@@ -101,7 +101,7 @@ pub enum Key {
     /// protocol (WezTerm's default, tmux) send it as Ctrl+A, so that counts too.
     Assist,
     /// Enter (#96): send what the asking lane last said to the model as the question, for when
-    /// the detector missed it. The lane follows `question_source`: the interviewer by default,
+    /// the detector missed it. The lane follows `question_source`: the other person by default,
     /// the mic under `you`, whichever spoke last under `both`. `r` only reaches a question
     /// already on screen.
     Ask,
@@ -253,15 +253,13 @@ pub fn live_input(cfg: &Config, args: &Args) -> Result<Input, String> {
     if !cfg.audio.system_audio && args.app.is_none() {
         return Err(
             "[audio].system_audio = false, but dmn run needs the call's audio for the \
-                    interviewer: set it to true, or name the call's app with --app"
+                    other person: set it to true, or name the call's app with --app"
                 .into(),
         );
     }
     Ok(Input::Live {
         mic: CaptureTarget::mic(args.mic.as_deref().unwrap_or(&cfg.audio.mic)),
-        interviewer: CaptureTarget::interviewer(
-            args.app.as_deref().unwrap_or(&cfg.audio.app_stream),
-        ),
+        them: CaptureTarget::them(args.app.as_deref().unwrap_or(&cfg.audio.app_stream)),
     })
 }
 
@@ -292,15 +290,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         None
     };
     let (input, questions) = match args.replay.clone() {
-        Some((interviewer, candidate)) => {
-            let questions = interviewer.parent().map(|d| d.join("questions.json"));
-            (
-                Input::Files {
-                    interviewer,
-                    candidate,
-                },
-                questions,
-            )
+        Some((them, candidate)) => {
+            let questions = them.parent().map(|d| d.join("questions.json"));
+            (Input::Files { them, candidate }, questions)
         }
         None => (live_input(cfg, args)?, None),
     };
@@ -369,7 +361,9 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         match rows {
             Some(rows) => print!("\n{}", latency::render(&rows, APPROACH_BUDGET_S)),
             None => {
-                println!("\nno questions.json next to the interviewer file: latency not measured")
+                println!(
+                    "\nno questions.json next to the other person's file: latency not measured"
+                )
             }
         }
         report
@@ -554,7 +548,7 @@ impl Observer for Emitted {
     fn candidate(&mut self, id: u64, found: &Found) {
         // #63: a continuation replaces the first part of its question on screen, so the question
         // is on screen when the whole of it is. Pairing the scripted question with the first
-        // part would time a half question, often before the interviewer finished asking.
+        // part would time a half question, often before the other person finished asking.
         if found.continues
             && let Some(prev) = self.last
         {
@@ -1528,14 +1522,14 @@ mod tests {
             live_input(&cfg, &args(None, None)).unwrap(),
             Input::Live {
                 mic: CaptureTarget::Mic(None),
-                interviewer: CaptureTarget::interviewer(&cfg.audio.app_stream),
+                them: CaptureTarget::them(&cfg.audio.app_stream),
             }
         );
         assert_eq!(
             live_input(&cfg, &args(Some("alsa_input.usb-mic"), Some(""))).unwrap(),
             Input::Live {
                 mic: CaptureTarget::Mic(Some("alsa_input.usb-mic".into())),
-                interviewer: CaptureTarget::SinkMonitor,
+                them: CaptureTarget::SinkMonitor,
             },
             "--app '' captures all system audio"
         );

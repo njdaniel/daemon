@@ -23,8 +23,9 @@ use super::{Mode, View};
 
 /// Transcript rows (SPEC § Transcript & status: the last two segments, one line each).
 const TRANSCRIPT_LINES: usize = 2;
-/// Speaker labels are padded to one width so the text lines up.
-const LABEL_CELLS: usize = 11;
+/// Speaker labels are padded to one width so the text lines up: the widest is a translated line's
+/// `You → yue` (a 2- or 3-letter `[speak]` code), 9 cells. 11 until #128, for `Interviewer`.
+const LABEL_CELLS: usize = 9;
 /// #79: the share of the local LLM in system memory, in percent, from which the status line says
 /// `llm partly on cpu`. The default `qwen3.6:35b-a3b` normally sits at 4 % on the dev 4090
 /// (`ollama ps`, 2026-09-29), and the 2 s budget was measured like that; loaded after GPU
@@ -167,7 +168,7 @@ fn wrapped(all: &[(&TranscriptLine, bool)], cells: usize, rows: usize) -> Vec<Li
 
 fn speaker(s: Speaker) -> (&'static str, Color) {
     match s {
-        Speaker::Interviewer => ("Interviewer", Color::Cyan),
+        Speaker::Them => ("Them", Color::Cyan),
         Speaker::You => ("You", Color::Magenta),
         Speaker::Unknown => ("?", Color::DarkGray),
     }
@@ -283,7 +284,7 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
         spans.push(Span::raw(format!(" {} dropped ", st.overruns)));
     }
     // #61: which device transcribes. `gpu+cpu` is the usual split beside a local LLM: the
-    // interviewer's lane on the GPU, yours on the CPU. Amber only when a GPU was asked for and
+    // the other person's lane on the GPU, yours on the CPU. Amber only when a GPU was asked for and
     // no lane got one (the reason is in the log and the replay header).
     if !st.stt.is_empty() {
         let on_gpu = st.stt.contains("GPU ");
@@ -312,7 +313,7 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     }
     // #90: whose questions this run answers, when it is not the default. Nothing is shown while
     // assistance is off: nothing is detected then, whatever the source.
-    if !view.session.assist_off && view.session.question_source != QuestionSource::Interviewer {
+    if !view.session.assist_off && view.session.question_source != QuestionSource::Them {
         spans.push(Span::styled(
             format!(" asks: {} ", view.session.question_source.as_str()),
             Style::new().fg(Color::DarkGray),
@@ -438,7 +439,7 @@ const NOT_A_QUESTION: &str = "not a question";
 /// while [`dmn_session::Session::lookup_failed`] is set.
 const LOOKUP_FAILED: &str = "lookup failed";
 
-/// #96: Enter asks about what the asking lane last said (the interviewer, by default; the hint
+/// #96: Enter asks about what the asking lane last said (the other person, by default; the hint
 /// names no lane, so it reads the same under `asks: you` and `asks: both`). Offered whenever
 /// assistance is on: the detector's miss it is for can come in any state of the screen.
 const ASK: &str = "⏎ ask";

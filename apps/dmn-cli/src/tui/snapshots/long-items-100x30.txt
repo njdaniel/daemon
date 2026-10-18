@@ -25,6 +25,6 @@
       held in its own memory, sends an alert and marks its decisions as degraded in the access
       log, so abuse during the outage can be found and billed afterwards.
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                                                   1 close · p pin · ⏎ ask

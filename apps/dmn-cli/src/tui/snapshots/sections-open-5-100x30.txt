@@ -25,6 +25,6 @@
       • You promised to come back to clock skew between regions.
       • Return 429 with a Retry-After header.
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                                                   5 close · p pin · ⏎ ask

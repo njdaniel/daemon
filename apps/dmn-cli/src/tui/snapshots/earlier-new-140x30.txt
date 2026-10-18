@@ -22,9 +22,9 @@
 │                                                                                  ││
 │                                                                                  ││
 │                                                                                  ││
-│                                                                                  ││Interviewer Hi, thanks for making the time today. This
-│                                                                                  ││            session is about an hour of system design.
-│                                                                                  ││You         Sounds great.
-│                                                                                  ││You         Okay, so first I'd want to know what we're
-└──────────────────────────────────────────────────────────────────────────────────┘│            limiting on.
+│                                                                                  ││Them      Hi, thanks for making the time today. This
+│                                                                                  ││          session is about an hour of system design.
+│                                                                                  ││You       Sounds great.
+│                                                                                  ││You       Okay, so first I'd want to know what we're
+└──────────────────────────────────────────────────────────────────────────────────┘│          limiting on.
  ● mic  ● system  ● model                                                                               2 new · ← earlier · → later · ⏎ ask

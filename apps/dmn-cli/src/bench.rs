@@ -1,7 +1,7 @@
-//! `dmn bench`: whisper real-time factor and word error rate on fixture interviewer turns.
+//! `dmn bench`: whisper real-time factor and word error rate on fixture Them turns.
 //!
 //! Loads `testdata/<fixture>/interviewer.wav` through `dmn-audio`'s `WavSource` (the same path
-//! replay uses), cuts interviewer turns using `turns.json`, and transcribes them in order with
+//! replay uses), cuts Them turns using `turns.json`, and transcribes them in order with
 //! the previous turn's text as prompt, the way the live worker will.
 
 use std::path::{Path, PathBuf};
@@ -32,8 +32,8 @@ pub struct Turn {
     pub text: String,
 }
 
-/// Interviewer turns from `turns.json`: turns of 3–15 s (a typical question) in script order,
-/// up to `n`; if fewer than `n` qualify, the first `n` interviewer turns of any length.
+/// Them turns from `turns.json`: turns of 3–15 s (a typical question) in script order,
+/// up to `n`; if fewer than `n` qualify, the first `n` Them turns of any length.
 pub fn pick_turns(turns_json: &str, n: usize) -> Result<Vec<Turn>, String> {
     let v: serde_json::Value =
         serde_json::from_str(turns_json).map_err(|e| format!("turns.json: {e}"))?;
@@ -66,10 +66,10 @@ pub fn pick_turns(turns_json: &str, n: usize) -> Result<Vec<Turn>, String> {
 /// Whole WAV as 16 kHz mono f32, through `WavSource` at full speed into a ring big enough that
 /// nothing is dropped.
 pub fn load_wav(path: &Path) -> Result<Vec<f32>, String> {
-    let mut src = WavSource::open(path, Source::Interviewer, Speed::Fast)
+    let mut src = WavSource::open(path, Source::Them, Speed::Fast)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let frames_needed = (src.duration().as_secs_f64() * 1000.0 / 20.0).ceil() as usize + 16;
-    let (sink, mut frames) = frame_channel(Source::Interviewer, frames_needed);
+    let (sink, mut frames) = frame_channel(Source::Them, frames_needed);
     src.start(sink).map_err(|e| e.to_string())?;
     src.wait().map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(frames_needed * FRAME_LEN);
@@ -185,7 +185,7 @@ pub fn render(
     rows: &[Row],
 ) -> String {
     let mut s = format!(
-        "whisper {model} on {fixture} interviewer turns, {backend} × {threads} threads, model load {:.2} s\n",
+        "whisper {model} on {fixture} Them turns, {backend} × {threads} threads, model load {:.2} s\n",
         load.as_secs_f64()
     );
     s.push_str("  #    dur    wall    RTF    WER  text\n");
@@ -254,10 +254,10 @@ mod tests {
     ]"#;
 
     #[test]
-    fn picks_typical_interviewer_turns_in_order() {
+    fn picks_typical_them_turns_in_order() {
         let t = pick_turns(TURNS, 5).unwrap();
         // 3–15 s turns: the 6.5 s and 4 s ones; fewer than 5 qualify and fewer than all 4
-        // interviewer turns, so fall back to the first interviewer turns in order.
+        // Them turns, so fall back to the first Them turns in order.
         assert_eq!(t.len(), 4);
         assert_eq!(t[0].text, "Hi.");
         let t = pick_turns(TURNS, 2).unwrap();

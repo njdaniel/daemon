@@ -15,8 +15,8 @@ pub enum Cue {
     QuestionOpener,
     /// Contains a hand-off phrase ("let's switch gears", "next question").
     HandOff,
-    /// The speaker is the interviewer.
-    Interviewer,
+    /// The speaker is the other person.
+    Them,
     /// Longer than six words.
     Long,
     /// Followed by >= 1.5 s of silence or by the candidate speaking.
@@ -34,7 +34,7 @@ impl Cue {
             Cue::QuestionMark => "?",
             Cue::QuestionOpener => "opener",
             Cue::HandOff => "handoff",
-            Cue::Interviewer => "interviewer",
+            Cue::Them => "them",
             Cue::Long => "long",
             Cue::Followed => "followed",
             Cue::Rhetorical => "rhetorical",
@@ -43,7 +43,7 @@ impl Cue {
     }
 
     /// True for the cues that make a line read as a question at all. The others corroborate:
-    /// being the interviewer, or speaking for more than six words, says nothing about whether a
+    /// being the other person, or speaking for more than six words, says nothing about whether a
     /// question was asked.
     pub fn is_question_form(self) -> bool {
         matches!(self, Cue::QuestionMark | Cue::QuestionOpener)
@@ -80,7 +80,7 @@ const OPENER_PHRASES: [&str; 7] = [
     "given a",
 ];
 
-/// Hand-off phrases: the interviewer signalling that a question is coming.
+/// Hand-off phrases: the other person signalling that a question is coming.
 const HANDOFF_PHRASES: [&str; 8] = [
     "let's switch gears",
     "let us switch gears",
@@ -110,7 +110,7 @@ const RHETORICAL_TAGS: [&str; 6] = [
 /// A single word stays here only when it has no technical sense (`weather`, `coffee`). Words that
 /// are also system-design vocabulary ("traffic", "connection", "audio", "calendar") are matched
 /// by phrase ("my audio", "calendar invite", "at my door") so that "How would you handle a traffic
-/// spike?" is not vetoed, and a phrase stays only when an interviewer would not plausibly say it
+/// spike?" is not vetoed, and a phrase stays only when a Them would not plausibly say it
 /// inside a technical question ("your connection", "the invite", "double-booked", "one second" and
 /// "reschedule" are not here). Chatter no phrase covers reaches the fast phase, which answers
 /// `small_talk` and shows nothing (#93).
@@ -420,7 +420,7 @@ mod tests {
             !Cue::HandOff.is_question_form(),
             "\"let's switch gears\" introduces a question but is not one"
         );
-        assert!(!Cue::Interviewer.is_question_form());
+        assert!(!Cue::Them.is_question_form());
         assert!(!Cue::Long.is_question_form());
         assert!(!Cue::Followed.is_question_form());
     }

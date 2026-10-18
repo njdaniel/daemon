@@ -1,7 +1,7 @@
 //! Question detector (Tier-C rules).
 //!
 //! Input: every final [`Segment`](dmn_transcript::Segment) from the transcript bus whose lane
-//! [`QuestionSource`] selects (`[detect].question_source`; the Interviewer lane by default, #90).
+//! [`QuestionSource`] selects (`[detect].question_source`; the Them lane by default, #90).
 //! Output: scored [`Candidate`]s (the question sentence, its score and the cues behind it) for the
 //! LLM fast phase, plus [`PinState`], the rule that a pinned question is never replaced.
 //! Owns: the bounded candidate channel from [`candidate_channel`] into `dmn-llm`.

@@ -4,7 +4,7 @@
   "ended_at": null,
   "transcript": [
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 1.0,
       "end": 13.0,
       "text": "Hi, thanks for making the time today. This session is about an hour of system design."
@@ -23,7 +23,7 @@
     }
   ],
   "partials": [],
-  "last_interviewer": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "last_them": "Hi, thanks for making the time today. This session is about an hour of system design.",
   "live": {
     "candidate": 1,
     "text": "Implement an LRU cache with O(1) get and put.",

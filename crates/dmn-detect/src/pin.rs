@@ -61,7 +61,7 @@ impl PinState {
         self.pinned
     }
 
-    /// Unpin and show the newest queued question, dropping the ones it overtook: the interviewer
+    /// Unpin and show the newest queued question, dropping the ones it overtook: the other person
     /// has moved on, and an older question is not worth showing after the fact.
     pub fn unpin(&mut self) -> Option<&Candidate> {
         self.pinned = false;
@@ -89,13 +89,13 @@ mod tests {
 
     fn candidate(text: &str, at: u64) -> Candidate {
         Candidate {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: Duration::from_secs(at),
             end: Duration::from_secs(at + 5),
             text: text.to_owned(),
             line: text.to_owned(),
             score: 5,
-            cues: vec![Cue::QuestionMark, Cue::Interviewer],
+            cues: vec![Cue::QuestionMark, Cue::Them],
         }
     }
 
