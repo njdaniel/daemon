@@ -24,4 +24,6 @@ Found in the second live Discord test of #113 (2026-10-08, translator `llama3.1:
 
 Proposed 2026-10-14, after Chinese was added to the Chatterbox server and the user asked for "whatever's fastest", free: #122 (speak: measure Qwen3-TTS and CosyVoice 3 against Chatterbox on the 4090 for zh/ru/de, then add the faster one as `[speak].engine`, so the translated sentence starts within ~1 s of the end of speech instead of 1.3–2.5 s; paid ElevenLabs left for later).
 
+Proposed 2026-10-18, from the #122 live Discord test (with the fast voice engine, the wait is the sentence end itself: 0.4 s of silence, and the echo guard's 1.5 s hold): #124 (speak: push-to-talk; hold a button read straight from its device (evdev, works while Discord has focus), everything said while held is one turn, the translation starts the moment it is released, and the call hears silence while it is not held).
+
 Created on GitHub only, with no file here: #34 (replay `--speed`), #39 (whisper `no_context`), #50 (coding-solutions switch), and the process issues #44, #45, #46, which carry the `backlog` label.
