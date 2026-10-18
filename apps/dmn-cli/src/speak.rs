@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use dmn_audio::{AudioError, PipeWireContext, PipeWireError, VMIC_NODE_NAME, VirtualMic};
 use dmn_core::Paths;
-use dmn_core::config::{Config, ConfigError};
+use dmn_core::config::{Config, ConfigError, SpeakEngine};
 use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider};
 
 /// A reference clip needs at least this much clean speech for the clone to hold up.
@@ -133,6 +133,15 @@ pub enum SpeakError {
         "[speak].languages in {config} has the code {code:?}, which is not a language whisper knows; use a code such as \"es\", \"de\" or \"fr\""
     )]
     UnknownLanguage { code: String, config: String },
+    /// #122: a language the engine's model does not speak (Qwen3-TTS has a fixed list of ten).
+    #[error(
+        "[speak].engine = {engine:?} does not speak {code:?} ([speak].target or [speak].languages); it speaks {speaks}. Drop the language, or set engine = \"chatterbox\""
+    )]
+    EngineLanguage {
+        engine: &'static str,
+        code: String,
+        speaks: String,
+    },
     /// #115: `enroll --language` takes the shape `[speak].target` takes, so the entry it
     /// writes parses.
     #[error(
@@ -335,6 +344,17 @@ pub fn enroll(
             "set {{ code = {code:?}, voice = {name:?} }} in [speak].languages (the picker's list, `v` in dmn run)\n"
         ));
     }
+    // #122: a cross-lingual engine needs no voice per language.
+    if provider.cross_lingual() {
+        let speaks = provider
+            .languages()
+            .map(|l| format!(" ({})", l.join(", ")))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{} voices speak every language it knows{speaks}: one voice can serve every [speak].languages entry (voice = {name:?})\n",
+            provider.name()
+        ));
+    }
     Ok(out)
 }
 
@@ -442,6 +462,19 @@ pub(crate) fn open_vmic_with(
 
 /// #113: `[speak]`'s TTS knobs for the speech request: the temperature always (0.6 by
 /// default, under the server's 0.8), `cfg_weight` and `exaggeration` only when set.
+/// #122: the client for `[speak].engine` on `[speak].tts_url`. `streaming` takes Chatterbox's
+/// streaming route (the first sentence plays while the next renders); Qwen3-TTS always streams.
+pub(crate) fn tts_provider(cfg: &Config, streaming: bool) -> Box<dyn TtsProvider> {
+    let url = &cfg.speak.tts_url;
+    match cfg.speak.engine {
+        SpeakEngine::Chatterbox => {
+            let p = dmn_tts::ChatterboxProvider::new(url);
+            Box::new(if streaming { p.streaming() } else { p })
+        }
+        SpeakEngine::Qwen3 => Box::new(dmn_tts::Qwen3Provider::new(url)),
+    }
+}
+
 pub(crate) fn tuning(cfg: &Config) -> dmn_tts::Tuning {
     dmn_tts::Tuning {
         temperature: Some(cfg.speak.temperature),

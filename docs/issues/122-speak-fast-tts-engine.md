@@ -24,6 +24,11 @@ RTX 4090, the user's clip (`voice-ru.wav`, English speech, 20 s), four sentences
 
 Findings: Qwen3-TTS through vLLM-Omni is the engine; with an English reference clip it must run in `x_vector_only_mode` (speaker embedding only), because ICL mode continues from the English transcript and derails Chinese. **Decided** 2026-10-18: the owner listened to the samples (`~/dmn-tests/2026-10-14-tts-122/`, each line from Chatterbox and from Qwen3-TTS) and chose Qwen3-TTS: "yeah qwen sounds great". The x-vector voice is close enough to theirs, so the README's warning that cloning "may be reduced" without `ref_text` does not block it. vLLM-Omni needed `VLLM_USE_FLASHINFER_SAMPLER=0` here (FlashInfer JIT-compiles its sampler and there is no `ninja`/`nvcc` on the box). CosyVoice 3 may need a prompt format the test did not give it; not pursued, as Qwen3-TTS is ahead on both speed and accuracy.
 
+## Built 2026-10-18 (steps 2 and 3)
+- Sidecar: `sidecars/qwen3-tts/compose.yaml`, the `vllm/vllm-omni:v0.30.0` image on 127.0.0.1:4124, `--stage-overrides` 0.2 + 0.1 of the GPU (about 6.5 GB, against ~9 GB at the default 0.3 + 0.3), voices and the model cache in volumes.
+- The server's default first streamed chunk is one 80 ms frame at ~0.04 s, then nothing until a 2 s block at ~0.3 s: played as it arrived, every one of 12 lines stalled up to 0.17 s after its first syllable. The client asks for `initial_codec_chunk_frames: 6` (0.48 s at ~0.1 s; 0 stalls in 12 lines) and a per-sentence `max_new_tokens`.
+- Through `Qwen3Provider` with the owner's clip, one voice enrolled without a language: first audio 0.127–0.133 s for short and three-sentence lines in zh, ru and de (`cargo test -p dmn-tts --test live_qwen3 -- --ignored --nocapture`); samples in `~/dmn-tests/2026-10-18-tts-122-sidecar/`.
+
 ## Goal
 With `[speak].engine` set to the new engine, a translated sentence starts playing in `dmn-voice` within ~1 s of the end of the user's speech (today 1.3–2.5 s) for zh, ru and de, in the user's cloned voice; Chatterbox still works when selected.
 

@@ -532,6 +532,52 @@ directory in its place) is said on the status line for 5 s (`language not saved:
 speaks the chosen language all the same. With one language enrolled the picker still opens, on
 that one row, with a hint on how to enroll more.
 
+**A faster voice: Qwen3-TTS (#122).** `[speak].engine = "qwen3"` speaks through Alibaba's
+[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (1.7B Base, Apache-2.0) served by
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni) instead of Chatterbox. It streams each
+sentence as it renders, so the first sound comes about 0.13 s after dmn asks for it, against
+1.0–2.0 s for Chatterbox on the same GPU (measured 2026-10-18 on the 4090 with the user's clip:
+0.127–0.133 s for short and three-sentence lines in Chinese, Russian and German, rendering about
+7× faster than real time). One enrolled clip speaks all ten of its languages (zh, en, ja, ko, de,
+fr, ru, pt, es, it), so there is one voice to enroll, not one per language. It needs an NVIDIA GPU
+and Docker's NVIDIA runtime (the one-time host step above) and holds about 6.5 GB of VRAM.
+
+```bash
+docker compose -f sidecars/qwen3-tts/compose.yaml up -d      # vllm/vllm-omni:v0.30.0, on 127.0.0.1:4124
+docker compose -f sidecars/qwen3-tts/compose.yaml logs -f    # ready at "Application startup complete"
+curl -s http://localhost:4124/v1/models                      # "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+```
+
+The first start downloads the model (about 4.3 GB) into the sidecar's `cache` volume and takes a
+minute or two to compile; later starts take about a minute. Enrolled voices live in its `voices`
+volume and survive restarts. Then:
+
+```toml
+[speak]
+engine = "qwen3"                      # default "chatterbox"
+tts_url = "http://localhost:4124"
+languages = [{ code = "zh", voice = "voice" }, { code = "ru", voice = "voice" }, { code = "de", voice = "voice" }]
+```
+
+```bash
+dmn speak enroll --wav ~/my-voice.wav    # no --language: the voice speaks every language
+```
+
+`enroll` uploads the clip (1–30 s for this server) under its name, and the start-up check accepts
+that one voice for every language in the list; per-language voices (`--language de`, named
+`voice-de`) still work, and with this engine each also speaks every language. A language the
+model does not speak (`tr`, say) is refused at start, naming the ones it does. The clone is made
+from the clip's speaker embedding only (vLLM-Omni's `x_vector_only_mode`): the other mode, which
+also feeds the clip's transcript, garbled Chinese when the clip is English. dmn still asks for one
+sentence at a time and keeps the 0.8 s silence cut, and caps each sentence's length so a
+generation that runs away ends within seconds; `temperature`, `cfg_weight` and `exaggeration` are
+Chatterbox's and are not sent. `dmn doctor` names the engine, its URL, the model it serves and
+the device. To give it less or more of the GPU, set `TALKER_GPU` (default 0.2) and `DECODER_GPU`
+(0.1), the fractions of the card each of its two stages takes, in the environment of `docker
+compose up`; `QWEN3_TTS_PORT` moves the port. Chatterbox keeps working with `engine =
+"chatterbox"` and its own `tts_url`; the two servers can run side by side (about 11 GB together),
+but not beside the 35B answer model.
+
 With `[stt].language = "auto"` (or a code, for an interview in another language), whisper
 translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it
 detects your language and keeps your own words, so `t` translates what you said rather than

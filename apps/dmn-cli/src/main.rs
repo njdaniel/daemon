@@ -548,7 +548,6 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Some(Command::Sources { action }) => Ok(sources::run(&paths, action)?),
         Some(Command::Speak { action, text, out }) => {
             let cfg = Config::load(&paths.config_file)?;
-            let provider = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url);
             match action {
                 Some(SpeakAction::Enroll {
                     wav,
@@ -560,7 +559,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
                         name,
                         language,
                     };
-                    print!("{}", speak::enroll(&cfg, &paths, &args, &provider)?);
+                    let provider = speak::tts_provider(&cfg, false);
+                    print!("{}", speak::enroll(&cfg, &paths, &args, provider.as_ref())?);
                 }
                 None => {
                     let text = text.ok_or(CliError::Usage(
@@ -568,14 +568,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     ))?;
                     // Playback takes the streaming route, so the first sentence plays while
                     // the server renders the next; a file is written from the whole WAV.
-                    let provider = if out.is_none() {
-                        provider.streaming()
-                    } else {
-                        provider
-                    };
+                    let provider = speak::tts_provider(&cfg, out.is_none());
                     print!(
                         "{}",
-                        speak::speak(&cfg, &paths, &text, out.as_deref(), &provider)?
+                        speak::speak(&cfg, &paths, &text, out.as_deref(), provider.as_ref())?
                     );
                 }
             }

@@ -628,6 +628,16 @@ pub fn check(
             });
         }
     }
+    // #122: an engine with a fixed list (Qwen3-TTS) speaks nothing else, whatever the voice.
+    if let Some(speaks) = tts.languages()
+        && let Some(entry) = entries.iter().find(|l| !speaks.contains(&l.code.as_str()))
+    {
+        return Err(SpeakError::EngineLanguage {
+            engine: tts.name(),
+            code: entry.code.clone(),
+            speaks: speaks.join(", "),
+        });
+    }
     let languages: Vec<Language> = entries
         .iter()
         .map(|l| Language::new(&l.code, &l.voice))
@@ -667,6 +677,11 @@ pub fn check(
                 SpeakError::VoiceGone { voice, clip }
             });
         };
+        // #122: a cross-lingual engine's voice speaks every language, whatever it was enrolled
+        // with.
+        if tts.cross_lingual() {
+            continue;
+        }
         match enrolled.language.as_deref() {
             Some(speaks) if speaks != code => {
                 return Err(if listed {
@@ -701,8 +716,8 @@ pub fn check(
 /// source) passing through it (#114). `None` opens the node without a pass-through, which the
 /// live tests do so that none of them captures the real microphone.
 pub fn setup(cfg: &Config, paths: &Paths, mic: Option<&str>) -> Result<SpeakSetup, SpeakError> {
-    let tts = dmn_tts::ChatterboxProvider::new(&cfg.speak.tts_url).streaming();
-    let languages = check(cfg, paths, &tts)?;
+    let tts: Arc<dyn TtsProvider> = Arc::from(speak::tts_provider(cfg, true));
+    let languages = check(cfg, paths, tts.as_ref())?;
     let provider = wire::provider(&cfg.translator_llm())
         .map_err(|e: LlmError| SpeakError::Llm(e.to_string()))?;
     let target = cfg.speak.target.clone();
@@ -726,7 +741,7 @@ pub fn setup(cfg: &Config, paths: &Paths, mic: Option<&str>) -> Result<SpeakSetu
     Ok(SpeakSetup {
         provider,
         model: cfg.translator_model().to_owned(),
-        tts: Arc::new(tts),
+        tts,
         open_sink: Box::new(move || open_dmn_voice(tap.clone())),
         language,
         languages,
@@ -1051,6 +1066,58 @@ pub(crate) mod tests {
         let err = check(&cfg, &paths, &all).unwrap_err();
         assert!(matches!(err, SpeakError::UnknownLanguage { .. }), "{err}");
         assert!(err.to_string().contains("\"xx\""), "{err}");
+    }
+
+    /// #122: with a cross-lingual engine (Qwen3-TTS) one voice, enrolled without a language,
+    /// serves zh, ru and de; a language outside the engine's list is refused before the server
+    /// is asked, naming the ones it speaks.
+    #[test]
+    fn one_cross_lingual_voice_serves_every_listed_language() {
+        let (_dir, paths, mut cfg) = cfg("zh");
+        cfg.speak.engine = dmn_core::config::SpeakEngine::Qwen3;
+        cfg.speak.voice_ref.clear();
+        cfg.speak.languages = ["zh", "ru", "de"]
+            .iter()
+            .map(|code| SpeakLanguage {
+                code: (*code).into(),
+                voice: "voice".into(),
+            })
+            .collect();
+        let listing = r#"{"voices":[],"uploaded_voices":[{"name":"voice","consent":"dmn-self","created_at":1,"file_size":1,"mime_type":"audio/wav","embedding_source":"audio","embedding_dim":null}]}"#;
+        let server =
+            dmn_tts::testserver::serve(vec![dmn_tts::testserver::Reply::json(listing)]).unwrap();
+        cfg.speak.tts_url = server.url.clone();
+        let qwen = speak::tts_provider(&cfg, true);
+        assert_eq!(qwen.name(), "qwen3");
+        assert_eq!(
+            check(&cfg, &paths, qwen.as_ref()).unwrap(),
+            [
+                Language::new("zh", "voice"),
+                Language::new("ru", "voice"),
+                Language::new("de", "voice")
+            ]
+        );
+        assert_eq!(server.request_lines(), ["GET /v1/audio/voices"]);
+
+        // The same list on Chatterbox: a voice enrolled for Chinese does not speak Russian.
+        let chatterbox = MockTtsProvider::new().with_voices(Some(&[("voice", Some("zh"))]));
+        let err = check(&cfg, &paths, &chatterbox).unwrap_err();
+        assert!(
+            matches!(err, SpeakError::LanguageVoiceMismatch { .. }),
+            "{err}"
+        );
+
+        cfg.speak.languages.push(SpeakLanguage {
+            code: "tr".into(),
+            voice: "voice".into(),
+        });
+        let err = check(&cfg, &paths, qwen.as_ref()).unwrap_err();
+        assert!(matches!(err, SpeakError::EngineLanguage { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"qwen3\" does not speak \"tr\"") && msg.contains("zh, en"),
+            "{msg}"
+        );
     }
 
     #[test]
