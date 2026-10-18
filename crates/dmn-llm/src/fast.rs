@@ -144,7 +144,7 @@ impl FastAssembler {
     }
 
     /// Hold back a reply whose `question` restates the question already on screen instead of
-    /// what the Interviewer just said (`candidate`). Live session 5: "Design a ride-sharing
+    /// what the other person just said (`candidate`). Live session 5: "Design a ride-sharing
     /// matching system" came back as the Slack question from the `## Current question` section,
     /// and its Approach answered Slack. A clarification is exempt: it is about the current
     /// question by definition.
@@ -322,7 +322,7 @@ fn overlap(a: &str, b: &str) -> f64 {
     a.intersection(&b).count() as f64 / small as f64
 }
 
-/// `question` is the current question again and not what the Interviewer just said.
+/// `question` is the current question again and not what the other person just said.
 fn echoes(question: &str, candidate: &str, current: &str) -> bool {
     overlap(question, current) >= 0.6 && overlap(question, candidate) < 0.3
 }
@@ -810,7 +810,7 @@ mod tests {
         ));
         assert!(
             !echoes(slack, "How do you design a chat app like slack?", slack),
-            "the interviewer asking the same question again is not an echo"
+            "the other person asking the same question again is not an echo"
         );
         assert!(!echoes(
             "How would you design a ride-sharing system?",

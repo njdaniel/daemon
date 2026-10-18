@@ -22,9 +22,9 @@
   3 ▸ Tradeoffs                           6 ▸ Resume Context                        │
       Algorithm: Token bucket per key: refill r tokens a second up to a burst b,    │
       and each request takes one. Sliding-window counters are exact but cost a      │
-      sorted set per key.                                                           │Interviewer Hi, thanks for making the time today. This
-      State: Counters live in regional Redis with INCR and a TTL; a small           │            session is about an hour of system design.
-      in-process cache absorbs hot keys and syncs every 100 ms.                     │You         Sounds great.
-      Failure: If Redis is unreachable, fail open to a conservative local limit     │You         Okay, so first I'd want to know what we're
-      per node and alert.                                                           │            limiting on.
+      sorted set per key.                                                           │Them      Hi, thanks for making the time today. This
+      State: Counters live in regional Redis with INCR and a TTL; a small           │          session is about an hour of system design.
+      in-process cache absorbs hot keys and syncs every 100 ms.                     │You       Sounds great.
+      Failure: If Redis is unreachable, fail open to a conservative local limit     │You       Okay, so first I'd want to know what we're
+      per node and alert.                                                           │          limiting on.
  ● mic  ● system  ● model                                                                                           1 close · p pin · ⏎ ask

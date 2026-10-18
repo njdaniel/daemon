@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn a_question_about_a_resume_skill_finds_a_chunk_that_has_it_in_the_top_3() {
         let lib = Library::load(&fixtures()).unwrap();
-        // (question as an interviewer would ask it, a word the retrieved chunk must contain)
+        // (question as the other person would ask it, a word the retrieved chunk must contain)
         let cases = [
             (
                 "How would you design a rate limiter for a public API?",

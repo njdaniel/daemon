@@ -31,8 +31,8 @@ impl Segment {
         (self.source, self.start)
     }
 
-    /// `[mm:ss.t] Interviewer: text`, the transcript line `dmn replay` and the TUI print. A
-    /// detected language other than English is tagged after the speaker: `Interviewer (es→en)`.
+    /// `[mm:ss.t] Them: text`, the transcript line `dmn replay` and the TUI print. A
+    /// detected language other than English is tagged after the speaker: `Them (es→en)`.
     pub fn render(&self) -> String {
         format!(
             "[{}] {}{}{}: {}",
@@ -125,7 +125,7 @@ mod tests {
 
     fn seg(start_ms: u64, end_ms: u64, text: &str) -> Segment {
         Segment {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: Duration::from_millis(start_ms),
             end: Duration::from_millis(end_ms),
             text: text.to_owned(),
@@ -158,9 +158,9 @@ mod tests {
     fn a_partial_renders_with_a_marker_and_a_final_without() {
         let mut s = seg(12_450, 14_000, "how would you design");
         s.is_final = false;
-        assert_eq!(s.render(), "[00:12.4] Interviewer ~: how would you design");
+        assert_eq!(s.render(), "[00:12.4] Them ~: how would you design");
         s.is_final = true;
-        assert_eq!(s.render(), "[00:12.4] Interviewer: how would you design");
+        assert_eq!(s.render(), "[00:12.4] Them: how would you design");
     }
 
     #[test]

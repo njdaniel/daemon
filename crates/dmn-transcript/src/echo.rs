@@ -1,18 +1,18 @@
 //! The echo guard (docs/SPEC.md § Audio capture, speaker attribution rule 2; issue #60).
 //!
 //! When the mic hears the call itself (a laptop without echo cancellation, or questions read
-//! from a phone in the same room: live session 5, the issue's motivation), every interviewer
+//! from a phone in the same room: live session 5, the issue's motivation), every Them
 //! line comes back as a You line a moment later. This guard drops those copies: a mic (You)
-//! final whose `[start, end]` interval meets an interviewer final's (the gap between the two is
+//! final whose `[start, end]` interval meets a Them final's (the gap between the two is
 //! at most [`WINDOW`] either way) and whose text is a near-duplicate of it is dropped and
 //! counted, never published. "Near-duplicate" is the SPEC's ratio ≥ 0.8 ([`MIN_SIMILARITY`]),
-//! measured as [`containment`] (the mic text found inside the meeting interviewer text) for a
+//! measured as [`containment`] (the mic text found inside the meeting Them text) for a
 //! mic final of [`MIN_CONTAINED_WORDS`] or more, and as the whole-line [`similarity`] for a
 //! shorter one: the two lanes cut the same speech at different pauses, so a copy is usually a
-//! piece of an interviewer line, not the whole of it.
+//! piece of a Them line, not the whole of it.
 //!
-//! Interviewer segments publish at once and are never held. A mic final with no match yet is
-//! held, waiting for its loopback original, for [`HOLD`]; while an interviewer utterance that
+//! Them segments publish at once and are never held. A mic final with no match yet is
+//! held, waiting for its loopback original, for [`HOLD`]; while a Them utterance that
 //! could still meet it is open (its partials have arrived but not its final) the hold stretches,
 //! up to [`MAX_HOLD`]. The two lanes are transcribed by separate whisper workers, so an original
 //! and its echo reach the guard in either order and up to about a second apart; that is wall
@@ -21,7 +21,7 @@
 //! segments leave the guard in the order they came in: a partial that arrives behind a held
 //! final waits with it, so a transcript that keeps one partial per source never sees a newer
 //! utterance's partial evicted by an older final. Only the You lane pays the hold; the
-//! detector scores Interviewer lines, which are never delayed.
+//! detector scores Them lines, which are never delayed.
 //!
 //! Empty finals (dmn-stt's "this utterance produced no text" marker) and Unknown-source
 //! segments are not compared, only kept in order.
@@ -46,19 +46,19 @@ use crate::Segment;
 /// at most this, in either direction. An echo typically trails its original by ~100 ms.
 pub const WINDOW: Duration = Duration::from_millis(300);
 
-/// A mic final at or above this [`similarity`] with a meeting interviewer final is a copy.
+/// A mic final at or above this [`similarity`] with a meeting Them final is a copy.
 pub const MIN_SIMILARITY: f64 = 0.8;
 
-/// How long, in wall time from its arrival, a mic final waits for an interviewer final that
-/// might condemn it when no interviewer utterance is open. Covers the skew between the two
+/// How long, in wall time from its arrival, a mic final waits for a Them final that
+/// might condemn it when no Them utterance is open. Covers the skew between the two
 /// whisper lanes (each final pass takes ~0.3–1 s on CPU and they run independently).
 pub const HOLD: Duration = Duration::from_millis(1500);
 
-/// The longest a mic final waits while an interviewer utterance that could meet it is still
-/// open. Bounds the You lane's added latency whatever the interviewer lane is doing.
+/// The longest a mic final waits while a Them utterance that could meet it is still
+/// open. Bounds the You lane's added latency whatever the Them lane is doing.
 pub const MAX_HOLD: Duration = Duration::from_millis(4000);
 
-/// Interviewer finals kept for matching, at most. One lane's finals arrive in time order, so
+/// Them finals kept for matching, at most. One lane's finals arrive in time order, so
 /// old ones are pruned as mic finals move past them; this caps a session in which the candidate
 /// never speaks.
 const KEEP: usize = 64;
@@ -153,7 +153,7 @@ fn meets(a: &Segment, b: &Segment) -> bool {
 ///
 /// The SPEC's ratio compares whole lines, but the two lanes cut the same speech at different
 /// places: on the echo fixture the quieter copy on the mic splits at pauses the clean loopback
-/// lane runs straight through, so a copy is usually one sentence of a longer interviewer final
+/// lane runs straight through, so a copy is usually one sentence of a longer Them final
 /// ("How would you design a rate limiter…" inside "Let's start with something concrete. How
 /// would you design…"), and its whole-line ratio is 0.3–0.7. Containment scores those 1.0.
 pub fn containment(mic: &str, orig: &str) -> f64 {
@@ -177,12 +177,12 @@ pub fn containment(mic: &str, orig: &str) -> f64 {
     1.0 - best as f64 / x.len() as f64
 }
 
-/// Below this many words a mic final must match a whole interviewer line ([`similarity`]), not
+/// Below this many words a mic final must match a whole Them line ([`similarity`]), not
 /// just appear inside one ([`containment`]): a candidate's "Right." or "Makes sense." said over
-/// the interviewer's last words would otherwise be found inside almost any line.
+/// the other person's last words would otherwise be found inside almost any line.
 pub const MIN_CONTAINED_WORDS: usize = 3;
 
-/// Whether `mic` duplicates the loopback in `ivs`. Only interviewer finals that meet it in time
+/// Whether `mic` duplicates the loopback in `ivs`. Only Them finals that meet it in time
 /// count. A mic final of [`MIN_CONTAINED_WORDS`] or more is a copy when it is contained in them
 /// (joined in time order, so an echo spanning a 12 s forced split still matches); a shorter one
 /// when it is a near copy of one whole line.
@@ -214,7 +214,7 @@ fn comparable(seg: &Segment) -> bool {
 enum State {
     /// A mic final that may still turn out to be an echo.
     Waiting,
-    /// A mic final an interviewer final has since condemned: goes out as a drop.
+    /// A mic final a Them final has since condemned: goes out as a drop.
     Condemned,
     /// Anything else (a partial, an empty final, a mic final already cleared): goes out as is,
     /// in order.
@@ -235,9 +235,9 @@ pub struct EchoGuard {
     enabled: bool,
     /// You segments not yet released, in arrival order.
     queue: VecDeque<Queued>,
-    /// Interviewer finals a mic final could still duplicate, in arrival order.
-    interviewers: VecDeque<Segment>,
-    /// The interviewer utterance whose partials have arrived but whose final has not:
+    /// Them finals a mic final could still duplicate, in arrival order.
+    their_finals: VecDeque<Segment>,
+    /// The Them utterance whose partials have arrived but whose final has not:
     /// `(start, end so far)`.
     open: Option<(Duration, Duration)>,
     dropped: u64,
@@ -253,7 +253,7 @@ impl EchoGuard {
         Self {
             enabled,
             queue: VecDeque::new(),
-            interviewers: VecDeque::new(),
+            their_finals: VecDeque::new(),
             open: None,
             dropped: 0,
             speaking: VecDeque::new(),
@@ -313,7 +313,7 @@ impl EchoGuard {
             return vec![Verdict::Drop(seg)];
         }
         match seg.source {
-            Source::Interviewer => self.interviewer(seg, now),
+            Source::Them => self.them(seg, now),
             Source::You => self.you(seg, now),
             // Single-stream fallback: there is no second lane to echo from.
             _ => vec![Verdict::Publish(seg)],
@@ -325,7 +325,7 @@ impl EchoGuard {
         self.release(now)
     }
 
-    /// Release everything still held: the audio has ended, so no interviewer final can condemn
+    /// Release everything still held: the audio has ended, so no Them final can condemn
     /// it any more (a copy already condemned still goes out as a drop).
     pub fn finish(&mut self) -> Vec<Verdict> {
         self.open = None;
@@ -336,7 +336,7 @@ impl EchoGuard {
         out
     }
 
-    fn interviewer(&mut self, seg: Segment, now: Duration) -> Vec<Verdict> {
+    fn them(&mut self, seg: Segment, now: Duration) -> Vec<Verdict> {
         if !seg.is_final {
             self.open = Some((seg.start, seg.end));
             return vec![Verdict::Publish(seg)];
@@ -345,14 +345,14 @@ impl EchoGuard {
             self.open = None;
         }
         if comparable(&seg) {
-            self.interviewers.push_back(seg.clone());
-            while self.interviewers.len() > KEEP {
-                self.interviewers.pop_front();
+            self.their_finals.push_back(seg.clone());
+            while self.their_finals.len() > KEEP {
+                self.their_finals.pop_front();
             }
             // The original may condemn mic finals already waiting.
             for i in 0..self.queue.len() {
                 if self.queue[i].state == State::Waiting
-                    && duplicates(&self.queue[i].seg, &self.interviewers)
+                    && duplicates(&self.queue[i].seg, &self.their_finals)
                 {
                     self.queue[i].state = State::Condemned;
                 }
@@ -365,16 +365,16 @@ impl EchoGuard {
 
     fn you(&mut self, seg: Segment, now: Duration) -> Vec<Verdict> {
         let state = if comparable(&seg) {
-            // An interviewer final too old to meet this one can never meet a later one either:
+            // A Them final too old to meet this one can never meet a later one either:
             // the mic lane's finals arrive in time order.
             while self
-                .interviewers
+                .their_finals
                 .front()
                 .is_some_and(|iv| iv.end + WINDOW < seg.start)
             {
-                self.interviewers.pop_front();
+                self.their_finals.pop_front();
             }
-            if duplicates(&seg, &self.interviewers) {
+            if duplicates(&seg, &self.their_finals) {
                 State::Condemned
             } else {
                 State::Waiting
@@ -457,8 +457,8 @@ mod tests {
         seg(Source::You, start_ms, end_ms, text, true)
     }
 
-    fn interviewer(start_ms: u64, end_ms: u64, text: &str) -> Segment {
-        seg(Source::Interviewer, start_ms, end_ms, text, true)
+    fn them(start_ms: u64, end_ms: u64, text: &str) -> Segment {
+        seg(Source::Them, start_ms, end_ms, text, true)
     }
 
     fn ms(ms: u64) -> Duration {
@@ -507,8 +507,8 @@ mod tests {
         // While it plays: the mic, the loopback, a partial; all overlapping the open window.
         let during = [
             mic(41_000, 43_000, "Empezaría por clave."),
-            interviewer(42_000, 44_000, "Mm-hm, go on."),
-            seg(Source::Interviewer, 44_500, 45_000, "Sure", false),
+            them(42_000, 44_000, "Mm-hm, go on."),
+            seg(Source::Them, 44_500, 45_000, "Sure", false),
         ];
         for s in during {
             let verdicts = guard.observe(s.clone(), now);
@@ -517,10 +517,10 @@ mod tests {
         }
         guard.speaking_until(ms(46_000));
         // Transcribed late, spoken inside the window: still dropped.
-        let late = interviewer(45_500, 47_000, "Sounds good.");
+        let late = them(45_500, 47_000, "Sounds good.");
         assert_eq!(guard.observe(late.clone(), now), [Verdict::Drop(late)]);
         // After the window, on both lanes: kept.
-        let after = interviewer(46_500, 49_000, "And how would you test it?");
+        let after = them(46_500, 49_000, "And how would you test it?");
         assert_eq!(
             guard.observe(after.clone(), now),
             [Verdict::Publish(after.clone())]
@@ -540,7 +540,7 @@ mod tests {
             published(&log),
             [
                 (Source::You, "I'd shard by tenant.".to_owned()),
-                (Source::Interviewer, "And how would you test it?".to_owned()),
+                (Source::Them, "And how would you test it?".to_owned()),
                 (Source::You, "With a replay harness.".to_owned()),
             ]
         );
@@ -613,12 +613,12 @@ mod tests {
     }
 
     #[test]
-    fn echo_of_one_sentence_of_a_longer_interviewer_line_is_dropped() {
+    fn echo_of_one_sentence_of_a_longer_them_line_is_dropped() {
         // The echo fixture's pattern: the clean loopback runs two sentences together, the
         // quieter copy on the mic splits at the pause between them.
         let mut guard = EchoGuard::new(true);
         guard.observe(
-            interviewer(
+            them(
                 20_000,
                 29_800,
                 "Let's start with something concrete. How would you design a rate limiter for \
@@ -644,12 +644,12 @@ mod tests {
     }
 
     #[test]
-    fn echo_guard_keeps_a_short_backchannel_said_over_the_interviewer() {
-        // "Right." inside the interviewer's line would be a perfect containment match; under
+    fn echo_guard_keeps_a_short_backchannel_said_over_the_other_person() {
+        // "Right." inside the other person's line would be a perfect containment match; under
         // MIN_CONTAINED_WORDS only a whole-line match counts, so the candidate's aside stays.
         let mut guard = EchoGuard::new(true);
         guard.observe(
-            interviewer(
+            them(
                 10_000,
                 14_000,
                 "Right, so the cache sits in front. Makes sense?",
@@ -665,11 +665,11 @@ mod tests {
     #[test]
     fn echo_arriving_after_its_original_is_dropped_at_once() {
         let mut guard = EchoGuard::new(true);
-        let original = interviewer(10_000, 12_000, QUESTION);
+        let original = them(10_000, 12_000, QUESTION);
         assert_eq!(
             guard.observe(original.clone(), ms(0)),
             vec![Verdict::Publish(original)],
-            "interviewer lines are never held"
+            "them lines are never held"
         );
         let echo = mic(10_100, 12_100, "How would you design a rate limiter");
         assert_eq!(
@@ -685,7 +685,7 @@ mod tests {
         let echo = mic(10_100, 12_100, QUESTION);
         assert_eq!(guard.observe(echo.clone(), ms(0)), vec![], "held");
         assert_eq!(guard.expire(ms(900)), vec![], "still inside the hold");
-        let original = interviewer(10_000, 12_000, QUESTION);
+        let original = them(10_000, 12_000, QUESTION);
         assert_eq!(
             guard.observe(original.clone(), ms(1_000)),
             vec![Verdict::Publish(original), Verdict::Drop(echo)],
@@ -713,12 +713,12 @@ mod tests {
     }
 
     #[test]
-    fn echo_hold_stretches_for_an_open_interviewer_utterance_up_to_the_cap() {
+    fn echo_hold_stretches_for_an_open_them_utterance_up_to_the_cap() {
         let mut guard = EchoGuard::new(true);
-        // The interviewer lane has an utterance open (its partials are in) that overlaps the
+        // The Them lane has an utterance open (its partials are in) that overlaps the
         // mic final: its final may still condemn it, so the mic final waits past HOLD...
         guard.observe(
-            seg(Source::Interviewer, 10_000, 11_000, "How would you", false),
+            seg(Source::Them, 10_000, 11_000, "How would you", false),
             ms(0),
         );
         let line = mic(10_100, 12_100, QUESTION);
@@ -738,11 +738,8 @@ mod tests {
     #[test]
     fn echo_hold_is_not_stretched_by_an_utterance_that_cannot_meet() {
         let mut guard = EchoGuard::new(true);
-        // The interviewer started talking again well after the mic line ended.
-        guard.observe(
-            seg(Source::Interviewer, 20_000, 21_000, "Next", false),
-            ms(0),
-        );
+        // The other person started talking again well after the mic line ended.
+        guard.observe(seg(Source::Them, 20_000, 21_000, "Next", false), ms(0));
         let line = mic(10_000, 12_000, "I would shard by tenant.");
         guard.observe(line.clone(), ms(100));
         assert_eq!(guard.expire(ms(100) + HOLD), vec![Verdict::Publish(line)]);
@@ -751,8 +748,8 @@ mod tests {
     #[test]
     fn echo_guard_keeps_a_real_answer_overlapping_the_loopback() {
         let mut guard = EchoGuard::new(true);
-        guard.observe(interviewer(10_000, 12_000, QUESTION), ms(0));
-        // The candidate starts before the interviewer quite stops: overlapping, nothing alike.
+        guard.observe(them(10_000, 12_000, QUESTION), ms(0));
+        // The candidate starts before the other person quite stops: overlapping, nothing alike.
         let answer = mic(
             11_500,
             14_000,
@@ -766,8 +763,8 @@ mod tests {
     #[test]
     fn echo_window_bound_is_inclusive_at_300_ms() {
         let mut guard = EchoGuard::new(true);
-        guard.observe(interviewer(10_000, 12_000, QUESTION), ms(0));
-        // 301 ms after the interviewer stopped: someone reading the line back, not an echo.
+        guard.observe(them(10_000, 12_000, QUESTION), ms(0));
+        // 301 ms after the other person stopped: someone reading the line back, not an echo.
         guard.observe(mic(12_301, 14_500, QUESTION), ms(100));
         assert_eq!(guard.dropped(), 0);
         assert_eq!(
@@ -776,7 +773,7 @@ mod tests {
         );
 
         let mut guard = EchoGuard::new(true);
-        guard.observe(interviewer(10_000, 12_000, QUESTION), ms(0));
+        guard.observe(them(10_000, 12_000, QUESTION), ms(0));
         let at_bound = mic(12_300, 14_500, QUESTION);
         assert_eq!(
             guard.observe(at_bound.clone(), ms(100)),
@@ -788,7 +785,7 @@ mod tests {
     fn echo_guard_keeps_a_meeting_mic_final_under_the_similarity_bar() {
         let mut guard = EchoGuard::new(true);
         guard.observe(
-            interviewer(
+            them(
                 10_000,
                 12_000,
                 "Tell me about a time you disagreed with a coworker.",
@@ -810,10 +807,10 @@ mod tests {
     #[test]
     fn echo_of_a_line_split_at_12_s_matches_the_joined_halves() {
         let mut guard = EchoGuard::new(true);
-        // The interviewer lane force-split one long question at 12 s; the echo lane's VAD
+        // The Them lane force-split one long question at 12 s; the echo lane's VAD
         // closed it once.
         guard.observe(
-            interviewer(
+            them(
                 0,
                 12_000,
                 "Imagine you run a chat service with a million users and",
@@ -821,7 +818,7 @@ mod tests {
             ms(0),
         );
         guard.observe(
-            interviewer(
+            them(
                 12_000,
                 15_000,
                 "every message must be searchable forever. How?",
@@ -864,7 +861,7 @@ mod tests {
     #[test]
     fn echo_guard_never_compares_empty_finals_or_unknown_source() {
         let mut guard = EchoGuard::new(true);
-        guard.observe(interviewer(10_000, 12_000, QUESTION), ms(0));
+        guard.observe(them(10_000, 12_000, QUESTION), ms(0));
         let empty = mic(10_100, 12_100, "");
         assert_eq!(
             guard.observe(empty.clone(), ms(100)),
@@ -881,7 +878,7 @@ mod tests {
     #[test]
     fn echo_guard_disabled_publishes_everything_and_drops_nothing() {
         let mut guard = EchoGuard::new(false);
-        guard.observe(interviewer(10_000, 12_000, QUESTION), ms(0));
+        guard.observe(them(10_000, 12_000, QUESTION), ms(0));
         let echo = mic(10_100, 12_100, QUESTION);
         assert_eq!(
             guard.observe(echo.clone(), ms(100)),
@@ -894,7 +891,7 @@ mod tests {
 
     #[test]
     fn echo_whose_original_never_comes_is_published_not_lost() {
-        // The interviewer lane dropped the original as a hallucination; the mic copy is all
+        // The Them lane dropped the original as a hallucination; the mic copy is all
         // that survives, and it must not vanish too.
         let mut guard = EchoGuard::new(true);
         let line = mic(10_000, 12_000, QUESTION);
@@ -908,7 +905,7 @@ mod tests {
         let mut guard = EchoGuard::new(true);
         let answer = mic(5_000, 8_000, "I would shard by tenant.");
         guard.observe(answer.clone(), ms(0));
-        guard.observe(interviewer(10_000, 12_000, QUESTION), ms(100));
+        guard.observe(them(10_000, 12_000, QUESTION), ms(100));
         let echo = mic(10_100, 12_100, QUESTION);
         assert_eq!(
             guard.observe(echo.clone(), ms(200)),
@@ -923,7 +920,7 @@ mod tests {
     }
 
     /// The acceptance scenario at segment level: a two-lane stream built like the echo fixture
-    /// (every interviewer question copied onto the mic ~100 ms late, plus real answers), with
+    /// (every Them question copied onto the mic ~100 ms late, plus real answers), with
     /// the lanes' finals reaching the guard in both orders.
     #[test]
     fn echo_fixture_scenario_drops_duplicates_and_keeps_the_answers() {
@@ -974,7 +971,7 @@ mod tests {
             };
         for (i, (qs, qe, qt)) in questions.iter().enumerate() {
             let echo = mic(qs + 100, qe + 100, &qt.replace('?', ""));
-            let original = interviewer(*qs, *qe, qt);
+            let original = them(*qs, *qe, qt);
             // Alternate which lane's final lands first, up to 900 ms apart.
             if i % 2 == 0 {
                 feed(&mut guard, &mut log, Some(original), 500);
@@ -997,10 +994,7 @@ mod tests {
         let lines = published(&log);
         assert_eq!(guard.dropped(), 3, "every copied question: {lines:?}");
         for (_, _, qt) in &questions {
-            assert!(
-                lines.contains(&(Source::Interviewer, (*qt).to_owned())),
-                "{qt}"
-            );
+            assert!(lines.contains(&(Source::Them, (*qt).to_owned())), "{qt}");
             let copy = qt.replace('?', "");
             assert!(!lines.iter().any(|(_, t)| *t == copy), "copy gone: {copy}");
         }

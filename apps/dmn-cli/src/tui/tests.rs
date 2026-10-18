@@ -153,7 +153,7 @@ fn opening() -> Vec<Action> {
     a.extend(status_ok());
     a.extend([
         seg(
-            Speaker::Interviewer,
+            Speaker::Them,
             1.0,
             13.0,
             "Hi, thanks for making the time today. This session is about an hour of system design.",
@@ -169,7 +169,7 @@ fn answered(id: u64, question: &str, kind: &str, focus: &str, approach: &[&str])
     let mut a = vec![
         Action::Candidate {
             id,
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 29.7,
             text: question.into(),
@@ -351,7 +351,7 @@ fn behavioral_star() -> Vec<Action> {
     vec![
         Action::Candidate {
             id: 1,
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 40.0,
             end: 44.0,
             text: "Tell me about a time you disagreed with a teammate.".into(),
@@ -518,19 +518,13 @@ fn actions(state: &str) -> Vec<Action> {
     match state {
         "listening" => {
             a.push(seg(
-                Speaker::Interviewer,
+                Speaker::Them,
                 18.0,
                 21.5,
                 "Great. Let me tell you a bit about the team before we start.",
                 true,
             ));
-            a.push(seg(
-                Speaker::Interviewer,
-                22.0,
-                24.0,
-                "We run the platform",
-                false,
-            ));
+            a.push(seg(Speaker::Them, 22.0, 24.0, "We run the platform", false));
         }
         "live" => {
             a.extend(rate_limiter());
@@ -561,7 +555,7 @@ fn actions(state: &str) -> Vec<Action> {
                 true,
             ));
             a.push(seg(
-                Speaker::Interviewer,
+                Speaker::Them,
                 136.5,
                 144.2,
                 "Where would you put the limiter in the request path?",
@@ -578,7 +572,7 @@ fn actions(state: &str) -> Vec<Action> {
                 true,
             ));
             a.push(seg(
-                Speaker::Interviewer,
+                Speaker::Them,
                 94.7,
                 100.4,
                 "And what if it goes down for a whole region, not just one node?",
@@ -587,7 +581,7 @@ fn actions(state: &str) -> Vec<Action> {
             // The next candidate is out to the model: the rate-limiter Approach dims.
             a.push(Action::Candidate {
                 id: 2,
-                speaker: Speaker::Interviewer,
+                speaker: Speaker::Them,
                 start: 94.7,
                 end: 100.4,
                 text: "And what if it goes down for a whole region, not just one node?".into(),
@@ -726,19 +720,13 @@ fn actions(state: &str) -> Vec<Action> {
                     language: Some("es".into()),
                 });
             }
-            a.push(seg(
-                Speaker::Interviewer,
-                90.0,
-                92.0,
-                "And what about the",
-                false,
-            ));
+            a.push(seg(Speaker::Them, 90.0, 92.0, "And what about the", false));
             if state == "assist-on-again" {
                 a.push(Action::Assist { enabled: true });
             }
         }
         "asks-you" => {
-            // The interviewer's greeting is in the transcript, but that lane cannot ask: the
+            // The other person's greeting is in the transcript, but that lane cannot ask: the
             // question area still waits for the mic.
             a.insert(
                 1,
@@ -785,7 +773,7 @@ fn actions(state: &str) -> Vec<Action> {
             };
             a.extend(reply);
         }
-        // #96: the rate-limiter question on screen, then a remark of the interviewer's goes to
+        // #96: the rate-limiter question on screen, then a remark of the other person's goes to
         // the model, sent by Enter or found by the detector, and the model says it is not a
         // question. The screen keeps what it had; only the key press is answered.
         "asked-not-a-question" | "detected-not-a-question" => {
@@ -799,7 +787,7 @@ fn actions(state: &str) -> Vec<Action> {
                 true,
             ));
             a.push(seg(
-                Speaker::Interviewer,
+                Speaker::Them,
                 37.0,
                 40.5,
                 "Sure. Take whichever you think matters most, right?",
@@ -807,7 +795,7 @@ fn actions(state: &str) -> Vec<Action> {
             ));
             a.push(Action::Candidate {
                 id: 2,
-                speaker: Speaker::Interviewer,
+                speaker: Speaker::Them,
                 start: 37.0,
                 end: 40.5,
                 text: "Sure. Take whichever you think matters most, right?".into(),
@@ -1208,28 +1196,25 @@ class LRUCache:
 /// #79's fixture: a translated exchange, some lines long enough to wrap at 80 columns.
 const ASSIST_OFF_TURNS: [(Speaker, &str); 7] = [
     (
-        Speaker::Interviewer,
+        Speaker::Them,
         "Let's move on. Tell me about the team you worked with on the payments migration.",
     ),
     (
         Speaker::You,
         "There were five of us: two backend engineers, a data engineer, a product manager and me leading the cut-over plan.",
     ),
-    (Speaker::Interviewer, "How long did the migration take?"),
+    (Speaker::Them, "How long did the migration take?"),
     (
         Speaker::You,
         "About four months, with the last three weeks running both systems side by side and comparing every ledger entry.",
     ),
-    (
-        Speaker::Interviewer,
-        "And did anything go wrong on the day?",
-    ),
+    (Speaker::Them, "And did anything go wrong on the day?"),
     (
         Speaker::You,
         "One batch job still pointed at the old database, so we paused it and replayed its writes.",
     ),
     (
-        Speaker::Interviewer,
+        Speaker::Them,
         "Good. Let's talk about how you would test that.",
     ),
 ];
@@ -1329,7 +1314,7 @@ fn tui_snapshots_match() {
 }
 
 #[test]
-fn tui_listening_shows_the_last_interviewer_line_muted() {
+fn tui_listening_shows_the_last_them_line_muted() {
     let buf = render(&load("listening"), (100, 30));
     let screen = text(&buf);
     assert!(screen.contains("LISTENING"), "{screen}");
@@ -1601,13 +1586,7 @@ fn tui_a_wide_pane_puts_the_transcript_in_a_right_hand_column() {
 fn tui_the_side_column_keeps_the_end_of_an_utterance_taller_than_it() {
     let words: Vec<String> = (1..=200).map(|n| format!("w{n}")).collect();
     let mut a = actions("live");
-    a.push(seg(
-        Speaker::Interviewer,
-        40.0,
-        52.0,
-        &words.join(" "),
-        true,
-    ));
+    a.push(seg(Speaker::Them, 40.0, 52.0, &words.join(" "), true));
     let screen = text(&render(&Session::replay(&a), (120, 12)));
     let rows: Vec<&str> = screen.lines().collect();
     assert!(
@@ -1627,7 +1606,7 @@ fn tui_assist_off_keeps_the_end_of_an_utterance_taller_than_the_screen() {
     let words: Vec<String> = (1..=120).map(|n| format!("w{n}")).collect();
     let mut a = actions("assist-off");
     a.push(Action::Segment {
-        speaker: Speaker::Interviewer,
+        speaker: Speaker::Them,
         start: 95.0,
         end: 107.0,
         text: words.join(" "),
@@ -1697,7 +1676,7 @@ fn tui_a_model_partly_in_system_memory_is_named() {
 }
 
 #[test]
-fn tui_the_status_line_names_a_question_source_other_than_the_interviewer() {
+fn tui_the_status_line_names_a_question_source_other_than_the_other_person() {
     // #90: `asks: you` / `asks: both`; nothing for the default, nothing while assistance is off.
     for size in SIZES {
         assert!(text(&render(&load("asks-you"), size)).contains(" asks: you "));
@@ -1837,7 +1816,7 @@ fn tui_the_voice_tag_leads_the_status_line_and_the_transcript_marks_what_went_ou
         // The strip has two rows: the newest line, and the one before it labelled for what it
         // went out as (its translation would have been a third row).
         assert!(
-            screen.contains("You → de    If Redis goes down"),
+            screen.contains("You → de  If Redis goes down"),
             "the line that went out translated is labelled:\n{screen}"
         );
         assert!(!screen.contains("» Wenn Redis"), "{screen}");
@@ -1857,11 +1836,11 @@ fn tui_the_voice_tag_leads_the_status_line_and_the_transcript_marks_what_went_ou
     );
     let rows: Vec<String> = text(&buf).lines().map(str::to_owned).collect();
     assert!(
-        rows[27].starts_with("You → de    Then I'd shard"),
+        rows[27].starts_with("You → de  Then I'd shard"),
         "{}",
         rows[27]
     );
-    assert!(rows[28].starts_with("            » "), "{}", rows[28]);
+    assert!(rows[28].starts_with("          » "), "{}", rows[28]);
     // The side column (#88) wraps every line with its translation under it, dim.
     let buf = render(&load("voice-translate"), WIDE);
     let (x, y) = row_containing(&buf, "» Wenn Redis ausfällt");
@@ -1979,7 +1958,7 @@ fn tui_the_picker_lists_the_languages_over_an_unchanged_layout_and_a_choice_upda
     chosen.push(Action::SpeakDone { id: 2 });
     let screen = text(&render(&Session::replay(&chosen), (140, 30)));
     assert!(
-        screen.contains("You → de    Then I'd shard"),
+        screen.contains("You → de  Then I'd shard"),
         "spoken in the language it started in:\n{screen}"
     );
     assert!(!screen.contains("You → es"), "{screen}");
@@ -2100,16 +2079,16 @@ fn tui_the_listening_placeholder_names_who_can_ask() {
         a.extend(source.map(|source| Action::QuestionSource { source }));
         text(&render(&Session::replay(&a), (100, 30)))
     };
-    assert!(waiting(None).contains("Waiting for the interviewer…"));
-    assert!(waiting(Some(QuestionSource::Interviewer)).contains("Waiting for the interviewer…"));
+    assert!(waiting(None).contains("Waiting for their question…"));
+    assert!(waiting(Some(QuestionSource::Them)).contains("Waiting for their question…"));
     assert!(waiting(Some(QuestionSource::You)).contains("Waiting for your question…"));
     assert!(waiting(Some(QuestionSource::Both)).contains("Waiting for a question…"));
-    // The interviewer's greeting does not fill the question area when only the mic can ask, and
+    // The other person's greeting does not fill the question area when only the mic can ask, and
     // it is in the transcript under its own label all the same.
     let screen = text(&render(&load("asks-you"), (100, 30)));
     assert!(screen.contains("Waiting for your question…"), "{screen}");
     assert!(
-        screen.contains("Interviewer Hi, thanks for making"),
+        screen.contains("Them      Hi, thanks for making"),
         "{screen}"
     );
 }
@@ -2120,7 +2099,7 @@ fn tui_the_status_line_names_a_detected_language_other_than_english() {
     let heard = |language: Option<&str>, is_final: bool| {
         let mut actions = actions("listening");
         actions.push(Action::Segment {
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 1.0,
             end: 3.0,
             text: "How would you design it?".into(),
@@ -2174,7 +2153,7 @@ fn tui_the_status_line_says_which_device_transcribes() {
     let (x, y) = row_containing(&buf, "stt cpu (no gpu)");
     assert_eq!(buf[(x, y)].fg, Color::Yellow, "a fallback is amber");
 
-    // Beside a local LLM the usual split: the interviewer's lane on the GPU, yours on the CPU.
+    // Beside a local LLM the usual split: the other person's lane on the GPU, yours on the CPU.
     let mixed = text(&with(
         "GPU NVIDIA GeForce RTX 4090 (Vulkan0, 1.2 of 26.0 GB free); CPU (fallback: Vulkan0 has \
          0.33 GB free, whisper needs 1.16 GB)",
@@ -2348,7 +2327,7 @@ fn tui_an_earlier_question_is_titled_with_its_place_and_is_never_dimmed() {
     // A candidate out to the model dims the live Approach; the one on screen is not the live one.
     a.push(Action::Candidate {
         id: 9,
-        speaker: Speaker::Interviewer,
+        speaker: Speaker::Them,
         start: 200.0,
         end: 204.0,
         text: "And at ten times the load?".into(),
@@ -2727,4 +2706,19 @@ fn tui_the_wheel_goes_three_rows_a_notch_on_the_left_column_and_stops_at_both_en
         s.assist_off = true;
         assert!(!on_left_column(&s, pane, 5, 10));
     }
+}
+
+#[test]
+fn a_session_file_from_before_128_reads_interviewer_as_them() {
+    let new = std::fs::read_to_string(fixture_path("assist-off")).expect("fixture file");
+    let old = new.replace("\"speaker\": \"them\"", "\"speaker\": \"interviewer\"");
+    assert_ne!(old, new, "the fixture has lines from the other person");
+    let parsed: Session = serde_json::from_str(&old).expect("an old session file still parses");
+    let current: Session = serde_json::from_str(&new).expect("fixture");
+    assert_eq!(parsed, current);
+    assert!(
+        !serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("interviewer")
+    );
 }

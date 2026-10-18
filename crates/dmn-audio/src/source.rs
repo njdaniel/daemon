@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use crate::frames::FrameSink;
 
 /// Who a stream belongs to. Attribution is a property of the source (docs/SPEC.md § Speaker
-/// attribution): mic → `You`, app loopback → `Interviewer`, single-stream fallback → `Unknown`.
+/// attribution): mic → `You`, app loopback → `Them`, single-stream fallback → `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     You,
-    Interviewer,
+    Them,
     Unknown,
 }
 
@@ -16,7 +16,7 @@ impl Source {
     pub fn label(self) -> &'static str {
         match self {
             Source::You => "You",
-            Source::Interviewer => "Interviewer",
+            Source::Them => "Them",
             Source::Unknown => "Unknown",
         }
     }

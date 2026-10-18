@@ -12,7 +12,7 @@
 //!
 //! v3 (#50) records the coding-solutions mode per question; v4 (#53) adds context `sources` and
 //! their `chunks`; v5 (#54) caches the job-description summary; v6 (#57) keeps the session
-//! memory's summary lines and promises.
+//! memory's summary lines and promises; v9 (#128) renames the `interviewer` lane to `them`.
 //!
 //! v2 (#16) adds what `dmn bench --live` needs to report latency and CPU from a stored session:
 //! per question, the audio time (REAL seconds, the same clock as segment times) at which the
@@ -25,45 +25,64 @@ use rusqlite::Connection;
 use crate::error::StoreError;
 
 /// The schema version a freshly migrated database reports in `user_version`.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 struct Migration {
     version: i64,
     sql: &'static str,
+    /// The migration rebuilds a table other tables reference (v9). SQLite's `CHECK` cannot be
+    /// altered, so the table is copied, dropped and renamed; with foreign keys enforced, the drop
+    /// would cascade and delete every row that references it. The runner switches them off for
+    /// this migration (the pragma is a no-op inside a transaction, so it is set before one
+    /// starts), checks every reference before the commit, and restores the setting.
+    rebuilds: bool,
 }
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         sql: V1,
+        rebuilds: false,
     },
     Migration {
         version: 2,
         sql: V2,
+        rebuilds: false,
     },
     Migration {
         version: 3,
         sql: V3,
+        rebuilds: false,
     },
     Migration {
         version: 4,
         sql: V4,
+        rebuilds: false,
     },
     Migration {
         version: 5,
         sql: V5,
+        rebuilds: false,
     },
     Migration {
         version: 6,
         sql: V6,
+        rebuilds: false,
     },
     Migration {
         version: 7,
         sql: V7,
+        rebuilds: false,
     },
     Migration {
         version: 8,
         sql: V8,
+        rebuilds: false,
+    },
+    Migration {
+        version: 9,
+        sql: V9,
+        rebuilds: true,
     },
 ];
 
@@ -231,6 +250,32 @@ const V8: &str = "
 ALTER TABLE segments ADD COLUMN language TEXT;
 ";
 
+/// v9 (#128): the other person's lane is `them`, no longer `interviewer`. The rows are rewritten
+/// and the `CHECK` names the new value, which takes a rebuild of `segments` (see
+/// [`Migration::rebuilds`]); ids are copied, so `questions.segment_id` still points at its row.
+/// `Source::parse` keeps reading `interviewer` all the same.
+const V9: &str = "
+CREATE TABLE segments_v9 (
+    id          INTEGER PRIMARY KEY,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    source      TEXT NOT NULL CHECK (source IN ('them', 'you', 'unknown')),
+    start_time  REAL NOT NULL,
+    end_time    REAL NOT NULL,
+    text        TEXT NOT NULL,
+    is_final    INTEGER NOT NULL,
+    avg_logprob REAL NOT NULL,
+    language    TEXT
+);
+INSERT INTO segments_v9 (id, session_id, source, start_time, end_time, text, is_final,
+                         avg_logprob, language)
+    SELECT id, session_id, CASE source WHEN 'interviewer' THEN 'them' ELSE source END,
+           start_time, end_time, text, is_final, avg_logprob, language
+    FROM segments;
+DROP TABLE segments;
+ALTER TABLE segments_v9 RENAME TO segments;
+CREATE INDEX idx_segments_session ON segments(session_id);
+";
+
 /// Apply every migration newer than the database's `user_version`, each in a transaction.
 pub fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     migrate_to(conn, SCHEMA_VERSION)
@@ -244,10 +289,41 @@ pub(crate) fn migrate_to(conn: &mut Connection, target: i64) -> Result<(), Store
         if migration.version <= current || migration.version > target {
             continue;
         }
-        let tx = conn.transaction()?;
-        tx.execute_batch(migration.sql)?;
-        tx.pragma_update(None, "user_version", migration.version)?;
-        tx.commit()?;
+        if migration.rebuilds {
+            let enforced: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let applied = apply(conn, migration, true);
+            conn.pragma_update(None, "foreign_keys", if enforced { "ON" } else { "OFF" })?;
+            applied?;
+        } else {
+            apply(conn, migration, false)?;
+        }
     }
+    Ok(())
+}
+
+/// One migration in its own transaction with its `user_version` bump. `check_references`: fail,
+/// and so roll back, if any foreign key points at a missing row afterwards.
+fn apply(
+    conn: &mut Connection,
+    migration: &Migration,
+    check_references: bool,
+) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    tx.execute_batch(migration.sql)?;
+    if check_references {
+        let dangling: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if dangling > 0 {
+            return Err(StoreError::Migration {
+                version: migration.version,
+                detail: format!("{dangling} rows reference a missing row"),
+            });
+        }
+    }
+    tx.pragma_update(None, "user_version", migration.version)?;
+    tx.commit()?;
     Ok(())
 }

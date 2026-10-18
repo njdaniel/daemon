@@ -294,7 +294,7 @@ mod tests {
 
     /// Feed `pattern` as (frames, speech?) runs; return every event.
     fn run(pattern: &[(u64, bool)]) -> Vec<VadEvent> {
-        let mut seg = Segmenter::new(Source::Interviewer, &SegmenterConfig::default());
+        let mut seg = Segmenter::new(Source::Them, &SegmenterConfig::default());
         let mut out = Vec::new();
         for &(count, speech) in pattern {
             for _ in 0..count {
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(
             ev[0],
             VadEvent::SpeechStart {
-                source: Source::Interviewer,
+                source: Source::Them,
                 at: ms(1000)
             }
         );
@@ -349,11 +349,11 @@ mod tests {
             pauses,
             vec![
                 &VadEvent::Pause {
-                    source: Source::Interviewer,
+                    source: Source::Them,
                     at: ms(1000)
                 },
                 &VadEvent::Pause {
-                    source: Source::Interviewer,
+                    source: Source::Them,
                     at: ms(2300)
                 }
             ]

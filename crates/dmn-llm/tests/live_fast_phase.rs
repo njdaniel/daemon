@@ -20,7 +20,7 @@ async fn live_question_streams_before_the_approach() {
         "So let's switch gears. How would you design a rate limiter for a globally distributed API?",
         5,
     );
-    req.transcript = "Interviewer: Thanks for the intro.\nYou: Happy to be here.".into();
+    req.transcript = "Them: Thanks for the intro.\nYou: Happy to be here.".into();
     let started = Instant::now();
     let mut events = Vec::new();
     let outcome = run_fast_phase(&p, &req, CancellationToken::new(), |e| {
@@ -71,8 +71,8 @@ const SLACK: &str = "How would you design a chat app like Slack for a company wi
 #[ignore]
 async fn live_a_new_question_is_not_answered_as_the_one_on_screen() {
     let transcript = format!(
-        "Interviewer: {SLACK}\nYou: {SLACK}\nInterviewer: Let's switch gears. Design a ride sharing device.\n\
-         Interviewer: Service action system.\nInterviewer: What happens when the database behind your cache goes down?"
+        "Them: {SLACK}\nYou: {SLACK}\nThem: Let's switch gears. Design a ride sharing device.\n\
+         Them: Service action system.\nThem: What happens when the database behind your cache goes down?"
     );
     let outcome = live(
         "Design a ride-sharing device matching system.",
@@ -93,7 +93,7 @@ async fn live_a_new_question_is_not_answered_as_the_one_on_screen() {
 async fn live_any_questions_for_me_gets_questions_to_ask_back() {
     let outcome = live(
         "Do you have any questions for me?",
-        "Interviewer: Why are you looking to leave your current role?\nYou: I want to work on larger systems.",
+        "Them: Why are you looking to leave your current role?\nYou: I want to work on larger systems.",
         None,
     )
     .await;
@@ -111,7 +111,7 @@ async fn live_any_questions_for_me_gets_questions_to_ask_back() {
 async fn live_small_talk_is_still_ignored() {
     let outcome = live(
         "How's your week going so far?",
-        "Interviewer: Hi, can you hear me okay?",
+        "Them: Hi, can you hear me okay?",
         None,
     )
     .await;

@@ -1941,7 +1941,7 @@ mod tests {
         /// #114, the issue's first criterion: a 440 Hz tone played by `pw-play` as a stream
         /// named `dmn-test-114-tone` (nothing on disk: raw samples on its stdin), captured by
         /// the pass-through's stream through the same PipeWire capture path the mic lane uses
-        /// (`target.object` naming the node, as the Interviewer lane names an app's stream),
+        /// (`target.object` naming the node, as the Them lane names an app's stream),
         /// written through the mixer into `dmn-voice`, and recorded there with `pw-record
         /// --target dmn-voice`: the right length, the right pitch at the graph rate, loud. The
         /// real microphone is never used: the tap names the tone's node and does not fall back.

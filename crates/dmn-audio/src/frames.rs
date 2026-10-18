@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn overrun_drops_one_frame_counts_and_never_blocks() {
-        let (mut sink, mut frames) = frame_channel(Source::Interviewer, 2);
+        let (mut sink, mut frames) = frame_channel(Source::Them, 2);
         assert!(sink.push_frame(&frame(1.0)));
         assert!(sink.push_frame(&frame(2.0)));
         let t = Instant::now();

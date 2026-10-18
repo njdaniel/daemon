@@ -49,28 +49,16 @@ fn replies() -> Vec<serde_json::Value> {
     ]
 }
 
-/// The transcript of a tiny call: partials, finals from both speakers, three interviewer
+/// The transcript of a tiny call: partials, finals from both speakers, three Them
 /// questions (one a clarification, one small talk).
 fn call() -> Vec<Segment> {
     vec![
-        seg(Source::Interviewer, 1.0, 3.0, "Thanks for joining", false),
-        seg(
-            Source::Interviewer,
-            1.0,
-            4.0,
-            "Thanks for joining today.",
-            true,
-        ),
+        seg(Source::Them, 1.0, 3.0, "Thanks for joining", false),
+        seg(Source::Them, 1.0, 4.0, "Thanks for joining today.", true),
         seg(Source::You, 4.5, 5.5, "Glad to be here.", true),
+        seg(Source::Them, 8.0, 10.0, "How would you design", false),
         seg(
-            Source::Interviewer,
-            8.0,
-            10.0,
-            "How would you design",
-            false,
-        ),
-        seg(
-            Source::Interviewer,
+            Source::Them,
             8.0,
             13.0,
             "How would you design a rate limiter for a global API?",
@@ -84,7 +72,7 @@ fn call() -> Vec<Segment> {
             true,
         ),
         seg(
-            Source::Interviewer,
+            Source::Them,
             25.0,
             28.0,
             "And what if Redis goes down for a whole region?",
@@ -98,7 +86,7 @@ fn call() -> Vec<Segment> {
             true,
         ),
         seg(
-            Source::Interviewer,
+            Source::Them,
             40.0,
             42.0,
             "Where are you based these days, by the way?",
@@ -326,7 +314,7 @@ async fn remote_providers_keep_the_api_key_out_of_the_log_the_database_and_expor
         at: 1_700_000_000,
     });
     let question = seg(
-        Source::Interviewer,
+        Source::Them,
         1.0,
         4.0,
         "How would you design a rate limiter?",
@@ -590,7 +578,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
             at: 1_700_000_000,
         },
         Action::Segment {
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.5,
             text: q.into(),
@@ -600,7 +588,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
         },
         Action::Candidate {
             id: 1,
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.5,
             text: q.into(),
@@ -655,7 +643,7 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
     let asked = |id: u64, start: f64, text: &str| {
         [
             Action::Segment {
-                speaker: Speaker::Interviewer,
+                speaker: Speaker::Them,
                 start,
                 end: start + 4.0,
                 text: text.into(),
@@ -665,7 +653,7 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
             },
             Action::Candidate {
                 id,
-                speaker: Speaker::Interviewer,
+                speaker: Speaker::Them,
                 start,
                 end: start + 4.0,
                 text: text.into(),
@@ -720,7 +708,7 @@ fn a_question_from_the_you_lane_links_to_the_you_segment() {
         source: QuestionSource::Both,
     });
     let lines = [
-        (Speaker::Interviewer, "How would you shard the counters?"),
+        (Speaker::Them, "How would you shard the counters?"),
         (Speaker::You, "What is the SLA for the limiter?"),
     ];
     for (speaker, text) in lines {
@@ -750,7 +738,7 @@ fn a_question_from_the_you_lane_links_to_the_you_segment() {
     let sources: Vec<dmn_store::Source> = segments.iter().map(|s| s.source).collect();
     assert_eq!(
         sources,
-        [dmn_store::Source::Interviewer, dmn_store::Source::You],
+        [dmn_store::Source::Them, dmn_store::Source::You],
         "labels as captured"
     );
     let questions = store.questions(session).unwrap();
@@ -782,7 +770,7 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
     let asked = "How would you design a cache?";
     for a in [
         Action::Segment {
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.0,
             text: asked.into(),
@@ -792,7 +780,7 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
         },
         Action::Candidate {
             id: 1,
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.0,
             text: asked.into(),

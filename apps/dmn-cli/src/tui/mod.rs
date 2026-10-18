@@ -9,7 +9,7 @@
 //! and still readable at 80 × 24:
 //!
 //! 1. Question: a bordered block of four lines holding the question (or, before any question,
-//!    the last thing the interviewer said), the focus line and the latest clarification (`↳`).
+//!    the last thing the other person said), the focus line and the latest clarification (`↳`).
 //!    Its title is the state label (`LISTENING`, `LIVE QUESTION`, `PINNED QUESTION`), with the
 //!    "N new" badge while pinned questions queue. `←` steps back to an earlier question (#94),
 //!    which holds the screen as a pin does under the title `QUESTION 2 of 5`; `→` steps forward,

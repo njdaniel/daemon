@@ -71,7 +71,7 @@ impl SessionClock {
 /// Segment times count the frames a lane's VAD has consumed (20 ms each), which is not the wall
 /// clock: a live stream starts delivering some time after capture starts, and a stalled stream
 /// (a suspended sink) delivers nothing for a while. The clock is therefore an anchor, "at wall
-/// instant `at` the interviewer lane had reached audio time `audio`", that the pipeline moves
+/// instant `at` the Them lane had reached audio time `audio`", that the pipeline moves
 /// forward whenever that lane's frame count advances, and between anchors it runs at `speed` ×
 /// the wall clock. A WAV replay anchors once, at the instant its files start. Cheap to clone; the
 /// anchor is shared.
@@ -139,7 +139,7 @@ pub fn cpu_seconds_from_stat(stat: &str) -> Option<f64> {
 
 pub fn speaker(source: dmn_audio::Source) -> Speaker {
     match source {
-        dmn_audio::Source::Interviewer => Speaker::Interviewer,
+        dmn_audio::Source::Them => Speaker::Them,
         dmn_audio::Source::You => Speaker::You,
         dmn_audio::Source::Unknown => Speaker::Unknown,
     }

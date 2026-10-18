@@ -159,7 +159,7 @@ pub fn resolve(choice: DeviceChoice, backend: Backend, devices: &[GpuDevice]) ->
 /// small.en on the dev box's RTX 4090, 2026-09-26: whisper logs 334 MiB (kv self 18.9 + kv cross
 /// 56.6 + kv pad 4.7 + compute conv 22.4, encode 128.0, cross 6.2, decode 97.3), and `nvidia-smi`
 /// showed one Vulkan context add 836 MiB with the 465 MiB model, so 371 MiB beyond it. Rounded up
-/// once more; a bigger margin kept the interviewer lane off a GPU it fitted on by 60 MiB.
+/// once more; a bigger margin kept the Them lane off a GPU it fitted on by 60 MiB.
 pub const STATE_BYTES: u64 = 384 * 1024 * 1024;
 /// VRAM left free after whisper loads, so the desktop and the LLM keep working.
 pub const VRAM_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -388,7 +388,7 @@ mod tests {
         rtx.free_bytes = 2_000_000_000;
         assert!(fits(&rtx, small_en).is_ok());
         // With Ollama at num_ctx 8192 fully in VRAM the 4090 had 1.22 GB free: room for exactly
-        // one whisper context (the interviewer's lane), not two.
+        // one whisper context (the other person's lane), not two.
         rtx.free_bytes = 1_220_000_000;
         assert!(fits(&rtx, small_en).is_ok(), "one lane fits");
         rtx.free_bytes -= small_en + STATE_BYTES;

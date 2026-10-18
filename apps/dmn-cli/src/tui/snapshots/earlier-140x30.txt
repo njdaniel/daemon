@@ -22,9 +22,9 @@
 │                                                                                  ││
 └──────────────────────────────────────────────────────────────────────────────────┘│
   1 ▸ Deeper Answer                       4 ▸ Example                               │
-  2 ▾ Follow-up Questions                 5 ▸ Things I Should Mention               │Interviewer Hi, thanks for making the time today. This
-  3 ▸ Tradeoffs                           6 ▸ Resume Context                        │            session is about an hour of system design.
-      • How would you rate-limit a key whose traffic spans regions?                 │You         Sounds great.
-      • What happens to in-flight requests when a tier's limit changes?             │You         Okay, so first I'd want to know what we're
-      • How would you test the limiter under a network partition?                   │            limiting on.
+  2 ▾ Follow-up Questions                 5 ▸ Things I Should Mention               │Them      Hi, thanks for making the time today. This
+  3 ▸ Tradeoffs                           6 ▸ Resume Context                        │          session is about an hour of system design.
+      • How would you rate-limit a key whose traffic spans regions?                 │You       Sounds great.
+      • What happens to in-flight requests when a tier's limit changes?             │You       Okay, so first I'd want to know what we're
+      • How would you test the limiter under a network partition?                   │          limiting on.
  ● mic  ● system  ● model                                                                                         → later · 2 close · ⏎ ask

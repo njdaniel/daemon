@@ -526,7 +526,7 @@ mod tests {
 
     fn utterance(start_ms: u64, end_ms: u64) -> VadEvent {
         VadEvent::Utterance(Utterance {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: Duration::from_millis(start_ms),
             end: Duration::from_millis(end_ms),
             samples: vec![0.0; 16_000],
@@ -537,7 +537,7 @@ mod tests {
 
     fn partial(start_ms: u64, at_ms: u64) -> VadEvent {
         VadEvent::Partial {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: Duration::from_millis(start_ms),
             at: Duration::from_millis(at_ms),
             samples: vec![0.0; 16_000],
@@ -689,7 +689,7 @@ mod tests {
         );
         assert_eq!(
             out[2].render(),
-            "[00:00.0] Interviewer (es→en): How would you design it?"
+            "[00:00.0] Them (es→en): How would you design it?"
         );
     }
 
@@ -708,7 +708,7 @@ mod tests {
         assert!(calls.iter().all(|c| c.2.is_none()));
         let out = h.out.lock().unwrap();
         assert!(out.iter().all(|s| s.language.is_none()));
-        assert_eq!(out[1].render(), "[00:00.0] Interviewer: How would you?");
+        assert_eq!(out[1].render(), "[00:00.0] Them: How would you?");
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
         // And that closing segment clears the partial the utterance had already shown.
         let mut log = dmn_transcript::TranscriptLog::new();
         log.apply(Segment {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: Duration::from_millis(1_000),
             end: Duration::from_millis(2_000),
             text: "how would you".to_owned(),

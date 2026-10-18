@@ -10,14 +10,14 @@
       "text": "Redis in each region, with a small local cache to absorb bursts before it."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 94.7,
       "end": 100.4,
       "text": "And what if it goes down for a whole region, not just one node?"
     }
   ],
   "partials": [],
-  "last_interviewer": "And what if it goes down for a whole region, not just one node?",
+  "last_them": "And what if it goes down for a whole region, not just one node?",
   "live": {
     "candidate": 1,
     "text": "How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",
@@ -49,7 +49,10 @@
     "model": {
       "state": "ok"
     },
-    "overruns": 0
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
   },
   "counts": {
     "candidates": 2,

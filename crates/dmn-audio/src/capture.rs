@@ -50,8 +50,8 @@ pub enum CaptureTarget {
 }
 
 impl CaptureTarget {
-    /// The interviewer target from `[audio].app_stream`: an empty name means the sink monitor.
-    pub fn interviewer(app_stream: &str) -> Self {
+    /// The Them target from `[audio].app_stream`: an empty name means the sink monitor.
+    pub fn them(app_stream: &str) -> Self {
         if app_stream.trim().is_empty() {
             CaptureTarget::SinkMonitor
         } else {
@@ -503,7 +503,7 @@ impl LoopCapture {
         props.insert(*pw::keys::NODE_NAME, spec.node_name.as_str());
         props.insert(*pw::keys::NODE_LATENCY, "160/16000");
         if spec.strict {
-            // An interviewer stream must never drift to the mic or another app on its own.
+            // A Them stream must never drift to the mic or another app on its own.
             props.insert("node.dont-fallback", "true");
             props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
         }
@@ -643,7 +643,7 @@ impl Drop for LoopCapture {
 /// What the loop thread needs to create a stream.
 pub(crate) struct OpenSpec {
     pub(crate) node_name: String,
-    /// Set `node.dont-fallback` / `node.dont-reconnect` (interviewer streams).
+    /// Set `node.dont-fallback` / `node.dont-reconnect` (Them streams).
     pub(crate) strict: bool,
     pub(crate) status: Arc<CaptureStatus>,
 }
@@ -907,7 +907,7 @@ mod tests {
 
     #[test]
     fn nothing_is_decided_before_the_first_enumeration() {
-        let mut r = Reattach::new(CaptureTarget::interviewer("zoom"));
+        let mut r = Reattach::new(CaptureTarget::them("zoom"));
         let mut t = NodeTable::default();
         app(&mut t, 50, "zoom", "150");
         assert_eq!(r.step(&t), None, "no fallback decision before sync");
@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn app_stream_connects_by_serial_case_insensitively_and_only_once() {
-        let mut r = Reattach::new(CaptureTarget::interviewer("firefox"));
+        let mut r = Reattach::new(CaptureTarget::them("firefox"));
         let mut t = synced();
         app(&mut t, 50, "Firefox", "150");
         assert_eq!(
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn missing_app_falls_back_to_the_sink_monitor_then_switches_when_it_appears() {
-        let mut r = Reattach::new(CaptureTarget::interviewer("zoom"));
+        let mut r = Reattach::new(CaptureTarget::them("zoom"));
         let mut t = synced();
         assert_eq!(r.step(&t), connect(None, true, CaptureMode::SinkMonitor));
         assert_eq!(r.step(&t), None);
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn app_that_disappears_disconnects_and_reattaches_by_application_name() {
-        let mut r = Reattach::new(CaptureTarget::interviewer("teams-for-linux"));
+        let mut r = Reattach::new(CaptureTarget::them("teams-for-linux"));
         let mut t = synced();
         app(&mut t, 70, "teams-for-linux", "170");
         assert!(matches!(r.step(&t), Some(Action::Connect { .. })));
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn newest_stream_of_an_app_wins() {
-        let mut r = Reattach::new(CaptureTarget::interviewer("Firefox"));
+        let mut r = Reattach::new(CaptureTarget::them("Firefox"));
         let mut t = synced();
         app(&mut t, 10, "Firefox", "110");
         app(&mut t, 12, "Firefox", "112");
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn empty_app_stream_means_sink_monitor_connected_once() {
-        let target = CaptureTarget::interviewer("");
+        let target = CaptureTarget::them("");
         assert_eq!(target, CaptureTarget::SinkMonitor);
         let mut r = Reattach::new(target);
         let mut t = synced();
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn server_loss_disconnects_once() {
-        let mut r = Reattach::new(CaptureTarget::interviewer("zoom"));
+        let mut r = Reattach::new(CaptureTarget::them("zoom"));
         let mut t = synced();
         app(&mut t, 4, "zoom", "104");
         assert!(r.step(&t).is_some());
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn accumulator_cuts_arbitrary_quanta_into_20ms_frames_in_order() {
         let status = Arc::new(CaptureStatus::default());
-        let (sink, mut frames) = frame_channel(Source::Interviewer, 10);
+        let (sink, mut frames) = frame_channel(Source::Them, 10);
         let mut acc = Accum::new(sink, Arc::clone(&status));
         // 3.5 frames of a ramp, delivered in PipeWire-ish uneven chunks (as LE bytes).
         let total = FRAME_LEN * 7 / 2;
@@ -1116,7 +1116,7 @@ mod tests {
         // Copilot on PR #25: a mismatch only set the status to Error while `process` kept
         // copying those buffers into the 16 kHz mono ring.
         let status = Arc::new(CaptureStatus::default());
-        let (sink, mut frames) = frame_channel(Source::Interviewer, 10);
+        let (sink, mut frames) = frame_channel(Source::Them, 10);
         let mut acc = Accum::new(sink, Arc::clone(&status));
         let samples = vec![0.5f32; FRAME_LEN * 2];
 
@@ -1276,14 +1276,14 @@ mod tests {
             let mut player = play(2.0, &app);
             let mut src = PipeWireSource::new(
                 Arc::clone(&ctx),
-                Source::Interviewer,
+                Source::Them,
                 CaptureTarget::App {
                     application: app.clone(),
                     monitor_fallback: false,
                 },
             );
             let status = src.status();
-            let (sink, mut frames) = crate::frame_channel(Source::Interviewer, 200);
+            let (sink, mut frames) = crate::frame_channel(Source::Them, 200);
             src.start(sink).unwrap();
             wait_for("streaming", Duration::from_secs(2), || {
                 status.state() == CaptureState::Streaming
@@ -1314,14 +1314,14 @@ mod tests {
 
             let mut src = PipeWireSource::new(
                 Arc::clone(&ctx),
-                Source::Interviewer,
+                Source::Them,
                 CaptureTarget::App {
                     application: app.clone(),
                     monitor_fallback: false,
                 },
             );
             let status = src.status();
-            let (sink, mut frames) = crate::frame_channel(Source::Interviewer, 400);
+            let (sink, mut frames) = crate::frame_channel(Source::Them, 400);
             src.start(sink).unwrap();
 
             // The mic runs alongside and must not notice the app coming and going. Its frames

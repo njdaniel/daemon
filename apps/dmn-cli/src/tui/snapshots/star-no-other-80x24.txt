@@ -19,6 +19,6 @@
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-Interviewer …ing the time today. This session is about an hour of system design.
-You         Sounds great.
+Them      …aking the time today. This session is about an hour of system design.
+You       Sounds great.
  ● mic  ● system  ● model                                p pin · r redo · ⏎ ask

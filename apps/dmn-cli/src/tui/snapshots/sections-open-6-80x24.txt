@@ -19,6 +19,6 @@
       resume.md: Built the API gateway rate limiter at Acme (Envoy + Redis),
       40k requests a second.
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                               6 close · p pin · ⏎ ask

@@ -224,12 +224,14 @@ pub struct Detect {
 }
 
 /// `[detect].question_source` (#90): the mic lane (`you`), the call's output lane
-/// (`interviewer`, the default) or either (`both`). Fixed for a session, like `[stt].language`.
+/// (`them`, the default) or either (`both`). Fixed for a session, like `[stt].language`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum QuestionSource {
     #[default]
-    Interviewer,
+    /// Spelled `interviewer` before #128; a config that still says so keeps working.
+    #[serde(alias = "interviewer")]
+    Them,
     You,
     Both,
 }
@@ -238,7 +240,7 @@ impl QuestionSource {
     /// The config-file spelling, for the status line and `dmn config show`.
     pub fn as_str(self) -> &'static str {
         match self {
-            QuestionSource::Interviewer => "interviewer",
+            QuestionSource::Them => "them",
             QuestionSource::You => "you",
             QuestionSource::Both => "both",
         }
@@ -755,7 +757,7 @@ pub const TEMPLATE: &str = r#"# Daemon (dmn) configuration. Every key is optiona
 
 [audio]
 mic = "default"                      # PipeWire node.name, or "default"
-system_audio = true                  # capture the interviewer from an app's output stream
+system_audio = true                  # capture the other person from an app's output stream
 app_stream = "Firefox"               # application.name to capture; "" = whole default sink monitor
 echo_guard = false                   # true when the mic can hear the call (speakers): drops mic text that copies the call, at the cost of a 1.5 s hold on each of your sentences (#125)
 
@@ -770,7 +772,7 @@ language = "en"                      # en | auto | es, de, ...: auto detects and
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
-question_source = "interviewer"      # interviewer | you | both: whose questions are detected and answered
+question_source = "them"             # them | you | both: whose questions are detected and answered
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic. Only ollama keeps transcripts local.
@@ -1308,7 +1310,7 @@ language = "en"                      # en | auto | es, de, ...: auto detects and
 
 [detect]
 sensitivity = "balanced"             # eager | balanced | strict
-question_source = "interviewer"      # interviewer | you | both: whose questions trigger an answer
+question_source = "them"             # them | you | both: whose questions trigger an answer
 
 [llm]
 provider = "ollama"                  # ollama | openai | anthropic
@@ -1431,13 +1433,13 @@ keep_transcripts = true
     }
 
     #[test]
-    fn question_source_defaults_to_the_interviewer_and_round_trips_its_three_values() {
+    fn question_source_defaults_to_them_and_round_trips_its_three_values() {
         assert_eq!(
             Config::default().detect.question_source,
-            QuestionSource::Interviewer
+            QuestionSource::Them
         );
         for (name, want) in [
-            ("interviewer", QuestionSource::Interviewer),
+            ("them", QuestionSource::Them),
             ("you", QuestionSource::You),
             ("both", QuestionSource::Both),
         ] {
@@ -1452,11 +1454,20 @@ keep_transcripts = true
             assert_eq!(Config::from_toml(&toml, name).unwrap(), cfg);
             assert_eq!(want.as_str(), name);
         }
+        // #128: the name before `them` still reads, and is written back as `them`.
+        let old =
+            Config::from_toml("[detect]\nquestion_source = \"interviewer\"\n", "old").unwrap();
+        assert_eq!(old.detect.question_source, QuestionSource::Them);
+        assert!(
+            old.to_toml()
+                .unwrap()
+                .contains("question_source = \"them\"")
+        );
         // An unknown value names the three choices rather than falling back to a default.
         let err = Config::from_toml("[detect]\nquestion_source = \"candidate\"\n", "bad")
             .expect_err("an unknown question source is a config error")
             .to_string();
-        for name in ["interviewer", "you", "both"] {
+        for name in ["them", "you", "both"] {
             assert!(err.contains(name), "{err}");
         }
     }

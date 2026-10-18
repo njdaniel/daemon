@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Speaker {
-    Interviewer,
+    /// Spelled `interviewer` before #128; old session files still read.
+    #[serde(alias = "interviewer")]
+    Them,
     You,
     Unknown,
 }
@@ -25,7 +27,8 @@ pub enum Speaker {
 #[serde(rename_all = "lowercase")]
 pub enum QuestionSource {
     #[default]
-    Interviewer,
+    #[serde(alias = "interviewer")]
+    Them,
     You,
     Both,
 }
@@ -34,16 +37,16 @@ impl QuestionSource {
     /// Whether a final from `speaker` is scored at all.
     pub fn allows(self, speaker: Speaker) -> bool {
         match self {
-            QuestionSource::Interviewer => speaker == Speaker::Interviewer,
+            QuestionSource::Them => speaker == Speaker::Them,
             QuestionSource::You => speaker == Speaker::You,
-            QuestionSource::Both => matches!(speaker, Speaker::Interviewer | Speaker::You),
+            QuestionSource::Both => matches!(speaker, Speaker::Them | Speaker::You),
         }
     }
 
     /// The config-file spelling, which is also the status line's tag (`asks: you`).
     pub fn as_str(self) -> &'static str {
         match self {
-            QuestionSource::Interviewer => "interviewer",
+            QuestionSource::Them => "them",
             QuestionSource::You => "you",
             QuestionSource::Both => "both",
         }
@@ -359,7 +362,7 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         language: Option<String>,
     },
-    /// The detector proposed the final interviewer segment that starts at `start` as a question.
+    /// The detector proposed the final Them segment that starts at `start` as a question.
     /// `id` is assigned by the pipeline and tags every fast-phase action for this candidate.
     Candidate {
         id: u64,

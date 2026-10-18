@@ -486,10 +486,10 @@ mod tests {
         let path = dir.path().join("stereo48.wav");
         write_sine(&path, 48_000, &[0.5, 0.3], 440.0, 1.0);
 
-        let mut src = WavSource::open(&path, Source::Interviewer, Speed::Fast).unwrap();
+        let mut src = WavSource::open(&path, Source::Them, Speed::Fast).unwrap();
         assert_eq!(src.input_format(), (48_000, 2));
         assert_eq!(src.duration(), Duration::from_secs(1));
-        let (sink, mut frames) = frame_channel(Source::Interviewer, 200);
+        let (sink, mut frames) = frame_channel(Source::Them, 200);
         src.start(sink).unwrap();
         src.wait().unwrap();
         assert!(src.is_finished());

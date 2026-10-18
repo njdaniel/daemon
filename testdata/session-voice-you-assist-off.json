@@ -4,7 +4,7 @@
   "ended_at": null,
   "transcript": [
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 40.0,
       "end": 45.0,
       "text": "Let's move on. Tell me about the team you worked with on the payments migration."
@@ -16,7 +16,7 @@
       "text": "There were five of us: two backend engineers, a data engineer, a product manager and me leading the cut-over plan."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 52.0,
       "end": 57.0,
       "text": "How long did the migration take?"
@@ -28,7 +28,7 @@
       "text": "About four months, with the last three weeks running both systems side by side and comparing every ledger entry."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 64.0,
       "end": 69.0,
       "text": "And did anything go wrong on the day?"
@@ -40,7 +40,7 @@
       "text": "One batch job still pointed at the old database, so we paused it and replayed its writes."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 76.0,
       "end": 81.0,
       "text": "Good. Let's talk about how you would test that."
@@ -48,13 +48,13 @@
   ],
   "partials": [
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 90.0,
       "end": 92.0,
       "text": "And what about the"
     }
   ],
-  "last_interviewer": "Good. Let's talk about how you would test that.",
+  "last_them": "Good. Let's talk about how you would test that.",
   "live": {
     "candidate": 1,
     "text": "How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",

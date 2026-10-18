@@ -10,16 +10,17 @@ use crate::schema::Kind;
 
 const BASE: &str = include_str!("../prompts/base.md");
 /// The base rules worded for a question asked on the mic lane (#90). A separate file rather than
-/// a substitution so the Interviewer prompt stays byte for byte what it was before #90.
+/// a substitution so the Them prompt stayed byte for byte what it was before #90 (#128 then
+/// renamed its section and says once that Them is the interviewer).
 const BASE_YOU: &str = include_str!("../prompts/base_you.md");
 
 /// Which lane the candidate line came from (#90): the user message's last header, and which base
-/// rules the system prompt carries. [`Asker::Interviewer`] is the default, so every prompt built
+/// rules the system prompt carries. [`Asker::Them`] is the default, so every prompt built
 /// before #90 is unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Asker {
     #[default]
-    Interviewer,
+    Them,
     You,
 }
 
@@ -27,14 +28,14 @@ impl Asker {
     /// The transcript's own label for the lane, which is also the `## <label> just said` header.
     pub fn label(self) -> &'static str {
         match self {
-            Asker::Interviewer => "Interviewer",
+            Asker::Them => "Them",
             Asker::You => "You",
         }
     }
 
     fn base(self) -> &'static str {
         match self {
-            Asker::Interviewer => BASE,
+            Asker::Them => BASE,
             Asker::You => BASE_YOU,
         }
     }
@@ -47,7 +48,7 @@ fn section(kind: Kind, asker: Asker) -> &'static str {
         (Kind::Behavioral, _) => include_str!("../prompts/behavioral.md"),
         (Kind::Knowledge, _) => include_str!("../prompts/knowledge.md"),
         // The only per-kind rule that names who asked.
-        (Kind::Clarification, Asker::Interviewer) => include_str!("../prompts/clarification.md"),
+        (Kind::Clarification, Asker::Them) => include_str!("../prompts/clarification.md"),
         (Kind::Clarification, Asker::You) => include_str!("../prompts/clarification_you.md"),
         (Kind::SmallTalk, _) => include_str!("../prompts/small_talk.md"),
     }
@@ -97,7 +98,7 @@ pub struct FastRequest {
     /// The text the detector proposed.
     pub candidate: String,
     /// Which lane `candidate` came from (#90). Names the last header and chooses the base rules;
-    /// [`Asker::Interviewer`] is the default and the only value before #90.
+    /// [`Asker::Them`] is the default and the only value before #90.
     pub asker: Asker,
     /// The detector's score for `candidate`, logged when the model says it is not a question.
     pub score: i32,
@@ -251,7 +252,7 @@ mod tests {
 
     #[test]
     fn unknown_kind_prompt_carries_every_kind_and_the_rules() {
-        let p = system_prompt(None, Asker::Interviewer);
+        let p = system_prompt(None, Asker::Them);
         for k in Kind::ALL {
             assert!(p.contains(&format!("- {}:", k.as_str())), "missing {k:?}");
         }
@@ -261,7 +262,7 @@ mod tests {
 
     #[test]
     fn known_kind_prompt_carries_only_that_kind() {
-        let p = system_prompt(Some(Kind::Coding), Asker::Interviewer);
+        let p = system_prompt(Some(Kind::Coding), Asker::Them);
         assert!(p.contains("- coding:"));
         assert!(!p.contains("- behavioral:"));
     }
@@ -273,12 +274,12 @@ mod tests {
             asker: Asker::You,
             ..them.clone()
         };
-        assert!(user_message(&them).contains("## Interviewer just said\n"));
+        assert!(user_message(&them).contains("## Them just said\n"));
         assert!(!user_message(&them).contains("## You just said"));
         assert!(user_message(&you).contains("## You just said\n"));
-        assert!(!user_message(&you).contains("## Interviewer just said"));
-        // The default is the Interviewer, so nothing built before #90 moved.
-        assert_eq!(FastRequest::default().asker, Asker::Interviewer);
+        assert!(!user_message(&you).contains("## Them just said"));
+        // The default is the other person, so nothing built before #90 moved.
+        assert_eq!(FastRequest::default().asker, Asker::Them);
         assert_eq!(
             user_message(&them),
             user_message(&FastRequest {
@@ -289,13 +290,13 @@ mod tests {
     }
 
     #[test]
-    fn the_you_base_rules_replace_the_interviewer_ones_and_only_for_that_lane() {
-        let them = system_prompt(None, Asker::Interviewer);
+    fn the_you_base_rules_replace_the_them_ones_and_only_for_that_lane() {
+        let them = system_prompt(None, Asker::Them);
         let you = system_prompt(None, Asker::You);
         assert_ne!(them, you);
         assert!(you.contains("the candidate's own microphone lane"));
         assert!(you.contains(r#"the "You just said" section"#));
-        assert!(them.contains(r#"the "Interviewer just said" section"#));
+        assert!(them.contains(r#"the "Them just said" section"#));
         // Both wordings still state every schema field and the density rules.
         for rule in [
             "- is_question:",
@@ -321,7 +322,7 @@ mod tests {
             Kind::Knowledge,
             Kind::SmallTalk,
         ] {
-            assert_eq!(section(kind, Asker::Interviewer), section(kind, Asker::You));
+            assert_eq!(section(kind, Asker::Them), section(kind, Asker::You));
         }
     }
 
@@ -330,7 +331,7 @@ mod tests {
         let req = FastRequest {
             candidate: "How would you design a rate limiter?".into(),
             score: 5,
-            transcript: "Interviewer: Let's switch gears.\nYou: Sure.".into(),
+            transcript: "Them: Let's switch gears.\nYou: Sure.".into(),
             job_requirements: vec!["Distributed systems".into()],
             current: Some(CurrentQuestion {
                 question: "Tell me about yourself".into(),
@@ -342,7 +343,7 @@ mod tests {
         let job = m.find("## Job requirements").unwrap();
         let cur = m.find("## Current question (behavioral)").unwrap();
         let tr = m.find("## Recent transcript").unwrap();
-        let cand = m.find("## Interviewer just said").unwrap();
+        let cand = m.find("## Them just said").unwrap();
         assert!(job < cur && cur < tr && tr < cand, "{m}");
         assert!(!m.contains("## Candidate's material"));
         assert!(!m.contains("## Session so far"));
@@ -353,7 +354,7 @@ mod tests {
     fn the_user_message_opens_with_the_date_the_caller_passed() {
         let req = FastRequest {
             today: "2026-10-05".into(),
-            transcript: "Interviewer: hi".into(),
+            transcript: "Them: hi".into(),
             job_requirements: vec!["Go services".into()],
             ..FastRequest::new("What is the latest stable major version of Go?", 6)
         };
@@ -385,7 +386,7 @@ mod tests {
         use crate::lookup::FreshFact;
         let req = FastRequest {
             today: "2026-10-05".into(),
-            transcript: "Interviewer: What is the latest stable major version of Go?".into(),
+            transcript: "Them: What is the latest stable major version of Go?".into(),
             ..FastRequest::new("What is the latest stable major version of Go?", 6)
         };
         let with = FastRequest {
@@ -402,7 +403,7 @@ mod tests {
         let m = user_message(&with);
         let section = m.find("## Fresh facts\n").expect(&m);
         assert!(section > m.find("## Recent transcript").unwrap(), "{m}");
-        assert!(section < m.find("## Interviewer just said").unwrap(), "{m}");
+        assert!(section < m.find("## Them just said").unwrap(), "{m}");
         assert!(m.contains(r#"Web search results for "latest stable Go release""#));
         assert!(m.contains(
             "Prefer these to what you remember; if they do not answer the question, say so."
@@ -421,7 +422,7 @@ mod tests {
         );
         assert!(m.contains("[1] All releases (go.dev): go1.25.1 (released 2025-09-03)\n"));
         assert!(
-            m.contains("(end of fresh facts)\n\n## Interviewer just said"),
+            m.contains("(end of fresh facts)\n\n## Them just said"),
             "{m}"
         );
         // Without results (and with an empty list) the message is what it was.
@@ -437,7 +438,7 @@ mod tests {
 
     #[test]
     fn both_base_prompts_carry_the_rule_for_answers_that_depend_on_what_is_current() {
-        for asker in [Asker::Interviewer, Asker::You] {
+        for asker in [Asker::Them, Asker::You] {
             let p = system_prompt(None, asker);
             assert!(p.contains("- lookup:"), "{asker:?}");
             assert!(p.contains(r#"the "Today" section"#), "{asker:?}");
@@ -461,7 +462,7 @@ mod tests {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };
-        let them = rule(system_prompt(None, Asker::Interviewer));
+        let them = rule(system_prompt(None, Asker::Them));
         assert_eq!(them.len(), 2, "{them:?}");
         assert_eq!(them, rule(system_prompt(None, Asker::You)));
     }
@@ -493,7 +494,7 @@ mod tests {
     #[test]
     fn a_matched_story_goes_in_before_the_transcript_and_without_one_nothing_changes() {
         let plain = FastRequest {
-            transcript: "Interviewer: hi".into(),
+            transcript: "Them: hi".into(),
             ..FastRequest::new("Tell me about a time you disagreed.", 5)
         };
         let with = FastRequest {

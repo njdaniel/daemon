@@ -25,6 +25,6 @@
       Central Redis: + exact counts − a network hop per request and a single point of failure
       Local counters: + no hop, survives partitions − over-admits by up to N× across N nodes
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                                                   3 close · p pin · ⏎ ask

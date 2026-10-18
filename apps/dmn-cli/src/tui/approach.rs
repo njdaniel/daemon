@@ -72,8 +72,8 @@ fn content(view: &View<'_>, cells: usize) -> Vec<Line<'static>> {
         let note = match view.mode {
             // #90: who can ask depends on `[detect].question_source`.
             Mode::Listening => match view.session.question_source {
-                QuestionSource::Interviewer => {
-                    "The Approach appears here when the interviewer asks a question."
+                QuestionSource::Them => {
+                    "The Approach appears here when the other person asks a question."
                 }
                 QuestionSource::You => "The Approach appears here when you ask a question.",
                 QuestionSource::Both => "The Approach appears here when a question is asked.",
