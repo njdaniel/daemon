@@ -62,6 +62,10 @@ pub struct Audio {
     pub system_audio: bool,
     /// `application.name` to match; "" means the default sink monitor.
     pub app_stream: String,
+    /// #60: drop mic text that copies the call within 300 ms, for a mic that hears the call
+    /// (speakers, a laptop without echo cancellation). Off by default (#125): it holds each of
+    /// the user's finals up to 1.5 s (4 s while the call is talking) waiting for the copy, and
+    /// translate mode (#114) waits with it; on headphones there is nothing to catch.
     pub echo_guard: bool,
 }
 
@@ -71,7 +75,7 @@ impl Default for Audio {
             mic: "default".into(),
             system_audio: true,
             app_stream: "Firefox".into(),
-            echo_guard: true,
+            echo_guard: false,
         }
     }
 }
@@ -753,7 +757,7 @@ pub const TEMPLATE: &str = r#"# Daemon (dmn) configuration. Every key is optiona
 mic = "default"                      # PipeWire node.name, or "default"
 system_audio = true                  # capture the interviewer from an app's output stream
 app_stream = "Firefox"               # application.name to capture; "" = whole default sink monitor
-echo_guard = true                    # drop mic text that duplicates the loopback within 300 ms
+echo_guard = false                   # true when the mic can hear the call (speakers): drops mic text that copies the call, at the cost of a 1.5 s hold on each of your sentences (#125)
 
 [stt]
 engine = "whisper.cpp"
@@ -1291,7 +1295,7 @@ mod tests {
 mic = "default"                      # pw node.name or "default"
 system_audio = true
 app_stream = "Firefox"               # application.name match; "" = sink monitor
-echo_guard = true
+echo_guard = false                   # true when the mic hears the call (#125)
 
 [stt]
 engine = "whisper.cpp"
@@ -1383,6 +1387,20 @@ keep_transcripts = true
             err.contains("passthrough") && err.contains("translate"),
             "{err}"
         );
+    }
+
+    /// #125: the echo guard is off unless the file turns it on.
+    #[test]
+    fn echo_guard_defaults_to_off_and_parses_on() {
+        assert!(!Config::default().audio.echo_guard);
+        assert!(
+            !Config::from_toml("[audio]\nmic = \"default\"\n", "f")
+                .unwrap()
+                .audio
+                .echo_guard
+        );
+        let on = Config::from_toml("[audio]\necho_guard = true\n", "on").unwrap();
+        assert!(on.audio.echo_guard);
     }
 
     /// #122: `[speak].engine` is `chatterbox` unless the file says `qwen3`; anything else is a

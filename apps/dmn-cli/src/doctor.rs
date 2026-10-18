@@ -673,6 +673,31 @@ fn chatterbox_server(at: &str, h: &dyn Http) -> Check {
     }
 }
 
+/// Informational (#125): `[audio].echo_guard`, and what it costs while it is on: each of the
+/// user's finals waits up to 1.5 s for a copy on the call's stream, and with `[speak]` on every
+/// translation waits with it.
+pub fn echo_guard(cfg: &Config) -> Check {
+    if !cfg.audio.echo_guard {
+        return Check::pass(
+            "echo guard",
+            "off: your lines are not held (with speakers, set [audio].echo_guard = true)",
+        )
+        .optional();
+    }
+    let speak = if cfg.speak.enabled {
+        "; [speak] translations start that much later too"
+    } else {
+        ""
+    };
+    Check::pass(
+        "echo guard",
+        format!(
+            "on: each of your sentences waits up to 1.5 s (4 s while the call is talking) for an echo{speak}; on headphones set [audio].echo_guard = false"
+        ),
+    )
+    .optional()
+}
+
 /// Informational: which GPU features this binary carries and which GPU tools exist.
 pub fn gpu_backend(r: &dyn Runner) -> Check {
     let mut built = Vec::new();
@@ -902,6 +927,7 @@ pub fn run_all(
     }
     checks.push(web_lookup(cfg, h, |name| std::env::var(name).ok()));
     checks.extend(speak(cfg, h));
+    checks.push(echo_guard(cfg));
     checks.push(gpu_backend(r));
     checks.push(whisper_device(cfg.stt.device, &dmn_stt::gpu_devices()));
     Report { header, checks }
@@ -1309,6 +1335,23 @@ mod tests {
 
     /// #113: doctor names the model `t` translates with and whether Ollama has it, and the TTS
     /// server's device, with the way to the GPU when it is the CPU.
+    /// #125: the echo guard is off by default and doctor says so; on, it names the wait, and
+    /// with `[speak]` on that translations wait too. Informational either way.
+    #[test]
+    fn doctor_names_the_echo_guard_and_its_wait() {
+        let mut cfg = Config::default();
+        let off = echo_guard(&cfg);
+        assert!(off.ok && !off.required, "{off:?}");
+        assert!(off.detail.starts_with("off"), "{off:?}");
+        cfg.audio.echo_guard = true;
+        let on = echo_guard(&cfg);
+        assert!(on.ok && !on.required, "{on:?}");
+        assert!(on.detail.contains("up to 1.5 s"), "{on:?}");
+        assert!(!on.detail.contains("[speak]"), "{on:?}");
+        cfg.speak.enabled = true;
+        assert!(echo_guard(&cfg).detail.contains("[speak] translations"));
+    }
+
     #[test]
     fn doctor_names_the_translator_and_the_tts_device() {
         let mut cfg = Config::default();
