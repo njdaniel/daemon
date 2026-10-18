@@ -478,9 +478,8 @@ by `pw-play` into the capture, `pw-record` on `dmn-voice`), 0.0–0.1 ms inside 
 `pw-record`'s pipe, one 1024-sample quantum, which is `pw-record`'s own buffering. The tone came
 out at 440 Hz and its full length; the mic's clock and the call's drifting apart is absorbed by
 skipping a backlog over 60 ms down to 20 ms. Translate mode's delay is the sentence's: the VAD's
-0.4 s, whisper, the echo guard's hold on a mic final (up to 1.5 s, `[audio].echo_guard`), then
-#113's translation and rendering, so with the GPU server a sentence is heard a few seconds after
-you finish it.
+0.4 s, whisper, then the translation and the voice; with the echo guard on (below) each sentence
+also waits up to 1.5 s for it first.
 
 **After a restart, select `dmn-voice` again.** Each `dmn run` creates a new `dmn-voice` node.
 PipeWire links an app back to it only when the app names the device in its own stream (`pw-record
@@ -664,12 +663,24 @@ call's stream and once on your mic, and the mic copy is transcribed as **You**:
   interviewer sentence now looks answered at once (a You line right after it is one of the
   detector's cues for a question), so statements get flagged as questions more often.
 
-The echo guard (`[audio].echo_guard`, dropping mic text that duplicates the call within 300 ms)
-is planned for M2 and is not active yet. Until then:
+Wear headphones, or earbuds, for any call you run Daemon beside. A laptop or conference
+speakerphone with hardware echo cancellation helps, but check it (below) before relying on it.
 
-- Wear headphones, or earbuds, for any call you run Daemon beside.
-- A laptop or conference speakerphone with hardware echo cancellation helps, but check it (below)
-  before relying on it.
+If the mic cannot help hearing the call, turn on the echo guard:
+
+```toml
+[audio]
+echo_guard = true    # default false (#125)
+```
+
+It drops a line of yours whose words copy the call's within 300 ms (#60). The price is a wait:
+each of your sentences is held up to 1.5 s (4 s while the other side is talking) for its copy to
+arrive on the call's stream, so your lines appear later, and with `[speak]` in translate mode
+every translation starts that much later. On headphones there is nothing to catch, which is why
+it is off by default; a config written before #125 may still say `echo_guard = true`, so set it to
+`false` there if you use headphones. With `[speak]` translate mode and speakers, the guard is what
+stops the other side's words from coming back through your mic and being translated and spoken
+to them; keep it on, or better, use headphones.
 
 To check your setup:
 
