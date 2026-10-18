@@ -12,10 +12,13 @@
 //! and dropping the [`PcmStream`] stops the download. Playback (the virtual microphone) is
 //! #108's; the translation that produces the text is #109's.
 //!
-//! The server is a sidecar the user runs, exactly like Ollama: chatterbox-tts-api (an
-//! OpenAI-compatible FastAPI server around Resemble AI's Chatterbox, zero-shot voice cloning)
-//! on `[speak].tts_url`. [`ChatterboxProvider`] is the real client (its module doc lists the
-//! requests); [`MockTtsProvider`] replays a generated sine WAV so tests need no live server.
+//! The server is a sidecar the user runs, exactly like Ollama, on `[speak].tts_url`; which one
+//! is `[speak].engine` (#122). [`ChatterboxProvider`] speaks to chatterbox-tts-api (an
+//! OpenAI-compatible FastAPI server around Resemble AI's Chatterbox, zero-shot voice cloning,
+//! one language per voice); [`Qwen3Provider`] to Qwen3-TTS on vLLM-Omni (`sidecars/qwen3-tts/`:
+//! streamed, first audio in under 0.1 s, one voice for every language it speaks). Each module
+//! doc lists its server's requests; `http.rs` holds what they share. [`MockTtsProvider`]
+//! replays a generated sine WAV so tests need no live server.
 //!
 //! **Trait shape.** [`TtsProvider::synthesize`] and [`TtsProvider::enroll`] are plain `fn`s
 //! returning [`BoxFuture`]s, mirroring `dmn-llm`'s `Provider`: no `async fn` in the trait and
@@ -29,8 +32,10 @@
 
 mod chatterbox;
 mod decode;
+mod http;
 mod mock;
 mod provider;
+mod qwen3;
 mod sentences;
 mod tail;
 #[cfg(any(test, feature = "test-server"))]
@@ -42,3 +47,4 @@ pub use mock::{MockEnrollment, MockTtsProvider};
 pub use provider::{
     Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Tuning, Voice,
 };
+pub use qwen3::{QWEN3_LANGUAGES, QWEN3_MODEL, Qwen3Provider, qwen3_language};

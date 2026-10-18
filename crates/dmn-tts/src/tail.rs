@@ -12,6 +12,16 @@
 //! goes out, so the sentence ends softly, and the stream stops). At the end of the body the
 //! held silence goes out as it is.
 //!
+//! **The leading trim (#122).** Qwen3-TTS opens most sentences with 0.4–0.8 s of near-silence
+//! (measured 2026-10-18 with the owner's clip; Chatterbox up to 1.5 s), which the listener sits
+//! through before the first word. Until speech has been heard, the samples are held, not passed
+//! on; a run of [`LEAD_RESET`] of near-silence drops what is held but the last [`KEEP_LEAD`] (so
+//! a click before the speech goes too). Once speech is heard, the held samples go out, starting
+//! at most [`KEEP_LEAD`] before the first loud window, so a soft first consonant is kept. The
+//! hold is also a small jitter buffer: playback starts with [`SPEECH_MIN`] of speech in hand,
+//! enough to cover the wait for the server's next block when the first one ends just after the
+//! speech starts. A generation with no speech at all goes out as the trim left it.
+//!
 //! The cut ends a whole generation, so it is applied to one sentence at a time: the client asks
 //! the server for each sentence on its own (`chatterbox.rs`). Measured 2026-10-08 on the GPU
 //! server: inside one generation of two sentences the model paused up to 0.98 s between them
@@ -32,9 +42,14 @@ pub(crate) const SPEECH_MIN_SECS: f32 = 0.2;
 /// Near-silence after speech that ends the stream: 0.8 s (the issue's figure). Mid-sentence
 /// pauses measured at most 0.64 s.
 pub(crate) const CUT_AFTER_SECS: f32 = 0.8;
-/// How much of the silence before the cut is kept: a soft end, and with the next sentence's own
-/// leading silence a natural pause between two sentences.
+/// How much of the silence before the cut is kept: a soft end, and with the next sentence's
+/// [`KEEP_LEAD_SECS`] a natural pause between two sentences.
 pub(crate) const KEEP_TAIL_SECS: f32 = 0.3;
+/// #122: near-silence kept before a sentence's first sound: a soft onset ("s", "f") and a breath.
+pub(crate) const KEEP_LEAD_SECS: f32 = 0.1;
+/// #122: near-silence before any speech that drops what was held (a click and its silence):
+/// longer than the gap inside a word (a stop consonant's closure is under 0.15 s).
+pub(crate) const LEAD_RESET_SECS: f32 = 0.3;
 
 /// What [`TailCut::push`] decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +67,12 @@ pub(crate) struct TailCut {
     speech_min: usize,
     cut_after: usize,
     keep: usize,
+    keep_lead: usize,
+    lead_reset: usize,
+    /// #122: before speech, everything since the last reset, not passed on yet.
+    lead: Vec<f32>,
+    /// #122: near-silent samples at the end of `lead`.
+    lead_quiet: usize,
     /// Samples of the window being filled.
     partial: Vec<f32>,
     /// Quiet samples after speech, not passed on yet.
@@ -69,6 +90,10 @@ impl TailCut {
             speech_min: at(SPEECH_MIN_SECS),
             cut_after: at(CUT_AFTER_SECS),
             keep: at(KEEP_TAIL_SECS),
+            keep_lead: at(KEEP_LEAD_SECS),
+            lead_reset: at(LEAD_RESET_SECS),
+            lead: Vec::new(),
+            lead_quiet: 0,
             partial: Vec::new(),
             held: Vec::new(),
             loud: 0,
@@ -91,6 +116,10 @@ impl TailCut {
                 continue;
             }
             let peak = self.partial.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            if !self.speech_seen() {
+                self.lead_window(peak >= QUIET, out);
+                continue;
+            }
             if peak >= QUIET {
                 self.loud += self.partial.len();
                 out.append(&mut self.held);
@@ -113,12 +142,50 @@ impl TailCut {
         Cut::More
     }
 
+    /// #122: one window before speech has been heard (module doc, the leading trim).
+    fn lead_window(&mut self, loud: bool, out: &mut Vec<f32>) {
+        let len = self.partial.len();
+        self.lead.append(&mut self.partial);
+        if loud {
+            self.loud += len;
+            self.lead_quiet = 0;
+        } else {
+            self.lead_quiet += len;
+            if self.lead_quiet >= self.lead_reset {
+                // Nothing held is speech: a click, or the opening silence. Keep the tail only.
+                let drop = self.lead.len().saturating_sub(self.keep_lead);
+                self.lead.drain(..drop);
+                self.lead_quiet = self.lead.len();
+                self.loud = 0;
+            }
+        }
+        if self.speech_seen() {
+            // The first loud window is at most `lead_reset` in; keep `keep_lead` before it.
+            let first_loud = self.leading_quiet();
+            let drop = first_loud.saturating_sub(self.keep_lead);
+            self.lead.drain(..drop);
+            out.append(&mut self.lead);
+            self.lead_quiet = 0;
+        }
+    }
+
+    /// #122: near-silent samples at the start of `lead`, in whole windows.
+    fn leading_quiet(&self) -> usize {
+        self.lead
+            .chunks(self.window)
+            .take_while(|w| w.iter().fold(0.0f32, |m, v| m.max(v.abs())) < QUIET)
+            .map(<[f32]>::len)
+            .sum()
+    }
+
     /// The body ended without a cut: whatever is held (a silence shorter than the cut, and the
     /// last partial window) goes out.
     pub(crate) fn finish(&mut self, out: &mut Vec<f32>) {
         if self.stopped {
             return;
         }
+        // #122: a generation too short to count as speech goes out as the trim left it.
+        out.append(&mut self.lead);
         out.append(&mut self.held);
         out.append(&mut self.partial);
     }
@@ -257,15 +324,68 @@ mod tests {
     }
 
     /// The server's leading silence (1.5 s measured with the Russian voice) and a click before
-    /// the speech do not arm the cut.
+    /// the speech do not arm the cut; #122: they are trimmed, all but the last 0.1 s before the
+    /// speech.
     #[test]
-    fn silence_before_the_speech_is_not_a_trailing_silence() {
+    fn silence_before_the_speech_is_trimmed_and_does_not_arm_the_cut() {
         let mut click = quiet(0.5);
         click[100] = 0.3;
-        let parts = [click, quiet(1.5), tone(1.0, 0.2), quiet(0.2)];
-        let (out, stopped) = run(&parts);
+        let speech = [tone(1.0, 0.2), quiet(0.2)].concat();
+        let (out, stopped) = run(&[click, quiet(1.5), speech.clone()]);
         assert!(!stopped);
-        assert_eq!(out, parts.concat());
+        let lead = out.len() - speech.len();
+        assert!(
+            (secs(lead) - KEEP_LEAD_SECS).abs() < 0.021,
+            "{} s of lead kept",
+            secs(lead)
+        );
+        assert!(
+            out[..lead].iter().all(|v| v.abs() < QUIET),
+            "the click is gone"
+        );
+        assert_eq!(&out[lead..], &speech[..], "the speech is untouched");
+    }
+
+    /// #122: Qwen3-TTS's opening silence (0.4-0.8 s) goes, but a soft onset in the last 0.1 s
+    /// before the first loud window stays, and a short gap early in the speech (a stop
+    /// consonant) does not drop what came before it.
+    #[test]
+    fn the_leading_trim_keeps_a_soft_onset_and_a_gap_inside_the_first_word() {
+        let soft: Vec<f32> = tone(0.08, 0.015);
+        let word = [tone(0.1, 0.2), quiet(0.12), tone(0.6, 0.2)].concat();
+        let (out, stopped) = run(&[quiet(0.6), soft.clone(), word.clone()]);
+        assert!(!stopped);
+        let tail = [soft, word].concat();
+        assert!(
+            out.ends_with(&tail),
+            "the soft onset and the whole word went out"
+        );
+        assert!(
+            secs(out.len() - tail.len()) <= KEEP_LEAD_SECS,
+            "{}",
+            secs(out.len())
+        );
+    }
+
+    /// #122: a generation with no speech (the warm-up's "OK." came back near-silent) ends with
+    /// at most the kept lead, and short speech that never reaches the speech minimum still
+    /// goes out at the end.
+    #[test]
+    fn a_generation_without_speech_is_mostly_dropped_and_a_short_one_still_plays() {
+        let (out, stopped) = run(&[quiet(1.2)]);
+        assert!(!stopped);
+        assert!(
+            secs(out.len()) <= LEAD_RESET_SECS + 0.02,
+            "{}",
+            secs(out.len())
+        );
+
+        let blip = tone(0.1, 0.3);
+        let (out, _) = run(&[quiet(0.5), blip.clone(), quiet(0.1)]);
+        assert!(
+            out.windows(blip.len()).any(|w| w == &blip[..]),
+            "a 0.1 s word still plays"
+        );
     }
 
     #[test]

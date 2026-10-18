@@ -1,0 +1,67 @@
+# Qwen3-TTS 1.7B Base on vLLM-Omni: the voice engine for `[speak].engine = "qwen3"` (#122).
+#
+#   docker compose -f sidecars/qwen3-tts/compose.yaml up -d
+#   docker compose -f sidecars/qwen3-tts/compose.yaml logs -f   # ready at "Application startup complete"
+#
+# Then in ~/.config/dmn/config.toml:
+#   [speak]
+#   engine = "qwen3"
+#   tts_url = "http://localhost:4124"
+# and enroll once: dmn speak enroll --wav <clip> (one voice speaks every language).
+#
+# Needs an NVIDIA GPU and the NVIDIA container toolkit (vLLM-Omni has no CPU path). The first
+# start downloads the model (~4.3 GB) into the `cache` volume and compiles CUDA graphs; later
+# starts reuse both. Listens on 127.0.0.1 only: dmn sends text and the voice clip to localhost
+# and nowhere else.
+
+name: dmn-qwen3-tts
+
+services:
+  qwen3-tts:
+    # Pinned: the version #122 measured (first audio 0.04-0.08 s on the 4090).
+    image: vllm/vllm-omni:v0.30.0
+    container_name: dmn-qwen3-tts
+    command:
+      - vllm-omni
+      - serve
+      - Qwen/Qwen3-TTS-12Hz-1.7B-Base
+      - --omni
+      - --host=0.0.0.0
+      - --port=8091
+      - --trust-remote-code
+      # Two stages (talker, then code2wav), each 0.3 of the GPU by default. dmn asks for one
+      # sentence at a time, so few sequences and less memory do (README § Speak). silence_ban_frames:
+      # the model may not draw its silence codes in a sentence's first 8 frames (0.64 s), which
+      # cuts the half second of silence it otherwise opens most sentences with (#122).
+      - --stage-overrides={"0":{"gpu_memory_utilization":${TALKER_GPU:-0.2},"max_num_seqs":4,"silence_ban_frames":${SILENCE_BAN_FRAMES:-8}},"1":{"gpu_memory_utilization":${DECODER_GPU:-0.1},"max_num_seqs":4}}
+    ports:
+      - "127.0.0.1:${QWEN3_TTS_PORT:-4124}:8091"
+    environment:
+      # FlashInfer JIT-compiles its sampler, which needs ninja and nvcc; PyTorch's sampler does not.
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+      # Enrolled voices, kept across restarts in the `voices` volume.
+      SPEAKER_SAMPLES_DIR: /voices
+    volumes:
+      # The model download and vLLM's compile caches.
+      - cache:/root/.cache
+      - voices:/voices
+    # The two stages pass audio codes through shared memory.
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
+    restart: unless-stopped
+
+volumes:
+  cache:
+  voices:

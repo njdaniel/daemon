@@ -482,6 +482,10 @@ impl Default for Assist {
 #[serde(default, deny_unknown_fields)]
 pub struct Speak {
     pub enabled: bool,
+    /// #122: which TTS server `tts_url` is: `chatterbox` (chatterbox-tts-api, the default) or
+    /// `qwen3` (Qwen3-TTS on vLLM-Omni, `sidecars/qwen3-tts/`: first audio in under 0.1 s, and
+    /// one enrolled voice speaks every language it knows).
+    pub engine: SpeakEngine,
     /// Base URL of the TTS server, like `http://localhost:4123`.
     pub tts_url: String,
     /// Path to the enrolled reference clip (`dmn speak enroll` writes it); "" = not enrolled.
@@ -529,6 +533,29 @@ pub struct Speak {
 
 /// `[speak].temperature`'s default (#113).
 pub const SPEAK_TEMPERATURE: f64 = 0.6;
+
+/// `[speak].engine` (#122): the TTS server behind `tts_url`. An unknown value is a parse error
+/// that names both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeakEngine {
+    /// chatterbox-tts-api: a voice speaks the one language it was enrolled with; ~1-2 s to the
+    /// first sound of a sentence on the GPU.
+    #[default]
+    Chatterbox,
+    /// Qwen3-TTS 1.7B Base on vLLM-Omni: cross-lingual (one clip, ten languages), streamed,
+    /// first audio in 0.04-0.08 s on the 4090.
+    Qwen3,
+}
+
+impl SpeakEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpeakEngine::Chatterbox => "chatterbox",
+            SpeakEngine::Qwen3 => "qwen3",
+        }
+    }
+}
 
 /// The shape `[speak].target` and a `languages` code take, as `[stt].language` does: two or
 /// three lowercase letters. Whether whisper and the TTS server know it is checked when `dmn run`
@@ -628,6 +655,7 @@ impl Default for Speak {
     fn default() -> Self {
         Self {
             enabled: false,
+            engine: SpeakEngine::Chatterbox,
             tts_url: "http://localhost:4123".into(),
             voice_ref: String::new(),
             device: "cpu".into(),
@@ -763,7 +791,8 @@ enabled = true                       # false = transcribe / translate only: no d
 
 [speak]
 enabled = false                      # speak text in your cloned voice via a local TTS server (`dmn speak`, #107)
-tts_url = "http://localhost:4123"    # chatterbox-tts-api on this machine (no other host); README § Speak
+engine = "chatterbox"                # chatterbox | qwen3 (Qwen3-TTS on vLLM-Omni, sidecars/qwen3-tts, tts_url = "http://localhost:4124"; #122)
+tts_url = "http://localhost:4123"    # the TTS server on this machine (no other host); README § Speak
 voice_ref = ""                       # enrolled reference clip; `dmn speak enroll --wav <clip>` sets it
 device = "cpu"                       # cpu | cuda: a hint for the server setup; check nvidia-smi first
 target = ""                          # dmn run: `t` speaks your last turn in this language (es, de, ...); the voice's enroll --language; needed with enabled = true
@@ -1352,6 +1381,25 @@ keep_transcripts = true
             .to_string();
         assert!(
             err.contains("passthrough") && err.contains("translate"),
+            "{err}"
+        );
+    }
+
+    /// #122: `[speak].engine` is `chatterbox` unless the file says `qwen3`; anything else is a
+    /// config error naming both.
+    #[test]
+    fn speak_engine_defaults_to_chatterbox_and_parses_qwen3() {
+        assert_eq!(Config::default().speak.engine, SpeakEngine::Chatterbox);
+        let c = Config::from_toml("[speak]\nengine = \"qwen3\"\n", "e").unwrap();
+        assert_eq!(c.speak.engine, SpeakEngine::Qwen3);
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("engine = \"qwen3\""), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+        let err = Config::from_toml("[speak]\nengine = \"elevenlabs\"\n", "bad")
+            .expect_err("an unknown engine is a config error")
+            .to_string();
+        assert!(
+            err.contains("elevenlabs") && err.contains("chatterbox") && err.contains("qwen3"),
             "{err}"
         );
     }
