@@ -535,10 +535,12 @@ that one row, with a hint on how to enroll more.
 **A faster voice: Qwen3-TTS (#122).** `[speak].engine = "qwen3"` speaks through Alibaba's
 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (1.7B Base, Apache-2.0) served by
 [vLLM-Omni](https://github.com/vllm-project/vllm-omni) instead of Chatterbox. It streams each
-sentence as it renders, so the first sound comes about 0.13 s after dmn asks for it, against
+sentence as it renders, so the first word is heard about 0.17 s after dmn asks for it, against
 1.0–2.0 s for Chatterbox on the same GPU (measured 2026-10-18 on the 4090 with the user's clip:
-0.127–0.133 s for short and three-sentence lines in Chinese, Russian and German, rendering about
-7× faster than real time). One enrolled clip speaks all ten of its languages (zh, en, ja, ko, de,
+0.17 s for 17 of 18 short and three-sentence lines in Chinese, Russian and German, 0.44 s for
+the other, rendering about 6× faster than real time). The model opens most sentences with half a
+second of near-silence; the sidecar's `silence_ban_frames` shortens it and dmn skips the rest
+(for Chatterbox too), keeping 0.1 s before the first word. One enrolled clip speaks all ten of its languages (zh, en, ja, ko, de,
 fr, ru, pt, es, it), so there is one voice to enroll, not one per language. It needs an NVIDIA GPU
 and Docker's NVIDIA runtime (the one-time host step above) and holds about 6.5 GB of VRAM.
 

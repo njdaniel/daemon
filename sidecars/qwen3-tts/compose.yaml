@@ -30,8 +30,10 @@ services:
       - --port=8091
       - --trust-remote-code
       # Two stages (talker, then code2wav), each 0.3 of the GPU by default. dmn asks for one
-      # sentence at a time, so few sequences and less memory do; see GPU_MEMORY in README § Speak.
-      - --stage-overrides={"0":{"gpu_memory_utilization":${TALKER_GPU:-0.2},"max_num_seqs":4},"1":{"gpu_memory_utilization":${DECODER_GPU:-0.1},"max_num_seqs":4}}
+      # sentence at a time, so few sequences and less memory do (README § Speak). silence_ban_frames:
+      # the model may not draw its silence codes in a sentence's first 8 frames (0.64 s), which
+      # cuts the half second of silence it otherwise opens most sentences with (#122).
+      - --stage-overrides={"0":{"gpu_memory_utilization":${TALKER_GPU:-0.2},"max_num_seqs":4,"silence_ban_frames":${SILENCE_BAN_FRAMES:-8}},"1":{"gpu_memory_utilization":${DECODER_GPU:-0.1},"max_num_seqs":4}}
     ports:
       - "127.0.0.1:${QWEN3_TTS_PORT:-4124}:8091"
     environment:

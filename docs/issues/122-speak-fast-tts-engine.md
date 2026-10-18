@@ -26,8 +26,10 @@ Findings: Qwen3-TTS through vLLM-Omni is the engine; with an English reference c
 
 ## Built 2026-10-18 (steps 2 and 3)
 - Sidecar: `sidecars/qwen3-tts/compose.yaml`, the `vllm/vllm-omni:v0.30.0` image on 127.0.0.1:4124, `--stage-overrides` 0.2 + 0.1 of the GPU (about 6.5 GB, against ~9 GB at the default 0.3 + 0.3), voices and the model cache in volumes.
-- The server's default first streamed chunk is one 80 ms frame at ~0.04 s, then nothing until a 2 s block at ~0.3 s: played as it arrived, every one of 12 lines stalled up to 0.17 s after its first syllable. The client asks for `initial_codec_chunk_frames: 6` (0.48 s at ~0.1 s; 0 stalls in 12 lines) and a per-sentence `max_new_tokens`.
-- Through `Qwen3Provider` with the owner's clip, one voice enrolled without a language: first audio 0.127–0.133 s for short and three-sentence lines in zh, ru and de (`cargo test -p dmn-tts --test live_qwen3 -- --ignored --nocapture`); samples in `~/dmn-tests/2026-10-18-tts-122-sidecar/`.
+- The server's default first streamed chunk is one 80 ms frame at ~0.04 s, then nothing until a 2 s block at ~0.3 s: played as it arrived, every one of 12 lines stalled up to 0.17 s after its first syllable. The client asks for a larger first chunk and a per-sentence `max_new_tokens`.
+- In the live test the model's leading near-silence (0.44–0.82 s per sentence) showed up: the call heard nothing for half a second after the first sample. The sidecar sets `silence_ban_frames: 8` (most sentences then open with 0.06–0.16 s), the client trims what is left (`tail.rs`, keeping 0.1 s before the first word, both engines), and with the trim a 10-frame first chunk puts the first sound at 0.15 s every time (6 frames: 0.105 s median but 0.38 s at p90).
+- A Chinese three-sentence line once came back 2.7 s long instead of ~8 s: `。` was not a sentence end, so the line was one generation, and a 0.8 s pause between its sentences tripped the trailing-silence cut. `。！？` now split.
+- Through `Qwen3Provider` with the owner's clip, one voice enrolled without a language: the first sound at 0.17 s for 17 of 18 short and three-sentence lines in zh, ru and de (0.44 s for one) (`cargo test -p dmn-tts --test live_qwen3 -- --ignored --nocapture`); samples in `~/dmn-tests/2026-10-18-tts-122-sidecar/`.
 
 ## Goal
 With `[speak].engine` set to the new engine, a translated sentence starts playing in `dmn-voice` within ~1 s of the end of the user's speech (today 1.3–2.5 s) for zh, ru and de, in the user's cloned voice; Chatterbox still works when selected.

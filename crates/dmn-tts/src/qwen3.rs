@@ -15,8 +15,13 @@
 //! - First chunk: the server sends the first [`FIRST_CHUNK_FRAMES`] codec frames (80 ms of audio
 //!   each) on their own, then blocks of 25 (2 s). Its default first chunk is one frame, at
 //!   ~0.04 s, but the next block only comes ~0.3 s after the request, so playback started on
-//!   the first frame stalled for up to 0.17 s after it, in 12 of 12 measured lines. Six frames
-//!   arrive at ~0.1 s and cover the wait (no stall in 12 lines; three to six frames all did).
+//!   the first frame stalled for up to 0.17 s after it, in 12 of 12 measured lines. Three to
+//!   six frames cover that wait, but the model opens most sentences with 0.4–0.8 s of
+//!   near-silence (the sidecar's `silence_ban_frames` shortens it, not always), which the
+//!   leading trim (`tail.rs`) skips; when the speech starts past the first chunk, the first
+//!   sound waits for the next block. Measured 2026-10-18 (24 lines each, the owner's clip), the
+//!   first audible sample arrived after 0.105 s median but 0.38 s at p90 with six frames, and
+//!   0.147 s median, 0.164 s at most with ten: ten it is (12 frames 0.17 s, 16 frames 0.21 s).
 //! - x-vector mode: the voice is cloned from the clip's speaker embedding only. The other mode
 //!   (in-context, with the clip's transcript) continued from the English transcript and garbled
 //!   Chinese in step 1's test, so dmn never uploads a transcript and always asks for this mode.
@@ -54,8 +59,9 @@ const SPEECH: &str = "/v1/audio/speech";
 const VOICES: &str = "/v1/audio/voices";
 /// The consent id the server stores with an uploaded clip: the user enrolls their own voice.
 const CONSENT: &str = "dmn-self";
-/// Codec frames in the first streamed chunk (module doc: 0.48 s of audio at ~0.1 s).
-pub(crate) const FIRST_CHUNK_FRAMES: u32 = 6;
+/// Codec frames in the first streamed chunk (module doc: 0.8 s of audio, the first sound at
+/// ~0.15 s).
+pub(crate) const FIRST_CHUNK_FRAMES: u32 = 10;
 
 /// The languages Qwen3-TTS speaks (vLLM-Omni's `DEFAULT_TTS_LANGUAGES`), as the code dmn's
 /// config uses and the name the model takes.
@@ -349,7 +355,7 @@ mod tests {
                 "x_vector_only_mode": true,
                 "response_format": "wav",
                 "stream_format": "audio",
-                "initial_codec_chunk_frames": 6,
+                "initial_codec_chunk_frames": 10,
                 "language": "Chinese",
             })
         );
