@@ -11,6 +11,26 @@ Candidates (free, local, voice cloning; figures are from secondary write-ups and
 - **CosyVoice 3** (Alibaba, Apache-2.0): Chinese, Russian, German among 9 languages; bi-streaming, ~150 ms reported. (CosyVoice 2 has no Russian or German.)
 - Kept as the fallback: Chatterbox, which is what `dmn-tts` speaks to today.
 
+## Measured 2026-10-14 (step 1)
+RTX 4090, the user's clip (`voice-ru.wav`, English speech, 20 s), four sentences each in zh/ru/de, one request per sentence as dmn sends them. "Correct" = Whisper large-v3-turbo transcribes the audio back to the line (minor spelling aside). Scripts and audio stayed in the session scratchpad; listening samples in the owner's `~/dmn-tests/2026-10-14-tts-122/`.
+
+| Engine | First audio | Whole sentence | Correct (zh / ru / de) | VRAM |
+|---|---|---|---|---|
+| Chatterbox (chatterbox-tts-api, `/v1/audio/speech/stream`) — baseline | 1.0–2.0 s (no audio until the sentence is done) | 1.0–2.0 s | 3 / 4 / 3 of 4 | 4.9 GB |
+| Qwen3-TTS 1.7B Base, `qwen-tts` Python package (no streaming) | = whole sentence | 1.6–3.7 s (RTF 0.73) | 1 / 4 / 4 (zh ran away to 14.8 s once) | 4.6 GB |
+| **Qwen3-TTS 1.7B Base, vLLM-Omni 0.30.0, streamed PCM, `x_vector_only_mode`** | **0.04–0.08 s** | 0.3–0.8 s (RTF ~0.13) | **4 / 4 / 4** | ~9 GB at the default 0.3 + 0.3 `gpu_memory_utilization` |
+| Qwen3-TTS 1.7B Base, vLLM-Omni, ICL (`ref_text` = the clip's English transcript) | 0.07 s | 0.3–0.8 s | 0–1 / 4 / 4 (zh garbled or looping) | same |
+| Fun-CosyVoice3 0.5B, vLLM-Omni, ICL | 0.55–0.58 s | 0.8–1.9 s | 1–2 / 1 / 1 | ~14 GB |
+
+Findings: Qwen3-TTS through vLLM-Omni is the engine; with an English reference clip it must run in `x_vector_only_mode` (speaker embedding only), because ICL mode continues from the English transcript and derails Chinese. **Decided** 2026-10-18: the owner listened to the samples (`~/dmn-tests/2026-10-14-tts-122/`, each line from Chatterbox and from Qwen3-TTS) and chose Qwen3-TTS: "yeah qwen sounds great". The x-vector voice is close enough to theirs, so the README's warning that cloning "may be reduced" without `ref_text` does not block it. vLLM-Omni needed `VLLM_USE_FLASHINFER_SAMPLER=0` here (FlashInfer JIT-compiles its sampler and there is no `ninja`/`nvcc` on the box). CosyVoice 3 may need a prompt format the test did not give it; not pursued, as Qwen3-TTS is ahead on both speed and accuracy.
+
+## Built 2026-10-18 (steps 2 and 3)
+- Sidecar: `sidecars/qwen3-tts/compose.yaml`, the `vllm/vllm-omni:v0.30.0` image on 127.0.0.1:4124, `--stage-overrides` 0.2 + 0.1 of the GPU (about 6.5 GB, against ~9 GB at the default 0.3 + 0.3), voices and the model cache in volumes.
+- The server's default first streamed chunk is one 80 ms frame at ~0.04 s, then nothing until a 2 s block at ~0.3 s: played as it arrived, every one of 12 lines stalled up to 0.17 s after its first syllable. The client asks for a larger first chunk and a per-sentence `max_new_tokens`.
+- In the live test the model's leading near-silence (0.44–0.82 s per sentence) showed up: the call heard nothing for half a second after the first sample. The sidecar sets `silence_ban_frames: 8` (most sentences then open with 0.06–0.16 s), the client trims what is left (`tail.rs`, keeping 0.1 s before the first word, both engines), and with the trim a 10-frame first chunk puts the first sound at 0.15 s every time (6 frames: 0.105 s median but 0.38 s at p90).
+- A Chinese three-sentence line once came back 2.7 s long instead of ~8 s: `。` was not a sentence end, so the line was one generation, and a 0.8 s pause between its sentences tripped the trailing-silence cut. `。！？` now split.
+- Through `Qwen3Provider` with the owner's clip, one voice enrolled without a language: the first sound at 0.17 s for 17 of 18 short and three-sentence lines in zh, ru and de (0.44 s for one) (`cargo test -p dmn-tts --test live_qwen3 -- --ignored --nocapture`); samples in `~/dmn-tests/2026-10-18-tts-122-sidecar/`.
+
 ## Goal
 With `[speak].engine` set to the new engine, a translated sentence starts playing in `dmn-voice` within ~1 s of the end of the user's speech (today 1.3–2.5 s) for zh, ru and de, in the user's cloned voice; Chatterbox still works when selected.
 
@@ -22,14 +42,15 @@ L | Opus | 60
 ### 1. Measure first (the PR reports the table before any client code)
 - Run Qwen3-TTS (1.7B, and 0.6B if the 1.7B misses) and CosyVoice 3 on the 4090 as Docker sidecars on localhost, each cloned from `~/.local/share/dmn/voice-ru.wav`.
 - For one short and one three-sentence line in zh, ru and de: time to first audio byte, real-time factor, VRAM, and a by-ear note on the voice and pronunciation. Same lines through Chatterbox for the baseline.
-- Pick the engine with the lowest first-audio time that sounds right in all three languages; if neither beats Chatterbox by ≥ 0.5 s, stop and report.
+- Pick the engine with the lowest first-audio time that sounds right in all three languages; if neither beats Chatterbox by ≥ 0.5 s, stop and report. **Done; the engine is Qwen3-TTS 1.7B Base on vLLM-Omni in `x_vector_only_mode` (see Measured).**
 
 ### 2. Sidecar
 - The chosen engine behind an HTTP server on 127.0.0.1: an existing OpenAI-compatible server if one serves it with streaming and voice cloning; otherwise a small wrapper kept under `sidecars/<engine>/` (Dockerfile + compose, localhost only) with the same three routes `dmn-tts` already uses: synthesize (streamed), list voices, enroll.
+- Decided by step 1: vLLM-Omni already is that server (`vllm-omni serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni`, OpenAI-style `POST /v1/audio/speech` with `stream_format: "audio"` + `response_format: "pcm"`, voices at `GET/POST/DELETE /v1/audio/voices`). The sidecar is its Docker setup on 127.0.0.1 with `VLLM_USE_FLASHINFER_SAMPLER=0`, and `gpu_memory_utilization` lowered from 0.3 + 0.3 if latency holds (state the VRAM in the PR). Requests use `task_type: "Base"`, `x_vector_only_mode: true`, `language` as the model's name for it (Chinese, Russian, German).
 - Its license and why it was chosen go in docs/DEPENDENCIES.md.
 
 ### 3. Client (`crates/dmn-tts`, `crates/dmn-core/src/config.rs`)
-- `[speak].engine = "chatterbox" | "<new>"`, default stays `chatterbox` until the live test passes.
+- `[speak].engine = "chatterbox" | "qwen3"`, default stays `chatterbox` until the live test passes.
 - A provider for the new server implementing `TtsProvider` (synthesize streamed in chunks, `voices`, `enroll`); sentence splitting and the silence cut (`tail.rs`) apply only where the engine needs them.
 - A cross-lingual engine needs one clip for every language: `enroll` without `--language` registers a voice the start-up check accepts for any `[speak].languages` code; per-language voices still work.
 - `dmn doctor`: the engine, its URL, and its device.
@@ -56,5 +77,5 @@ Out of scope: paid/cloud TTS (ElevenLabs; later, as its own issue), phrase-by-ph
 ```bash
 cargo test -p dmn-tts
 cargo test -p dmn-core config
-# live: [speak].engine = "<new>", dmn run --no-assist --app "", press l, speak a sentence: time to first audio in dmn-voice for zh, ru, de
+# live: [speak].engine = "qwen3", dmn run --no-assist --app "", press l, speak a sentence: time to first audio in dmn-voice for zh, ru, de
 ```

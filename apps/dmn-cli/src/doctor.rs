@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use dmn_core::config::{LookupProvider, Provider};
+use dmn_core::config::{LookupProvider, Provider, SpeakEngine};
 use dmn_core::{Config, Paths};
 
 /// Result of one check.
@@ -568,23 +568,85 @@ fn translator(cfg: &Config, h: &dyn Http) -> Check {
     }
 }
 
-/// The TTS server's `/health`: up, and on `cuda` or `cpu`. A CPU server works but renders
-/// about 4-5× slower than real time, so it is a warning with the way to the GPU.
+/// The TTS server for `[speak].engine` (#122): Chatterbox's `/health` (up, on `cuda` or
+/// `cpu`), or the model vLLM-Omni serves for Qwen3-TTS.
 fn tts_server(cfg: &Config, h: &dyn Http) -> Check {
     let at = cfg.speak.tts_url.trim().trim_end_matches('/');
     if !cfg.speak.is_local() {
+        let local = match cfg.speak.engine {
+            SpeakEngine::Chatterbox => "http://localhost:4123",
+            SpeakEngine::Qwen3 => "http://localhost:4124",
+        };
         return Check::fail(
             "tts server",
             format!("{at} is not on this machine; dmn sends text and your voice only to localhost"),
-            "set [speak].tts_url to http://localhost:4123",
+            format!("set [speak].tts_url to {local}"),
         );
     }
+    match cfg.speak.engine {
+        SpeakEngine::Chatterbox => chatterbox_server(at, h),
+        SpeakEngine::Qwen3 => qwen3_server(at, h),
+    }
+}
+
+/// Qwen3-TTS on vLLM-Omni: `GET /v1/models` lists the model it serves. vLLM-Omni runs on the
+/// GPU only, so the device is `cuda` whenever it answers.
+fn qwen3_server(at: &str, h: &dyn Http) -> Check {
+    let start =
+        "start it: docker compose -f sidecars/qwen3-tts/compose.yaml up -d (README § Speak)";
+    let body = match h.get(&format!("{at}/v1/models")) {
+        Ok(body) => body,
+        Err(e) => {
+            return Check::fail(
+                "tts server",
+                format!(
+                    "engine qwen3: {at} is not answering ({e}); `dmn run` with [speak] on will not start"
+                ),
+                start,
+            );
+        }
+    };
+    let models: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .map(|d| d.iter().filter_map(|m| m["id"].as_str()).collect())
+        .unwrap_or_default();
+    if ids.contains(&dmn_tts::QWEN3_MODEL) {
+        Check::pass(
+            "tts server",
+            format!(
+                "engine qwen3: {at} serves {} on vLLM-Omni, device cuda",
+                dmn_tts::QWEN3_MODEL
+            ),
+        )
+    } else {
+        Check::fail(
+            "tts server",
+            format!(
+                "engine qwen3: {at} serves {}, not {}",
+                if ids.is_empty() {
+                    "no model it names".to_owned()
+                } else {
+                    ids.join(", ")
+                },
+                dmn_tts::QWEN3_MODEL
+            ),
+            format!("point [speak].tts_url at the Qwen3-TTS sidecar, or {start}"),
+        )
+    }
+}
+
+/// chatterbox-tts-api's `/health`: up, and on `cuda` or `cpu`. A CPU server works but renders
+/// about 4-5× slower than real time, so it is a warning with the way to the GPU.
+fn chatterbox_server(at: &str, h: &dyn Http) -> Check {
     let body = match h.get(&format!("{at}/health")) {
         Ok(body) => body,
         Err(e) => {
             return Check::fail(
                 "tts server",
-                format!("{at} is not answering ({e}); `dmn run` with [speak] on will not start"),
+                format!(
+                    "engine chatterbox: {at} is not answering ({e}); `dmn run` with [speak] on will not start"
+                ),
                 "start chatterbox-tts-api (README § Speak)",
             );
         }
@@ -595,15 +657,18 @@ fn tts_server(cfg: &Config, h: &dyn Http) -> Check {
         Some("cpu") => Check::fail(
             "tts server",
             format!(
-                "{at} {status}, device cpu: about 4-5x slower than real time, 8-18 s to the first sound of a sentence"
+                "engine chatterbox: {at} {status}, device cpu: about 4-5x slower than real time, 8-18 s to the first sound of a sentence"
             ),
             "run it on the GPU (1.9 s for a sentence): README § Speak, docker/docker-compose.gpu.yml",
         )
         .optional(),
-        Some(device) => Check::pass("tts server", format!("{at} {status}, device {device}")),
+        Some(device) => Check::pass(
+            "tts server",
+            format!("engine chatterbox: {at} {status}, device {device}"),
+        ),
         None => Check::pass(
             "tts server",
-            format!("{at} answering; its /health names no device"),
+            format!("engine chatterbox: {at} answering; its /health names no device"),
         ),
     }
 }
@@ -1357,6 +1422,64 @@ mod tests {
             checks[1].detail.contains("not answering"),
             "{:?}",
             checks[1]
+        );
+    }
+
+    /// #122: with `engine = "qwen3"` doctor names the engine, its URL, the model vLLM-Omni
+    /// serves and the device; another model there, or nothing, is a failure with the way to
+    /// the sidecar.
+    #[test]
+    fn doctor_names_the_qwen3_engine_its_model_and_device() {
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "zh".into();
+        cfg.speak.engine = SpeakEngine::Qwen3;
+        cfg.speak.tts_url = "http://localhost:4124".into();
+        let tags = r#"{"models":[{"name":"qwen3.6:35b-a3b"}]}"#;
+        let models = r#"{"object":"list","data":[{"id":"Qwen/Qwen3-TTS-12Hz-1.7B-Base","object":"model","owned_by":"vllm-omni"}]}"#;
+        let up = RoutedHttp(vec![
+            ("/api/tags", Ok(tags.into())),
+            ("/v1/models", Ok(models.into())),
+        ]);
+        let checks = speak(&cfg, &up);
+        assert!(checks[1].ok, "{:?}", checks[1]);
+        assert_eq!(
+            checks[1].detail,
+            "engine qwen3: http://localhost:4124 serves Qwen/Qwen3-TTS-12Hz-1.7B-Base on vLLM-Omni, device cuda"
+        );
+
+        let other = RoutedHttp(vec![
+            ("/api/tags", Ok(tags.into())),
+            (
+                "/v1/models",
+                Ok(r#"{"data":[{"id":"FunAudioLLM/Fun-CosyVoice3-0.5B-2512"}]}"#.into()),
+            ),
+        ]);
+        let checks = speak(&cfg, &other);
+        assert!(!checks[1].ok && checks[1].required, "{:?}", checks[1]);
+        assert!(
+            checks[1].detail.contains("Fun-CosyVoice3"),
+            "{:?}",
+            checks[1]
+        );
+
+        let down = speak(&cfg, &RoutedHttp(vec![("/api/tags", Ok(tags.into()))]));
+        assert!(!down[1].ok, "{:?}", down[1]);
+        assert!(
+            down[1]
+                .detail
+                .starts_with("engine qwen3: http://localhost:4124 is not answering"),
+            "{:?}",
+            down[1]
+        );
+        assert!(
+            down[1]
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("sidecars/qwen3-tts"),
+            "{:?}",
+            down[1]
         );
     }
 

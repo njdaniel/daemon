@@ -175,4 +175,17 @@ pub trait TtsProvider: Send + Sync {
     /// The server's voice library (#109: `dmn run` checks at start that the enrolled voice
     /// speaks `[speak].target`). `None` when the server has no library to list.
     fn voices<'a>(&'a self) -> BoxFuture<'a, Result<Option<Vec<Voice>>, TtsError>>;
+
+    /// #122: whether one enrolled voice speaks every language in [`TtsProvider::languages`]
+    /// (Qwen3-TTS clones the speaker, not the language), so the start-up check does not
+    /// compare a voice's enrollment language with the one it is asked to speak.
+    fn cross_lingual(&self) -> bool {
+        false
+    }
+
+    /// #122: the language codes the engine speaks, when it has a fixed list; `None` when it
+    /// does not say (chatterbox-tts-api: each voice speaks the language it was enrolled with).
+    fn languages(&self) -> Option<&'static [&'static str]> {
+        None
+    }
 }

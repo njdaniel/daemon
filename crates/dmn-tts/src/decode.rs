@@ -345,7 +345,7 @@ where
             Err(e) => {
                 return fail(
                     TtsError::BodyRead {
-                        detail: crate::chatterbox::error_chain(&e),
+                        detail: crate::http::error_chain(&e),
                     },
                     &mut on_rate,
                     &mut on_chunk,
