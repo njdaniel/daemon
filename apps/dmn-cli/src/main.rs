@@ -292,6 +292,7 @@ enum Command {
         /// The other person's audio
         them: std::path::PathBuf,
         /// Your audio
+        #[arg(value_name = "YOU")]
         candidate: std::path::PathBuf,
         /// Paces delivery at N× wall-clock; 1 is a live call. Must be positive and finite
         #[arg(long, default_value_t = 1.0)]
@@ -519,7 +520,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 Some([them, candidate]) => Some((them.clone(), candidate.clone())),
                 Some(_) => {
                     return Err(CliError::Usage(
-                        "run --replay takes two files: <interviewer.wav> <candidate.wav>".into(),
+                        "run --replay takes two files: <them.wav> <you.wav>".into(),
                     ));
                 }
             };

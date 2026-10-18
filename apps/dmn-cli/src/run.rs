@@ -14,7 +14,7 @@
 //!
 //! With no flags it captures the call live (#16): the mic as You and the call's app output as the
 //! Them, from `[audio].mic` / `[audio].app_stream` or `--mic` / `--app` (`dmn devices`
-//! lists the names), until `q`. `--replay <interviewer.wav> <candidate.wav>` feeds the same
+//! lists the names), until `q`. `--replay <them.wav> <you.wav>` feeds the same
 //! pipeline from files at 1× instead (#15), and `--headless` runs a replay with no terminal and
 //! prints how long each scripted question took to reach the screen (#15's latency criterion).
 
@@ -55,7 +55,7 @@ const FRAME: Duration = Duration::from_millis(33);
 const SAMPLE: Duration = Duration::from_millis(10);
 
 pub struct Args {
-    /// `--replay <interviewer.wav> <candidate.wav>`; `None` captures live.
+    /// `--replay <them.wav> <you.wav>`; `None` captures live.
     pub replay: Option<(PathBuf, PathBuf)>,
     /// Live: the mic's `node.name` (or "default"), over `[audio].mic`.
     pub mic: Option<String>,
