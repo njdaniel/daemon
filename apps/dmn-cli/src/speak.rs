@@ -133,6 +133,9 @@ pub enum SpeakError {
         "[speak].languages in {config} has the code {code:?}, which is not a language whisper knows; use a code such as \"es\", \"de\" or \"fr\""
     )]
     UnknownLanguage { code: String, config: String },
+    /// #124: push-to-talk setup failed (no readable device, no press in time).
+    #[error("push-to-talk: {0}")]
+    Ptt(String),
     /// #122: a language the engine's model does not speak (Qwen3-TTS has a fixed list of ten).
     #[error(
         "[speak].engine = {engine:?} does not speak {code:?} ([speak].target or [speak].languages); it speaks {speaks}. Drop the language, or set engine = \"chatterbox\""
@@ -462,6 +465,55 @@ pub(crate) fn open_vmic_with(
 
 /// #113: `[speak]`'s TTS knobs for the speech request: the temperature always (0.6 by
 /// default, under the server's 0.8), `cfg_weight` and `exaggeration` only when set.
+/// #124: `dmn speak ptt devices`: every input device, whether dmn can read it, and for one it
+/// cannot, the udev rule that grants the logged-in user access to it.
+pub(crate) fn ptt_devices() -> String {
+    let devices = crate::ptt::devices();
+    if devices.is_empty() {
+        return "no input devices under /dev/input/by-id or /dev/input/by-path\n".to_owned();
+    }
+    let mut out = String::new();
+    for d in &devices {
+        out.push_str(&format!(
+            "{}  {}\n    {}{}\n",
+            if d.readable {
+                "readable  "
+            } else {
+                "no access "
+            },
+            d.path,
+            d.name.as_deref().unwrap_or("(no name)"),
+            if d.readable {
+                String::new()
+            } else {
+                crate::ptt::udev_rule(&d.node)
+                    .map(|r| format!("\n    udev rule: {r}"))
+                    .unwrap_or_default()
+            }
+        ));
+    }
+    out.push_str(
+        "\nTo grant access to one device, put its rule in /etc/udev/rules.d/70-dmn-ptt.rules, then:\n  \
+         sudo udevadm control --reload && sudo udevadm trigger\n\
+         (log out and back in if it is still not readable). Then: dmn speak ptt learn\n",
+    );
+    out
+}
+
+/// #124: `dmn speak ptt learn`: the next press on any readable device becomes
+/// `[speak].ptt_device` and `ptt_key`, written in place like `enroll`'s edits.
+pub(crate) fn ptt_learn(paths: &Paths, timeout: u64) -> Result<String, SpeakError> {
+    println!("press the button you want to hold while talking (within {timeout} s)...");
+    let (device, key) = crate::ptt::learn(Duration::from_secs(timeout))
+        .map_err(|e| SpeakError::Ptt(e.to_string()))?;
+    Config::write_speak_ptt(&paths.config_file, &device, &key)?;
+    Ok(format!(
+        "push-to-talk button: {key} on {device}\nset [speak].ptt_device and ptt_key in {}\n\
+         In dmn run, `l` now cycles your own voice -> translate -> push-to-talk; or start in it with [speak].mode = \"ptt\"\n",
+        paths.config_file.display()
+    ))
+}
+
 /// #122: the client for `[speak].engine` on `[speak].tts_url`. `streaming` takes Chatterbox's
 /// streaming route (the first sentence plays while the next renders); Qwen3-TTS always streams.
 pub(crate) fn tts_provider(cfg: &Config, streaming: bool) -> Box<dyn TtsProvider> {

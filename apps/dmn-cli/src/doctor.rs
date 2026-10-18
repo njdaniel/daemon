@@ -516,7 +516,39 @@ pub fn speak(cfg: &Config, h: &dyn Http) -> Vec<Check> {
     if !cfg.speak.enabled {
         return vec![Check::pass("speak", "off ([speak].enabled = false)").optional()];
     }
-    vec![translator(cfg, h), tts_server(cfg, h)]
+    let mut checks = vec![translator(cfg, h), tts_server(cfg, h)];
+    checks.extend(ptt_button(cfg, |p| std::fs::File::open(p).map(|_| ())));
+    checks
+}
+
+/// #124: the push-to-talk button, when one is set up: the key is known and the device can be
+/// read (`open` is `File::open`, a fake in tests). Push-to-talk is an option: without a device
+/// there is no line, and an unreadable one is a warning, since the run goes on without it.
+fn ptt_button(cfg: &Config, open: impl Fn(&str) -> std::io::Result<()>) -> Option<Check> {
+    let s = &cfg.speak;
+    if s.ptt_device.is_empty() {
+        return None;
+    }
+    let Some(code) = dmn_core::config::ptt_key_code(&s.ptt_key) else {
+        return Some(Check::fail(
+            "push-to-talk",
+            format!("[speak].ptt_key {:?} is not a key dmn knows", s.ptt_key),
+            "dmn speak ptt learn",
+        ));
+    };
+    let key = dmn_core::config::ptt_key_name(code);
+    Some(match open(&s.ptt_device) {
+        Ok(()) => Check::pass("push-to-talk", format!("{key} on {}", s.ptt_device)),
+        Err(e) => Check::fail(
+            "push-to-talk",
+            format!(
+                "cannot read {} ({e}): `dmn run` goes on without push-to-talk",
+                s.ptt_device
+            ),
+            "grant access with a udev rule: `dmn speak ptt devices` prints it (README § Push-to-talk)",
+        )
+        .optional(),
+    })
 }
 
 /// The translator model: `[speak].model`, or `[llm].model` when it is left out.
@@ -1385,6 +1417,34 @@ mod tests {
     /// #122: with `engine = "qwen3"` doctor names the engine, its URL, the model vLLM-Omni
     /// serves and the device; another model there, or nothing, is a failure with the way to
     /// the sidecar.
+    /// #124: no line without a button; the key and device with one; an unreadable device is a
+    /// warning with the way to the udev rule, and an unknown key a failure.
+    #[test]
+    fn doctor_reports_the_push_to_talk_button() {
+        let mut cfg = Config::default();
+        assert!(ptt_button(&cfg, |_| Ok(())).is_none());
+        cfg.speak.ptt_device = "/dev/input/by-id/usb-UHK-event-kbd".into();
+        cfg.speak.ptt_key = "183".into();
+        let ok = ptt_button(&cfg, |_| Ok(())).unwrap();
+        assert!(ok.ok, "{ok:?}");
+        assert_eq!(ok.detail, "KEY_F13 on /dev/input/by-id/usb-UHK-event-kbd");
+        let denied = ptt_button(&cfg, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap();
+        assert!(!denied.ok && !denied.required, "{denied:?}");
+        assert!(
+            denied
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("dmn speak ptt devices")
+        );
+        cfg.speak.ptt_key = "KEY_NOPE".into();
+        let bad = ptt_button(&cfg, |_| Ok(())).unwrap();
+        assert!(!bad.ok && bad.required, "{bad:?}");
+    }
+
     #[test]
     fn doctor_names_the_qwen3_engine_its_model_and_device() {
         let mut cfg = Config::default();

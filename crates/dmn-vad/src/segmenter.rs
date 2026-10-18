@@ -54,6 +54,9 @@ pub enum CloseReason {
     MaxLength,
     /// The source ended (end of file, or the worker was stopped) mid-utterance.
     EndOfStream,
+    /// #124: the push-to-talk button was released: the utterance ends at once, with no
+    /// trailing silence waited for.
+    Released,
 }
 
 /// One segment of speech from one source.
@@ -226,6 +229,14 @@ impl Segmenter {
             self.recent.pop_front();
         }
         self.n += 1;
+    }
+
+    /// #124: close the open utterance now (the push-to-talk button was released), whatever the
+    /// silence so far. Nothing when none is open.
+    pub fn close_now(&mut self, out: &mut Vec<VadEvent>) {
+        if self.open.is_some() {
+            self.emit(CloseReason::Released, out);
+        }
     }
 
     /// Close any open utterance at end of stream.

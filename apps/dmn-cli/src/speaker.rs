@@ -142,6 +142,8 @@ struct Job {
     id: u64,
     text: String,
     pressed: Instant,
+    /// #124: when the push-to-talk button was released for this turn, if it was one.
+    released: Option<Instant>,
 }
 
 /// What the pipeline sends the worker.
@@ -202,12 +204,20 @@ impl Speaker {
     }
 
     /// Speak `text` (the user's turn) as press `id`. False when the worker cannot take it.
+    #[cfg(test)]
     pub fn speak(&self, id: u64, text: String) -> bool {
+        self.speak_released(id, text, None)
+    }
+
+    /// #124: [`Speaker::speak`] for a push-to-talk turn released at `released`: the log line
+    /// adds the time from the release to the first sound.
+    pub fn speak_released(&self, id: u64, text: String, released: Option<Instant>) -> bool {
         self.msgs.as_ref().is_some_and(|msgs| {
             msgs.send(Msg::Speak(Job {
                 id,
                 text,
                 pressed: Instant::now(),
+                released,
             }))
             .is_ok()
         })
@@ -424,7 +434,12 @@ impl Worker {
     /// One press: translate, synthesize, play, in the language set when it starts (#115: a
     /// language chosen meanwhile waits for the next press). `Err` is the status line's reason.
     fn speak(&mut self, job: Job) -> Result<(), String> {
-        let Job { id, text, pressed } = job;
+        let Job {
+            id,
+            text,
+            pressed,
+            released,
+        } = job;
         let language = self.setup.language.clone();
         let provider = Arc::clone(&self.setup.provider);
         let translated = self
@@ -482,6 +497,10 @@ impl Worker {
                 translated_ms,
                 first_audio_ms =
                     first.map(|t| t.saturating_duration_since(pressed).as_millis() as u64),
+                // #124: from the push-to-talk release (whisper's final pass included).
+                released_to_first_audio_ms = first
+                    .zip(released)
+                    .map(|(t, r)| t.saturating_duration_since(r).as_millis() as u64),
                 done_ms,
                 "speak: spoke into {VMIC_NODE_NAME}"
             ),

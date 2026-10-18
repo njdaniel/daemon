@@ -580,6 +580,54 @@ compose up`; `QWEN3_TTS_PORT` moves the port. Chatterbox keeps working with `eng
 "chatterbox"` and its own `tts_url`; the two servers can run side by side (about 11 GB together),
 but not beside the 35B answer model.
 
+**Push-to-talk (#124, an option).** In translate mode a sentence ends when you pause (0.4 s of
+silence), so the translation starts a little after you stop, and a pause mid-thought splits it.
+With push-to-talk you hold a button while you speak: everything said while it is held is one
+turn, and its translation starts the moment you let go. While the button is up the call hears
+nothing from your microphone, only the translations. It is off unless you set it up, and nothing
+else changes without it.
+
+dmn reads the button straight from its input device, so it works while the call's window has
+focus. That needs read access to the one device, which by default only root has:
+
+```bash
+dmn speak ptt devices      # every input device, whether dmn can read it, and the udev rule for one it cannot
+```
+
+Pick the device the button is on and put its rule in a file of its own, for example for a Logitech
+G402 mouse:
+
+```bash
+echo 'SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c07e", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/70-dmn-ptt.rules
+sudo udevadm control --reload && sudo udevadm trigger
+dmn speak ptt devices      # the device now says "readable" (log out and back in if not)
+dmn speak ptt learn        # press the button you want; it is saved as [speak].ptt_device and ptt_key
+```
+
+`uaccess` gives the logged-in user (and nobody else) access to that device only, for as long as
+they are logged in; adding yourself to the `input` group would instead let every program you run
+read every keystroke on every keyboard. dmn never grabs the device, so the button still does
+whatever else it does: pick one nothing else uses, such as F13–F24 mapped on a programmable
+keyboard, or a spare mouse button (a mouse's side button is "back" in a browser).
+
+```toml
+[speak]
+mode = "ptt"                          # start in push-to-talk; or press `l` during a run
+ptt_device = "/dev/input/by-id/usb-Logitech_Gaming_Mouse_G402_4982247A3239-event-mouse"
+ptt_key = "BTN_SIDE"                  # or KEY_F13, or the key's number
+```
+
+With a button set up, `l` cycles your own voice → translate → push-to-talk. The status tag reads
+`voice: PTT → zh`, and `● talking → zh` in red while the button is held. Releasing it closes the
+sentence at once (no silence wait), whisper's final pass runs, and the turn goes to the
+translator; the echo guard's hold is skipped for it. Each press is one translation, even if the
+previous one is still playing. The log line for each spoken sentence adds
+`released_to_first_audio_ms`, the time from letting go to the first sound in `dmn-voice`.
+`mode = "ptt"` without a button is a config error naming `dmn speak ptt learn`; a device dmn cannot
+read at start, or one unplugged mid-run, is said on the status line and the run goes on in
+translate mode. `dmn doctor` shows the button and, for an unreadable device, the way to the rule.
+
 With `[stt].language = "auto"` (or a code, for an interview in another language), whisper
 translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it
 detects your language and keeps your own words, so `t` translates what you said rather than

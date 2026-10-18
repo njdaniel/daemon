@@ -240,6 +240,20 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
                 };
                 (format!(" {VOICE_TO} {} ", v.target), bg)
             }
+            // #124: push-to-talk: red while the button is held (the call hears nothing yet),
+            // then as translate mode.
+            VoiceMode::Ptt => {
+                if view.session.ptt == Some(true) {
+                    (format!(" {VOICE_PTT_HELD} {} ", v.target), Color::Red)
+                } else {
+                    let bg = if view.session.speech.is_some() {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    };
+                    (format!(" {VOICE_PTT} {} ", v.target), bg)
+                }
+            }
         };
         spans.push(Span::styled(
             text,
@@ -496,7 +510,9 @@ fn shortcuts(view: &View<'_>) -> Keys {
     let voice = view.session.voice.as_ref().map(|v| {
         match v.mode {
             VoiceMode::Passthrough => VOICE_TRANSLATE,
-            VoiceMode::Translate => VOICE_OWN,
+            // #124: `l` goes on to push-to-talk when a button is set up.
+            VoiceMode::Translate if view.session.ptt.is_some() => VOICE_TO_PTT,
+            VoiceMode::Translate | VoiceMode::Ptt => VOICE_OWN,
         }
         .to_owned()
     });
@@ -573,6 +589,11 @@ const SPEAK: &str = "t speak";
 const VOICE_TRANSLATE: &str = "l translate";
 /// #114: `l` in translate mode: back to your own voice.
 const VOICE_OWN: &str = "l own voice";
+/// #124: the mode key in translate mode when a push-to-talk button is set up.
+const VOICE_TO_PTT: &str = "l push-to-talk";
+/// #124: the voice tag in push-to-talk mode, and while the button is held.
+pub(super) const VOICE_PTT: &str = "voice: PTT →";
+pub(super) const VOICE_PTT_HELD: &str = "● talking →";
 /// #114: the voice tag in pass-through mode (`voice: you (en)` when the language is known).
 pub(super) const VOICE_YOU: &str = "voice: you";
 /// #114: the voice tag in translate mode, followed by the target (`voice: → de`).

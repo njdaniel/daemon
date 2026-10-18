@@ -16,6 +16,7 @@ mod doctor;
 mod latency;
 mod pipeline;
 mod probe;
+mod ptt;
 mod replay;
 mod run;
 mod sources;
@@ -360,6 +361,24 @@ enum SpeakAction {
         #[arg(long)]
         language: Option<String>,
     },
+    /// Push-to-talk (#124, an option): find the button and save it to the config
+    Ptt {
+        #[command(subcommand)]
+        action: PttAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PttAction {
+    /// List the input devices, whether dmn can read each, and the udev rule that grants access
+    Devices,
+    /// Wait for the next key or button press on a readable device and save it as
+    /// [speak].ptt_device and ptt_key (press the button you want to hold while talking)
+    Learn {
+        /// Seconds to wait for the press
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -562,6 +581,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     let provider = speak::tts_provider(&cfg, false);
                     print!("{}", speak::enroll(&cfg, &paths, &args, provider.as_ref())?);
                 }
+                Some(SpeakAction::Ptt { action }) => match action {
+                    PttAction::Devices => print!("{}", speak::ptt_devices()),
+                    PttAction::Learn { timeout } => {
+                        print!("{}", speak::ptt_learn(&paths, timeout)?);
+                    }
+                },
                 None => {
                     let text = text.ok_or(CliError::Usage(
                         "speak needs the text to synthesize: dmn speak \"text\" [--out <file.wav>] (or `dmn speak enroll --wav <clip>`)".into(),

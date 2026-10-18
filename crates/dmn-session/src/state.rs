@@ -486,6 +486,7 @@ pub struct Voice {
 pub fn voice_marker(mode: VoiceMode, target: &str) -> String {
     match mode {
         VoiceMode::Translate => format!("— translate mode on: → {target} —"),
+        VoiceMode::Ptt => format!("— push-to-talk on: → {target} —"),
         VoiceMode::Passthrough => "— translate mode off: your own voice —".to_owned(),
     }
 }
@@ -606,6 +607,10 @@ pub struct Session {
     /// before it and while `[speak]` is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<Voice>,
+    /// #124: the push-to-talk button: `None` while none is set up and readable, else whether it
+    /// is held now. `l` offers push-to-talk only with a button.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptt: Option<bool>,
     /// #115: the languages the session can speak, each with its enrolled voice, in the config's
     /// order; empty in every log from before it and while `[speak]` is off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1151,6 +1156,7 @@ fn apply(s: &mut Session, action: &Action) {
         Action::LlmOffload { cpu_percent } => s.status.llm_cpu_percent = *cpu_percent,
         Action::WebLookup { enabled } => s.status.web = *enabled,
         Action::SpeakEnabled { enabled } => s.speak = *enabled,
+        Action::Ptt { held } => s.ptt = *held,
         Action::Voice { mode, target, own } => {
             let was = s.voice.as_ref().map(|v| v.mode);
             s.voice = Some(Voice {

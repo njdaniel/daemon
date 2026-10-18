@@ -2387,6 +2387,15 @@ fn the_voice_mode_is_session_state_and_a_change_writes_one_marker_line() {
     );
     assert_eq!(VoiceMode::Passthrough.toggled(), VoiceMode::Translate);
     assert_eq!(VoiceMode::Translate.toggled(), VoiceMode::Passthrough);
+    // #124: with a push-to-talk button, translate goes on to push-to-talk, then own voice.
+    assert_eq!(VoiceMode::Translate.next(true), VoiceMode::Ptt);
+    assert_eq!(VoiceMode::Ptt.next(true), VoiceMode::Passthrough);
+    assert_eq!(VoiceMode::Ptt.next(false), VoiceMode::Passthrough);
+    assert!(VoiceMode::Ptt.translates() && !VoiceMode::Passthrough.translates());
+    assert_eq!(
+        voice_marker(VoiceMode::Ptt, "zh"),
+        "— push-to-talk on: → zh —"
+    );
     assert_eq!(VoiceMode::default(), VoiceMode::Passthrough);
     assert_eq!(
         (
