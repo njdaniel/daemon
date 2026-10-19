@@ -28,4 +28,6 @@ Proposed 2026-10-18, from the #122 live Discord test (with the fast voice engine
 
 Proposed 2026-10-18 by the owner, since dmn now runs on ordinary calls (translated Discord and Telegram chats) as well as interviews: #128 (the other person's lane is `Them`, not `Interviewer`, everywhere: transcript labels, prompts, `question_source = "them"`, `--question-source them`, session JSON, a v9 store migration and the code; `interviewer` is still accepted wherever a name is read; fixture file names and njdaniel/dmn-audio stay, with a note on #121).
 
+Proposed 2026-10-18 by the owner ("different voices"): #130 (speak: `o` in `dmn run` opens a picker of the voices enrolled on the TTS server, and the chosen one speaks every language (Qwen3 is cross-lingual); saved as `[speak].voice`, unset keeps each language's own voice; `dmn speak enroll --name` without `--language` and `dmn speak voices` manage the library; under Chatterbox only voices of the current target are offered).
+
 Created on GitHub only, with no file here: #34 (replay `--speed`), #39 (whisper `no_context`), #50 (coding-solutions switch), and the process issues #44, #45, #46, which carry the `backlog` label.
