@@ -67,6 +67,7 @@ fn voice_list(body: &[u8]) -> Option<Vec<Voice>> {
                 name: n.to_owned(),
                 aliases: Vec::new(),
                 language: None,
+                consent: None,
             });
             continue;
         }
@@ -93,6 +94,7 @@ fn voice_list(body: &[u8]) -> Option<Vec<Voice>> {
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .map(str::to_owned),
+            consent: None,
         });
     }
     Some(voices)
@@ -753,21 +755,25 @@ mod tests {
                     name: "me".into(),
                     aliases: vec!["voice".into()],
                     language: Some("es".into()),
+                    consent: None,
                 },
                 Voice {
                     name: "en-voice".into(),
                     aliases: vec![],
                     language: Some("en".into()),
+                    consent: None,
                 },
                 Voice {
                     name: "bare".into(),
                     aliases: vec![],
                     language: None,
+                    consent: None,
                 },
                 Voice {
                     name: String::new(),
                     aliases: vec!["x".into()],
                     language: None,
+                    consent: None,
                 },
             ]
         );

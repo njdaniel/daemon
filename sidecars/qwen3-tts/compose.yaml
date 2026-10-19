@@ -13,6 +13,13 @@
 # start downloads the model (~4.3 GB) into the `cache` volume and compiles CUDA graphs; later
 # starts reuse both. Listens on 127.0.0.1 only: dmn sends text and the voice clip to localhost
 # and nowhere else.
+#
+# #130: a second service, `qwen3-tts-design` (profile `design`, 127.0.0.1:4125), serves the
+# VoiceDesign checkpoint, which renders a line in a voice described in words. It is not started
+# by `up -d`; `dmn speak design` starts it, renders one sample, enrolls that into the service
+# above, and stops it again (this file is compiled into dmn for that). By hand:
+#   docker compose -f sidecars/qwen3-tts/compose.yaml --profile design up -d qwen3-tts-design
+#   docker compose -f sidecars/qwen3-tts/compose.yaml --profile design stop qwen3-tts-design
 
 name: dmn-qwen3-tts
 
@@ -61,6 +68,49 @@ services:
       retries: 3
       start_period: 600s
     restart: unless-stopped
+
+  # #130: VoiceDesign, for `dmn speak design` only (see the header). Same image and cache
+  # volume (its model is another ~4.3 GB there); no voices volume, since nothing is enrolled
+  # into it. One line at a time, one request. Measured on the 4090 (24 GiB) 2026-10-19 with
+  # 0.19 + 0.07: the talker's weights take 3.88 GiB, and it peaked at 5206 MiB, the decoder at
+  # 1382 MiB, 6588 MiB in all (dmn speak design wants 6600 free first); a 13 s sample rendered
+  # in 3.0 s, about a minute after the start. 0.16 for the talker left no room for its KV cache
+  # ("No available memory for the cache blocks") and the container exited.
+  qwen3-tts-design:
+    profiles: [design]
+    image: vllm/vllm-omni:v0.30.0
+    container_name: dmn-qwen3-tts-design
+    command:
+      - vllm-omni
+      - serve
+      - Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+      - --omni
+      - --host=0.0.0.0
+      - --port=8091
+      - --trust-remote-code
+      - --stage-overrides={"0":{"gpu_memory_utilization":${DESIGN_TALKER_GPU:-0.19},"max_num_seqs":1},"1":{"gpu_memory_utilization":${DESIGN_DECODER_GPU:-0.07},"max_num_seqs":1}}
+    ports:
+      - "127.0.0.1:${QWEN3_DESIGN_PORT:-4125}:8091"
+    environment:
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
+    volumes:
+      - cache:/root/.cache
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
+    # Started and stopped by `dmn speak design`; never on its own.
+    restart: "no"
 
 volumes:
   cache:

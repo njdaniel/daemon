@@ -1,0 +1,126 @@
+{
+  "label": "sysdesign mock",
+  "started_at": 1790200000,
+  "ended_at": null,
+  "transcript": [
+    {
+      "speaker": "them",
+      "start": 1.0,
+      "end": 13.0,
+      "text": "Hi, thanks for making the time today. This session is about an hour of system design."
+    },
+    {
+      "speaker": "you",
+      "start": 16.2,
+      "end": 17.2,
+      "text": "Sounds great."
+    },
+    {
+      "speaker": "you",
+      "start": 31.0,
+      "end": 36.5,
+      "text": "I'd start with a token bucket per API key and keep the counters in regional Redis."
+    },
+    {
+      "speaker": "unknown",
+      "start": 36.5,
+      "end": 36.5,
+      "text": "— voice: pirate —",
+      "note": true
+    },
+    {
+      "speaker": "unknown",
+      "start": 36.5,
+      "end": 36.5,
+      "text": "— translate mode on: → de —",
+      "note": true
+    },
+    {
+      "speaker": "unknown",
+      "start": 36.5,
+      "end": 36.5,
+      "text": "— re-voice on: pirate —",
+      "note": true
+    },
+    {
+      "speaker": "you",
+      "start": 40.0,
+      "end": 44.0,
+      "text": "If Redis goes down, I'd fail open with a local limit.",
+      "spoken_as": "pirate"
+    },
+    {
+      "speaker": "you",
+      "start": 46.0,
+      "end": 48.0,
+      "text": "Then I'd shard the counters by key."
+    }
+  ],
+  "partials": [],
+  "last_them": "Hi, thanks for making the time today. This session is about an hour of system design.",
+  "live": {
+    "candidate": 1,
+    "text": "How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",
+    "kind": "system_design",
+    "focus": "architecture, consistency tradeoffs, distributed state, failure handling",
+    "approach": [
+      "Clarify scope: per user, per API key or per IP, and the limits per tier.",
+      "Use a token bucket per key; sliding-window counters if bursts matter.",
+      "Keep counters in regional Redis with a local in-process cache in front.",
+      "Accept small over-admission across regions; reconcile quotas asynchronously.",
+      "If Redis is down, fail open to a conservative local limit and alert."
+    ],
+    "star": null,
+    "clarifications": [],
+    "progress": {
+      "state": "done"
+    }
+  },
+  "pinned": false,
+  "queued": [],
+  "pending": null,
+  "status": {
+    "mic": {
+      "state": "ok"
+    },
+    "system": {
+      "state": "ok"
+    },
+    "model": {
+      "state": "ok"
+    },
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
+  },
+  "counts": {
+    "candidates": 1,
+    "shown": 1,
+    "clarifications": 0,
+    "ignored": 0,
+    "failed": 0
+  },
+  "coding_solutions": "hints",
+  "speak": true,
+  "speech": {
+    "id": 2,
+    "stage": "speaking",
+    "secs": 1,
+    "span": [
+      46.0,
+      48.0
+    ],
+    "target": "de",
+    "revoice": "pirate"
+  },
+  "voice": {
+    "mode": "revoice",
+    "target": "de",
+    "own": "en",
+    "chosen": "pirate"
+  },
+  "voices": [
+    "pirate"
+  ]
+}

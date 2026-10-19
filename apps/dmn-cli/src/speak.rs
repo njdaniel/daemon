@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 use dmn_audio::{AudioError, PipeWireContext, PipeWireError, VMIC_NODE_NAME, VirtualMic};
 use dmn_core::Paths;
 use dmn_core::config::{Config, ConfigError, SpeakEngine};
-use dmn_tts::{PcmStream, SpeakRequest, TtsError, TtsProvider};
+use dmn_tts::{Consent, PcmStream, SpeakRequest, TtsError, TtsProvider};
 
 /// A reference clip needs at least this much clean speech for the clone to hold up.
-const MIN_CLIP_SECS: f64 = 6.0;
+pub(crate) const MIN_CLIP_SECS: f64 = 6.0;
 /// chatterbox-tts-api refuses voice files over 10 MB (`voices.py`); say so before uploading.
 const MAX_CLIP_BYTES: u64 = 10 * 1024 * 1024;
 /// The default voice name, and so the stored clip `voice.wav` the issue names.
@@ -150,6 +150,51 @@ pub enum SpeakError {
     BadLanguage { code: String },
     #[error("cannot reach the [llm] provider for translation: {0}")]
     Llm(String),
+    /// #130: VoiceDesign is a Qwen3-TTS checkpoint; its sample is enrolled into the Base server.
+    #[error(
+        "dmn speak design makes a Qwen3-TTS voice, but [speak].engine = {engine:?} in {config}; set engine = \"qwen3\" and tts_url to the Base server (sidecars/qwen3-tts, README § Speak)"
+    )]
+    DesignNeedsQwen3 {
+        engine: &'static str,
+        config: String,
+    },
+    /// #130: `design --name` would replace one of the user's own voices.
+    #[error(
+        "{name:?} is one of your own voices ([speak].voice_ref or [speak].languages); give the designed voice another --name"
+    )]
+    DesignOwnName { name: String },
+    /// #130: no NVIDIA GPU to check, or `nvidia-smi` is missing: vLLM-Omni has no CPU path.
+    #[error(
+        "cannot read the GPU's free memory ({detail}); the VoiceDesign server needs an NVIDIA GPU and nvidia-smi"
+    )]
+    NoGpu { detail: String },
+    /// #130: too little free VRAM for the VoiceDesign server: named, never stopped.
+    #[error(
+        "the VoiceDesign server needs about {need_mib} MiB of free GPU memory and {free_mib} MiB are free; what holds the GPU:\n{holders}\nstop what you do not need (dmn stops nothing itself), then run this again"
+    )]
+    LowVram {
+        free_mib: u64,
+        need_mib: u64,
+        holders: String,
+    },
+    /// #130: `docker compose` could not start or stop the design service.
+    #[error("{0}")]
+    Docker(String),
+    /// #130: the design server did not come up in time.
+    #[error(
+        "the VoiceDesign server at {url} was not ready after {secs} s; see `docker logs dmn-qwen3-tts-design` (its first start downloads ~4.3 GB and compiles CUDA graphs)"
+    )]
+    DesignNotReady { url: String, secs: u64 },
+    /// #130: the design server's container exited while starting.
+    #[error(
+        "the VoiceDesign server stopped while starting: {why} (docker logs dmn-qwen3-tts-design has the rest; DESIGN_TALKER_GPU and DESIGN_DECODER_GPU set its share of the GPU, sidecars/qwen3-tts/compose.yaml)"
+    )]
+    DesignExited { why: String },
+    /// #130: a designed sample too short (or long) to clone from.
+    #[error(
+        "the designed sample is {secs:.1} s long; the Base model clones from 6-30 s, so give --line {more} text"
+    )]
+    DesignSampleLength { secs: f64, more: &'static str },
     #[error(transparent)]
     Tts(TtsError),
     #[error(transparent)]
@@ -164,7 +209,7 @@ pub struct EnrollArgs {
     pub language: Option<String>,
 }
 
-fn rt() -> Result<tokio::runtime::Runtime, SpeakError> {
+pub(crate) fn rt() -> Result<tokio::runtime::Runtime, SpeakError> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -206,7 +251,7 @@ pub(crate) fn voice_name(voice_ref: &str) -> String {
     dmn_core::config::voice_ref_name(voice_ref)
 }
 
-fn check_name(name: &str) -> Result<(), SpeakError> {
+pub(crate) fn check_name(name: &str) -> Result<(), SpeakError> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME
         && name
@@ -224,7 +269,7 @@ fn check_name(name: &str) -> Result<(), SpeakError> {
 /// Check the clip is a WAV the server can clone from. Returns a note when it works but is not
 /// the preferred shape: a stereo clip is accepted (the server mixes it down), as is one below
 /// 16 kHz, but a mono 16 kHz+ recording clones best.
-fn validate_clip(path: &Path) -> Result<Option<String>, SpeakError> {
+pub(crate) fn validate_clip(path: &Path) -> Result<Option<String>, SpeakError> {
     let shown = path.display().to_string();
     let invalid = |detail: String| SpeakError::InvalidWav {
         path: shown.clone(),
@@ -263,7 +308,7 @@ fn validate_clip(path: &Path) -> Result<Option<String>, SpeakError> {
 
 /// Copy `from` to `to` through a sibling temp file, so a failed copy never leaves half a clip
 /// where the old one was.
-fn store_clip(from: &Path, to: &Path) -> Result<(), SpeakError> {
+pub(crate) fn store_clip(from: &Path, to: &Path) -> Result<(), SpeakError> {
     let store_err = |path: &Path, e: std::io::Error| SpeakError::Store {
         path: path.display().to_string(),
         detail: e.to_string(),
@@ -279,11 +324,27 @@ fn store_clip(from: &Path, to: &Path) -> Result<(), SpeakError> {
     })
 }
 
+/// #130: whether an enrollment is the user's own voice (recorded in `voice_ref`, and with a
+/// language in `languages`) or a library voice the `o` picker offers. Own: with `--language`,
+/// without `--name`, while no voice is enrolled yet, or under a name that already is one of
+/// the user's (re-enrolling it). A `--name` of anything else is a library voice.
+fn is_own_voice(cfg: &Config, name: Option<&str>, language: Option<&str>) -> bool {
+    match name {
+        _ if language.is_some() => true,
+        None => true,
+        Some(_) if cfg.speak.voice_ref.is_empty() && cfg.speak.languages.is_empty() => true,
+        Some(n) => cfg.speak.own_voices().iter().any(|own| own == n),
+    }
+}
+
 /// Enroll: validate the clip, register it with the server, then copy it under the data dir and
 /// record it as `[speak].voice_ref`. The server goes first, so a refused or failed
 /// registration changes nothing on disk. #115: with `--language <code>` the voice is named
 /// `voice-<code>` unless `--name` says otherwise, and the pair is added to (or updated in)
 /// `[speak].languages`, so enrolling German and Spanish gives the picker a two-entry list.
+/// #130: `--name` without `--language`, for a name that is not already the user's, is a
+/// library voice: uploaded and stored the same way, with `voice_ref` and `languages` left as
+/// they are, and offered by the `o` picker in `dmn run`.
 pub fn enroll(
     cfg: &Config,
     paths: &Paths,
@@ -306,24 +367,40 @@ pub fn enroll(
         .or(default_name.as_deref())
         .unwrap_or(DEFAULT_NAME);
     check_name(name)?;
+    let own = is_own_voice(cfg, args.name.as_deref(), language);
     let note = validate_clip(&args.wav)?;
+    let consent = if own { Consent::Own } else { Consent::Speaker };
     let enrolled = rt()?
-        .block_on(provider.enroll(name, &args.wav, language))
+        .block_on(provider.enroll_as(name, &args.wav, language, consent))
         .map_err(|e| tts_error(e, paths))?;
     let dest = paths.data_dir.join(format!("{name}.wav"));
     store_clip(&args.wav, &dest)?;
+    tracing::info!(voice = %enrolled.name, clip = %dest.display(), replaced = enrolled.replaced, own, "voice enrolled");
+    let mut out = String::new();
+    if let Some(n) = note {
+        out.push_str(&n);
+        out.push('\n');
+    }
+    if !own {
+        out.push_str(&format!(
+            "enrolled {:?}{} with the TTS server at {} as a library voice\nstored the clip as {}\n[speak].voice_ref and [speak].languages are unchanged (your own voice); pick it with `o` in dmn run, or list the library: dmn speak voices\n",
+            enrolled.name,
+            if enrolled.replaced {
+                " (replacing the voice of that name)"
+            } else {
+                ""
+            },
+            cfg.speak.tts_url,
+            dest.display(),
+        ));
+        return Ok(out);
+    }
     // The list first: a file with no list yet is seeded from its current `target` +
     // `voice_ref` pair, which must be the pair as it was before this enroll.
     if let Some(code) = language {
         Config::write_speak_language(&paths.config_file, code, name)?;
     }
     Config::write_voice_ref(&paths.config_file, &dest.display().to_string())?;
-    tracing::info!(voice = %enrolled.name, clip = %dest.display(), replaced = enrolled.replaced, "voice enrolled");
-    let mut out = String::new();
-    if let Some(n) = note {
-        out.push_str(&n);
-        out.push('\n');
-    }
     out.push_str(&format!(
         "enrolled {:?}{} with the TTS server at {}{}\nstored the clip as {}\nset [speak].voice_ref in {}\n",
         enrolled.name,
@@ -354,6 +431,65 @@ pub fn enroll(
             "{} voices speak every language it knows{speaks}: one voice can serve every [speak].languages entry (voice = {name:?})\n",
             provider.name()
         ));
+    }
+    Ok(out)
+}
+
+/// #130: `dmn speak voices`: the TTS server's library, one voice a line: its name, whether it
+/// was designed from a description or enrolled from a clip (Qwen3-TTS stores which; Chatterbox
+/// does not, so every voice there is `enrolled`), its language under Chatterbox (each voice
+/// speaks only that one), and which are the user's own and which is `[speak].voice`.
+pub fn voices(
+    cfg: &Config,
+    paths: &Paths,
+    provider: &dyn TtsProvider,
+) -> Result<String, SpeakError> {
+    check_gates(cfg, paths)?;
+    let Some(library) = rt()?
+        .block_on(provider.voices())
+        .map_err(|e| tts_error(e, paths))?
+    else {
+        return Ok(format!(
+            "the TTS server at {} ({}) has no voice library to list\n",
+            cfg.speak.tts_url,
+            provider.name()
+        ));
+    };
+    let mut out = format!(
+        "voices on the TTS server at {} ({}):\n",
+        cfg.speak.tts_url,
+        provider.name()
+    );
+    if library.is_empty() {
+        out.push_str("  none yet: dmn speak enroll --wav <clip>, or dmn speak design --name <name> --describe \"...\"\n");
+        return Ok(out);
+    }
+    let own = cfg.speak.own_voices();
+    let name_cells = library
+        .iter()
+        .map(|v| v.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let per_language = !provider.cross_lingual();
+    for v in &library {
+        let kind = if v.designed() { "designed" } else { "enrolled" };
+        let mut line = format!("  {:<name_cells$}  {kind}", v.name);
+        if per_language {
+            line.push_str(&format!("  {:<3}", v.language.as_deref().unwrap_or("?")));
+        }
+        let mut notes = Vec::new();
+        if own.iter().any(|o| v.answers_to(o)) {
+            notes.push(dmn_session::YOUR_VOICE.to_owned());
+        }
+        if cfg.speak.voice.as_deref().is_some_and(|c| v.answers_to(c)) {
+            notes.push("← [speak].voice".to_owned());
+        }
+        if !notes.is_empty() {
+            line.push_str("  ");
+            line.push_str(&notes.join(", "));
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
     }
     Ok(out)
 }
@@ -906,6 +1042,91 @@ mouse = false
         assert_eq!(mock.enrollments()[0].name, "narrator");
         let voice_ref = Config::load(&paths.config_file).unwrap().speak.voice_ref;
         assert_eq!(voice_name(&voice_ref), "narrator");
+    }
+
+    /// #130: with a voice of their own enrolled, `--name` without `--language` adds a library
+    /// voice: uploaded with `dmn-consented`, stored under the data dir, and `voice_ref` and
+    /// `languages` left exactly as they were; `dmn speak voices` lists it. Re-enrolling one of
+    /// the user's own names is still their own voice.
+    #[test]
+    fn enroll_with_a_name_and_no_language_adds_a_library_voice_and_speak_voices_lists_it() {
+        let (dir, paths, _) = setup("http://localhost:4123");
+        let owner = "[speak]\nenabled = true\ntarget = \"de\"\nvoice_ref = \"/d/voice.wav\"\nlanguages = [{ code = \"de\", voice = \"voice-de\" }]   # mine\n";
+        std::fs::create_dir_all(paths.config_file.parent().unwrap()).unwrap();
+        std::fs::write(&paths.config_file, owner).unwrap();
+        let cfg = Config::load(&paths.config_file).unwrap();
+        let wav = dir.path().join("gran.wav");
+        clip(&wav, 1, 16_000, 7.0);
+        let mock = MockTtsProvider::new()
+            .with_voices(Some(&[("voice", Some("en")), ("voice-de", Some("de"))]));
+        let out = enroll(&cfg, &paths, &args(&wav, Some("gran")), &mock).unwrap();
+        assert!(out.contains("as a library voice"), "{out}");
+        assert!(out.contains("pick it with `o`"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&paths.config_file).unwrap(),
+            owner,
+            "voice_ref and languages untouched"
+        );
+        assert!(paths.data_dir.join("gran.wav").is_file());
+        let e = mock.enrollments();
+        assert_eq!(
+            (e[0].name.as_str(), e[0].consent),
+            ("gran", "dmn-consented")
+        );
+
+        let mut chosen = cfg.clone();
+        chosen.speak.voice = Some("gran".into());
+        let listed = voices(&chosen, &paths, &mock).unwrap();
+        assert!(
+            listed.contains("voices on the TTS server at http://localhost:4123 (mock):"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("  voice     enrolled  en   your voice\n"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("  voice-de  enrolled  de   your voice\n"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("  gran      enrolled  ?    ← [speak].voice\n"),
+            "{listed}"
+        );
+
+        // One of the user's own names: their voice, as before.
+        let out = enroll(&cfg, &paths, &args(&wav, Some("voice-de")), &mock).unwrap();
+        assert!(!out.contains("library voice"), "{out}");
+        assert_eq!(mock.enrollments()[1].consent, "dmn-self");
+    }
+
+    /// #130: a cross-lingual engine lists no language, and a designed voice says so.
+    #[test]
+    fn speak_voices_says_designed_and_leaves_the_language_out_under_qwen3() {
+        let (dir, paths, mut cfg) = setup("http://localhost:4124");
+        cfg.speak.voice_ref = "/d/voice.wav".into();
+        let wav = dir.path().join("p.wav");
+        clip(&wav, 1, 16_000, 7.0);
+        let mock = MockTtsProvider::new()
+            .cross_lingual()
+            .with_voices(Some(&[("voice", None)]));
+        let rt = rt().unwrap();
+        rt.block_on(mock.enroll_as("pirate", &wav, None, Consent::Designed))
+            .unwrap();
+        let listed = voices(&cfg, &paths, &mock).unwrap();
+        assert!(
+            listed.contains("  voice   enrolled  your voice\n"),
+            "{listed}"
+        );
+        assert!(listed.contains("  pirate  designed\n"), "{listed}");
+        let none = voices(&cfg, &paths, &MockTtsProvider::new().with_voices(None)).unwrap();
+        assert!(none.contains("has no voice library"), "{none}");
+        let mut off = cfg.clone();
+        off.speak.enabled = false;
+        assert!(matches!(
+            voices(&off, &paths, &mock).unwrap_err(),
+            SpeakError::Disabled { .. }
+        ));
     }
 
     #[test]

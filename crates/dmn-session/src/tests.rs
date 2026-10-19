@@ -2316,6 +2316,7 @@ fn voice(mode: VoiceMode) -> Action {
         mode,
         target: "de".into(),
         own: Some("en".into()),
+        chosen: None,
     }
 }
 
@@ -2331,6 +2332,7 @@ fn the_voice_mode_is_session_state_and_a_change_writes_one_marker_line() {
             mode: VoiceMode::Passthrough,
             target: "de".into(),
             own: Some("en".into()),
+            chosen: None,
         })
     );
     assert_eq!(s.transcript.len(), 1, "the start-up mode is no line");
@@ -2347,7 +2349,10 @@ fn the_voice_mode_is_session_state_and_a_change_writes_one_marker_line() {
         (8.0, 8.0),
         "after the last line"
     );
-    assert_eq!(voice_marker(VoiceMode::Translate, "de"), marker.text);
+    assert_eq!(
+        voice_marker(VoiceMode::Translate, "de", YOUR_VOICE),
+        marker.text
+    );
     // The same mode again writes nothing; back writes the other marker.
     log.push(voice(VoiceMode::Translate));
     assert_eq!(Session::replay(&log).transcript.len(), 2);
@@ -2358,15 +2363,197 @@ fn the_voice_mode_is_session_state_and_a_change_writes_one_marker_line() {
         s.transcript[2].text,
         "— translate mode off: your own voice —"
     );
-    assert_eq!(VoiceMode::Passthrough.toggled(), VoiceMode::Translate);
-    assert_eq!(VoiceMode::Translate.toggled(), VoiceMode::Passthrough);
+    // #130: `l` cycles own voice → translate → re-voice → own voice.
+    assert_eq!(VoiceMode::Passthrough.next(), VoiceMode::Translate);
+    assert_eq!(VoiceMode::Translate.next(), VoiceMode::Revoice);
+    assert_eq!(VoiceMode::Revoice.next(), VoiceMode::Passthrough);
     assert_eq!(VoiceMode::default(), VoiceMode::Passthrough);
     assert_eq!(
         (
             VoiceMode::Passthrough.as_str(),
-            VoiceMode::Translate.as_str()
+            VoiceMode::Translate.as_str(),
+            VoiceMode::Revoice.as_str()
         ),
-        ("passthrough", "translate")
+        ("passthrough", "translate", "revoice")
+    );
+    assert!(VoiceMode::Revoice.speaks_turns() && VoiceMode::Translate.speaks_turns());
+    assert!(!VoiceMode::Passthrough.speaks_turns());
+}
+
+// --- #130: the voice picker, the chosen voice, re-voice mode -------------------------------
+
+fn with_voices(mode: VoiceMode) -> Vec<Action> {
+    let mut log = speak_on();
+    log.push(voice(mode));
+    log.push(Action::SpeakVoices {
+        voices: vec!["pirate".into(), "robot".into()],
+    });
+    log
+}
+
+fn choose_voice(name: Option<&str>) -> Action {
+    Action::SpeakVoice {
+        voice: name.map(str::to_owned),
+    }
+}
+
+#[test]
+fn the_voice_picker_lists_your_voice_first_and_opens_on_the_chosen_one() {
+    let mut log = with_voices(VoiceMode::Passthrough);
+    let s = Session::replay(&log);
+    assert_eq!(s.voice_rows(), [None, Some("pirate"), Some("robot")]);
+    assert_eq!(s.chosen_voice(), None);
+
+    log.push(pick(PickerOp::OpenVoices));
+    let s = Session::replay(&log);
+    assert_eq!(s.picker, Some(Picker::voices(0)), "on your voice");
+    assert_eq!(s.picked(), None, "not the language picker");
+    log.extend([
+        pick(PickerOp::Down),
+        pick(PickerOp::Down),
+        pick(PickerOp::Down),
+    ]);
+    assert_eq!(Session::replay(&log).picker, Some(Picker::voices(2)));
+    // `v` while the voice picker is open leaves it as it is.
+    log.push(pick(PickerOp::Open));
+    assert_eq!(Session::replay(&log).picker, Some(Picker::voices(2)));
+    // A refresh with fewer voices keeps the cursor on a row.
+    log.push(Action::SpeakVoices {
+        voices: vec!["pirate".into()],
+    });
+    assert_eq!(Session::replay(&log).picker, Some(Picker::voices(1)));
+    // Choosing closes it and writes one marker row.
+    log.push(choose_voice(Some("pirate")));
+    let s = Session::replay(&log);
+    assert_eq!(s.picker, None);
+    assert_eq!(s.chosen_voice(), Some("pirate"));
+    assert_eq!(s.transcript.last().unwrap().text, "— voice: pirate —");
+    assert_eq!(voice_choice_marker("pirate"), "— voice: pirate —");
+    // Opened again, the cursor starts on the chosen voice.
+    log.push(pick(PickerOp::OpenVoices));
+    assert_eq!(Session::replay(&log).picker, Some(Picker::voices(1)));
+    log.push(pick(PickerOp::Close));
+    // The same voice again writes nothing; `your voice` clears it.
+    log.push(choose_voice(Some("pirate")));
+    assert_eq!(Session::replay(&log).transcript.len(), 1);
+    log.push(choose_voice(None));
+    let s = Session::replay(&log);
+    assert_eq!(s.chosen_voice(), None);
+    assert_eq!(s.transcript.last().unwrap().text, "— voice: your voice —");
+
+    // With `[speak]` off the key does nothing; with no other voice it still opens, on yours.
+    let mut off = with_voices(VoiceMode::Passthrough);
+    off.push(Action::SpeakEnabled { enabled: false });
+    off.push(pick(PickerOp::OpenVoices));
+    assert_eq!(Session::replay(&off).picker, None);
+    let mut alone = speak_on();
+    alone.push(voice(VoiceMode::Passthrough));
+    alone.push(pick(PickerOp::OpenVoices));
+    let s = Session::replay(&alone);
+    assert_eq!(s.picker, Some(Picker::voices(0)));
+    assert_eq!(s.voice_rows(), [None]);
+}
+
+#[test]
+fn the_start_up_voice_comes_with_the_first_voice_action_and_writes_no_marker() {
+    let mut log = speak_on();
+    log.push(Action::Voice {
+        mode: VoiceMode::Revoice,
+        target: "de".into(),
+        own: None,
+        chosen: Some("pirate".into()),
+    });
+    let s = Session::replay(&log);
+    assert_eq!(s.chosen_voice(), Some("pirate"));
+    assert!(s.transcript.is_empty(), "no marker at start");
+    // A later Voice keeps the session's choice, whatever it carries.
+    log.push(choose_voice(None));
+    log.push(Action::Voice {
+        mode: VoiceMode::Translate,
+        target: "de".into(),
+        own: None,
+        chosen: Some("pirate".into()),
+    });
+    assert_eq!(Session::replay(&log).chosen_voice(), None);
+}
+
+#[test]
+fn a_change_of_mode_keeps_the_chosen_voice_and_re_voice_names_it() {
+    let mut log = with_voices(VoiceMode::Passthrough);
+    log.push(choose_voice(Some("robot")));
+    log.push(voice(VoiceMode::Translate));
+    log.push(voice(VoiceMode::Revoice));
+    let s = Session::replay(&log);
+    let v = s.voice.as_ref().unwrap();
+    assert_eq!(
+        (v.mode, v.chosen.as_deref()),
+        (VoiceMode::Revoice, Some("robot"))
+    );
+    assert_eq!(s.transcript.last().unwrap().text, "— re-voice on: robot —");
+    // A language chosen on `v` leaves the voice picker alone, and the other way round.
+    log.push(pick(PickerOp::OpenVoices));
+    log.push(Action::SpeakLanguages {
+        languages: vec![lang("de")],
+    });
+    assert_eq!(Session::replay(&log).picker, Some(Picker::voices(2)));
+}
+
+#[test]
+fn a_re_voiced_turn_is_marked_with_its_voice_and_no_translation_under_it() {
+    let mut log = with_voices(VoiceMode::Revoice);
+    log.push(choose_voice(Some("pirate")));
+    log.extend([
+        seg(Speaker::You, 5.0, 8.0, "Ahoy there.", true),
+        seg(Speaker::You, 8.5, 9.5, "All good.", true),
+        Action::SpeakStarted { id: 1 },
+        Action::SpeakTurn {
+            id: 1,
+            from: 5.0,
+            to: 9.5,
+        },
+        // A voice chosen while it plays applies to the next press.
+        choose_voice(None),
+        Action::SpeakTranslated {
+            id: 1,
+            text: "Ahoy there. All good.".into(),
+        },
+        Action::SpeakDone { id: 1 },
+    ]);
+    let s = Session::replay(&log);
+    let started = Session::replay(&log[..log.len() - 4]);
+    assert_eq!(
+        started.speech.as_ref().map(|sp| sp.stage),
+        Some(SpeakStage::Speaking),
+        "nothing to translate"
+    );
+    let spoken: Vec<_> = s
+        .transcript
+        .iter()
+        .filter(|l| !l.note)
+        .map(|l| (l.spoken_as.as_deref(), l.translation.as_deref()))
+        .collect();
+    assert_eq!(spoken, [(Some("pirate"), None), (Some("pirate"), None)]);
+
+    // In translate mode a press keeps #114's marks.
+    let mut log = with_voices(VoiceMode::Translate);
+    log.extend([
+        seg(Speaker::You, 5.0, 8.0, "Hello.", true),
+        Action::SpeakStarted { id: 1 },
+        Action::SpeakTurn {
+            id: 1,
+            from: 5.0,
+            to: 8.0,
+        },
+        Action::SpeakTranslated {
+            id: 1,
+            text: "Hallo.".into(),
+        },
+        Action::SpeakDone { id: 1 },
+    ]);
+    let l = Session::replay(&log).transcript[0].clone();
+    assert_eq!(
+        (l.spoken_as.as_deref(), l.translation.as_deref()),
+        (Some("de"), Some("Hallo."))
     );
 }
 
@@ -2562,14 +2749,14 @@ fn the_picker_opens_on_the_current_language_moves_within_the_list_and_closes() {
     let s = Session::replay(&log);
     assert_eq!(
         s.picker,
-        Some(Picker { cursor: 0 }),
+        Some(Picker::languages(0)),
         "on the current language"
     );
     assert_eq!(s.picked(), Some(&lang("de")));
     // A second Open leaves the cursor where it is.
     log.push(pick(PickerOp::Down));
     log.push(pick(PickerOp::Open));
-    assert_eq!(Session::replay(&log).picker, Some(Picker { cursor: 1 }));
+    assert_eq!(Session::replay(&log).picker, Some(Picker::languages(1)));
     // The cursor stops at both ends.
     log.extend([
         pick(PickerOp::Down),
@@ -2577,7 +2764,7 @@ fn the_picker_opens_on_the_current_language_moves_within_the_list_and_closes() {
         pick(PickerOp::Down),
     ]);
     let s = Session::replay(&log);
-    assert_eq!(s.picker, Some(Picker { cursor: 2 }));
+    assert_eq!(s.picker, Some(Picker::languages(2)));
     assert_eq!(s.picked(), Some(&lang("ru")));
     log.extend([
         pick(PickerOp::Up),
@@ -2585,7 +2772,7 @@ fn the_picker_opens_on_the_current_language_moves_within_the_list_and_closes() {
         pick(PickerOp::Up),
         pick(PickerOp::Up),
     ]);
-    assert_eq!(Session::replay(&log).picker, Some(Picker { cursor: 0 }));
+    assert_eq!(Session::replay(&log).picker, Some(Picker::languages(0)));
     // Esc closes it with nothing chosen.
     log.push(pick(PickerOp::Close));
     let s = Session::replay(&log);
@@ -2598,7 +2785,7 @@ fn the_picker_opens_on_the_current_language_moves_within_the_list_and_closes() {
         target: "ru".into(),
     });
     log.push(pick(PickerOp::Open));
-    assert_eq!(Session::replay(&log).picker, Some(Picker { cursor: 2 }));
+    assert_eq!(Session::replay(&log).picker, Some(Picker::languages(2)));
 
     // With no languages listed, or with `[speak]` off, the key does nothing.
     let mut off = speak_on();
@@ -2637,6 +2824,7 @@ fn choosing_a_language_changes_the_target_closes_the_picker_and_writes_one_marke
             mode: VoiceMode::Translate,
             target: "es".into(),
             own: Some("en".into()),
+            chosen: None,
         })
     );
     let marker = s.transcript.last().unwrap();
@@ -2666,6 +2854,7 @@ fn choosing_a_language_changes_the_target_closes_the_picker_and_writes_one_marke
         mode: VoiceMode::Passthrough,
         target: "es".into(),
         own: Some("en".into()),
+        chosen: None,
     });
     let s = Session::replay(&log);
     assert_eq!(

@@ -222,8 +222,11 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     let mut detail = None;
     // #114: what `dmn-voice` carries, first and wide, so which voice the call hears is never
     // in doubt: your own (the You lane's colour), or the translation (teal; amber while a
-    // turn is in flight). Assistance on or off.
+    // turn is in flight). Assistance on or off. #130: re-voice (blue; amber in flight) names
+    // its voice, and a chosen voice other than yours is named in every mode, so it is never
+    // on by accident.
     if let Some(v) = &view.session.voice {
+        let busy = view.session.speech.is_some();
         let (text, bg) = match v.mode {
             VoiceMode::Passthrough => {
                 let own = v
@@ -231,15 +234,26 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
                     .as_ref()
                     .map(|l| format!(" ({l})"))
                     .unwrap_or_default();
-                (format!(" {VOICE_YOU}{own} "), Color::Magenta)
+                let t = v
+                    .chosen
+                    .as_ref()
+                    .map(|c| format!(", t: {c}"))
+                    .unwrap_or_default();
+                (format!(" {VOICE_YOU}{own}{t} "), Color::Magenta)
             }
             VoiceMode::Translate => {
-                let bg = if view.session.speech.is_some() {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                };
-                (format!(" {VOICE_TO} {} ", v.target), bg)
+                let bg = if busy { Color::Yellow } else { Color::Cyan };
+                let r#as = v
+                    .chosen
+                    .as_ref()
+                    .map(|c| format!(" as {c}"))
+                    .unwrap_or_default();
+                (format!(" {VOICE_TO} {}{as} ", v.target), bg)
+            }
+            VoiceMode::Revoice => {
+                let bg = if busy { Color::Yellow } else { Color::Blue };
+                let who = v.chosen.as_deref().unwrap_or(REVOICE_YOU);
+                (format!(" {REVOICE}: {who} "), bg)
             }
         };
         spans.push(Span::styled(
@@ -353,7 +367,7 @@ pub(super) fn render_status(view: &View<'_>, area: Rect, buf: &mut Buffer) {
     // #96: the keys as long as the note fits whole beside them, `⏎ ask` going first: the note
     // had those cells before the key did. `← earlier` (#94) is the next to go. A note too long
     // for any form is cut, as it always was, beside the full keys.
-    // #114: the mode key (`l translate` / `l own voice`) is added only when the whole line
+    // #114: the mode key (`l translate` / `l revoice` / `l own voice`) is added only when the whole line
     // then fits: the voice tag at the front already says the mode, and a press's seconds or a
     // dot are worth more than a hint on a narrow pane.
     let Keys { lead, forms, voice } = shortcuts(view);
@@ -497,7 +511,8 @@ fn shortcuts(view: &View<'_>) -> Keys {
     let voice = view.session.voice.as_ref().map(|v| {
         match v.mode {
             VoiceMode::Passthrough => VOICE_TRANSLATE,
-            VoiceMode::Translate => VOICE_OWN,
+            VoiceMode::Translate => VOICE_REVOICE,
+            VoiceMode::Revoice => VOICE_OWN,
         }
         .to_owned()
     });
@@ -572,8 +587,14 @@ const SPEAK: &str = "t speak";
 /// #114: `l` in pass-through mode: switch to translate mode. Offered last, and only when the
 /// line has room: the voice tag at the front says the mode.
 const VOICE_TRANSLATE: &str = "l translate";
-/// #114: `l` in translate mode: back to your own voice.
+/// #130: `l` in translate mode: on to re-voice mode.
+const VOICE_REVOICE: &str = "l revoice";
+/// #114: `l` in re-voice mode (#130; translate mode before it): back to your own voice.
 const VOICE_OWN: &str = "l own voice";
+/// #130: the voice tag in re-voice mode, followed by the voice (`revoice: pirate`).
+pub(super) const REVOICE: &str = "revoice";
+/// #130: re-voice in the user's own cloned voice.
+const REVOICE_YOU: &str = "you";
 /// #114: the voice tag in pass-through mode (`voice: you (en)` when the language is known).
 pub(super) const VOICE_YOU: &str = "voice: you";
 /// #114: the voice tag in translate mode, followed by the target (`voice: → de`).

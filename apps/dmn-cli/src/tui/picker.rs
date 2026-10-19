@@ -7,8 +7,12 @@
 //!
 //! With one language listed the picker still opens, on that one row, with a hint on how to
 //! enroll more, so the key is seen to do something.
+//!
+//! #130: the voice picker (`o`) is the same overlay over the same layout: `your voice` first,
+//! then the TTS server's other voices ([`Session::voice_rows`]), the chosen one marked. With no
+//! other voice it opens on `your voice` with a hint on how to make one.
 
-use dmn_session::Session;
+use dmn_session::{PickerList, Session, YOUR_VOICE};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,11 +33,19 @@ const CURRENT: &str = "← now";
 /// Cells between the border and the text on each side.
 const PADDING: u16 = 1;
 
+/// #130: the voice picker's title and hint.
+const VOICE_TITLE: &str = " VOICE ";
+const VOICE_HINT: &str = "no other voices yet; make one with";
+const VOICE_HINT_COMMAND: &str = "dmn speak design --name <name> --describe \"…\"";
+
 /// Draw the picker over `area` (the whole pane) when it is open; nothing otherwise.
 pub(super) fn render(session: &Session, area: Rect, buf: &mut Buffer) {
     let Some(picker) = session.picker else {
         return;
     };
+    if picker.list == PickerList::Voices {
+        return render_voices(session, picker.cursor, area, buf);
+    }
     if session.languages.is_empty() {
         return;
     }
@@ -82,7 +94,45 @@ pub(super) fn render(session: &Session, area: Rect, buf: &mut Buffer) {
         rows.push(Line::from(Span::styled(HINT_COMMAND, dim)));
     }
     rows.push(Line::from(Span::styled(KEYS, dim)));
+    draw_box(TITLE, rows, area, buf);
+}
 
+/// #130: the voice picker: `▸ your voice   ← now`, then one row per library voice.
+fn render_voices(session: &Session, cursor: usize, area: Rect, buf: &mut Buffer) {
+    let chosen = session.chosen_voice();
+    let voices = session.voice_rows();
+    let mut rows: Vec<Line<'static>> = voices
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let on_cursor = i == cursor;
+            let is_current = *row == chosen;
+            let cursor = if on_cursor { "▸ " } else { "  " };
+            let mut text = format!("{cursor}{}", row.unwrap_or(YOUR_VOICE));
+            if is_current {
+                text.push_str("   ");
+                text.push_str(CURRENT);
+            }
+            let mut style = Style::new();
+            if on_cursor {
+                style = style.fg(Color::Black).bg(Color::Cyan);
+            } else if is_current {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+    let dim = Style::new().fg(Color::DarkGray);
+    if voices.len() == 1 {
+        rows.push(Line::from(Span::styled(VOICE_HINT, dim)));
+        rows.push(Line::from(Span::styled(VOICE_HINT_COMMAND, dim)));
+    }
+    rows.push(Line::from(Span::styled(KEYS, dim)));
+    draw_box(VOICE_TITLE, rows, area, buf);
+}
+
+/// The overlay's box around `rows`, centred over `area`.
+fn draw_box(title: &'static str, rows: Vec<Line<'static>>, area: Rect, buf: &mut Buffer) {
     // Size the box to its longest row (plus border and padding), never wider or taller than
     // the pane; a row that does not fit is cut with `…` rather than wrapped.
     let inner_cells = rows.iter().map(Line::width).max().unwrap_or(0);
@@ -92,7 +142,7 @@ pub(super) fn render(session: &Session, area: Rect, buf: &mut Buffer) {
     let want_h = u16::try_from(rows.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
-    let w = want_w.min(area.width).max(width(TITLE) as u16 + 2);
+    let w = want_w.min(area.width).max(width(title) as u16 + 2);
     let h = want_h.min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
@@ -100,7 +150,7 @@ pub(super) fn render(session: &Session, area: Rect, buf: &mut Buffer) {
     Clear.render(boxed, buf);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(TITLE)
+        .title(title)
         .title_alignment(Alignment::Left)
         .border_style(Style::new().fg(Color::Cyan));
     let inner = block.inner(boxed);

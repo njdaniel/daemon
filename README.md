@@ -91,8 +91,9 @@ Keys in `dmn run`:
 | `s` | Coding solutions: hints ↔ full |
 | `m` | Mute or unmute your microphone |
 | `t` | With `[speak]` on: translate what you last said into `[speak].target` and speak it in your cloned voice into `dmn-voice` (below, § Speak) |
-| `l` | With `[speak]` on: switch `dmn-voice` between your own voice, live (the default), and translate mode, where every sentence you finish goes out translated (#114, below) |
+| `l` | With `[speak]` on: cycle what `dmn-voice` carries: your own voice, live (the default) → translate mode, where every sentence you finish goes out translated (#114) → re-voice mode, where it goes out as said in the chosen voice (#130, below) |
 | `v` | With `[speak]` on: open the language picker over the screen; `↑` `↓` move, Enter makes that language (and its voice) the one the next sentence goes out in and saves it to the config, Esc closes (#115, below) |
+| `o` | With `[speak]` on: open the voice picker, `your voice` first and then the TTS server's other voices; the same keys, Enter makes that voice speak from the next sentence on and saves it as `[speak].voice` (#130, below) |
 | Ctrl+Shift+A | Interview assistance on ↔ off |
 | `q`, Esc, Ctrl+C | Quit (Esc closes the picker first while it is open) |
 
@@ -111,7 +112,9 @@ dmn run --replay THEM.wav YOU.wav [--headless]
 dmn replay THEM.wav YOU.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
 dmn sessions list | export ID | purge ID|all
-dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server; --language adds it to [speak].languages
+dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server; --language adds it to [speak].languages; --name alone, a library voice
+dmn speak voices                          # the TTS server's voices: designed or enrolled, yours, [speak].voice
+dmn speak design --name N --describe "TEXT" [--line T] [--language de] [--out F.wav] [--yes]   # make a voice from a description (Qwen3-TTS VoiceDesign)
 dmn speak "TEXT"                          # speak TEXT in your cloned voice into the virtual mic dmn-voice
 dmn speak "TEXT" --out FILE.wav           # or write it to a WAV file instead
 ```
@@ -578,6 +581,67 @@ the device. To give it less or more of the GPU, set `TALKER_GPU` (default 0.2) a
 compose up`; `QWEN3_TTS_PORT` moves the port. Chatterbox keeps working with `engine =
 "chatterbox"` and its own `tts_url`; the two servers can run side by side (about 11 GB together),
 but not beside the 35B answer model.
+
+**More voices: make one from a description, pick it with `o`, and re-voice your own words
+(#130).** Your own voice stays the default, and nothing below changes it. Other voices live in the
+TTS server's library beside yours:
+
+```bash
+dmn speak voices                                  # the library: name, designed or enrolled, yours
+dmn speak enroll --wav ~/gran.wav --name gran     # a library voice from a clip; voice_ref and languages untouched
+dmn speak design --name pirate --describe "grumpy old pirate, gravelly, slow"
+```
+
+`enroll --name` without `--language` adds a library voice (unless the name is already one of
+yours, which re-enrolls it): the clip is uploaded and kept under `~/.local/share/dmn/` like any
+other, and your config is not touched. Enroll only your own voice or that of someone who agreed;
+the server stores a consent tag with each clip (`dmn-self`, `dmn-consented`, `dmn-designed`), and
+`dmn speak voices` shows which voices were designed.
+
+**`dmn speak design`** makes a voice from words, with Qwen3-TTS's VoiceDesign model, the way
+Qwen recommends: render one sample line in the described voice, then clone that sample into the
+Base server you already run, so every later sentence sounds the same. It needs `engine = "qwen3"`.
+It starts the sidecar's second service (`qwen3-tts-design`, compose profile `design`, on
+127.0.0.1:4125, `[speak].design_url`), plays the sample on your speakers (or writes it to
+`--out <file>`), asks `keep "pirate"? [y/N]` (`--yes` skips the question), enrolls it as `pirate`,
+and stops the design service again. `--line "<text>"` sets what the sample says (the default is
+about ten seconds of English; the clone needs 6–30 s), and `--language <code>` its language. The
+first run downloads the VoiceDesign model (another ~4.3 GB) into the same cache volume; doctor
+says whether it is there. Before starting, it checks the GPU's free memory: the service took
+6.6 GB at its peak on the 4090 (`DESIGN_TALKER_GPU` 0.19 and `DESIGN_DECODER_GPU` 0.07 of the card,
+in `sidecars/qwen3-tts/compose.yaml`), so it wants 6600 MiB free. With less, it stops and lists
+what holds the GPU, by process and container (a Chatterbox container you no longer use, say); it
+never stops anything itself. Measured 2026-10-19 beside a running `dmn run`, Chatterbox and the
+Base sidecar: ready about a minute after the start, a 13 s sample rendered in 3.0 s, 78 s for the
+whole command. If the service exits while starting (too small a share of the GPU, say), the
+command says vLLM's reason at once.
+
+**`o` in `dmn run`** opens the voice picker: the same box and keys as `v`, with `your voice`
+first and then the server's other voices. The choice speaks from the next sentence on (one
+already playing finishes in its voice), writes a dim marker row (`— voice: pirate —`), and is saved
+as `[speak].voice`; choosing `your voice` comments that line out. While another voice is chosen,
+the status tag names it: `voice: → de as pirate` in translate mode, `voice: you (en), t: pirate`
+in pass-through mode (where `t` speaks in it). Under Qwen3-TTS the one chosen voice speaks every
+language. Under Chatterbox (one language per voice) the picker offers only the voices enrolled
+for the current language, and a `v` to a language the chosen voice cannot speak falls back to
+that language's own voice with a 5 s notice (`pirate speaks en: de in your voice`).
+
+**Re-voice mode** speaks your own words in the chosen voice: `l` now cycles your own voice →
+translate → re-voice, and `[speak].mode = "revoice"` starts in it. As in translate mode your
+microphone is shut off from the call, and each sentence you finish goes to the TTS server, but as
+you said it, word for word, in the language you said it in (whisper's detected language, else
+`[stt].language`, else the model's own guess): no translation, no model asked anything, so the
+wait after whisper's final is the TTS server's alone (0.17 s to the first sound with Qwen3-TTS,
+measured for #122).
+The tag reads `revoice: pirate` (blue, amber while a sentence is spoken), and the transcript marks
+those lines `You → pirate`, with nothing under them, since the call heard what you said.
+
+```toml
+[speak]
+voice = "pirate"                      # a library voice in place of yours; `o` sets and clears it
+mode = "revoice"                      # passthrough | translate | revoice; `l` cycles
+# design_url = "http://localhost:4125"   # the default, for `dmn speak design`; this machine only
+```
 
 With `[stt].language = "auto"` (or a code, for an interview in another language), whisper
 translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it

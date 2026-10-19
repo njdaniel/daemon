@@ -30,9 +30,10 @@
 //!   [{"name", ...}]}`; only uploaded voices are the user's, and a name missing there is refused
 //!   before any speech is asked for. The server matches names case-insensitively.
 //! - Enrollment: `POST /v1/audio/voices`, `multipart/form-data` with `name`, `consent` (an id
-//!   the server stores with the clip) and `audio_sample` (1–30 s, at most 10 MB). A voice of
-//!   that name is deleted first (`DELETE /v1/audio/voices/{name}`), so a re-enrollment replaces
-//!   it whatever the server's registration policy.
+//!   the server stores with the clip, and lists back with it: #130's [`Consent`] says whose
+//!   voice it is) and `audio_sample` (1–30 s, at most 10 MB). A voice of that name is deleted
+//!   first (`DELETE /v1/audio/voices/{name}`), so a re-enrollment replaces it whatever the
+//!   server's registration policy.
 //! - Errors: OpenAI's `{"error": {"message"}}`.
 //!
 //! Each sentence is its own request, as for Chatterbox: the measurement asked one sentence at
@@ -49,7 +50,7 @@ use crate::http::{
     Job, blocking_client, check_voice_name_chars, file_stem, list_voices, multipart_form,
     path_segment, read_body, status_error, unreachable,
 };
-use crate::provider::{Enrolled, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
+use crate::provider::{Consent, Enrolled, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
 use crate::sentences::sentences;
 
 const NAME: &str = "qwen3";
@@ -57,8 +58,6 @@ const NAME: &str = "qwen3";
 pub const QWEN3_MODEL: &str = "Qwen/Qwen3-TTS-12Hz-1.7B-Base";
 const SPEECH: &str = "/v1/audio/speech";
 const VOICES: &str = "/v1/audio/voices";
-/// The consent id the server stores with an uploaded clip: the user enrolls their own voice.
-const CONSENT: &str = "dmn-self";
 /// Codec frames in the first streamed chunk (module doc: 0.8 s of audio, the first sound at
 /// ~0.15 s).
 pub(crate) const FIRST_CHUNK_FRAMES: u32 = 10;
@@ -77,7 +76,7 @@ pub const QWEN3_LANGUAGES: [(&str, &str); 10] = [
     ("es", "Spanish"),
     ("it", "Italian"),
 ];
-const CODES: [&str; 10] = ["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"];
+pub(crate) const CODES: [&str; 10] = ["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"];
 
 /// The model's name for `code`; `None` for a language it does not speak.
 pub fn qwen3_language(code: &str) -> Option<&'static str> {
@@ -113,8 +112,8 @@ fn voice_list(body: &[u8]) -> Option<Vec<Voice>> {
     Some(
         entries
             .iter()
-            .filter_map(|e| e.get("name")?.as_str())
-            .map(|name| {
+            .filter_map(|e| Some((e.get("name")?.as_str()?, e)))
+            .map(|(name, entry)| {
                 let lower = name.to_lowercase();
                 Voice {
                     name: name.to_owned(),
@@ -124,6 +123,10 @@ fn voice_list(body: &[u8]) -> Option<Vec<Voice>> {
                         vec![lower]
                     },
                     language: None,
+                    consent: entry
+                        .get("consent")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_owned),
                 }
             })
             .collect(),
@@ -180,7 +183,12 @@ impl Qwen3Provider {
 }
 
 /// The blocking half of [`Qwen3Provider::enroll`].
-fn enroll_job(base: &str, name: &str, clip: Vec<u8>) -> Result<Enrolled, TtsError> {
+fn enroll_job(
+    base: &str,
+    name: &str,
+    clip: Vec<u8>,
+    consent: Consent,
+) -> Result<Enrolled, TtsError> {
     let url = format!("{base}{VOICES}");
     let client = blocking_client(&url)?;
     let lower = name.to_lowercase();
@@ -200,7 +208,7 @@ fn enroll_job(base: &str, name: &str, clip: Vec<u8>) -> Result<Enrolled, TtsErro
     }
     let file_name = format!("{}.wav", file_stem(name));
     let (content_type, form) = multipart_form(
-        &[("name", name), ("consent", CONSENT)],
+        &[("name", name), ("consent", consent.as_str())],
         ("audio_sample", &file_name),
         &clip,
     );
@@ -260,6 +268,16 @@ impl TtsProvider for Qwen3Provider {
         wav: &'a Path,
         language: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Enrolled, TtsError>> {
+        self.enroll_as(name, wav, language, Consent::Own)
+    }
+
+    fn enroll_as<'a>(
+        &'a self,
+        name: &'a str,
+        wav: &'a Path,
+        language: Option<&'a str>,
+        consent: Consent,
+    ) -> BoxFuture<'a, Result<Enrolled, TtsError>> {
         Box::pin(async move {
             check_voice_name_chars(name)?;
             if let Some(code) = language {
@@ -270,7 +288,7 @@ impl TtsProvider for Qwen3Provider {
                 detail: e.to_string(),
             })?;
             let (base, name) = (self.base_url.clone(), name.to_owned());
-            tokio::task::spawn_blocking(move || enroll_job(&base, &name, clip))
+            tokio::task::spawn_blocking(move || enroll_job(&base, &name, clip, consent))
                 .await
                 .map_err(|e| TtsError::Worker(format!("enroll task join: {e}")))?
         })
@@ -478,6 +496,9 @@ mod tests {
         assert_eq!(voices[0].name, "voice");
         assert!(voices.iter().all(|v| v.language.is_none()));
         assert!(voices[1].answers_to("voice-ru"));
+        // #130: the consent id comes back with each voice.
+        assert_eq!(voices[0].consent.as_deref(), Some("dmn-self"));
+        assert!(!voices[0].designed());
         assert!(p.cross_lingual());
         let langs = p.languages().unwrap();
         assert!(["zh", "ru", "de"].iter().all(|c| langs.contains(c)));
@@ -529,6 +550,42 @@ mod tests {
         assert!(!text.contains("language"), "{text}");
         assert!(!text.contains("ref_text"), "x-vector mode: no transcript");
         assert!(body.windows(bytes.len()).any(|w| w == bytes));
+    }
+
+    /// #130: a designed voice is stored with `dmn-designed`, a library clip with
+    /// `dmn-consented`, and the listing says which is which.
+    #[tokio::test]
+    async fn a_designed_voice_is_enrolled_and_listed_with_its_consent_tag() {
+        let server = serve(vec![
+            uploaded(&[]),
+            Reply::json(r#"{"success":true,"voice":{"name":"pirate"}}"#),
+            Reply::json(
+                r#"{"voices":[],"uploaded_voices":[{"name":"voice","consent":"dmn-self"},{"name":"pirate","consent":"dmn-designed"},{"name":"gran","consent":"dmn-consented"}]}"#,
+            ),
+        ])
+        .unwrap();
+        let (_dir, path, _) = clip();
+        let p = Qwen3Provider::new(&server.url);
+        p.enroll_as("pirate", &path, None, Consent::Designed)
+            .await
+            .unwrap();
+        let requests = server.requests();
+        let (_, body) = MockServer::head_and_body(&requests[1]);
+        let text = String::from_utf8_lossy(body);
+        assert!(
+            text.contains("name=\"consent\"\r\n\r\ndmn-designed\r\n"),
+            "{text}"
+        );
+        let voices = p.voices().await.unwrap().unwrap();
+        let designed: Vec<(&str, bool)> = voices
+            .iter()
+            .map(|v| (v.name.as_str(), v.designed()))
+            .collect();
+        assert_eq!(
+            designed,
+            [("voice", false), ("pirate", true), ("gran", false)]
+        );
+        assert_eq!(Consent::Speaker.as_str(), "dmn-consented");
     }
 
     #[tokio::test]

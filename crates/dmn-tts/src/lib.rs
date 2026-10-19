@@ -18,7 +18,9 @@
 //! one language per voice); [`Qwen3Provider`] to Qwen3-TTS on vLLM-Omni (`sidecars/qwen3-tts/`:
 //! streamed, first audio in under 0.1 s, one voice for every language it speaks). Each module
 //! doc lists its server's requests; `http.rs` holds what they share. [`MockTtsProvider`]
-//! replays a generated sine WAV so tests need no live server.
+//! replays a generated sine WAV so tests need no live server. #130: [`Qwen3Designer`] renders
+//! a sample in a voice described in words (Qwen3-TTS VoiceDesign, `design.rs`), which is then
+//! enrolled like any clip ([`TtsProvider::enroll_as`], [`Consent::Designed`]).
 //!
 //! **Trait shape.** [`TtsProvider::synthesize`] and [`TtsProvider::enroll`] are plain `fn`s
 //! returning [`BoxFuture`]s, mirroring `dmn-llm`'s `Provider`: no `async fn` in the trait and
@@ -32,6 +34,7 @@
 
 mod chatterbox;
 mod decode;
+mod design;
 mod http;
 mod mock;
 mod provider;
@@ -42,9 +45,10 @@ mod tail;
 pub mod testserver;
 
 pub use chatterbox::ChatterboxProvider;
+pub use design::{DesignRequest, Designed, QWEN3_DESIGN_MODEL, Qwen3Designer};
 pub use futures_util::future::BoxFuture;
 pub use mock::{MockEnrollment, MockTtsProvider};
 pub use provider::{
-    Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Tuning, Voice,
+    Consent, Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Tuning, Voice,
 };
 pub use qwen3::{QWEN3_LANGUAGES, QWEN3_MODEL, Qwen3Provider, qwen3_language};

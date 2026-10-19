@@ -1,0 +1,24 @@
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────
+
+
+
+
+
+Them      Let's move on. Tell me about the team you worked with on the payments
+          migration.
+You       There were five of us: two backend engineers, a data engineer, a
+          produ┌ VOICE ────────────────────────────────────────┐
+Them      How l│ ▸ your voice   ← now                          │
+You       About│ no other voices yet; make one with            │oth systems side
+          by si│ dmn speak design --name <name> --describe "…" │
+Them      And d│ ↑↓ move · ⏎ choose · esc close                │
+You       One b└───────────────────────────────────────────────┘ paused it and
+          replayed its writes.
+Them      Good. Let's talk about how you would test that.
+Them      And what about the▍
+— translate mode on: → de —
+You → de  I'd start with a token bucket per API key and keep the counters in
+          regional Redis.
+          » Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und die
+          Zähler in einem regionalen Redis halten.
+ voice: → de  ● mic  ● system  ● model  es→en   assist off · C-S-a on · t speak

@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::draw;
 
-const STATES: [&str; 44] = [
+const STATES: [&str; 47] = [
     "listening",
     "live",
     "pinned",
@@ -90,6 +90,12 @@ const STATES: [&str; 44] = [
     "picker-closed",
     "picker",
     "picker-one",
+    // #130: `o` over translate mode, the cursor moved to the first library voice; `o` with no
+    // other voice, on the transcript-first screen, with the hint to make one; and re-voice
+    // mode in the pirate's voice, one turn gone out as `You → pirate` and the next in flight.
+    "voice-picker",
+    "voice-picker-one",
+    "revoice",
 ];
 const SIZES: [(u16, u16); 2] = [(100, 30), (80, 24)];
 /// #88: the side-column layout, from 120 columns, on a pane wide enough to read it.
@@ -951,6 +957,51 @@ fn actions(state: &str) -> Vec<Action> {
             a.push(Action::Picker { op: PickerOp::Open });
             return a;
         }
+        // #130: the server's voices listed; `o`, then `↓`: the cursor on `pirate`, `your
+        // voice` marked as the current one.
+        "voice-picker" => {
+            let mut a = actions("voice-translate");
+            a.push(Action::SpeakVoices {
+                voices: vec!["pirate".into(), "robot".into()],
+            });
+            a.push(Action::Picker {
+                op: PickerOp::OpenVoices,
+            });
+            a.push(Action::Picker { op: PickerOp::Down });
+            return a;
+        }
+        "voice-picker-one" => {
+            let mut a = actions("voice-translate-assist-off");
+            a.push(Action::Picker {
+                op: PickerOp::OpenVoices,
+            });
+            return a;
+        }
+        // #130: `o` chose the pirate, `l` twice made it re-voice mode; a turn went out as
+        // said (`You → pirate`, nothing under it) and the next is in flight.
+        "revoice" => {
+            a.push(Action::SpeakEnabled { enabled: true });
+            a.push(voice(VoiceMode::Passthrough));
+            a.extend(rate_limiter());
+            a.push(seg(Speaker::You, 31.0, 36.5, YOUR_ANSWER, true));
+            a.push(Action::SpeakVoices {
+                voices: vec!["pirate".into()],
+            });
+            a.push(Action::SpeakVoice {
+                voice: Some("pirate".into()),
+            });
+            a.push(voice(VoiceMode::Translate));
+            a.push(voice(VoiceMode::Revoice));
+            a.extend(spoken_turn(1, 40.0, 44.0, YOUR_FAILOVER, YOUR_FAILOVER));
+            a.push(seg(Speaker::You, 46.0, 48.0, YOUR_SHARDING, true));
+            a.push(Action::SpeakStarted { id: 2 });
+            a.push(Action::SpeakTurn {
+                id: 2,
+                from: 46.0,
+                to: 48.0,
+            });
+            a.push(Action::SpeakElapsed { id: 2, secs: 1 });
+        }
         "long-items" => {
             a.extend(long_items());
             a.push(Action::ToggleSection {
@@ -996,6 +1047,7 @@ fn voice(mode: VoiceMode) -> Action {
         mode,
         target: "de".into(),
         own: Some("en".into()),
+        chosen: None,
     }
 }
 
@@ -1862,7 +1914,8 @@ fn tui_the_voice_tag_leads_the_status_line_and_the_transcript_marks_what_went_ou
         let row = screen.lines().nth(last).unwrap().to_owned();
         assert!(row.starts_with(" voice: → de "), "{row}");
         assert_eq!(buf[(1, last as u16)].bg, Color::Cyan);
-        assert_eq!(row.ends_with("t speak · l own voice"), wide, "{row}");
+        // #130: from translate mode `l` goes on to re-voice.
+        assert_eq!(row.ends_with("t speak · l revoice"), wide, "{row}");
         let (x, y) = row_containing(&buf, "— translate mode on: → de —");
         assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the marker is dim");
         assert!(screen.contains("You → de"), "{screen}");
@@ -1962,6 +2015,104 @@ fn tui_the_picker_lists_the_languages_over_an_unchanged_layout_and_a_choice_upda
         "spoken in the language it started in:\n{screen}"
     );
     assert!(!screen.contains("You → es"), "{screen}");
+}
+
+/// #130: the voice picker is the same centred box over the unchanged layout: `your voice`
+/// first, then the server's voices, the cursor row highlighted and the current voice marked;
+/// with no other voice the hint says how to make one. A choice names the voice on the tag, and
+/// re-voice mode has its own tag and marks its lines `You → pirate` with nothing under them.
+#[test]
+fn tui_the_voice_picker_lists_your_voice_first_and_the_tag_names_a_chosen_voice() {
+    for size in SIZES {
+        let buf = render(&load("voice-picker"), size);
+        let screen = text(&buf);
+        let (x, y) = row_containing(&buf, "VOICE ");
+        assert!(x > 20 && y > 5, "centred: ({x}, {y})\n{screen}");
+        assert!(screen.contains("  your voice   ← now"), "{screen}");
+        assert!(screen.contains("▸ pirate"), "{screen}");
+        assert!(screen.contains("  robot"), "{screen}");
+        assert!(
+            screen.contains("↑↓ move · ⏎ choose · esc close"),
+            "{screen}"
+        );
+        assert!(!screen.contains("LANGUAGE"), "{screen}");
+        let (x, y) = row_containing(&buf, "▸ pirate");
+        assert_eq!(
+            (buf[(x, y)].bg, buf[(x, y)].fg),
+            (Color::Cyan, Color::Black)
+        );
+        let last = usize::from(size.1) - 1;
+        assert!(
+            screen
+                .lines()
+                .nth(last)
+                .unwrap()
+                .starts_with(" voice: → de "),
+            "{screen}"
+        );
+        assert!(screen.contains("LIVE QUESTION"), "{screen}");
+
+        let buf = render(&load("voice-picker-one"), size);
+        let screen = text(&buf);
+        assert!(screen.contains("▸ your voice   ← now"), "{screen}");
+        assert!(
+            screen.contains("no other voices yet; make one with"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("dmn speak design --name <name>"),
+            "{screen}"
+        );
+        let (x, y) = row_containing(&buf, "no other voices yet");
+        assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the hint is dim");
+
+        // Re-voice: its own tag, amber while a turn is in flight; the line marked with the
+        // voice and no translation under it.
+        let buf = render(&load("revoice"), size);
+        let screen = text(&buf);
+        let row = screen.lines().nth(last).unwrap();
+        assert!(row.starts_with(" revoice: pirate "), "{row}");
+        let (x, y) = row_containing(&buf, "revoice: pirate");
+        assert_eq!(buf[(x, y)].bg, Color::Yellow, "in flight");
+        assert!(screen.contains("You → pirate"), "{screen}");
+        assert!(
+            !screen.contains("» If Redis"),
+            "nothing under it:\n{screen}"
+        );
+    }
+    // Enter on the pirate: the overlay closes, the marker row is written, and translate mode's
+    // tag names the voice.
+    let mut chosen = actions("voice-picker");
+    chosen.push(Action::SpeakVoice {
+        voice: Some("pirate".into()),
+    });
+    let session = Session::replay(&chosen);
+    assert_eq!(session.picker, None);
+    let buf = render(&session, (100, 30));
+    let screen = text(&buf);
+    assert!(!screen.contains("VOICE "), "{screen}");
+    assert!(
+        screen
+            .lines()
+            .nth(29)
+            .unwrap()
+            .starts_with(" voice: → de as pirate "),
+        "{screen}"
+    );
+    let (x, y) = row_containing(&buf, "— voice: pirate —");
+    assert_eq!(buf[(x, y)].fg, Color::DarkGray, "the marker is dim");
+    // Your own voice live, with a chosen voice for `t`: the tag says so.
+    let mut own = actions("voice-you");
+    own.push(Action::SpeakVoice {
+        voice: Some("pirate".into()),
+    });
+    let last = status_line(&Session::replay(&own), (100, 30));
+    assert!(last.starts_with(" voice: you (en), t: pirate "), "{last}");
+    // In re-voice mode `l` is offered as the way back to your own voice.
+    let revoice = status_line(&load("revoice"), (140, 30));
+    assert!(revoice.contains("l own voice"), "{revoice}");
+    let translate = status_line(&load("voice-translate"), (140, 30));
+    assert!(translate.contains("l revoice"), "{translate}");
 }
 
 /// #109: `t speak` is offered while `[speak]` is on, assistance on or off, and never otherwise;

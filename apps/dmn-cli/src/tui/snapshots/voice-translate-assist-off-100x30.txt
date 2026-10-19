@@ -27,4 +27,4 @@ Them      And what about the▍
 You → de  I'd start with a token bucket per API key and keep the counters in regional Redis.
           » Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und die Zähler in einem
           regionalen Redis halten.
- voice: → de  ● mic  ● system  ● model  es→en         assist off · C-S-a on · t speak · l own voice
+ voice: → de  ● mic  ● system  ● model  es→en           assist off · C-S-a on · t speak · l revoice
