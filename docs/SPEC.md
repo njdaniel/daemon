@@ -120,6 +120,7 @@ stream.capture.sink=true                                   # only for the sink-m
 - Mic: `target.object` = the chosen `Audio/Source` node (default: PipeWire's default source, resolved from the metadata object).
 - Them: `target.object` = the chosen app's `Stream/Output/Audio` node, so only that app's audio is captured, not the user's own music or notifications. Fallback when no app stream is selected or found: the default sink with `stream.capture.sink=true`, and a visible "capturing all system audio" badge.
 - If the app stream disappears (call ends, app restarts), the registry's global-removed event marks the Them source `disconnected`; the mic keeps running; when a stream with the same `application.name` reappears, a new capture stream is connected automatically.
+- Lane time (#132): a lane's times are its count of 20 ms frames, so replay and live agree, but a capture linked to an app's stream gets no frames while that stream is paused or closed (a browser between videos, a call app before the call), which put the Them lane behind the mic (~1,000 s in an hour of YouTube on 2026-10-21) and pruned each of its finals from the 60 s transcript on arrival. On a live run both lanes share the instant audio time 0 is (`audio_zero`, as `AudioClock` does); a lane with no frame for 0.5 s that is more than 0.5 s behind the wall clock counts the gap as silence and jumps to it (an open utterance closes as on real silence). Frames that keep arriving are never moved, so the mic keeps sample-exact time; replay lanes have no clock.
 
 **Speaker attribution**
 

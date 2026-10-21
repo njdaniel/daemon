@@ -79,7 +79,8 @@ use dmn_stt::{
 };
 use dmn_transcript::{Bus, DEFAULT_WINDOW, EchoGuard, Segment, TranscriptLog, Verdict};
 use dmn_vad::{
-    EnergyVad, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats, event_channel,
+    EnergyVad, LaneClock, SileroVad, SileroVadConfig, Vad, VadConfig, VadWorker, WorkerStats,
+    event_channel,
 };
 use tokio::sync::watch;
 
@@ -1188,8 +1189,13 @@ impl Pipeline {
         // → Approach path, so when the GPU has room for only one whisper context it gets it,
         // and the candidate's lane falls back to the CPU. `live_sources` lists the mic first, so
         // the order is enforced here for every input.
+        // #132: the live lanes share one clock, started below with `audio_zero`, so a lane
+        // whose app stream sends nothing for a while (a paused video, a muted call) keeps the
+        // same timeline as the mic. A WAV lane's time is its frame count.
+        let lane_clock = LaneClock::new();
         let mut built = Vec::new();
         for (source, audio) in them_first(sources) {
+            let clock = matches!(audio, Audio::Live { .. }).then(|| lane_clock.clone());
             let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));
             let ring = match &audio {
                 Audio::Wav(w) => ring_frames(w.duration(), speed),
@@ -1210,11 +1216,13 @@ impl Pipeline {
                 partials,
                 &bus,
                 gate,
+                clock,
             )?);
         }
         let placements: Vec<Placement> = built.iter().map(|(_, _, p)| p.clone()).collect();
         let stt_device = placement_summary(&placements);
         let audio_zero = Instant::now();
+        lane_clock.start(audio_zero);
         let mut lanes = Vec::new();
         for (mut lane, sink, _) in built {
             lane.audio.start(sink)?;
@@ -2457,6 +2465,7 @@ fn build_lane(
     partials: bool,
     bus: &Arc<Bus>,
     mute: Option<Arc<AtomicBool>>,
+    clock: Option<LaneClock>,
 ) -> Result<(Lane, FrameSink, Placement), Box<dyn Error>> {
     let (sink, frames) = dmn_audio::frame_channel(source, ring);
     let (tx, rx) = event_channel(EVENT_CAPACITY);
@@ -2487,7 +2496,10 @@ fn build_lane(
         Some(muted) => Box::new(Gated { inner, muted }),
         None => inner,
     };
-    let vad = VadWorker::spawn_with(frames, vad, &vad_cfg.segmenter, tx)?;
+    let vad = match clock {
+        Some(clock) => VadWorker::spawn_live(frames, vad, &vad_cfg.segmenter, tx, clock)?,
+        None => VadWorker::spawn_with(frames, vad, &vad_cfg.segmenter, tx)?,
+    };
     Ok((
         Lane {
             source,
