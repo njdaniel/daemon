@@ -235,6 +235,22 @@ impl Segmenter {
         }
     }
 
+    /// #132: the stream went quiet with no frames (an app stream paused or closed) until `to`:
+    /// advance to `to` as if the gap were silence. An open utterance hears silence frames until
+    /// it closes, so it ends exactly as on real silence; then the position jumps and the
+    /// pre-roll is emptied, since it holds audio from before the gap. Earlier than the position:
+    /// nothing.
+    pub fn skip_to(&mut self, to: Duration, out: &mut Vec<VadEvent>) {
+        let target = frames(to);
+        while self.open.is_some() && self.n < target {
+            self.push(&[0.0; FRAME_LEN], false, out);
+        }
+        if self.n < target {
+            self.n = target;
+            self.recent.clear();
+        }
+    }
+
     /// Emit a [`VadEvent::Partial`] if one is due for the open utterance. Called with `self.n`
     /// still pointing at the frame just pushed, so the partial covers `[start, n+1)`.
     fn emit_partial(&mut self, out: &mut Vec<VadEvent>) {
@@ -387,6 +403,57 @@ mod tests {
         assert_eq!(u[0].closed_by, CloseReason::MaxLength);
         assert_eq!((u[1].start, u[1].end), (ms(12_000), ms(20_000)));
         assert_eq!(u[1].closed_by, CloseReason::Silence);
+    }
+
+    #[test]
+    fn skip_to_closes_an_open_utterance_as_silence_and_moves_the_position() {
+        let mut seg = Segmenter::new(Source::Them, &SegmenterConfig::default());
+        let mut out = Vec::new();
+        for _ in 0..50 {
+            seg.push(&LOUD, true, &mut out); // 0–1 s speech
+        }
+        seg.skip_to(ms(600_000), &mut out); // then nothing for ten minutes
+        assert_eq!(seg.position(), ms(600_000));
+        assert!(!seg.in_utterance());
+        let u = utterances(&out);
+        assert_eq!(u.len(), 1);
+        assert_eq!((u[0].start, u[0].end), (ms(0), ms(1000)));
+        assert_eq!(
+            u[0].closed_by,
+            CloseReason::Silence,
+            "as real silence would"
+        );
+        // 200 ms pre-roll (none here: speech from frame 0) + 1 s speech + 100 ms tail.
+        assert_eq!(u[0].samples.len(), 16 * 1100);
+
+        // The next onset is stamped at the new position, with no audio from before the gap.
+        out.clear();
+        for _ in 0..50 {
+            seg.push(&LOUD, true, &mut out);
+        }
+        seg.flush(&mut out);
+        let u = utterances(&out);
+        assert_eq!((u[0].start, u[0].end), (ms(600_000), ms(601_000)));
+        assert_eq!(u[0].pre_roll, ms(0));
+    }
+
+    #[test]
+    fn skip_to_a_time_already_passed_or_too_short_to_close_changes_nothing_it_should_not() {
+        let mut seg = Segmenter::new(Source::Them, &SegmenterConfig::default());
+        let mut out = Vec::new();
+        for _ in 0..100 {
+            seg.push(&QUIET, false, &mut out);
+        }
+        seg.skip_to(ms(1000), &mut out);
+        assert_eq!(seg.position(), ms(2000), "never backwards");
+        for _ in 0..20 {
+            seg.push(&LOUD, true, &mut out);
+        }
+        // 200 ms of gap: silence inside the utterance, not a close.
+        seg.skip_to(ms(2600), &mut out);
+        assert_eq!(seg.position(), ms(2600));
+        assert!(seg.in_utterance());
+        assert!(utterances(&out).is_empty());
     }
 
     #[test]
