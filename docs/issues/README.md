@@ -30,4 +30,6 @@ Proposed 2026-10-18 by the owner, since dmn now runs on ordinary calls (translat
 
 Proposed 2026-10-18 by the owner ("different voices … a girls voice, and funny impressions"; "I dont want to lose my own voice"): #130 (speak: `o` in `dmn run` picks the voice, your own first and the default, saved as `[speak].voice`; `dmn speak design --name <n> --describe "<traits>"` makes a voice with Qwen3-TTS VoiceDesign, a sidecar service started only for that, and enrolls the sample into the Base model, so calls need no extra VRAM; a `revoice` voice mode speaks your own words, untranslated, in the chosen voice; L, with a three-way split if one run cannot finish it).
 
+Reported 2026-10-21 from a live test capturing a browser ("when i playing youtube, the input was going on top.. and then didnt stay"): #132 (audio: a live lane's time stopped whenever its app stream sent nothing, so the Them lane fell ~1,000 s behind the mic and each final was pruned from the 60 s transcript on arrival; a live lane's clock now jumps to the wall clock after 0.5 s with no frames, as if the gap were silence).
+
 Created on GitHub only, with no file here: #34 (replay `--speed`), #39 (whisper `no_context`), #50 (coding-solutions switch), and the process issues #44, #45, #46, which carry the `backlog` label.
