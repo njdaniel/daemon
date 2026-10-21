@@ -2,8 +2,9 @@
 # just review <pr> [--post] [--via agy|claude] [--model <id>] [--no-copilot] [--copilot-wait <s>] [--max-prompt-bytes <n>] [--prompt-only]
 # One review per PR (docs/PROCESS.md § 5): a fresh session of the reviewer gets the diff, the issue,
 # docs/SPEC.md and the prompt below, and this exits 0 only on "BLOCKING: 0 findings".
-# --via agy (the default) runs the prompt through the agy CLI: Gemini 3.1 Pro, a different model
-# family from every author model, no Claude usage. --via claude uses the reviewer from the size table.
+# --via agy (the default) runs the prompt through the agy CLI: Claude Opus 4.6 (Thinking), agy's
+# strongest reviewer since Gemini 3.1 Pro left it (2026-10-21), on agy's quota, not Claude Code's.
+# --via claude uses the reviewer from the size table.
 # GitHub Copilot reviews PRs on its own schedule and nothing here waits for it: if its review exists
 # when this runs, every finding goes into the prompt to be triaged VALID / FIXED / FALSE; if not,
 # the review proceeds without it and the prompt says so. --copilot-wait <s> waits that long first;
@@ -41,7 +42,7 @@ n=$(jq -r .body <<<"$prj" | grep -oiE 'closes #[0-9]+' | head -1 | grep -oE '[0-
 read -r _ _ _ reviewer <<<"$(size_row "$size")"
 case "$via" in
   claude) need claude; model=$(model_id "$(tr '[:upper:]' '[:lower:]' <<<"$reviewer" | grep -oE 'sonnet|opus|fable' | head -1)") ;;
-  agy)    need agy; model="gemini-3.1-pro-high" ;;
+  agy)    need agy; model="claude-opus-4-6-thinking" ;;
   *) die "unknown reviewer backend '$via' (agy|claude)" ;;
 esac
 [ -n "$model_override" ] && model="$model_override"

@@ -92,7 +92,7 @@ eval:
 agent +args:
     scripts/agent.sh {{args}}
 
-# Review a PR at once: Gemini via agy, Copilot findings triaged when present but never waited for; --via claude, --post
+# Review a PR at once: Opus via agy, Copilot findings triaged when present but never waited for; --via claude, --post
 review +args:
     scripts/review.sh {{args}}
 
