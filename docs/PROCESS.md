@@ -69,7 +69,7 @@ If the spec and the issue disagree, the issue wins; say so in the PR.
 
 ## 5. Review — `just review <pr>`
 
-- One review is enough, and it starts at once. `just review <pr>` runs a fresh session of Gemini 3.1 Pro through the `agy` CLI: a different model family from every author model, and no Claude usage. `--via claude` uses the reviewer from the size table instead (Opus reviews Sonnet and Opus PRs; Fable reviews every L PR regardless of author); `--model` overrides either. The reviewer gets the PR diff, the issue, `docs/SPEC.md` and this prompt:
+- One review is enough, and it starts at once. `just review <pr>` runs a fresh session of Claude Opus 4.6 (Thinking, `claude-opus-4-6-thinking`) through the `agy` CLI, on agy's quota rather than Claude Code's. Until 2026-10-21 it was Gemini 3.1 Pro, a different model family from the authors; agy dropped it, and its remaining Gemini is 3.8 Flash. `--via claude` uses the reviewer from the size table instead (Opus reviews Sonnet and Opus PRs; Fable reviews every L PR regardless of author); `--model` overrides either. The reviewer gets the PR diff, the issue, `docs/SPEC.md` and this prompt:
 
   ```
   List every acceptance criterion from the issue and state whether the diff meets it, with evidence from the diff.
