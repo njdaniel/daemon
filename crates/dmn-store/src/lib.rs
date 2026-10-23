@@ -1,7 +1,7 @@
 //! Persistence (SQLite via `rusqlite`, bundled).
 //!
 //! Input: sessions, segments, questions, suggestions, chunks, summaries.
-//! Output: queries for retrieval and session memory; JSONL export of a session.
+//! Output: queries for retrieval and session memory; text transcripts and JSONL session exports.
 //! Owns: `~/.local/share/dmn/dmn.sqlite` and its migration runner. Never stores API keys or audio.
 //!
 //! Issue #13 ships the migration runner, the v1 schema (sessions / segments / questions /

@@ -369,10 +369,13 @@ enum SpeakAction {
 enum SessionsAction {
     /// List stored sessions: id, start time, label, row counts
     List,
-    /// Write one session as JSON Lines to ~/.local/share/dmn/sessions/<id>.jsonl
+    /// Export a stored session under ~/.local/share/dmn/sessions/ as JSONL or readable text
     Export {
         /// Session id (from `dmn sessions list`)
         id: i64,
+        /// jsonl: all stored rows; text: finalized speech with timestamps and speaker labels
+        #[arg(long, value_enum, default_value_t = ExportFormatArg::Jsonl)]
+        format: ExportFormatArg,
     },
     /// Delete sessions: their rows, their files under sessions/, and the free pages that held
     /// them
@@ -380,6 +383,21 @@ enum SessionsAction {
         /// A session id, or `all`
         target: String,
     },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormatArg {
+    Jsonl,
+    Text,
+}
+
+impl From<ExportFormatArg> for dmn_core::recorder::ExportFormat {
+    fn from(format: ExportFormatArg) -> Self {
+        match format {
+            ExportFormatArg::Jsonl => Self::Jsonl,
+            ExportFormatArg::Text => Self::Text,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -753,9 +771,13 @@ fn sessions(paths: &Paths, action: SessionsAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        SessionsAction::Export { id } => {
-            let (path, lines) = recorder::export(paths, id)?;
-            println!("wrote {lines} line(s) to {}", path.display());
+        SessionsAction::Export { id, format } => {
+            let (path, count) = recorder::export_with_format(paths, id, format.into())?;
+            let unit = match format {
+                ExportFormatArg::Jsonl => "line(s)",
+                ExportFormatArg::Text => "segment(s)",
+            };
+            println!("wrote {count} {unit} to {}", path.display());
             Ok(())
         }
         SessionsAction::Purge { target } => {
@@ -781,6 +803,35 @@ fn sessions(paths: &Paths, action: SessionsAction) -> Result<(), CliError> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod sessions_arg_tests {
+    use super::*;
+
+    #[test]
+    fn session_export_defaults_to_jsonl_and_accepts_explicit_formats() {
+        for (extra, expected) in [
+            (vec![], ExportFormatArg::Jsonl),
+            (vec!["--format", "jsonl"], ExportFormatArg::Jsonl),
+            (vec!["--format", "text"], ExportFormatArg::Text),
+        ] {
+            let mut args = vec!["dmn", "sessions", "export", "42"];
+            args.extend(extra);
+            let parsed = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Sessions {
+                action: SessionsAction::Export { id, format },
+            }) = parsed.command
+            else {
+                panic!("expected sessions export");
+            };
+            assert_eq!(id, 42);
+            assert_eq!(format, expected);
+        }
+        assert!(
+            Cli::try_parse_from(["dmn", "sessions", "export", "42", "--format", "pdf"]).is_err()
+        );
     }
 }
 

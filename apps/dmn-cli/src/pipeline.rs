@@ -63,7 +63,7 @@ use dmn_audio::{
     FrameSink, PipeWireContext, PipeWireSource, PwRecordSource, Source, Speed, WavSource,
 };
 use dmn_core::config::Vad as VadChoice;
-use dmn_core::recorder::{Recorder, WriterReport, open_store};
+use dmn_core::recorder::{self, ExportFormat, Recorder, WriterReport, open_store};
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
 use dmn_detect::{
@@ -999,6 +999,9 @@ pub struct Report {
     pub wall: Duration,
     pub tally: Option<Tally>,
     pub session: Option<WriterReport>,
+    /// The readable transcript saved after the session writer drained; absent with --no-store
+    /// or an export failure (reported in `failures`).
+    pub transcript: Option<PathBuf>,
     pub detecting: Detecting,
     pub log: TranscriptLog,
     pub bus_dropped: u64,
@@ -1013,6 +1016,7 @@ type Finisher = JoinHandle<(Vec<(Source, WorkerStats, SttStats)>, Vec<String>)>;
 
 pub struct Pipeline {
     info: Info,
+    paths: Paths,
     /// When the other person's audio started: audio time 0 on the wall clock.
     audio_zero: Instant,
     bus: Arc<Bus>,
@@ -1320,6 +1324,7 @@ impl Pipeline {
         );
         let speaking = Speaking::new(Arc::clone(&hub));
         Ok(Self {
+            paths: paths.clone(),
             speaking,
             info: Info {
                 model: name,
@@ -1496,7 +1501,7 @@ impl Pipeline {
         }
         // `q` may land while the audio is still playing: the finisher sees the flag and stops
         // the sources.
-        let (stats, failures) = self
+        let (stats, mut failures) = self
             .finisher
             .join()
             .map_err(|_| "pipeline thread panicked")?;
@@ -1529,12 +1534,27 @@ impl Pipeline {
         // cancels instead.
         let (detecting, tally, dropped_candidates) = self.assist.finish(stopped);
         let session = self.recorder.finish(self.clock.now())?;
+        // Save only after all final speech, including shutdown flushes, has reached SQLite.
+        // Keep the report on export failure so the terminal is restored before showing it.
+        let transcript = session.and_then(|s| s.session_id).and_then(|id| {
+            match recorder::export_with_format(&self.paths, id, ExportFormat::Text) {
+                Ok((path, _)) => Some(path),
+                Err(error) => {
+                    failures.push(format!(
+                        "transcript export failed: {error}; session #{id} remains in SQLite; \
+                         retry: dmn sessions export {id} --format text"
+                    ));
+                    None
+                }
+            }
+        });
         Ok(Report {
             stats,
             failures,
             wall,
             tally,
             session,
+            transcript,
             detecting,
             log: self.log,
             bus_dropped: self.bus.dropped(),
@@ -2633,6 +2653,149 @@ fn placement_summary(placements: &[Placement]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real bus, session reducer, writer and shutdown; audio workers are replaced by a
+    /// finisher that publishes its final words while `finish` joins it. No model or capture.
+    fn pending_transcript_pipeline(
+        paths: &Paths,
+        live: bool,
+        assist: bool,
+        no_store: bool,
+    ) -> Pipeline {
+        let recorder = Recorder::start(
+            (!no_store).then(|| open_store(paths).unwrap()),
+            (!no_store).then_some(paths.db_file.as_path()),
+        );
+        let hub = recorder.hub();
+        let clock = wire::SessionClock::start(1.0);
+        hub.dispatch(Action::Started {
+            label: if live { "live" } else { "replay" }.into(),
+            at: clock.now(),
+        });
+        hub.dispatch(Action::Assist { enabled: assist });
+        let zero = Instant::now();
+        let audio = AudioClock::new(zero, 1.0);
+        let bus = Arc::new(Bus::new());
+        let segments = bus.subscribe();
+        let final_bus = Arc::clone(&bus);
+        let finisher = std::thread::spawn(move || {
+            final_bus.publish(final_at(
+                Source::You,
+                125_000,
+                128_000,
+                "Final words flushed during shutdown.",
+            ));
+            (Vec::new(), Vec::new())
+        });
+        let (commands_tx, commands) = mpsc::channel();
+        let mut pipeline = Pipeline {
+            info: Info {
+                model: "fixture".into(),
+                threads: 1,
+                stt_device: "CPU".into(),
+                vad: "energy",
+                language: "en".into(),
+                speed: Speed::RealTime,
+                partials: false,
+                audio: Duration::from_secs(128),
+                live,
+            },
+            paths: paths.clone(),
+            audio_zero: zero,
+            bus,
+            segments,
+            finisher,
+            done: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(AtomicBool::new(live)),
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            commands_tx,
+            commands,
+            recorder,
+            clock,
+            assist: Assistance::new(assist, Arc::clone(&hub), audio.clone(), detecting(), None),
+            speaking: Speaking::new(Arc::clone(&hub)),
+            hub,
+            audio,
+            echo: EchoGuard::new(false),
+            flushed: false,
+            log: TranscriptLog::new(),
+        };
+        pipeline.segment(
+            final_at(Source::Them, 1_000, 4_000, "Thanks for joining today."),
+            &mut Quiet,
+        );
+        let mut partial = final_at(Source::You, 5_000, 6_000, "unfinished partial");
+        partial.is_final = false;
+        pipeline.segment(partial, &mut Quiet);
+        pipeline
+    }
+
+    #[test]
+    fn transcript_is_saved_after_shutdown_with_assistance_on_or_off_unless_no_store() {
+        for live in [false, true] {
+            for assist in [false, true] {
+                for no_store in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let paths = Paths::under(dir.path());
+                    let pipeline = pending_transcript_pipeline(&paths, live, assist, no_store);
+                    assert_eq!(pipeline.hub.snapshot().assist_off, !assist);
+                    let report = pipeline.finish(&mut Quiet).unwrap();
+                    assert!(report.failures.is_empty(), "{:?}", report.failures);
+                    if no_store {
+                        assert!(report.session.is_none());
+                        assert!(report.transcript.is_none());
+                        assert!(!paths.db_file.exists());
+                        assert!(!paths.sessions_dir.exists());
+                    } else {
+                        let session = report.session.unwrap();
+                        assert_eq!(
+                            (session.segments, session.errors, session.lagged),
+                            (2, 0, 0)
+                        );
+                        let path = report.transcript.unwrap();
+                        assert_eq!(
+                            path,
+                            paths
+                                .sessions_dir
+                                .join(format!("{}.txt", session.session_id.unwrap()))
+                        );
+                        let text = std::fs::read_to_string(path).unwrap();
+                        assert!(text.contains("[00:01] Them: Thanks for joining today."));
+                        assert!(
+                            text.ends_with("[02:05] You: Final words flushed during shutdown.\n")
+                        );
+                        assert!(!text.contains("unfinished partial"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_save_failure_reports_how_to_recover_the_stored_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let pipeline = pending_transcript_pipeline(&paths, true, false, false);
+        std::fs::write(&paths.sessions_dir, "blocks the export directory").unwrap();
+        let report = pipeline.finish(&mut Quiet).unwrap();
+        assert!(report.transcript.is_none());
+        let id = report.session.unwrap().session_id.unwrap();
+        let failure = report.failures.join("; ");
+        assert!(failure.contains("transcript export failed"), "{failure}");
+        assert!(
+            failure.contains(&format!("dmn sessions export {id} --format text")),
+            "{failure}"
+        );
+        assert_eq!(open_store(&paths).unwrap().segments(id).unwrap().len(), 2);
+        std::fs::remove_file(&paths.sessions_dir).unwrap();
+        let (path, count) = recorder::export_with_format(&paths, id, ExportFormat::Text).unwrap();
+        assert_eq!(count, 2);
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("Final words flushed during shutdown.")
+        );
+    }
 
     #[test]
     fn two_lanes_on_the_same_device_read_as_one() {

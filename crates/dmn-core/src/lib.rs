@@ -8,7 +8,7 @@
 //! Until the full pipeline lands this crate holds what every stage shares: [`config`] (typed
 //! `config.toml`), [`paths`] (XDG locations) and [`logging`] (JSON log file with size rotation),
 //! plus, since #13, [`wire`] (pipeline values → session actions) and [`recorder`] (the session
-//! hub + store writer that `dmn replay` and `dmn run` both start, and `dmn sessions purge`).
+//! hub + store writer that `dmn replay` and `dmn run` both start, session exports and purge).
 
 // CLAUDE.md: no unwrap/expect outside tests and main.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]

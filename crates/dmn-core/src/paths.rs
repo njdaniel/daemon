@@ -15,7 +15,7 @@ pub struct Paths {
     pub sources_dir: PathBuf,
     /// `~/.local/share/dmn/dmn.sqlite`
     pub db_file: PathBuf,
-    /// `~/.local/share/dmn/sessions/`: optional JSONL exports and, if enabled, session WAVs.
+    /// `~/.local/share/dmn/sessions/`: text transcripts, optional JSONL exports and session WAVs.
     pub sessions_dir: PathBuf,
     /// `~/.cache/dmn/models/`: whisper ggml files.
     pub models_dir: PathBuf,

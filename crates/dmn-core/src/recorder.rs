@@ -7,8 +7,11 @@
 //! to mark, and so it sees which promise a You segment covered (#57: the reducer decides that).
 
 use std::collections::HashMap;
+use std::io::{BufWriter, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use dmn_session::{Action, Session, SessionHub, SlowEnd, Speaker, Stage, reduce};
@@ -652,6 +655,24 @@ pub fn purge(paths: &Paths, target: PurgeTarget) -> Result<PurgeReport, Recorder
 
 /// `dmn sessions export <id>`: write the session as JSON Lines to `sessions/<id>.jsonl`.
 pub fn export(paths: &Paths, id: i64) -> Result<(PathBuf, usize), RecorderError> {
+    export_with_format(paths, id, ExportFormat::Jsonl)
+}
+
+/// A session export's contents and filename extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Jsonl,
+    Text,
+}
+
+/// Export a session without changing an existing complete file until its replacement is
+/// flushed and synced. Returns JSONL line count or text segment count, depending on `format`.
+/// Open sessions are allowed so finalized speech can be recovered after a crash.
+pub fn export_with_format(
+    paths: &Paths,
+    id: i64,
+    format: ExportFormat,
+) -> Result<(PathBuf, usize), RecorderError> {
     if !paths.db_file.is_file() {
         return Err(RecorderError::NoSuchSession(id));
     }
@@ -667,17 +688,90 @@ pub fn export(paths: &Paths, id: i64) -> Result<(PathBuf, usize), RecorderError>
         path: paths.sessions_dir.clone(),
         source,
     })?;
-    let path = paths.sessions_dir.join(format!("{id}.jsonl"));
+    let extension = match format {
+        ExportFormat::Jsonl => "jsonl",
+        ExportFormat::Text => "txt",
+    };
+    let path = paths.sessions_dir.join(format!("{id}.{extension}"));
+    let count = atomic_export(&path, |out| {
+        match format {
+            ExportFormat::Jsonl => store.export_session_jsonl(id, out),
+            ExportFormat::Text => store.export_session_text(id, out),
+        }
+        .map_err(err)
+    })?;
+    Ok((path, count))
+}
+
+/// A temporary file beside its destination; the name belongs to the session so purge also
+/// finds leftovers from a killed process. Drop removes it on every ordinary error path.
+struct PendingExport(PathBuf);
+
+impl Drop for PendingExport {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn atomic_export(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<std::fs::File>) -> Result<usize, RecorderError>,
+) -> Result<usize, RecorderError> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let io = |source| RecorderError::Io {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source,
     };
-    let file = std::fs::File::create(&path).map_err(io)?;
-    let mut out = std::io::BufWriter::new(file);
-    let lines = store.export_session_jsonl(id, &mut out).map_err(err)?;
+    let (pending, file) = loop {
+        let temporary = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => break (PendingExport(temporary), file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io(e)),
+        }
+    };
+    let mut out = BufWriter::new(file);
+    let count = write(&mut out)?;
     // Flush and sync here: dropping a BufWriter swallows the error of its last write, which
     // would turn a full disk into a truncated export reported as a success.
-    std::io::Write::flush(&mut out).map_err(io)?;
+    out.flush().map_err(io)?;
     out.get_ref().sync_all().map_err(io)?;
-    Ok((path, lines))
+    drop(out);
+    std::fs::rename(&pending.0, path).map_err(io)?;
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_text_export_preserves_the_complete_file_and_removes_the_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("42.txt");
+        std::fs::write(&path, "previous complete transcript").unwrap();
+        let result = atomic_export(&path, |out| {
+            out.write_all(b"incomplete replacement").unwrap();
+            out.flush().unwrap();
+            Err(RecorderError::Io {
+                path: path.clone(),
+                source: std::io::Error::other("disk full"),
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "previous complete transcript"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 }

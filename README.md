@@ -110,13 +110,39 @@ dmn run --question-source you|both        # answer questions from your mic, or f
 dmn run --replay THEM.wav YOU.wav [--headless]
 dmn replay THEM.wav YOU.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
-dmn sessions list | export ID | purge ID|all
+dmn sessions list | export ID [--format jsonl|text] | purge ID|all
 dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server; --language adds it to [speak].languages
 dmn speak "TEXT"                          # speak TEXT in your cloned voice into the virtual mic dmn-voice
 dmn speak "TEXT" --out FILE.wav           # or write it to a WAV file instead
 ```
 
 `dmn sources` (context documents) arrives with M2.
+
+## Saved transcripts
+
+Daemon saves finalized speech locally in `~/.local/share/dmn/dmn.sqlite` as a live or replay
+session runs. After normal completion (including quitting with `q` or Ctrl+C), it also writes
+`~/.local/share/dmn/sessions/<id>.txt` and prints the path after the terminal UI closes.
+The text file includes the session ID, label, start time, and every finalized turn with its
+timestamp and **Them** / **You** speaker label. Overlapping turns stay separate; partials,
+AI suggestions and status messages are excluded. This works with `--no-assist` too.
+The paths follow `XDG_DATA_HOME` when it is set.
+
+Open the text file directly or give it to an assistant to summarize later. Daemon makes no
+model request to save it. To export an older session, or recover finalized speech after a
+crash, use:
+
+```bash
+dmn sessions list
+dmn sessions export 42 --format text
+```
+
+`dmn sessions export 42` still exports all stored session rows as JSONL; `--format jsonl` is
+equivalent. If saving the text file fails, Daemon reports the error and a retry command; the
+SQLite transcript and any previous complete export remain available. Text exports are written
+with owner-only permissions. `dmn run --no-store` and `dmn replay --no-store` keep the session
+in memory without saving either its database rows or a text file. To delete saved sessions
+and their exports, use `dmn sessions purge 42` or `dmn sessions purge all`.
 
 ## Quick start
 
