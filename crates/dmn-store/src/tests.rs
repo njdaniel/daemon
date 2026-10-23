@@ -236,6 +236,73 @@ fn suggestion_round_trip() {
 }
 
 #[test]
+fn transcript_export_keeps_final_speech_in_timeline_order() {
+    let store = store();
+    let (session_id, segment_id) = session_with_segment(&store);
+    question_with_suggestion(&store, session_id, segment_id);
+    for (source, start, end, text, is_final) in [
+        (
+            Source::Unknown,
+            3661.9,
+            3663.0,
+            "The final utterance.",
+            true,
+        ),
+        (Source::You, 3.8, 15.0, "Sí — diseño.\n続きも保存。", true),
+        (Source::Them, 1.0, 2.0, "unfinished partial", false),
+        (Source::You, 12.5, 20.0, "An overlapping answer.", true),
+    ] {
+        store
+            .insert_segment(&NewSegment {
+                session_id,
+                source,
+                start_time: start,
+                end_time: end,
+                text: text.into(),
+                is_final,
+                avg_logprob: -0.2,
+                language: None,
+            })
+            .unwrap();
+    }
+    let mut out = Vec::new();
+    assert_eq!(store.export_session_text(session_id, &mut out).unwrap(), 4);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "Session #{session_id} — fixture\n\
+             Started: 2023-11-14 22:13:20 UTC\n\n\
+             [00:03] You: Sí — diseño.\n続きも保存。\n\
+             [00:12] Them: How would you design a rate limiter?\n\
+             [00:12] You: An overlapping answer.\n\
+             [01:01:01] Unknown: The final utterance.\n"
+        )
+    );
+}
+
+#[test]
+fn transcript_export_validates_the_session_and_propagates_write_failures() {
+    let store = store();
+    let mut out = Vec::new();
+    assert!(store.export_session_text(42, &mut out).is_err());
+    assert!(out.is_empty());
+    let (id, _) = session_with_segment(&store);
+    struct Full;
+    impl std::io::Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    assert!(matches!(
+        store.export_session_text(id, Full),
+        Err(StoreError::Io(_))
+    ));
+}
+
+#[test]
 fn export_writes_one_json_object_per_line() {
     let store = store();
     let (session_id, segment_id) = session_with_segment(&store);

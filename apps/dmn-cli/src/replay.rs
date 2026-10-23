@@ -233,6 +233,9 @@ pub fn print_downstream(report: &Report, paths: &Paths) {
         ),
         None => println!("session log  off (--no-store)"),
     }
+    if let Some(path) = &report.transcript {
+        println!("transcript   saved to {}", path.display());
+    }
 }
 
 /// One NDJSON line per segment, for `eval/run.py`.
@@ -367,6 +370,8 @@ fn print_summary_json(report: &Report, audio: Duration) {
                 "errors": r.errors,
                 "lagged": r.lagged,
             })),
+            "transcript": report.transcript,
+            "failures": report.failures,
         })
     );
 }

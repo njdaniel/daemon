@@ -395,6 +395,7 @@ async fn purge_removes_rows_and_files() {
             .session_id
             .unwrap();
         recorder::export(&paths, id).unwrap();
+        recorder::export_with_format(&paths, id, recorder::ExportFormat::Text).unwrap();
         ids.push(id);
     }
     // A recorded WAV of the first session, as privacy.record_audio would write it.
@@ -406,7 +407,7 @@ async fn purge_removes_rows_and_files() {
 
     let one = recorder::purge(&paths, PurgeTarget::One(ids[0])).unwrap();
     assert_eq!(one.sessions, [ids[0]]);
-    assert_eq!(one.files.len(), 2, "{:?}", one.files);
+    assert_eq!(one.files.len(), 3, "{:?}", one.files);
     let store = open_store(&paths).unwrap();
     assert_eq!(store.session_ids().unwrap(), [ids[1]]);
     assert!(store.questions(ids[0]).unwrap().is_empty());
@@ -425,7 +426,7 @@ async fn purge_removes_rows_and_files() {
 
     let all = recorder::purge(&paths, PurgeTarget::All).unwrap();
     assert_eq!(all.sessions, [ids[1]]);
-    assert_eq!(all.files.len(), 1);
+    assert_eq!(all.files.len(), 2);
     let store = open_store(&paths).unwrap();
     assert_eq!(store.counts().unwrap(), (0, 0, 0, 0));
     assert_eq!(std::fs::read_dir(&paths.sessions_dir).unwrap().count(), 0);
@@ -435,6 +436,81 @@ async fn purge_removes_rows_and_files() {
         !bytes.windows(text.len()).any(|w| w == text),
         "purged text is gone from the file, free pages included"
     );
+}
+
+#[test]
+fn text_export_recovers_an_open_session_and_can_be_retried_after_a_file_error() {
+    use dmn_store::{NewSegment, NewSession, Source as StoredSource};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let store = open_store(&paths).unwrap();
+    let id = store
+        .insert_session(&NewSession::new(1_700_000_000, "recovered"))
+        .unwrap();
+    store
+        .insert_segment(&NewSegment {
+            session_id: id,
+            source: StoredSource::You,
+            start_time: 95.0,
+            end_time: 97.0,
+            text: "The last saved words.".into(),
+            is_final: true,
+            avg_logprob: -0.2,
+            language: None,
+        })
+        .unwrap();
+    drop(store);
+
+    let path = paths.sessions_dir.join(format!("{id}.txt"));
+    // A directory at the destination makes rename fail on every user, including root.
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(recorder::export_with_format(&paths, id, recorder::ExportFormat::Text).is_err());
+    let store = open_store(&paths).unwrap();
+    assert_eq!(store.session(id).unwrap().unwrap().ended_at, None);
+    assert_eq!(store.segments(id).unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(&paths.sessions_dir).unwrap().count(), 1);
+    std::fs::remove_dir(&path).unwrap();
+
+    let (export, segments) =
+        recorder::export_with_format(&paths, id, recorder::ExportFormat::Text).unwrap();
+    assert_eq!(export, path);
+    assert_eq!(segments, 1);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(&format!("Session #{id} — recovered\n")));
+    assert!(text.ends_with("[01:35] You: The last saved words.\n"));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        recorder::export_with_format(&paths, id, recorder::ExportFormat::Text)
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    recorder::purge(&paths, PurgeTarget::One(id)).unwrap();
+    assert!(!path.exists());
+    assert!(store.session(id).unwrap().is_none());
+}
+
+#[test]
+fn text_export_of_a_missing_session_creates_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    for existing_database in [false, true] {
+        if existing_database {
+            drop(open_store(&paths).unwrap());
+        }
+        assert!(matches!(
+            recorder::export_with_format(&paths, 42, recorder::ExportFormat::Text),
+            Err(recorder::RecorderError::NoSuchSession(42))
+        ));
+        assert!(!paths.sessions_dir.exists());
+        assert_eq!(paths.db_file.exists(), existing_database);
+    }
 }
 
 #[test]
