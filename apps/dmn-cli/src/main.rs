@@ -94,7 +94,9 @@ impl From<VadArg> for dmn_core::config::Vad {
 /// `[detect].question_source`. clap limits the value to these three names.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum QuestionSourceArg {
-    Interviewer,
+    /// `interviewer`, the name before #128, still works and is not listed.
+    #[value(alias = "interviewer")]
+    Them,
     You,
     Both,
 }
@@ -102,7 +104,7 @@ enum QuestionSourceArg {
 impl From<QuestionSourceArg> for dmn_core::config::QuestionSource {
     fn from(q: QuestionSourceArg) -> Self {
         match q {
-            QuestionSourceArg::Interviewer => dmn_core::config::QuestionSource::Interviewer,
+            QuestionSourceArg::Them => dmn_core::config::QuestionSource::Them,
             QuestionSourceArg::You => dmn_core::config::QuestionSource::You,
             QuestionSourceArg::Both => dmn_core::config::QuestionSource::Both,
         }
@@ -143,7 +145,7 @@ enum Command {
     /// STAR story, 1–6 sections, Ctrl+Shift+A assistance on/off, q quit
     Run {
         /// Feed the pipeline from two WAV files at 1× instead of live capture
-        #[arg(long, num_args = 2, value_names = ["INTERVIEWER", "CANDIDATE"])]
+        #[arg(long, num_args = 2, value_names = ["THEM", "YOU"])]
         replay: Option<Vec<std::path::PathBuf>>,
         /// Live: your mic's PipeWire node.name, or "default"; overrides [audio].mic.
         /// `dmn devices` lists them
@@ -172,7 +174,7 @@ enum Command {
         /// es; default is [stt].language. Anything but en needs a multilingual model (small)
         #[arg(long)]
         language: Option<dmn_core::config::SttLanguage>,
-        /// Whose questions are detected and answered: interviewer (default), you or both;
+        /// Whose questions are detected and answered: them (default), you or both;
         /// overrides [detect].question_source. Transcript labels and audio routing never change
         #[arg(long, value_enum)]
         question_source: Option<QuestionSourceArg>,
@@ -217,7 +219,7 @@ enum Command {
         #[arg(long, value_name = "MODEL", conflicts_with = "init")]
         fetch: Option<String>,
     },
-    /// Measure whisper speed and accuracy on fixture interviewer turns; with --live, report
+    /// Measure whisper speed and accuracy on fixture Them turns; with --live, report
     /// question end → Approach latency (p50 / p95) and CPU use from a stored session
     Bench {
         /// Read the session log instead: latency and CPU of the latest session (or --session)
@@ -227,7 +229,7 @@ enum Command {
         #[arg(long, requires = "live")]
         session: Option<i64>,
         /// With --live: pair candidates with this questions.json; a replay session finds the
-        /// one beside its interviewer file by itself
+        /// one beside its Them file by itself
         #[arg(long, requires = "live")]
         questions: Option<std::path::PathBuf>,
         /// Model name; default is [stt].model from the config
@@ -239,7 +241,7 @@ enum Command {
         /// Decoder threads; default is [stt].threads from the config
         #[arg(long)]
         threads: Option<usize>,
-        /// Number of interviewer turns to transcribe
+        /// Number of Them turns to transcribe
         #[arg(long, default_value_t = 5)]
         turns: usize,
         /// Use whisper's fixed 30 s encoder window instead of trimming it to each utterance
@@ -288,9 +290,10 @@ enum Command {
     },
     /// Run two fixture WAVs through the real pipeline and print labelled transcript segments
     Replay {
-        /// The interviewer's audio
-        interviewer: std::path::PathBuf,
+        /// The other person's audio
+        them: std::path::PathBuf,
         /// Your audio
+        #[arg(value_name = "YOU")]
         candidate: std::path::PathBuf,
         /// Paces delivery at N× wall-clock; 1 is a live call. Must be positive and finite
         #[arg(long, default_value_t = 1.0)]
@@ -327,7 +330,7 @@ enum Command {
         /// and no vetoes on rhetorical tags or small talk
         #[arg(long)]
         spec_literal_detector: bool,
-        /// Whose questions are detected and answered: interviewer (default), you or both;
+        /// Whose questions are detected and answered: them (default), you or both;
         /// overrides [detect].question_source. Transcript labels and audio routing never change
         #[arg(long, value_enum)]
         question_source: Option<QuestionSourceArg>,
@@ -385,10 +388,13 @@ enum PttAction {
 enum SessionsAction {
     /// List stored sessions: id, start time, label, row counts
     List,
-    /// Write one session as JSON Lines to ~/.local/share/dmn/sessions/<id>.jsonl
+    /// Export a stored session under ~/.local/share/dmn/sessions/ as JSONL or readable text
     Export {
         /// Session id (from `dmn sessions list`)
         id: i64,
+        /// jsonl: all stored rows; text: finalized speech with timestamps and speaker labels
+        #[arg(long, value_enum, default_value_t = ExportFormatArg::Jsonl)]
+        format: ExportFormatArg,
     },
     /// Delete sessions: their rows, their files under sessions/, and the free pages that held
     /// them
@@ -396,6 +402,21 @@ enum SessionsAction {
         /// A session id, or `all`
         target: String,
     },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormatArg {
+    Jsonl,
+    Text,
+}
+
+impl From<ExportFormatArg> for dmn_core::recorder::ExportFormat {
+    fn from(format: ExportFormatArg) -> Self {
+        match format {
+            ExportFormatArg::Jsonl => Self::Jsonl,
+            ExportFormatArg::Text => Self::Text,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -466,7 +487,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             Ok(())
         }
         Some(Command::Replay {
-            interviewer,
+            them,
             candidate,
             speed,
             model,
@@ -489,7 +510,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 &cfg,
                 &paths,
                 &replay::Args {
-                    interviewer,
+                    them,
                     candidate,
                     speed,
                     model,
@@ -533,10 +554,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
                 .and_then(dmn_session::CodingSolutions::from_label);
             let replay = match replay.as_deref() {
                 None => None,
-                Some([interviewer, candidate]) => Some((interviewer.clone(), candidate.clone())),
+                Some([them, candidate]) => Some((them.clone(), candidate.clone())),
                 Some(_) => {
                     return Err(CliError::Usage(
-                        "run --replay takes two files: <interviewer.wav> <candidate.wav>".into(),
+                        "run --replay takes two files: <them.wav> <you.wav>".into(),
                     ));
                 }
             };
@@ -775,9 +796,13 @@ fn sessions(paths: &Paths, action: SessionsAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        SessionsAction::Export { id } => {
-            let (path, lines) = recorder::export(paths, id)?;
-            println!("wrote {lines} line(s) to {}", path.display());
+        SessionsAction::Export { id, format } => {
+            let (path, count) = recorder::export_with_format(paths, id, format.into())?;
+            let unit = match format {
+                ExportFormatArg::Jsonl => "line(s)",
+                ExportFormatArg::Text => "segment(s)",
+            };
+            println!("wrote {count} {unit} to {}", path.display());
             Ok(())
         }
         SessionsAction::Purge { target } => {
@@ -803,5 +828,60 @@ fn sessions(paths: &Paths, action: SessionsAction) -> Result<(), CliError> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod sessions_arg_tests {
+    use super::*;
+
+    #[test]
+    fn session_export_defaults_to_jsonl_and_accepts_explicit_formats() {
+        for (extra, expected) in [
+            (vec![], ExportFormatArg::Jsonl),
+            (vec!["--format", "jsonl"], ExportFormatArg::Jsonl),
+            (vec!["--format", "text"], ExportFormatArg::Text),
+        ] {
+            let mut args = vec!["dmn", "sessions", "export", "42"];
+            args.extend(extra);
+            let parsed = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Sessions {
+                action: SessionsAction::Export { id, format },
+            }) = parsed.command
+            else {
+                panic!("expected sessions export");
+            };
+            assert_eq!(id, 42);
+            assert_eq!(format, expected);
+        }
+        assert!(
+            Cli::try_parse_from(["dmn", "sessions", "export", "42", "--format", "pdf"]).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod question_source_arg_tests {
+    use clap::ValueEnum;
+
+    use super::QuestionSourceArg;
+
+    #[test]
+    fn interviewer_still_means_them_and_is_not_listed() {
+        assert_eq!(
+            QuestionSourceArg::from_str("interviewer", false),
+            Ok(QuestionSourceArg::Them)
+        );
+        assert_eq!(
+            QuestionSourceArg::from_str("them", false),
+            Ok(QuestionSourceArg::Them)
+        );
+        let listed: Vec<String> = QuestionSourceArg::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value())
+            .filter(|p| !p.is_hide_set())
+            .map(|p| p.get_name().to_owned())
+            .collect();
+        assert_eq!(listed, ["them", "you", "both"]);
     }
 }

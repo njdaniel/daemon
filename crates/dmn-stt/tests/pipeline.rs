@@ -125,7 +125,7 @@ fn transcribe_lane_in(
 
 #[test]
 #[ignore = "needs the fixture WAVs (just fixtures-fetch) and a whisper model (dmn doctor --fetch small.en)"]
-fn the_interviewer_lane_transcribes_every_scripted_question_in_order() {
+fn the_them_lane_transcribes_every_scripted_question_in_order() {
     let fixture = testdata().join("sysdesign");
     let wav = fixture.join("interviewer.wav");
     let model = model_path(&models_dir(), Model::SmallEn);
@@ -143,7 +143,7 @@ fn the_interviewer_lane_transcribes_every_scripted_question_in_order() {
     let questions: Vec<serde_json::Value> =
         serde_json::from_reader(std::fs::File::open(fixture.join("questions.json")).expect("open"))
             .expect("parse questions.json");
-    let segments = transcribe_lane(&wav, Source::Interviewer, &model);
+    let segments = transcribe_lane(&wav, Source::Them, &model);
     assert!(!segments.is_empty(), "the lane produced no transcript");
 
     let mut log = TranscriptLog::new();
@@ -204,7 +204,7 @@ fn the_interviewer_lane_transcribes_every_scripted_question_in_order() {
 
 #[test]
 #[ignore = "needs the es fixture WAVs (just fixtures-fetch) and the multilingual model (dmn doctor --fetch small)"]
-fn the_spanish_interviewer_lane_arrives_in_english_with_es_detected() {
+fn the_spanish_them_lane_arrives_in_english_with_es_detected() {
     // #77: `language = "auto"` with the multilingual `small`: every final names the language
     // whisper heard and its text is English, matched against the script's English reference.
     let fixture = testdata().join("es");
@@ -223,7 +223,7 @@ fn the_spanish_interviewer_lane_arrives_in_english_with_es_detected() {
     let questions: Vec<serde_json::Value> =
         serde_json::from_reader(std::fs::File::open(fixture.join("questions.json")).expect("open"))
             .expect("parse questions.json");
-    let segments = transcribe_lane_in(&wav, Source::Interviewer, &model, Language::Auto);
+    let segments = transcribe_lane_in(&wav, Source::Them, &model, Language::Auto);
     let finals: Vec<&Segment> = segments.iter().filter(|s| !s.text.is_empty()).collect();
     assert!(!finals.is_empty(), "the lane produced no transcript");
     let es = finals
@@ -278,7 +278,7 @@ fn under_detect_the_spanish_lane_keeps_its_spanish() {
     let wav = fixture.join("interviewer.wav");
     let model = model_path(&models_dir(), Model::Small);
     assert!(wav.is_file() && model.is_file(), "fixture or model missing");
-    let segments = transcribe_lane_in(&wav, Source::Interviewer, &model, Language::Detect);
+    let segments = transcribe_lane_in(&wav, Source::Them, &model, Language::Detect);
     let finals: Vec<&Segment> = segments.iter().filter(|s| !s.text.is_empty()).collect();
     assert!(!finals.is_empty(), "the lane produced no transcript");
     // Words that run through Spanish and not English: their share of every final's words.
@@ -337,7 +337,7 @@ fn silence_between_turns_produces_no_hallucinated_segments() {
         "fixtures or model missing"
     );
 
-    let segments = transcribe_lane(&wav, Source::Interviewer, &model);
+    let segments = transcribe_lane(&wav, Source::Them, &model);
     for s in &segments {
         let fp: String = s
             .text
@@ -360,7 +360,7 @@ fn large_v3_turbo_under_the_translate_task_keeps_the_spanish() {
     // whisper's translate task on the Spanish fixture, it returned Spanish (2026-09-28). That
     // run used a model file later found corrupt (#84), so this re-runs it on a verified file,
     // straight through the transcriber (the guard lives in its callers). Each final is scored
-    // against the scripted interviewer turns in English and in the Spanish that was spoken; the
+    // against the scripted Them turns in English and in the Spanish that was spoken; the
     // refusal stands while most finals read as Spanish.
     let fixture = testdata().join("es");
     let wav = fixture.join("interviewer.wav");
@@ -378,7 +378,7 @@ fn large_v3_turbo_under_the_translate_task_keeps_the_spanish() {
     let turns: Vec<serde_json::Value> =
         serde_json::from_reader(std::fs::File::open(fixture.join("turns.json")).expect("open"))
             .expect("parse turns.json");
-    let interviewer: Vec<(&str, &str)> = turns
+    let them: Vec<(&str, &str)> = turns
         .iter()
         .filter(|t| t["speaker"] == "interviewer")
         .filter_map(|t| Some((t["text"].as_str()?, t["spoken"].as_str()?)))
@@ -389,7 +389,7 @@ fn large_v3_turbo_under_the_translate_task_keeps_the_spanish() {
     let dir = tempfile::tempdir().expect("tempdir");
     let neutral = dir.path().join("ggml-measured.bin");
     std::os::unix::fs::symlink(&model, &neutral).expect("symlink");
-    let segments = transcribe_lane_in(&wav, Source::Interviewer, &neutral, Language::Auto);
+    let segments = transcribe_lane_in(&wav, Source::Them, &neutral, Language::Auto);
     // `transcribe_lane_in` runs with partials off, so these are all finals already; the filter
     // says so rather than relying on it.
     let finals: Vec<&Segment> = segments
@@ -397,11 +397,10 @@ fn large_v3_turbo_under_the_translate_task_keeps_the_spanish() {
         .filter(|s| s.is_final && !s.text.is_empty())
         .collect();
     assert!(!finals.is_empty(), "the lane produced no transcript");
-    // The best overlap of `text` with any interviewer turn, as scripted in English or as
+    // The best overlap of `text` with any Them turn, as scripted in English or as
     // spoken in Spanish.
     let best = |text: &str, spanish: bool| {
-        interviewer
-            .iter()
+        them.iter()
             .map(|&(en, es)| overlap(if spanish { es } else { en }, text))
             .fold(0.0_f64, f64::max)
     };

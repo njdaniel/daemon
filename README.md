@@ -55,17 +55,17 @@ Off, Daemon only transcribes (and, with a multilingual model, translates to Engl
 transcript-only screen; no question detection runs and nothing is sent to the LLM. Press
 Ctrl+Shift+A again and the next question is answered as usual.
 
-By default only the interviewer's questions (the call's audio) are answered. Set
+By default only the other person's questions (the call's audio, labelled **Them**) are answered. Set
 `[detect] question_source = "you"` or start with `dmn run --question-source you` to have Daemon
 answer questions asked on your microphone instead, for asking it directly or for practising with
 a mock interview played from a phone; `both` answers either. The setting picks audio streams,
 not voices: everything on the mic is "You", so in `you` or `both` your own questions to the
-interviewer are answered too. The status line shows `asks: you` or `asks: both`.
+other person are answered too. The status line shows `asks: you` or `asks: both`.
 
 Question detection is a set of rules, and it can miss a real question. When it does, press
 Enter: the last turn of the asking lane (up to 30 seconds of it) goes to the model as the
 question, and the screen updates as it does for a detected one. The asking lane follows
-`question_source`: the interviewer by default, your microphone with `you`, and with `both`
+`question_source`: the other person by default, your microphone with `you`, and with `both`
 whichever of the two spoke last. If the model finds no question in it, the status line says
 `not a question` for 5 seconds and nothing else changes.
 
@@ -81,7 +81,7 @@ Keys in `dmn run`:
 | --- | --- |
 | `p` | Pin the question on screen, or unpin it; new questions queue while one is pinned |
 | `r` | Answer the question on screen again, from a different angle |
-| Enter | Ask about what the asking lane last said (the interviewer, by default), when the detector missed the question |
+| Enter | Ask about what the asking lane last said (the other person, by default), when the detector missed the question |
 | `1`–`6` | Open or close one of the six sections under the Approach |
 | `↑` `↓`, PgUp, PgDn | Scroll the open section when it is taller than the screen: a row, or the rows on screen |
 | Mouse wheel | Scroll the open section, three rows a notch, with the pointer on the left column (`[ui].mouse`, on by default) |
@@ -107,16 +107,42 @@ dmn devices
 dmn run [--mic NODE] [--app APP]          # live: your mic + the call's audio, until q
 dmn run --no-assist                       # transcribe / translate only; a turns assistance on
 dmn run --question-source you|both        # answer questions from your mic, or from either stream
-dmn run --replay INTERVIEWER.wav CANDIDATE.wav [--headless]
-dmn replay INTERVIEWER.wav CANDIDATE.wav [--speed N]
+dmn run --replay THEM.wav YOU.wav [--headless]
+dmn replay THEM.wav YOU.wav [--speed N]
 dmn bench [--live [--session ID]]          # whisper speed; or latency + CPU of a stored session
-dmn sessions list | export ID | purge ID|all
+dmn sessions list | export ID [--format jsonl|text] | purge ID|all
 dmn speak enroll --wav CLIP.wav [--name N] [--language es]   # register your voice with the TTS server; --language adds it to [speak].languages
 dmn speak "TEXT"                          # speak TEXT in your cloned voice into the virtual mic dmn-voice
 dmn speak "TEXT" --out FILE.wav           # or write it to a WAV file instead
 ```
 
 `dmn sources` (context documents) arrives with M2.
+
+## Saved transcripts
+
+Daemon saves finalized speech locally in `~/.local/share/dmn/dmn.sqlite` as a live or replay
+session runs. After normal completion (including quitting with `q` or Ctrl+C), it also writes
+`~/.local/share/dmn/sessions/<id>.txt` and prints the path after the terminal UI closes.
+The text file includes the session ID, label, start time, and every finalized turn with its
+timestamp and **Them** / **You** speaker label. Overlapping turns stay separate; partials,
+AI suggestions and status messages are excluded. This works with `--no-assist` too.
+The paths follow `XDG_DATA_HOME` when it is set.
+
+Open the text file directly or give it to an assistant to summarize later. Daemon makes no
+model request to save it. To export an older session, or recover finalized speech after a
+crash, use:
+
+```bash
+dmn sessions list
+dmn sessions export 42 --format text
+```
+
+`dmn sessions export 42` still exports all stored session rows as JSONL; `--format jsonl` is
+equivalent. If saving the text file fails, Daemon reports the error and a retry command; the
+SQLite transcript and any previous complete export remain available. Text exports are written
+with owner-only permissions. `dmn run --no-store` and `dmn replay --no-store` keep the session
+in memory without saving either its database rows or a text file. To delete saved sessions
+and their exports, use `dmn sessions purge 42` or `dmn sessions purge all`.
 
 ## Quick start
 
@@ -155,7 +181,7 @@ target/release/dmn
 #### Optional: whisper on the GPU
 
 Whisper runs on the CPU unless you ask for the GPU. With an NVIDIA GPU, a Vulkan build can run
-the interviewer's whisper on the GPU, which cuts the transcription step on the question →
+the Them lane's whisper on the GPU, which cuts the transcription step on the question →
 Approach path from about 0.8 s to about 0.35 s (#61, measured on an RTX 4090 beside
 `qwen3.6:35b-a3b`). Install the Vulkan headers and shader compiler, and `just build` includes
 GPU support from then on (it says which it built):
@@ -183,7 +209,7 @@ num_ctx = 8192       # Ollama context dmn asks for; frees the VRAM whisper needs
 ```
 
 `dmn doctor` lists the GPUs the build sees and where whisper would run; the status line shows
-`stt gpu+cpu` when the interviewer's lane is on the GPU and yours on the CPU (the usual split
+`stt gpu+cpu` when the Them lane is on the GPU and yours on the CPU (the usual split
 on a 24 GB card). Changing `num_ctx` makes Ollama reload the model (about 6 s), and any other
 tool that uses Ollama's default context reloads it again (about 11 s).
 
@@ -204,7 +230,7 @@ language = "auto"     # detect each utterance's language and translate it to Eng
 
 Both lanes then arrive in English (whisper translates as it transcribes), so questions are
 detected, answered and shown exactly as for an English call; the transcript tags what was heard
-(`Interviewer (es→en):`) and the status line shows `es→en`. `--language` on `dmn run`, `dmn
+(`Them (es→en):`) and the status line shows `es→en`. `--language` on `dmn run`, `dmn
 replay` and `dmn bench` overrides the config for one run. Keep `language = "en"` with `small.en`
 for English calls: the multilingual `small` is a little less accurate on English and pays a
 detection step per utterance.
@@ -263,7 +289,7 @@ says `web` beside the model dot while it is on. What it sends, and to whom, is u
 
 `dmn speak` synthesizes text in a clone of your own voice, from a 10–30 s recording of you, through
 a text-to-speech server on this machine (#107), and plays it into a virtual microphone named
-`dmn-voice` that the call selects as its microphone (#108), so the interviewer hears it and your
+`dmn-voice` that the call selects as its microphone (#108), so the other person hears it and your
 own speakers stay silent. In `dmn run`, `t` translates what you just said into the interview's
 language and speaks that (#109, below).
 
@@ -371,10 +397,10 @@ pw-play /tmp/vmic.wav                            # intelligible, right speed, yo
 
 Without a running PipeWire server the command says so and suggests `--out`; nothing panics.
 
-**`t` in `dmn run`: say it in your language, the interviewer hears it in theirs (#109).** With
+**`t` in `dmn run`: say it in your language, the other person hears it in theirs (#109).** With
 `[speak].enabled` and `target`, `dmn run` opens `dmn-voice` when it starts and keeps it for the
 whole session, so select it as the call's microphone once, before you need it. Say something
-(in English, say), then press `t`: your last turn (what you said since the interviewer last spoke,
+(in English, say), then press `t`: your last turn (what you said since the other person last spoke,
 up to 30 s) is translated into `target` by `[speak].model` (left out: the `[llm]` model the
 answers use; see translation only, below), synthesized in your enrolled voice, and played into
 `dmn-voice`. The status line shows `translating… 0s`, then
@@ -631,7 +657,7 @@ With `[stt].language = "auto"` (or a code, for an interview in another language)
 translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it
 detects your language and keeps your own words, so `t` translates what you said rather than
 whisper's English version of it. Use headphones: the mic lane is no longer translated, so a mic
-that hears the call would show the interviewer's own-language words as yours.
+that hears the call would show the other person's own-language words as yours.
 
 ### Initialize and inspect your system
 
@@ -649,18 +675,19 @@ The default config lives at:
 
 ### Use headphones
 
-Daemon tells you and the interviewer apart by where the audio comes from: your microphone is
-**You**, the call app's output is **Interviewer**. Nothing listens for voices, so that split only
+Daemon tells you and the other person apart by where the audio comes from: your microphone is
+**You**, the call app's output is **Them** (it was **Interviewer** until #128; a config that says
+`question_source = "interviewer"` still works). Nothing listens for voices, so that split only
 holds while each voice reaches Daemon through one path.
 
-With headphones it does. With speakers, the interviewer's voice plays out loud and your
-microphone picks it up again. Daemon then hears every interviewer sentence twice, once on the
+With headphones it does. With speakers, the other person's voice plays out loud and your
+microphone picks it up again. Daemon then hears every Them sentence twice, once on the
 call's stream and once on your mic, and the mic copy is transcribed as **You**:
 
-- The interviewer's words show up in your transcript lines, and go to the model as if you had
+- The other person's words show up in your transcript lines, and go to the model as if you had
   said them.
-- The detector scores only Interviewer lines, so it does not answer the echo itself, but every
-  interviewer sentence now looks answered at once (a You line right after it is one of the
+- The detector scores only Them lines, so it does not answer the echo itself, but every
+  Them sentence now looks answered at once (a You line right after it is one of the
   detector's cues for a question), so statements get flagged as questions more often.
 
 Wear headphones, or earbuds, for any call you run Daemon beside. A laptop or conference
@@ -689,11 +716,11 @@ dmn devices              # your mic (* = default) and the apps playing audio rig
 dmn doctor --probe       # plays a quiet 440 Hz tone and captures it back through the app stream,
                          # the sink monitor and pw-record (about 3 s of sound)
 dmn run                  # talk for a few seconds, then play a video with speech:
-                         # the video should show as Interviewer only, never as You
+                         # the video should show as Them only, never as You
 ```
 
 If the call's speech shows up as **You** in `dmn run`, the mic is hearing your speakers: switch to
-headphones. If nothing shows as **Interviewer**, name the call app with `--app` (the
+headphones. If nothing shows as **Them**, name the call app with `--app` (the
 `application.name` from `dmn devices`, e.g. `--app Firefox`), or `--app ""` to capture all system
 audio. Run `dmn bench --live` after a call to see its latency and CPU use; the status line's red
 **N dropped** means audio was lost because the machine fell behind.

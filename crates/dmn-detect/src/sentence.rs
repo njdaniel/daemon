@@ -1,6 +1,6 @@
 //! Splitting one transcript line into sentences.
 //!
-//! An interviewer turn is rarely one sentence: "Sorry about that. Where were we. Right, the
+//! A Them turn is rarely one sentence: "Sorry about that. Where were we. Right, the
 //! pipeline. Let's switch gears. Suppose you have a service whose p99 latency doubled..." is one
 //! VAD utterance and one [`Segment`](dmn_transcript::Segment). Scoring the whole line would judge
 //! the question by the filler around it, and the candidate text handed to the LLM would carry the

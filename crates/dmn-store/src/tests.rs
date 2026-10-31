@@ -17,7 +17,7 @@ fn session_with_segment(store: &Store) -> (i64, i64) {
     let segment_id = store
         .insert_segment(&NewSegment {
             session_id,
-            source: Source::Interviewer,
+            source: Source::Them,
             start_time: 12.5,
             end_time: 18.0,
             text: "How would you design a rate limiter?".to_string(),
@@ -143,7 +143,7 @@ fn segment_round_trip() {
 
     let segments = store.segments(session_id).unwrap();
     assert_eq!(segments.len(), 2);
-    assert_eq!(segments[0].source, Source::Interviewer);
+    assert_eq!(segments[0].source, Source::Them);
     assert_eq!(segments[0].start_time, 12.5);
     assert_eq!(segments[0].end_time, 18.0);
     assert!(segments[0].is_final);
@@ -236,6 +236,73 @@ fn suggestion_round_trip() {
 }
 
 #[test]
+fn transcript_export_keeps_final_speech_in_timeline_order() {
+    let store = store();
+    let (session_id, segment_id) = session_with_segment(&store);
+    question_with_suggestion(&store, session_id, segment_id);
+    for (source, start, end, text, is_final) in [
+        (
+            Source::Unknown,
+            3661.9,
+            3663.0,
+            "The final utterance.",
+            true,
+        ),
+        (Source::You, 3.8, 15.0, "Sí — diseño.\n続きも保存。", true),
+        (Source::Them, 1.0, 2.0, "unfinished partial", false),
+        (Source::You, 12.5, 20.0, "An overlapping answer.", true),
+    ] {
+        store
+            .insert_segment(&NewSegment {
+                session_id,
+                source,
+                start_time: start,
+                end_time: end,
+                text: text.into(),
+                is_final,
+                avg_logprob: -0.2,
+                language: None,
+            })
+            .unwrap();
+    }
+    let mut out = Vec::new();
+    assert_eq!(store.export_session_text(session_id, &mut out).unwrap(), 4);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!(
+            "Session #{session_id} — fixture\n\
+             Started: 2023-11-14 22:13:20 UTC\n\n\
+             [00:03] You: Sí — diseño.\n続きも保存。\n\
+             [00:12] Them: How would you design a rate limiter?\n\
+             [00:12] You: An overlapping answer.\n\
+             [01:01:01] Unknown: The final utterance.\n"
+        )
+    );
+}
+
+#[test]
+fn transcript_export_validates_the_session_and_propagates_write_failures() {
+    let store = store();
+    let mut out = Vec::new();
+    assert!(store.export_session_text(42, &mut out).is_err());
+    assert!(out.is_empty());
+    let (id, _) = session_with_segment(&store);
+    struct Full;
+    impl std::io::Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    assert!(matches!(
+        store.export_session_text(id, Full),
+        Err(StoreError::Io(_))
+    ));
+}
+
+#[test]
 fn export_writes_one_json_object_per_line() {
     let store = store();
     let (session_id, segment_id) = session_with_segment(&store);
@@ -254,7 +321,7 @@ fn export_writes_one_json_object_per_line() {
     assert_eq!(lines[0]["type"], "session");
     assert_eq!(lines[0]["label"], "fixture");
     assert_eq!(lines[1]["type"], "segment");
-    assert_eq!(lines[1]["source"], "interviewer");
+    assert_eq!(lines[1]["source"], "them");
     assert_eq!(lines[1]["start_time"], 12.5);
     assert_eq!(lines[2]["type"], "question");
     assert_eq!(lines[2]["kind"], "system_design");
@@ -314,7 +381,7 @@ fn check_constraints_reject_bad_enum_text() {
     let (session_id, _) = session_with_segment(&store);
     let bad = store.execute_raw(
         "INSERT INTO segments (session_id, source, start_time, end_time, text, is_final, avg_logprob)
-         VALUES (?1, 'them', 0.0, 1.0, 'x', 1, 0.0)",
+         VALUES (?1, 'candidate', 0.0, 1.0, 'x', 1, 0.0)",
         session_id,
     );
     assert!(matches!(bad, Err(StoreError::Sqlite(_))));
@@ -906,7 +973,7 @@ fn a_v7_database_upgrades_to_v8_and_segments_record_their_language() {
     let id = store
         .insert_segment(&NewSegment {
             session_id: 1,
-            source: Source::Interviewer,
+            source: Source::Them,
             start_time: 5.0,
             end_time: 8.0,
             text: "And if Redis goes down?".into(),
@@ -972,4 +1039,98 @@ fn a_question_has_one_summary_line_its_promise_can_be_marked_and_export_carries_
     // Purging the session takes its memory with it.
     assert!(store.delete_session(session_id).unwrap());
     assert!(store.summaries(session_id).unwrap().is_empty());
+}
+
+#[test]
+fn a_v8_database_upgrades_to_v9_renaming_interviewer_to_them_and_keeping_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dmn.sqlite");
+    {
+        // Foreign keys on, as `Store::open` has them: v9 rebuilds `segments`, and a careless
+        // rebuild would cascade into questions, suggestions and summaries.
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        crate::migrate::migrate_to(&mut conn, 8).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (id, started_at, label) VALUES (1, 1700000000, 'v8');
+             INSERT INTO segments (id, session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob, language)
+                 VALUES (1, 1, 'interviewer', 1.0, 3.0, 'How would you design it?', 1, -0.2, 'es'),
+                        (2, 1, 'you', 4.0, 6.0, 'With a queue.', 1, -0.1, NULL),
+                        (3, 1, 'unknown', 7.0, 8.0, 'Hm.', 0, -0.9, NULL);
+             INSERT INTO questions (id, session_id, segment_id, score, created_at)
+                 VALUES (1, 1, 1, 4, 1700000003);
+             INSERT INTO suggestions (question_id, phase, payload, created_at)
+                 VALUES (1, 'fast', '{}', 1700000004);
+             INSERT INTO summaries (session_id, question_id, line, created_at)
+                 VALUES (1, 1, 'Designed it with a queue.', 1700000006);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    let rows = store.segments(1).unwrap();
+    let sources: Vec<_> = rows.iter().map(|r| (r.id, r.source)).collect();
+    assert_eq!(
+        sources,
+        vec![(1, Source::Them), (2, Source::You), (3, Source::Unknown)]
+    );
+    assert_eq!(
+        rows[0].language.as_deref(),
+        Some("es"),
+        "v8's column is copied"
+    );
+    let q = &store.questions(1).unwrap()[0];
+    assert_eq!(
+        (q.segment_id, q.score),
+        (1, 4),
+        "the question kept its segment"
+    );
+    assert_eq!(store.suggestions_for_question(1).unwrap().len(), 1);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT count(*) FROM summaries"), 1);
+    assert_eq!(
+        count("SELECT count(*) FROM segments WHERE source = 'interviewer'"),
+        0
+    );
+    assert_eq!(count("SELECT count(*) FROM pragma_foreign_key_check"), 0);
+    assert_eq!(
+        count("SELECT count(*) FROM sqlite_master WHERE name = 'segments_v9'"),
+        0,
+        "the rebuild's scratch table is renamed, not left behind"
+    );
+    let fk: i64 = store
+        .conn_for_tests()
+        .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+        .unwrap();
+    assert_eq!(fk, 1, "foreign keys are enforced again after the rebuild");
+    // A deleted session still cascades through the rebuilt table.
+    store
+        .conn_for_tests()
+        .execute("DELETE FROM sessions WHERE id = 1", [])
+        .unwrap();
+    assert_eq!(count("SELECT count(*) FROM segments"), 0);
+    assert_eq!(count("SELECT count(*) FROM questions"), 0);
+}
+
+#[test]
+fn the_v9_schema_stores_them_and_rejects_interviewer_but_still_parses_it() {
+    let s = store();
+    let session_id = s
+        .insert_session(&NewSession::new(1_700_000_000, "v9"))
+        .unwrap();
+    let insert = |source: &str| {
+        s.conn_for_tests().execute(
+            "INSERT INTO segments (session_id, source, start_time, end_time, text, is_final,
+                                   avg_logprob)
+             VALUES (?1, ?2, 0.0, 1.0, 'Hi.', 1, -0.1)",
+            rusqlite::params![session_id, source],
+        )
+    };
+    insert("them").unwrap();
+    assert!(insert("interviewer").is_err(), "the CHECK names `them` now");
+    assert_eq!(Source::parse("interviewer"), Some(Source::Them));
+    assert_eq!(Source::Them.as_str(), "them");
 }

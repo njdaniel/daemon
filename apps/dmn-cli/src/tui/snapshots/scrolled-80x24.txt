@@ -19,6 +19,6 @@
           def _unlink(self, node):
       ↑ 9 · ↓ 25 more
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         I'd pair a dictionary with a doubly linked list.
+You       Sounds great.
+You       I'd pair a dictionary with a doubly linked list.
  ● mic  ● system  ● model                           ↑↓ scroll · s: full · ⏎ ask

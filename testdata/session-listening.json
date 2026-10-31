@@ -4,7 +4,7 @@
   "ended_at": null,
   "transcript": [
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 1.0,
       "end": 13.0,
       "text": "Hi, thanks for making the time today. This session is about an hour of system design."
@@ -16,7 +16,7 @@
       "text": "Sounds great."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 18.0,
       "end": 21.5,
       "text": "Great. Let me tell you a bit about the team before we start."
@@ -24,13 +24,13 @@
   ],
   "partials": [
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 22.0,
       "end": 24.0,
       "text": "We run the platform"
     }
   ],
-  "last_interviewer": "Great. Let me tell you a bit about the team before we start.",
+  "last_them": "Great. Let me tell you a bit about the team before we start.",
   "live": null,
   "pinned": false,
   "queued": [],
@@ -45,7 +45,10 @@
     "model": {
       "state": "ok"
     },
-    "overruns": 0
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
   },
   "counts": {
     "candidates": 0,

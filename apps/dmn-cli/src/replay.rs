@@ -19,7 +19,7 @@ use crate::pipeline::{Found, Input, Observer, Options, Partials, Pipeline, Repor
 use crate::suggest::{Output, Policy};
 
 pub struct Args {
-    pub interviewer: PathBuf,
+    pub them: PathBuf,
     pub candidate: PathBuf,
     /// Paces `WavSource` delivery at this many multiples of wall-clock time; 1.0 is a live call.
     pub speed: f32,
@@ -79,7 +79,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         paths,
         &Options {
             input: Input::Files {
-                interviewer: args.interviewer.clone(),
+                them: args.them.clone(),
                 candidate: args.candidate.clone(),
             },
             speed: args.speed,
@@ -105,7 +105,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
         let info = pipeline.info();
         println!(
             "replay: {} + {} ({} of audio) through {} on {} threads ({}), {} VAD, language {}, {}, partials {}\n",
-            args.interviewer.display(),
+            args.them.display(),
             args.candidate.display(),
             pretty(info.audio),
             info.model,
@@ -233,6 +233,9 @@ pub fn print_downstream(report: &Report, paths: &Paths) {
         ),
         None => println!("session log  off (--no-store)"),
     }
+    if let Some(path) = &report.transcript {
+        println!("transcript   saved to {}", path.display());
+    }
 }
 
 /// One NDJSON line per segment, for `eval/run.py`.
@@ -253,7 +256,7 @@ fn print_segment_json(seg: &Segment) {
 }
 
 /// The `--json` candidate event. `source` names the lane the question came from (#90):
-/// "Interviewer" or "You", the transcript's own labels.
+/// "Them" or "You", the transcript's own labels.
 fn candidate_json(found: &Found) -> serde_json::Value {
     let c = &found.candidate;
     serde_json::json!({
@@ -276,10 +279,10 @@ fn print_candidate(found: &Found, json: bool) {
     if json {
         println!("{}", candidate_json(found));
     } else {
-        // #90: name the lane whenever it is not the Interviewer, so a `you` or `both` run shows
-        // which stream triggered. An Interviewer candidate's line is unchanged (and its own
-        // `interviewer` cue already names the lane).
-        let lane = if c.source == Source::Interviewer {
+        // #90: name the lane whenever it is not the other person, so a `you` or `both` run shows
+        // which stream triggered. A Them candidate's line is unchanged (and its own
+        // `them` cue already names the lane).
+        let lane = if c.source == Source::Them {
             String::new()
         } else {
             format!("[{}] ", c.source.label().to_ascii_lowercase())
@@ -367,6 +370,8 @@ fn print_summary_json(report: &Report, audio: Duration) {
                 "errors": r.errors,
                 "lagged": r.lagged,
             })),
+            "transcript": report.transcript,
+            "failures": report.failures,
         })
     );
 }
@@ -451,7 +456,7 @@ mod tests {
 
     #[test]
     fn the_json_candidate_event_names_the_lane() {
-        for (source, label) in [(Source::You, "You"), (Source::Interviewer, "Interviewer")] {
+        for (source, label) in [(Source::You, "You"), (Source::Them, "Them")] {
             let found = Found {
                 candidate: dmn_detect::Candidate {
                     source,

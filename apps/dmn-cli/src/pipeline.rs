@@ -5,7 +5,7 @@
 //!
 //! The echo guard ([`EchoGuard`], #60) sits where both lanes' finals meet, just past the bus: a
 //! mic final that copies the loopback within 300 ms is dropped and counted (`[audio].echo_guard`
-//! turns it off); any other mic final waits up to 1.5 s (4 s while an overlapping interviewer
+//! turns it off); any other mic final waits up to 1.5 s (4 s while an overlapping Them
 //! utterance is still open) for its possible original, on the wall clock, since the skew between
 //! the two whisper lanes is wall time whatever the replay speed. Only the You lane waits.
 //!
@@ -45,7 +45,7 @@
 //!
 //! A monitor thread watches the lanes while they run (#16): it counts ring-buffer overruns into
 //! the session, turns live capture state into the mic / system dots, moves the [`AudioClock`]'s
-//! anchor as the interviewer lane consumes frames (so [`Action::Timing`] marks are on the clock
+//! anchor as the Them lane consumes frames (so [`Action::Timing`] marks are on the clock
 //! segment times use), and samples the process's CPU time into the session log every few
 //! seconds. `dmn bench --live` reads all of it back from the store.
 
@@ -63,7 +63,7 @@ use dmn_audio::{
     FrameSink, PipeWireContext, PipeWireSource, PwRecordSource, Source, Speed, WavSource,
 };
 use dmn_core::config::Vad as VadChoice;
-use dmn_core::recorder::{Recorder, WriterReport, open_store};
+use dmn_core::recorder::{self, ExportFormat, Recorder, WriterReport, open_store};
 use dmn_core::wire::AudioClock;
 use dmn_core::{Config, Paths, wire};
 use dmn_detect::{
@@ -178,15 +178,12 @@ impl Partials {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
     /// Two WAV files, paced at [`Options::speed`]: `dmn replay` and `dmn run --replay`.
-    Files {
-        interviewer: PathBuf,
-        candidate: PathBuf,
-    },
-    /// Live capture (#16): `mic` is You, `interviewer` is the call's app output stream (or the
+    Files { them: PathBuf, candidate: PathBuf },
+    /// Live capture (#16): `mic` is You, `them` is the call's app output stream (or the
     /// default sink monitor). Runs until quit.
     Live {
         mic: CaptureTarget,
-        interviewer: CaptureTarget,
+        them: CaptureTarget,
     },
 }
 
@@ -194,12 +191,11 @@ impl Input {
     /// The session label.
     fn label(&self) -> String {
         match self {
-            Input::Files {
-                interviewer,
-                candidate,
-            } => format!("replay {} + {}", interviewer.display(), candidate.display()),
-            Input::Live { mic, interviewer } => {
-                format!("live {} + {}", describe(mic), describe(interviewer))
+            Input::Files { them, candidate } => {
+                format!("replay {} + {}", them.display(), candidate.display())
+            }
+            Input::Live { mic, them } => {
+                format!("live {} + {}", describe(mic), describe(them))
             }
         }
     }
@@ -275,7 +271,7 @@ pub struct Info {
 
 /// Runs the detector over the finals as they arrive.
 ///
-/// Each final from a lane `[detect].question_source` selects (#90; the Interviewer lane by
+/// Each final from a lane `[detect].question_source` selects (#90; the Them lane by
 /// default) is scored the moment it arrives with [`Following::UNKNOWN`], exactly as a live
 /// session would, and a line that clears the bar is emitted then; that is the latency the SPEC's
 /// 100 ms budget is about. A line that falls short is held until the next final: the "followed
@@ -315,14 +311,14 @@ struct Chain {
 #[derive(Debug, Clone, Default)]
 struct Spans {
     you: VecDeque<(Duration, Duration)>,
-    interviewer: VecDeque<(Duration, Duration)>,
+    them: VecDeque<(Duration, Duration)>,
 }
 
 impl Spans {
     fn lane(&mut self, source: Source) -> Option<&mut VecDeque<(Duration, Duration)>> {
         match source {
             Source::You => Some(&mut self.you),
-            Source::Interviewer => Some(&mut self.interviewer),
+            Source::Them => Some(&mut self.them),
             // A single-stream fallback is no lane: nothing scores it, and nothing interrupts.
             Source::Unknown => None,
         }
@@ -340,8 +336,8 @@ impl Spans {
     /// Whether the lane that is not `source` spoke across `(after, before)`.
     fn spoke_between(&self, source: Source, after: Duration, before: Duration) -> bool {
         let other = match source {
-            Source::You => &self.interviewer,
-            Source::Interviewer | Source::Unknown => &self.you,
+            Source::You => &self.them,
+            Source::Them | Source::Unknown => &self.you,
         };
         other
             .iter()
@@ -360,7 +356,7 @@ pub struct Found {
     pub continues: bool,
 }
 
-/// #63: an interviewer final that starts within this long after the previous interviewer final,
+/// #63: a Them final that starts within this long after the previous Them final,
 /// with no You speech in between, continues it. Since #16 closes an utterance on 500 ms of
 /// silence, a question with a mid-sentence pause ("And if the state lived in Redis … and Redis
 /// went down, what then?") or a 12 s forced split arrives as two finals; each part scored alone
@@ -534,7 +530,7 @@ impl Detecting {
         }
         if self.question_source().allows(seg.source) {
             // #90: a chain never crosses lanes. In `both`, a You question asked while an
-            // interviewer chain is open ends that chain and starts its own.
+            // Them chain is open ends that chain and starts its own.
             let open = self
                 .chain
                 .take()
@@ -673,7 +669,7 @@ pub fn sensitivity(s: dmn_core::config::Sensitivity) -> Sensitivity {
 /// `[detect].question_source` (#90) in the detector's own type, as [`sensitivity`] above.
 pub fn question_source(s: dmn_core::config::QuestionSource) -> QuestionSource {
     match s {
-        dmn_core::config::QuestionSource::Interviewer => QuestionSource::Interviewer,
+        dmn_core::config::QuestionSource::Them => QuestionSource::Them,
         dmn_core::config::QuestionSource::You => QuestionSource::You,
         dmn_core::config::QuestionSource::Both => QuestionSource::Both,
     }
@@ -683,7 +679,7 @@ pub fn question_source(s: dmn_core::config::QuestionSource) -> QuestionSource {
 /// listening placeholder.
 pub fn session_question_source(s: dmn_core::config::QuestionSource) -> dmn_session::QuestionSource {
     match s {
-        dmn_core::config::QuestionSource::Interviewer => dmn_session::QuestionSource::Interviewer,
+        dmn_core::config::QuestionSource::Them => dmn_session::QuestionSource::Them,
         dmn_core::config::QuestionSource::You => dmn_session::QuestionSource::You,
         dmn_core::config::QuestionSource::Both => dmn_session::QuestionSource::Both,
     }
@@ -798,7 +794,7 @@ impl Controls {
         let _ = self.commands.send(Command::Regenerate);
     }
 
-    /// Enter (#96): make the last thing the interviewer said (the asking lane's last turn) the
+    /// Enter (#96): make the last thing the other person said (the asking lane's last turn) the
     /// question, for when the detector missed it. The pipeline thread builds the candidate from
     /// its transcript log; it sends nothing while assistance is off, before that lane has
     /// spoken, or when that turn already has its question. A press whose request failed can be
@@ -1062,6 +1058,9 @@ pub struct Report {
     pub wall: Duration,
     pub tally: Option<Tally>,
     pub session: Option<WriterReport>,
+    /// The readable transcript saved after the session writer drained; absent with --no-store
+    /// or an export failure (reported in `failures`).
+    pub transcript: Option<PathBuf>,
     pub detecting: Detecting,
     pub log: TranscriptLog,
     pub bus_dropped: u64,
@@ -1076,7 +1075,8 @@ type Finisher = JoinHandle<(Vec<(Source, WorkerStats, SttStats)>, Vec<String>)>;
 
 pub struct Pipeline {
     info: Info,
-    /// When the interviewer's audio started: audio time 0 on the wall clock.
+    paths: Paths,
+    /// When the other person's audio started: audio time 0 on the wall clock.
     audio_zero: Instant,
     bus: Arc<Bus>,
     segments: Receiver<Segment>,
@@ -1228,22 +1228,19 @@ impl Pipeline {
 
         // Load both whisper models and spawn every worker first, then start both sources back
         // to back: loading a model takes the better part of a second, and starting each file as
-        // its lane was built put the candidate's audio that far behind the interviewer's.
+        // its lane was built put the candidate's audio that far behind the other person's.
         let sources = match &opts.input {
-            Input::Files {
-                interviewer,
-                candidate,
-            } => vec![
+            Input::Files { them, candidate } => vec![
                 (
-                    Source::Interviewer,
-                    Audio::Wav(WavSource::open(interviewer, Source::Interviewer, speed)?),
+                    Source::Them,
+                    Audio::Wav(WavSource::open(them, Source::Them, speed)?),
                 ),
                 (
                     Source::You,
                     Audio::Wav(WavSource::open(candidate, Source::You, speed)?),
                 ),
             ],
-            Input::Live { mic, interviewer } => live_sources(mic, interviewer),
+            Input::Live { mic, them } => live_sources(mic, them),
         };
         let audio = sources
             .iter()
@@ -1253,12 +1250,12 @@ impl Pipeline {
             })
             .max()
             .unwrap_or_default();
-        // The interviewer lane is built first on purpose (#61): its finals are on the question
+        // The Them lane is built first on purpose (#61): its finals are on the question
         // → Approach path, so when the GPU has room for only one whisper context it gets it,
         // and the candidate's lane falls back to the CPU. `live_sources` lists the mic first, so
         // the order is enforced here for every input.
         let mut built = Vec::new();
-        for (source, audio) in interviewer_first(sources) {
+        for (source, audio) in them_first(sources) {
             let gate = (source == Source::You).then(|| Arc::clone(&mic_muted));
             let ptt_gate = (source == Source::You).then(|| ptt.gate.clone());
             let ring = match &audio {
@@ -1392,6 +1389,7 @@ impl Pipeline {
         let mut speaking = Speaking::new(Arc::clone(&hub));
         speaking.ptt = ptt.clone();
         Ok(Self {
+            paths: paths.clone(),
             speaking,
             info: Info {
                 model: name,
@@ -1580,7 +1578,7 @@ impl Pipeline {
         }
         // `q` may land while the audio is still playing: the finisher sees the flag and stops
         // the sources.
-        let (stats, failures) = self
+        let (stats, mut failures) = self
             .finisher
             .join()
             .map_err(|_| "pipeline thread panicked")?;
@@ -1613,12 +1611,27 @@ impl Pipeline {
         // cancels instead.
         let (detecting, tally, dropped_candidates) = self.assist.finish(stopped);
         let session = self.recorder.finish(self.clock.now())?;
+        // Save only after all final speech, including shutdown flushes, has reached SQLite.
+        // Keep the report on export failure so the terminal is restored before showing it.
+        let transcript = session.and_then(|s| s.session_id).and_then(|id| {
+            match recorder::export_with_format(&self.paths, id, ExportFormat::Text) {
+                Ok((path, _)) => Some(path),
+                Err(error) => {
+                    failures.push(format!(
+                        "transcript export failed: {error}; session #{id} remains in SQLite; \
+                         retry: dmn sessions export {id} --format text"
+                    ));
+                    None
+                }
+            }
+        });
         Ok(Report {
             stats,
             failures,
             wall,
             tally,
             session,
+            transcript,
             detecting,
             log: self.log,
             bus_dropped: self.bus.dropped(),
@@ -1773,7 +1786,7 @@ impl Assistance {
     /// shown, or after the model declined it (the same prompt at temperature 0 gets the same
     /// answer). It sends again when the first one's request failed: a timeout, an unreachable
     /// model or a malformed reply is the tool letting the user down a second time, and the key
-    /// must not go dead until the interviewer speaks again. The session says which it was
+    /// must not go dead until the other person speaks again. The session says which it was
     /// ([`Session::ask_failed`]).
     fn ask(&mut self, log: &TranscriptLog) {
         if self.suggester.is_none() {
@@ -1981,7 +1994,7 @@ struct Utterance {
     text: String,
     from: Duration,
     to: Duration,
-    /// The interviewer spoke after this turn was finalized (#114): a later You final is a new
+    /// The other person spoke after this turn was finalized (#114): a later You final is a new
     /// turn, not more of this one, as #109's `last_turn` grouping ends at the other speaker.
     sealed: bool,
 }
@@ -2188,8 +2201,8 @@ impl Speaking {
     /// #114: a segment the guard let through. In translate mode a final You line with text is
     /// a turn to speak: queued, or joined to the turn already waiting (the VAD split one
     /// sentence; what is said while another plays is one utterance), then started if nothing
-    /// is in flight. An interviewer final with text seals the waiting turn: what the user says
-    /// after the interviewer spoke is a turn of its own, as `last_turn` groups them (#109).
+    /// is in flight. A Them final with text seals the waiting turn: what the user says
+    /// after the other person spoke is a turn of its own, as `last_turn` groups them (#109).
     fn heard(&mut self, seg: &Segment) {
         if self.speaker.is_none()
             || !self.mode.translates()
@@ -2200,7 +2213,7 @@ impl Speaking {
         }
         match seg.source {
             Source::You => {}
-            Source::Interviewer => {
+            Source::Them => {
                 if let Some(waiting) = self.queue.back_mut() {
                     waiting.sealed = true;
                 }
@@ -2324,7 +2337,7 @@ pub const PTT_LOST: &str = "push-to-talk button lost";
 /// user's own words: under `[stt].language = "auto"` or a code (#77), whisper's translate task
 /// would turn them into English before `t` could translate them into the interview's language,
 /// so that lane detects its language and transcribes without translating
-/// ([`dmn_stt::Language::Detect`]). The Interviewer lane, and both lanes with `[speak]` off or
+/// ([`dmn_stt::Language::Detect`]). The Them lane, and both lanes with `[speak]` off or
 /// `language = "en"`, are as configured.
 pub fn lane_language(
     source: Source,
@@ -2355,7 +2368,7 @@ fn kind(s: &str) -> Option<Kind> {
 fn dot(source: Source) -> Dot {
     match source {
         Source::You => Dot::Mic,
-        Source::Interviewer | Source::Unknown => Dot::System,
+        Source::Them | Source::Unknown => Dot::System,
     }
 }
 
@@ -2392,7 +2405,7 @@ struct Monitor {
     cpu0: Option<f64>,
     last_cpu: Option<Instant>,
     overruns: u64,
-    /// Interviewer frames consumed at the last anchor.
+    /// Them frames consumed at the last anchor.
     anchored_frames: u64,
     /// Whisper inference time so far, over both lanes, at the last tick.
     whisper_ms: u64,
@@ -2425,8 +2438,8 @@ impl Monitor {
                 continue;
             };
             // Segment times count the frames a lane's VAD consumed; anchor the audio clock to
-            // the interviewer's, whose segments the questions are.
-            if lane.source == Source::Interviewer && stats.frames > self.anchored_frames {
+            // the other person's, whose segments the questions are.
+            if lane.source == Source::Them && stats.frames > self.anchored_frames {
                 self.anchored_frames = stats.frames;
                 let audio = stats.frames as f64 * f64::from(FRAME_MS) / 1000.0;
                 self.clock.anchor(now, audio);
@@ -2542,10 +2555,10 @@ fn spawn_finisher(
     })
 }
 
-/// The live sources: PipeWire capture of `mic` and `interviewer` on one shared context, or,
+/// The live sources: PipeWire capture of `mic` and `them` on one shared context, or,
 /// when PipeWire cannot be reached, the `pw-record` emergency fallback (SPEC § Decisions), which
-/// can target the mic by name but only the whole sink monitor for the interviewer.
-fn live_sources(mic: &CaptureTarget, interviewer: &CaptureTarget) -> Vec<(Source, Audio)> {
+/// can target the mic by name but only the whole sink monitor for the other person.
+fn live_sources(mic: &CaptureTarget, them: &CaptureTarget) -> Vec<(Source, Audio)> {
     let connected = PipeWireContext::connect().and_then(|ctx| {
         let table = ctx.wait_for_sync(SYNC_TIMEOUT);
         match table.disconnected {
@@ -2554,7 +2567,7 @@ fn live_sources(mic: &CaptureTarget, interviewer: &CaptureTarget) -> Vec<(Source
         }
     });
     match connected {
-        Ok(ctx) => [(Source::You, mic), (Source::Interviewer, interviewer)]
+        Ok(ctx) => [(Source::You, mic), (Source::Them, them)]
             .into_iter()
             .map(|(source, target)| {
                 let capture = PipeWireSource::new(Arc::clone(&ctx), source, target.clone());
@@ -2585,9 +2598,9 @@ fn live_sources(mic: &CaptureTarget, interviewer: &CaptureTarget) -> Vec<(Source
                     },
                 ),
                 (
-                    Source::Interviewer,
+                    Source::Them,
                     Audio::Live {
-                        source: Box::new(PwRecordSource::new(Source::Interviewer, None, true)),
+                        source: Box::new(PwRecordSource::new(Source::Them, None, true)),
                         status: None,
                         target: describe(&CaptureTarget::SinkMonitor),
                     },
@@ -2765,9 +2778,9 @@ pub fn device_choice(d: dmn_core::config::SttDevice) -> DeviceChoice {
     }
 }
 
-/// The interviewer's lane before the candidate's, whatever order `sources` came in.
-fn interviewer_first<T>(mut sources: Vec<(Source, T)>) -> Vec<(Source, T)> {
-    sources.sort_by_key(|(source, _)| *source != Source::Interviewer);
+/// The other person's lane before the candidate's, whatever order `sources` came in.
+fn them_first<T>(mut sources: Vec<(Source, T)>) -> Vec<(Source, T)> {
+    sources.sort_by_key(|(source, _)| *source != Source::Them);
     sources
 }
 
@@ -2788,6 +2801,150 @@ fn placement_summary(placements: &[Placement]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real bus, session reducer, writer and shutdown; audio workers are replaced by a
+    /// finisher that publishes its final words while `finish` joins it. No model or capture.
+    fn pending_transcript_pipeline(
+        paths: &Paths,
+        live: bool,
+        assist: bool,
+        no_store: bool,
+    ) -> Pipeline {
+        let recorder = Recorder::start(
+            (!no_store).then(|| open_store(paths).unwrap()),
+            (!no_store).then_some(paths.db_file.as_path()),
+        );
+        let hub = recorder.hub();
+        let clock = wire::SessionClock::start(1.0);
+        hub.dispatch(Action::Started {
+            label: if live { "live" } else { "replay" }.into(),
+            at: clock.now(),
+        });
+        hub.dispatch(Action::Assist { enabled: assist });
+        let zero = Instant::now();
+        let audio = AudioClock::new(zero, 1.0);
+        let bus = Arc::new(Bus::new());
+        let segments = bus.subscribe();
+        let final_bus = Arc::clone(&bus);
+        let finisher = std::thread::spawn(move || {
+            final_bus.publish(final_at(
+                Source::You,
+                125_000,
+                128_000,
+                "Final words flushed during shutdown.",
+            ));
+            (Vec::new(), Vec::new())
+        });
+        let (commands_tx, commands) = mpsc::channel();
+        let mut pipeline = Pipeline {
+            info: Info {
+                model: "fixture".into(),
+                threads: 1,
+                stt_device: "CPU".into(),
+                vad: "energy",
+                language: "en".into(),
+                speed: Speed::RealTime,
+                partials: false,
+                audio: Duration::from_secs(128),
+                live,
+            },
+            paths: paths.clone(),
+            audio_zero: zero,
+            bus,
+            segments,
+            finisher,
+            done: Arc::new(AtomicBool::new(true)),
+            stop: Arc::new(AtomicBool::new(live)),
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            ptt: PttLine::default(),
+            commands_tx,
+            commands,
+            recorder,
+            clock,
+            assist: Assistance::new(assist, Arc::clone(&hub), audio.clone(), detecting(), None),
+            speaking: Speaking::new(Arc::clone(&hub)),
+            hub,
+            audio,
+            echo: EchoGuard::new(false),
+            flushed: false,
+            log: TranscriptLog::new(),
+        };
+        pipeline.segment(
+            final_at(Source::Them, 1_000, 4_000, "Thanks for joining today."),
+            &mut Quiet,
+        );
+        let mut partial = final_at(Source::You, 5_000, 6_000, "unfinished partial");
+        partial.is_final = false;
+        pipeline.segment(partial, &mut Quiet);
+        pipeline
+    }
+
+    #[test]
+    fn transcript_is_saved_after_shutdown_with_assistance_on_or_off_unless_no_store() {
+        for live in [false, true] {
+            for assist in [false, true] {
+                for no_store in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let paths = Paths::under(dir.path());
+                    let pipeline = pending_transcript_pipeline(&paths, live, assist, no_store);
+                    assert_eq!(pipeline.hub.snapshot().assist_off, !assist);
+                    let report = pipeline.finish(&mut Quiet).unwrap();
+                    assert!(report.failures.is_empty(), "{:?}", report.failures);
+                    if no_store {
+                        assert!(report.session.is_none());
+                        assert!(report.transcript.is_none());
+                        assert!(!paths.db_file.exists());
+                        assert!(!paths.sessions_dir.exists());
+                    } else {
+                        let session = report.session.unwrap();
+                        assert_eq!(
+                            (session.segments, session.errors, session.lagged),
+                            (2, 0, 0)
+                        );
+                        let path = report.transcript.unwrap();
+                        assert_eq!(
+                            path,
+                            paths
+                                .sessions_dir
+                                .join(format!("{}.txt", session.session_id.unwrap()))
+                        );
+                        let text = std::fs::read_to_string(path).unwrap();
+                        assert!(text.contains("[00:01] Them: Thanks for joining today."));
+                        assert!(
+                            text.ends_with("[02:05] You: Final words flushed during shutdown.\n")
+                        );
+                        assert!(!text.contains("unfinished partial"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_save_failure_reports_how_to_recover_the_stored_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let pipeline = pending_transcript_pipeline(&paths, true, false, false);
+        std::fs::write(&paths.sessions_dir, "blocks the export directory").unwrap();
+        let report = pipeline.finish(&mut Quiet).unwrap();
+        assert!(report.transcript.is_none());
+        let id = report.session.unwrap().session_id.unwrap();
+        let failure = report.failures.join("; ");
+        assert!(failure.contains("transcript export failed"), "{failure}");
+        assert!(
+            failure.contains(&format!("dmn sessions export {id} --format text")),
+            "{failure}"
+        );
+        assert_eq!(open_store(&paths).unwrap().segments(id).unwrap().len(), 2);
+        std::fs::remove_file(&paths.sessions_dir).unwrap();
+        let (path, count) = recorder::export_with_format(&paths, id, ExportFormat::Text).unwrap();
+        assert_eq!(count, 2);
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("Final words flushed during shutdown.")
+        );
+    }
 
     #[test]
     fn two_lanes_on_the_same_device_read_as_one() {
@@ -2818,15 +2975,15 @@ mod tests {
     }
 
     #[test]
-    fn the_interviewer_lane_is_built_first_whatever_the_input_order() {
-        // `live_sources` lists the mic first; the GPU must still go to the interviewer's lane.
-        let live = vec![(Source::You, "mic"), (Source::Interviewer, "app")];
+    fn the_them_lane_is_built_first_whatever_the_input_order() {
+        // `live_sources` lists the mic first; the GPU must still go to the other person's lane.
+        let live = vec![(Source::You, "mic"), (Source::Them, "app")];
         assert_eq!(
-            interviewer_first(live),
-            [(Source::Interviewer, "app"), (Source::You, "mic")]
+            them_first(live),
+            [(Source::Them, "app"), (Source::You, "mic")]
         );
-        let files = vec![(Source::Interviewer, "i.wav"), (Source::You, "c.wav")];
-        assert_eq!(interviewer_first(files.clone()), files);
+        let files = vec![(Source::Them, "i.wav"), (Source::You, "c.wav")];
+        assert_eq!(them_first(files.clone()), files);
     }
 
     #[test]
@@ -2872,7 +3029,7 @@ mod tests {
     }
 
     fn detecting() -> Detecting {
-        detecting_for(QuestionSource::Interviewer)
+        detecting_for(QuestionSource::Them)
     }
 
     fn detecting_for(source: QuestionSource) -> Detecting {
@@ -2891,15 +3048,9 @@ mod tests {
     #[test]
     fn a_question_split_at_a_pause_continues_as_one_candidate() {
         let mut d = detecting();
-        assert_eq!(
-            d.feed(&final_at(Source::Interviewer, 19_980, 26_000, FIRST)),
-            1
-        );
+        assert_eq!(d.feed(&final_at(Source::Them, 19_980, 26_000, FIRST)), 1);
         assert!(!d.found()[0].continues);
-        assert_eq!(
-            d.feed(&final_at(Source::Interviewer, 26_560, 29_740, SECOND)),
-            1
-        );
+        assert_eq!(d.feed(&final_at(Source::Them, 26_560, 29_740, SECOND)), 1);
         let second = &d.found()[1];
         assert!(
             second.continues,
@@ -2918,9 +3069,9 @@ mod tests {
     }
 
     #[test]
-    fn you_only_scores_the_mic_lane_and_ignores_the_interviewer() {
+    fn you_only_scores_the_mic_lane_and_ignores_the_other_person() {
         let mut d = detecting_for(QuestionSource::You);
-        assert_eq!(d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST)), 0);
+        assert_eq!(d.feed(&final_at(Source::Them, 0, 5_000, FIRST)), 0);
         assert_eq!(d.feed(&final_at(Source::You, 6_000, 9_000, MINE)), 1);
         assert_eq!(
             d.feed(&final_at(
@@ -2941,30 +3092,24 @@ mod tests {
     fn the_default_source_still_ignores_the_mic_lane() {
         let mut d = detecting();
         assert_eq!(d.feed(&final_at(Source::You, 0, 3_000, MINE)), 0);
-        assert_eq!(
-            d.feed(&final_at(Source::Interviewer, 4_000, 9_000, FIRST)),
-            1
-        );
+        assert_eq!(d.feed(&final_at(Source::Them, 4_000, 9_000, FIRST)), 1);
         d.flush();
-        assert_eq!(sources(&d), [Source::Interviewer]);
+        assert_eq!(sources(&d), [Source::Them]);
     }
 
     #[test]
     fn both_scores_each_lane_and_a_chain_never_crosses_lanes() {
         let mut d = detecting_for(QuestionSource::Both);
-        // An Interviewer question, then a You question 1 s later: inside CONTINUE_GAP, but on
+        // A Them question, then a You question 1 s later: inside CONTINUE_GAP, but on
         // the other lane, so it is a question of its own.
-        assert_eq!(d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST)), 1);
+        assert_eq!(d.feed(&final_at(Source::Them, 0, 5_000, FIRST)), 1);
         assert_eq!(d.feed(&final_at(Source::You, 6_000, 9_000, MINE)), 1);
-        assert_eq!(sources(&d), [Source::Interviewer, Source::You]);
+        assert_eq!(sources(&d), [Source::Them, Source::You]);
         assert!(!d.found()[1].continues, "two candidates, not one continued");
         assert_eq!(d.found()[1].candidate.text, MINE);
         assert_eq!(d.found()[1].candidate.start, Duration::from_millis(6_000));
-        // The Interviewer's next line does not continue the first question either: You spoke.
-        assert_eq!(
-            d.feed(&final_at(Source::Interviewer, 9_500, 12_000, SECOND)),
-            1
-        );
+        // The other person's next line does not continue the first question either: You spoke.
+        assert_eq!(d.feed(&final_at(Source::Them, 9_500, 12_000, SECOND)), 1);
         assert!(!d.found()[2].continues);
     }
 
@@ -2983,10 +3128,10 @@ mod tests {
     }
 
     #[test]
-    fn the_interviewer_speaking_in_the_gap_ends_a_you_question() {
+    fn the_other_person_speaking_in_the_gap_ends_a_you_question() {
         let mut d = detecting_for(QuestionSource::You);
         d.feed(&final_at(Source::You, 10_000, 14_000, MINE));
-        d.feed(&final_at(Source::Interviewer, 14_100, 14_500, "Sure."));
+        d.feed(&final_at(Source::Them, 14_100, 14_500, "Sure."));
         d.feed(&final_at(Source::You, 14_600, 17_000, MINE_REST));
         assert!(
             !d.found()[1].continues,
@@ -2995,8 +3140,8 @@ mod tests {
     }
 
     #[test]
-    fn a_you_line_that_needs_its_follower_is_scored_once_the_interviewer_answers() {
-        // Strict: `?` alone (2 points, no Interviewer cue) is under the bar of 3 until the
+    fn a_you_line_that_needs_its_follower_is_scored_once_the_other_person_answers() {
+        // Strict: `?` alone (2 points, no Them cue) is under the bar of 3 until the
         // other lane follows it.
         let mut d = Detecting::new(
             false,
@@ -3005,12 +3150,7 @@ mod tests {
         );
         assert_eq!(d.feed(&final_at(Source::You, 0, 1_000, "The p99?")), 0);
         assert_eq!(
-            d.feed(&final_at(
-                Source::Interviewer,
-                1_200,
-                3_000,
-                "About two seconds."
-            )),
+            d.feed(&final_at(Source::Them, 1_200, 3_000, "About two seconds.")),
             1
         );
         assert!(d.found()[0].late);
@@ -3020,9 +3160,9 @@ mod tests {
     #[test]
     fn the_candidates_answer_in_the_gap_ends_the_question() {
         let mut d = detecting();
-        d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST));
+        d.feed(&final_at(Source::Them, 0, 5_000, FIRST));
         d.feed(&final_at(Source::You, 5_200, 5_900, "Sure."));
-        d.feed(&final_at(Source::Interviewer, 6_000, 9_000, SECOND));
+        d.feed(&final_at(Source::Them, 6_000, 9_000, SECOND));
         assert!(
             !d.found()[1].continues,
             "the candidate spoke: a new question"
@@ -3033,28 +3173,23 @@ mod tests {
     fn an_answer_transcribed_early_but_spoken_later_does_not_end_it() {
         // At replay speed the answer (spoken after the second half) can arrive first.
         let mut d = detecting();
-        d.feed(&final_at(Source::Interviewer, 19_980, 26_000, FIRST));
+        d.feed(&final_at(Source::Them, 19_980, 26_000, FIRST));
         d.feed(&final_at(
             Source::You,
             31_040,
             43_040,
             "Okay, first I'd clarify the scope.",
         ));
-        d.feed(&final_at(Source::Interviewer, 26_560, 29_740, SECOND));
+        d.feed(&final_at(Source::Them, 26_560, 29_740, SECOND));
         assert!(d.found()[1].continues);
     }
 
     #[test]
     fn a_pause_that_hands_the_floor_back_starts_a_new_question() {
         let mut d = detecting();
-        d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST));
+        d.feed(&final_at(Source::Them, 0, 5_000, FIRST));
         let gap = u64::try_from(CONTINUE_GAP.as_millis()).unwrap_or(1_500) + 100;
-        d.feed(&final_at(
-            Source::Interviewer,
-            5_000 + gap,
-            9_000 + gap,
-            SECOND,
-        ));
+        d.feed(&final_at(Source::Them, 5_000 + gap, 9_000 + gap, SECOND));
         assert!(!d.found()[1].continues);
     }
 
@@ -3062,14 +3197,14 @@ mod tests {
     fn a_forced_split_at_12_s_continues() {
         let mut d = detecting();
         d.feed(&final_at(
-            Source::Interviewer,
+            Source::Them,
             148_400,
             160_400,
             "Sorry about that. Where were we? Right, the pipeline. Let's switch gears to something \
              more hands-on. Suppose you have a service whose P99 latency doubled overnight.",
         ));
         d.feed(&final_at(
-            Source::Interviewer,
+            Source::Them,
             161_180,
             162_940,
             "How do you go about finding the cause?",
@@ -3087,12 +3222,9 @@ mod tests {
     #[test]
     fn an_empty_final_between_the_halves_does_not_break_the_question() {
         let mut d = detecting();
-        d.feed(&final_at(Source::Interviewer, 19_980, 26_000, FIRST));
-        assert_eq!(
-            d.feed(&final_at(Source::Interviewer, 26_100, 26_300, "")),
-            0
-        );
-        d.feed(&final_at(Source::Interviewer, 26_560, 29_740, SECOND));
+        d.feed(&final_at(Source::Them, 19_980, 26_000, FIRST));
+        assert_eq!(d.feed(&final_at(Source::Them, 26_100, 26_300, "")), 0);
+        d.feed(&final_at(Source::Them, 26_560, 29_740, SECOND));
         assert!(d.found()[1].continues);
     }
 
@@ -3100,19 +3232,19 @@ mod tests {
     fn a_question_in_three_parts_continues_through_the_middle_statement() {
         let mut d = detecting();
         d.feed(&final_at(
-            Source::Interviewer,
+            Source::Them,
             208_700,
             212_700,
             "Imagine you're building the notification service for a food delivery app.",
         ));
         d.feed(&final_at(
-            Source::Interviewer,
+            Source::Them,
             213_600,
             216_000,
             "Orders change state every few seconds.",
         ));
         d.feed(&final_at(
-            Source::Interviewer,
+            Source::Them,
             216_900,
             219_600,
             "How would you get those updates to the customer's phone quickly?",
@@ -3131,18 +3263,18 @@ mod tests {
     #[test]
     fn a_chain_ends_after_30_s() {
         let mut d = detecting();
-        d.feed(&final_at(Source::Interviewer, 0, 5_000, FIRST));
+        d.feed(&final_at(Source::Them, 0, 5_000, FIRST));
         let mut at = 5_000;
         for _ in 0..5 {
             d.feed(&final_at(
-                Source::Interviewer,
+                Source::Them,
                 at + 500,
                 at + 6_000,
                 "That's the setup.",
             ));
             at += 6_000;
         }
-        d.feed(&final_at(Source::Interviewer, at + 500, at + 4_000, SECOND));
+        d.feed(&final_at(Source::Them, at + 500, at + 4_000, SECOND));
         assert!(
             !d.found().last().unwrap().continues,
             "34 s in: a new question"
@@ -3152,13 +3284,8 @@ mod tests {
     #[test]
     fn only_a_candidate_is_continued() {
         let mut d = detecting();
-        d.feed(&final_at(
-            Source::Interviewer,
-            0,
-            3_000,
-            "Okay, that makes sense.",
-        ));
-        d.feed(&final_at(Source::Interviewer, 3_400, 7_000, FIRST));
+        d.feed(&final_at(Source::Them, 0, 3_000, "Okay, that makes sense."));
+        d.feed(&final_at(Source::Them, 3_400, 7_000, FIRST));
         assert_eq!(d.found().len(), 1);
         assert!(
             !d.found()[0].continues,
@@ -3169,7 +3296,7 @@ mod tests {
     #[test]
     fn the_configured_sensitivity_reaches_the_detector() {
         let threshold = |s| {
-            Detecting::new(false, sensitivity(s), QuestionSource::Interviewer)
+            Detecting::new(false, sensitivity(s), QuestionSource::Them)
                 .detector()
                 .config()
                 .effective_threshold()
@@ -3204,9 +3331,9 @@ mod tests {
         };
         let finals = [
             seg(Source::You, 5, "Before the question."),
-            seg(Source::Interviewer, 10, "Design a cache."),
+            seg(Source::Them, 10, "Design a cache."),
             seg(Source::You, 14, "LRU in front of Redis."),
-            seg(Source::Interviewer, 20, "Mm-hm."),
+            seg(Source::Them, 20, "Mm-hm."),
             seg(Source::You, 22, " I'll come back to eviction. "),
             seg(Source::You, 40, "After the next question."),
         ];
@@ -3261,7 +3388,7 @@ mod tests {
 
     impl AudioSource for Ended {
         fn source(&self) -> Source {
-            Source::Interviewer
+            Source::Them
         }
         fn start(&mut self, _sink: FrameSink) -> Result<(), AudioError> {
             Ok(())
@@ -3327,15 +3454,15 @@ mod tests {
     fn a_live_input_is_labelled_by_what_it_captures() {
         let live = Input::Live {
             mic: CaptureTarget::Mic(None),
-            interviewer: CaptureTarget::interviewer("Firefox"),
+            them: CaptureTarget::them("Firefox"),
         };
         assert_eq!(live.label(), "live mic (default source) + app Firefox");
         assert_eq!(
-            describe(&CaptureTarget::interviewer("")),
+            describe(&CaptureTarget::them("")),
             "all system audio (sink monitor)"
         );
         let files = Input::Files {
-            interviewer: "a.wav".into(),
+            them: "a.wav".into(),
             candidate: "b.wav".into(),
         };
         assert_eq!(files.label(), "replay a.wav + b.wav");
@@ -3360,7 +3487,7 @@ mod tests {
             &Options {
                 input: Input::Live {
                     mic: CaptureTarget::Mic(None),
-                    interviewer: CaptureTarget::SinkMonitor,
+                    them: CaptureTarget::SinkMonitor,
                 },
                 speed: 1.0,
                 model: None,
@@ -3450,7 +3577,7 @@ mod tests {
     /// Assistance over a mock model that records every request, and whether the suggester was
     /// ever started.
     fn assistance(on: bool) -> (Assistance, dmn_llm::MockProvider, Arc<AtomicBool>) {
-        assistance_for(on, QuestionSource::Interviewer)
+        assistance_for(on, QuestionSource::Them)
     }
 
     /// [`assistance`] with `[detect].question_source` set (#90).
@@ -3497,7 +3624,7 @@ mod tests {
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         a.flush(&log, &mut Quiet);
         let (d, tally, _) = a.finish(false);
@@ -3514,7 +3641,7 @@ mod tests {
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         publish(
             &mut a,
@@ -3529,7 +3656,7 @@ mod tests {
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 31_000, 36_000, LATER),
+            final_at(Source::Them, 31_000, 36_000, LATER),
         );
         a.flush(&log, &mut Quiet);
         a.command(Command::Regenerate, &log);
@@ -3556,7 +3683,7 @@ mod tests {
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         a.command(Command::Assist { on: true }, &log);
         assert!(
@@ -3566,7 +3693,7 @@ mod tests {
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 40_000, 45_000, LATER),
+            final_at(Source::Them, 40_000, 45_000, LATER),
         );
         a.flush(&log, &mut Quiet);
         let (d, _, _) = a.finish(false);
@@ -3584,14 +3711,14 @@ mod tests {
     }
 
     #[test]
-    fn you_only_answers_the_mic_question_and_never_asks_about_the_interviewers() {
+    fn you_only_answers_the_mic_question_and_never_asks_about_theirs() {
         let (mut a, mock, _) = assistance_for(true, QuestionSource::You);
         let hub = Arc::clone(&a.hub);
         let mut log = TranscriptLog::new();
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         publish(
             &mut a,
@@ -3601,7 +3728,7 @@ mod tests {
         a.flush(&log, &mut Quiet);
         // Labels and the transcript are the source's business not at all.
         let lanes: Vec<Source> = log.finals().iter().map(|s| s.source).collect();
-        assert_eq!(lanes, [Source::Interviewer, Source::You]);
+        assert_eq!(lanes, [Source::Them, Source::You]);
         assert_eq!(hub.snapshot().counts.candidates, 1);
         let (d, _, _) = a.finish(false);
         assert_eq!(sources(&d), [Source::You]);
@@ -3612,7 +3739,7 @@ mod tests {
             user.contains(&format!("## You just said\n{MINE}")),
             "{user}"
         );
-        assert!(!user.contains("## Interviewer just said"), "{user}");
+        assert!(!user.contains("## Them just said"), "{user}");
     }
 
     #[test]
@@ -3624,7 +3751,7 @@ mod tests {
             publish(
                 &mut a,
                 &mut log,
-                final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+                final_at(Source::Them, 20_000, 26_000, FIRST),
             );
             publish(
                 &mut a,
@@ -3662,14 +3789,14 @@ mod tests {
     }
 
     #[test]
-    fn in_both_an_echoed_interviewer_question_is_one_candidate_not_two() {
-        // No headphones: the mic hears the interviewer's question a moment later. The echo
+    fn in_both_an_echoed_them_question_is_one_candidate_not_two() {
+        // No headphones: the mic hears the other person's question a moment later. The echo
         // guard sits above assistance, so the copy is dropped before the detector sees it.
         let (mut a, mock, _) = assistance_for(true, QuestionSource::Both);
         let mut log = TranscriptLog::new();
         let mut echo = EchoGuard::new(true);
         let now = Duration::from_secs(27);
-        let mut verdicts = echo.observe(final_at(Source::Interviewer, 20_000, 26_000, FIRST), now);
+        let mut verdicts = echo.observe(final_at(Source::Them, 20_000, 26_000, FIRST), now);
         verdicts.extend(echo.observe(final_at(Source::You, 20_150, 26_200, FIRST), now));
         verdicts.extend(echo.finish());
         for verdict in verdicts {
@@ -3682,7 +3809,7 @@ mod tests {
         a.flush(&log, &mut Quiet);
         assert_eq!(echo.dropped(), 1, "the mic copy");
         let (d, _, _) = a.finish(false);
-        assert_eq!(sources(&d), [Source::Interviewer]);
+        assert_eq!(sources(&d), [Source::Them]);
         assert_eq!(mock.requests().len(), 1);
     }
 
@@ -3704,7 +3831,7 @@ mod tests {
                 &paths,
                 &Options {
                     input: Input::Files {
-                        interviewer: fixture.join("interviewer.wav"),
+                        them: fixture.join("interviewer.wav"),
                         candidate: fixture.join("candidate.wav"),
                     },
                     speed: 8.0,
@@ -3745,7 +3872,7 @@ mod tests {
                 .detecting
                 .found()
                 .iter()
-                .all(|f| f.candidate.source == Source::Interviewer)
+                .all(|f| f.candidate.source == Source::Them)
         );
         let lines = |r: &Report| -> Vec<(Source, String)> {
             r.log
@@ -3782,7 +3909,7 @@ mod tests {
             &paths,
             &Options {
                 input: Input::Files {
-                    interviewer: fixture.join("interviewer.wav"),
+                    them: fixture.join("interviewer.wav"),
                     candidate: fixture.join("candidate.wav"),
                 },
                 // 10:45 of audio in about a minute; whisper small keeps up on 8 threads.
@@ -3875,14 +4002,14 @@ mod tests {
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         a.command(Command::Assist { on: false }, &log);
         a.command(Command::Assist { on: true }, &log);
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 26_600, 31_000, SECOND),
+            final_at(Source::Them, 26_600, 31_000, SECOND),
         );
         let (d, _, _) = a.finish(false);
         assert_eq!(d.found().len(), 2);
@@ -3894,7 +4021,7 @@ mod tests {
 
     // --- The ask key (#96) -------------------------------------------------------------------
 
-    /// What the interviewer said in the mock interview #96 came from (session 24), after the
+    /// What the other person said in the mock interview #96 came from (session 24), after the
     /// candidate's answer ended at about 197 s, as `(start ms, end ms, text)`. The question is
     /// the end of the last line, and the detector made no candidate from any of them.
     const SESSION_24: [(u64, u64, &str); 5] = [
@@ -3977,7 +4104,7 @@ mod tests {
 
     fn hear_session_24(hub: &SessionHub, log: &mut TranscriptLog) {
         for (start, end, text) in SESSION_24 {
-            hear(hub, log, final_at(Source::Interviewer, start, end, text));
+            hear(hub, log, final_at(Source::Them, start, end, text));
         }
     }
 
@@ -4044,30 +4171,28 @@ mod tests {
         ),
     ];
 
-    fn three_interviewer_finals() -> Vec<Segment> {
+    fn three_them_finals() -> Vec<Segment> {
         let mut finals = vec![final_at(
             Source::You,
             0,
             4_000,
             "I'd start with a token bucket.",
         )];
-        finals.extend(
-            THREE.map(|(start, end, text)| final_at(Source::Interviewer, start, end, text)),
-        );
+        finals.extend(THREE.map(|(start, end, text)| final_at(Source::Them, start, end, text)));
         finals
     }
 
     #[test]
     fn a_turn_of_three_finals_is_one_candidate_in_spoken_order() {
-        let log = log_of(&three_interviewer_finals());
-        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        let log = log_of(&three_them_finals());
+        let turn = last_turn(log.finals(), QuestionSource::Them).unwrap();
         assert_eq!(
             turn.text,
             "Okay, that covers the happy path. Now say one region loses its Redis. What does \
              the limiter do for those callers?"
         );
         assert_eq!(turn.line, turn.text);
-        assert_eq!(turn.source, Source::Interviewer);
+        assert_eq!(turn.source, Source::Them);
         assert_eq!(
             (turn.start, turn.end),
             (Duration::from_millis(5_000), Duration::from_millis(18_000))
@@ -4079,30 +4204,30 @@ mod tests {
         );
 
         // What the candidate says after the turn is not between its lines.
-        let mut answering = three_interviewer_finals();
+        let mut answering = three_them_finals();
         answering.push(final_at(Source::You, 19_000, 24_000, "Good question."));
         let log = log_of(&answering);
-        let later = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        let later = last_turn(log.finals(), QuestionSource::Them).unwrap();
         assert_eq!(later.text, turn.text);
     }
 
     #[test]
     fn a_you_final_between_the_lines_cuts_the_turn_there() {
-        let mut finals = three_interviewer_finals();
+        let mut finals = three_them_finals();
         finals.push(final_at(Source::You, 9_100, 9_500, "Right."));
         let log = log_of(&finals);
-        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        let turn = last_turn(log.finals(), QuestionSource::Them).unwrap();
         assert_eq!(
             turn.text,
             "Now say one region loses its Redis. What does the limiter do for those callers?"
         );
         assert_eq!(turn.start, Duration::from_millis(9_600));
 
-        // A "mm-hm" while the interviewer is still speaking is inside a line, not between two.
-        let mut finals = three_interviewer_finals();
+        // A "mm-hm" while the other person is still speaking is inside a line, not between two.
+        let mut finals = three_them_finals();
         finals.push(final_at(Source::You, 10_000, 10_400, "Mm-hm."));
         let log = log_of(&finals);
-        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        let turn = last_turn(log.finals(), QuestionSource::Them).unwrap();
         assert_eq!(turn.start, Duration::from_millis(5_000), "{}", turn.text);
     }
 
@@ -4113,29 +4238,29 @@ mod tests {
         let whole = "Okay, that covers the happy path. Now say one region loses its Redis. What \
                      does the limiter do for those callers?";
         for nothing in ["", "  "] {
-            let mut finals = three_interviewer_finals();
+            let mut finals = three_them_finals();
             // In the gap between the first and the second line, where "Right." cuts the turn.
             finals.insert(2, final_at(Source::You, 9_100, 9_500, nothing));
-            let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+            let turn = last_turn(&finals, QuestionSource::Them).unwrap();
             assert_eq!(turn.text, whole, "{nothing:?}");
             assert_eq!(turn.start, Duration::from_millis(5_000));
 
             // On the asking lane it is not the turn's last line, nor a line of it.
-            finals.push(final_at(Source::Interviewer, 18_400, 18_900, nothing));
-            let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+            finals.push(final_at(Source::Them, 18_400, 18_900, nothing));
+            let turn = last_turn(&finals, QuestionSource::Them).unwrap();
             assert_eq!(turn.text, whole, "{nothing:?}");
             assert_eq!(turn.end, Duration::from_millis(18_000));
             // Alone, it is not a turn at all: that lane has said nothing.
             assert!(last_turn(&finals[2..3], QuestionSource::You).is_none());
         }
         // The same place with something said in it still cuts the turn.
-        let mut finals = three_interviewer_finals();
+        let mut finals = three_them_finals();
         finals.insert(2, final_at(Source::You, 9_100, 9_500, "Right."));
-        let turn = last_turn(&finals, QuestionSource::Interviewer).unwrap();
+        let turn = last_turn(&finals, QuestionSource::Them).unwrap();
         assert_eq!(turn.start, Duration::from_millis(9_600), "{}", turn.text);
 
         // And the log is where such a final stops: it never holds one.
-        let mut log = log_of(&three_interviewer_finals());
+        let mut log = log_of(&three_them_finals());
         log.apply(final_at(Source::You, 9_100, 9_500, ""));
         assert_eq!(log.finals().len(), 4);
     }
@@ -4144,10 +4269,10 @@ mod tests {
     fn a_turn_goes_back_at_most_30_s() {
         let finals: Vec<Segment> = SESSION_24
             .iter()
-            .map(|&(start, end, text)| final_at(Source::Interviewer, start, end, text))
+            .map(|&(start, end, text)| final_at(Source::Them, start, end, text))
             .collect();
         let log = log_of(&finals);
-        let turn = last_turn(log.finals(), QuestionSource::Interviewer).unwrap();
+        let turn = last_turn(log.finals(), QuestionSource::Them).unwrap();
         // 232.5 s back to 206.8 s is 25.7 s; the line before starts 30.4 s back.
         assert_eq!(turn.start, Duration::from_millis(206_800));
         assert_eq!(
@@ -4160,26 +4285,26 @@ mod tests {
     #[test]
     fn the_turn_is_on_the_lane_the_question_source_selects() {
         let finals = [
-            final_at(Source::Interviewer, 0, 5_000, FIRST),
+            final_at(Source::Them, 0, 5_000, FIRST),
             final_at(Source::You, 6_000, 9_000, MINE),
             final_at(Source::You, 9_400, 12_000, MINE_REST),
-            final_at(Source::Interviewer, 13_000, 13_600, "Mm-hm."),
+            final_at(Source::Them, 13_000, 13_600, "Mm-hm."),
         ];
         let log = log_of(&finals);
         let turn = |asks| last_turn(log.finals(), asks).map(|c| (c.source, c.text));
         assert_eq!(
-            turn(QuestionSource::Interviewer),
-            Some((Source::Interviewer, "Mm-hm.".into())),
-            "your lines in between cut the interviewer's turn"
+            turn(QuestionSource::Them),
+            Some((Source::Them, "Mm-hm.".into())),
+            "your lines in between cut the other person's turn"
         );
         assert_eq!(
             turn(QuestionSource::You),
             Some((Source::You, format!("{MINE} {MINE_REST}"))),
-            "the mic lane's last turn, though the interviewer spoke after it"
+            "the mic lane's last turn, though the other person spoke after it"
         );
         assert_eq!(
             turn(QuestionSource::Both),
-            Some((Source::Interviewer, "Mm-hm.".into())),
+            Some((Source::Them, "Mm-hm.".into())),
             "both: whichever lane spoke last"
         );
         let log = log_of(&finals[..3]);
@@ -4207,7 +4332,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_asks_the_last_thing_the_interviewer_said_when_the_detector_made_no_candidate() {
+    fn enter_asks_the_last_thing_the_other_person_said_when_the_detector_made_no_candidate() {
         // The whole path, store included: the session-24 lines are the transcript, nothing was
         // detected in them, and one key press puts the question and its Approach on screen.
         let dir = tempfile::tempdir().unwrap();
@@ -4219,7 +4344,7 @@ mod tests {
             at: 1_790_000_000,
         });
         let mock = dmn_llm::MockProvider::json(&reply(RESERVE));
-        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut a = asking(&hub, &mock, QuestionSource::Them);
         let mut log = TranscriptLog::new();
         hear(
             &hub,
@@ -4256,7 +4381,7 @@ mod tests {
         assert_eq!(asked.len(), 1);
         let turn = [SESSION_24[2].2, SESSION_24[3].2, SESSION_24[4].2].join(" ");
         assert!(
-            asked[0].contains(&format!("## Interviewer just said\n{turn}")),
+            asked[0].contains(&format!("## Them just said\n{turn}")),
             "{}",
             asked[0]
         );
@@ -4292,12 +4417,12 @@ mod tests {
     fn enter_while_pinned_queues_the_question_and_the_badge_counts_it() {
         let hub = Arc::new(SessionHub::default());
         let mock = dmn_llm::MockProvider::json(&reply(FIRST)).then_json(&reply(RESERVE));
-        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut a = asking(&hub, &mock, QuestionSource::Them);
         let mut log = TranscriptLog::new();
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         wait_until(&hub, "the detected question", answered);
         hub.dispatch(Action::Pin);
@@ -4316,7 +4441,12 @@ mod tests {
         let shown = screen(&s);
         assert!(shown.contains("PINNED QUESTION"), "{shown}");
         assert!(shown.contains("1 new"), "the badge counts it:\n{shown}");
-        assert!(!shown.contains("reserve and then reconcile"), "{shown}");
+        // Not in the question area; the transcript below holds the turn's own words.
+        let question_area = shown.split(" TRANSCRIPT").next().unwrap_or_default();
+        assert!(
+            !question_area.contains("reserve and then reconcile"),
+            "{shown}"
+        );
 
         // The queued question is that turn's: Enter again asks nothing.
         a.command(Command::Ask, &log);
@@ -4331,7 +4461,7 @@ mod tests {
         // Streams for about a second, so the second press comes while the first is in flight.
         let mock =
             dmn_llm::MockProvider::json(&reply(RESERVE)).with_delay(Duration::from_millis(20));
-        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut a = asking(&hub, &mock, QuestionSource::Them);
         let mut log = TranscriptLog::new();
         hear_session_24(&hub, &mut log);
         a.command(Command::Ask, &log);
@@ -4342,12 +4472,12 @@ mod tests {
         a.command(Command::Ask, &log);
         assert_eq!(hub.snapshot().counts.candidates, 1);
 
-        // A new line from the interviewer is a new turn.
+        // A new line from the other person is a new turn.
         hear(
             &hub,
             &mut log,
             final_at(
-                Source::Interviewer,
+                Source::Them,
                 233_400,
                 236_000,
                 "And how would you test that under load?",
@@ -4368,7 +4498,7 @@ mod tests {
         )])
         .then_json(&reply(RESERVE))
         .with_delay(Duration::from_millis(20));
-        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut a = asking(&hub, &mock, QuestionSource::Them);
         let mut log = TranscriptLog::new();
         hear_session_24(&hub, &mut log);
         a.command(Command::Ask, &log);
@@ -4393,7 +4523,7 @@ mod tests {
         let turn = [SESSION_24[2].2, SESSION_24[3].2, SESSION_24[4].2].join(" ");
         for user in &asked {
             assert!(
-                user.contains(&format!("## Interviewer just said\n{turn}")),
+                user.contains(&format!("## Them just said\n{turn}")),
                 "{user}"
             );
         }
@@ -4403,12 +4533,12 @@ mod tests {
     fn enter_on_a_turn_the_detector_already_made_the_question_asks_nothing() {
         let hub = Arc::new(SessionHub::default());
         let mock = dmn_llm::MockProvider::json(&reply(FIRST)).with_delay(Duration::from_millis(20));
-        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut a = asking(&hub, &mock, QuestionSource::Them);
         let mut log = TranscriptLog::new();
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         // Its reply is on its way: an impatient Enter must not cancel it and ask again.
         a.command(Command::Ask, &log);
@@ -4459,14 +4589,14 @@ mod tests {
             "is_question": false,
             "kind": "small_talk"
         }));
-        let mut a = asking(&hub, &mock, QuestionSource::Interviewer);
+        let mut a = asking(&hub, &mock, QuestionSource::Them);
         let mut log = TranscriptLog::new();
 
         // The detector's candidate, declined: nothing is said, as before #96.
         publish(
             &mut a,
             &mut log,
-            final_at(Source::Interviewer, 20_000, 26_000, FIRST),
+            final_at(Source::Them, 20_000, 26_000, FIRST),
         );
         let s = wait_until(&hub, "the detector's candidate declined", |s| {
             s.counts.ignored == 1
@@ -4487,12 +4617,7 @@ mod tests {
         hear(
             &hub,
             &mut log,
-            final_at(
-                Source::Interviewer,
-                31_000,
-                33_000,
-                "Okay, that makes sense.",
-            ),
+            final_at(Source::Them, 31_000, 33_000, "Okay, that makes sense."),
         );
         a.command(Command::Ask, &log);
         let s = wait_until(&hub, "the key's candidate declined", |s| {
@@ -4550,7 +4675,7 @@ mod tests {
         let mut a = asking(&hub, &mock, QuestionSource::You);
         let mut log = TranscriptLog::new();
         for seg in [
-            final_at(Source::Interviewer, 0, 5_000, FIRST),
+            final_at(Source::Them, 0, 5_000, FIRST),
             final_at(
                 Source::You,
                 6_000,
@@ -4563,7 +4688,7 @@ mod tests {
                 13_000,
                 "Token bucket or sliding window for a public API.",
             ),
-            final_at(Source::Interviewer, 14_000, 14_600, "Mm-hm."),
+            final_at(Source::Them, 14_000, 14_600, "Mm-hm."),
         ] {
             hear(&hub, &mut log, seg);
         }
@@ -4580,11 +4705,7 @@ mod tests {
             "{}",
             asked[0]
         );
-        assert!(
-            !asked[0].contains("## Interviewer just said"),
-            "{}",
-            asked[0]
-        );
+        assert!(!asked[0].contains("## Them just said"), "{}", asked[0]);
     }
 
     // --- #113: translation-only: a translator of its own, the answer model left out ---------
@@ -4674,7 +4795,7 @@ mod tests {
             false,
             hub,
             AudioClock::new(Instant::now(), 1.0),
-            detecting_for(QuestionSource::Interviewer),
+            detecting_for(QuestionSource::Them),
             Some(launch),
         );
         a.command(Command::Assist { on: true }, &TranscriptLog::new());
@@ -4938,20 +5059,20 @@ mod tests {
     }
 
     /// #124: a You line skips the echo guard's hold while push-to-talk is on, unless the guard
-    /// still holds earlier ones; the interviewer's lines always go through it.
+    /// still holds earlier ones; Them's lines always go through it.
     #[test]
     fn push_to_talk_lines_skip_the_echo_guard() {
         assert!(ptt_skips_guard(Source::You, true, 0));
         assert!(!ptt_skips_guard(Source::You, true, 1));
         assert!(!ptt_skips_guard(Source::You, false, 0));
-        assert!(!ptt_skips_guard(Source::Interviewer, true, 0));
+        assert!(!ptt_skips_guard(Source::Them, true, 0));
     }
 
-    /// The interviewer's question, then your answer in two finals.
+    /// The other person's question, then your answer in two finals.
     fn your_answer(hub: &SessionHub) -> TranscriptLog {
         let mut log = TranscriptLog::new();
         for seg in [
-            final_at(Source::Interviewer, 0, 5_000, FIRST),
+            final_at(Source::Them, 0, 5_000, FIRST),
             final_at(Source::You, 6_000, 9_000, SAID),
             final_at(Source::You, 9_400, 12_000, SAID_REST),
         ] {
@@ -4995,11 +5116,7 @@ mod tests {
         let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
         let (mut s, played) = speaking(&hub, &llm, &tts);
         let mut log = TranscriptLog::new();
-        hear(
-            &hub,
-            &mut log,
-            final_at(Source::Interviewer, 0, 5_000, FIRST),
-        );
+        hear(&hub, &mut log, final_at(Source::Them, 0, 5_000, FIRST));
         s.press(&log);
         let snap = hub.snapshot();
         assert_eq!(snap.speech, None);
@@ -5196,7 +5313,7 @@ mod tests {
         s.finish();
         let ms = |d: Duration| d.as_millis() as u64;
         let during = final_at(
-            Source::Interviewer,
+            Source::Them,
             ms(pressed_at),
             ms(done_at),
             "Empezaría con un token bucket.",
@@ -5204,7 +5321,7 @@ mod tests {
         let verdicts = echo.observe(during.clone(), Duration::from_secs(100));
         assert_eq!(verdicts, [Verdict::Drop(during)]);
         let later = final_at(
-            Source::Interviewer,
+            Source::Them,
             ms(done_at) + 5_000,
             ms(done_at) + 8_000,
             LATER,
@@ -5213,7 +5330,7 @@ mod tests {
         assert_eq!(verdicts, [Verdict::Publish(later)]);
     }
 
-    /// #109 with #77: with `[speak]` on the You lane keeps your own words; the Interviewer lane
+    /// #109 with #77: with `[speak]` on the You lane keeps your own words; the Them lane
     /// translates as configured. With `[speak]` off, or English, nothing changes.
     #[test]
     fn with_speak_on_the_you_lane_transcribes_without_whisper_translate() {
@@ -5222,10 +5339,10 @@ mod tests {
         let es = Language::Fixed("es".into());
         assert_eq!(lane_language(Source::You, &auto, true), Language::Detect);
         assert_eq!(lane_language(Source::You, &es, true), Language::Detect);
-        assert_eq!(lane_language(Source::Interviewer, &auto, true), auto);
-        assert_eq!(lane_language(Source::Interviewer, &es, true), es);
+        assert_eq!(lane_language(Source::Them, &auto, true), auto);
+        assert_eq!(lane_language(Source::Them, &es, true), es);
         for lang in [Language::English, auto.clone(), es.clone()] {
-            for source in [Source::You, Source::Interviewer] {
+            for source in [Source::You, Source::Them] {
                 assert_eq!(lane_language(source, &lang, false), lang, "speak off");
             }
         }
@@ -5479,11 +5596,7 @@ mod tests {
         let (mut s, played, gate) = speaking_in(&hub, &llm, &tts, VoiceMode::Translate);
         gate_settles(&gate, false);
         let mut log = TranscriptLog::new();
-        hear(
-            &hub,
-            &mut log,
-            final_at(Source::Interviewer, 0, 5_000, FIRST),
-        );
+        hear(&hub, &mut log, final_at(Source::Them, 0, 5_000, FIRST));
         let first = final_at(Source::You, 6_000, 9_000, SAID);
         hear(&hub, &mut log, first.clone());
         s.heard(&first);
@@ -5561,12 +5674,12 @@ mod tests {
     }
 
     /// #114 (review of PR #119): while a turn waits, a You final joins it only until the
-    /// interviewer speaks; what the user says after that is a turn of its own, as `last_turn`
-    /// groups them. Here the first turn is in flight, the second waits, the interviewer answers,
+    /// other person speaks; what the user says after that is a turn of its own, as `last_turn`
+    /// groups them. Here the first turn is in flight, the second waits, the other person answers,
     /// and the third and fourth finals arrive: three translate requests, the third and fourth
     /// finals joined into the third.
     #[test]
-    fn in_translate_mode_the_interviewer_speaking_ends_the_waiting_turn() {
+    fn in_translate_mode_the_other_person_speaking_ends_the_waiting_turn() {
         let hub = Arc::new(SessionHub::default());
         let llm = spanish().with_delay(Duration::from_millis(300));
         let tts = dmn_tts::MockTtsProvider::new();
@@ -5580,13 +5693,13 @@ mod tests {
         hear(&hub, &mut log, second.clone());
         s.heard(&second);
         assert_eq!(s.queue.len(), 1, "the second waits");
-        let asked = final_at(Source::Interviewer, 16_000, 18_000, FIRST);
+        let asked = final_at(Source::Them, 16_000, 18_000, FIRST);
         hear(&hub, &mut log, asked.clone());
         s.heard(&asked);
         assert_eq!(
             s.queue.len(),
             1,
-            "the interviewer's line is not a turn to speak"
+            "the other person's line is not a turn to speak"
         );
         // Long enough that the mock's Spanish passes #117's length rule for the joined turn.
         let third = final_at(Source::You, 19_000, 21_000, SAID);
@@ -5595,7 +5708,7 @@ mod tests {
         assert_eq!(
             s.queue.len(),
             2,
-            "after the interviewer spoke, a turn of its own"
+            "after the other person spoke, a turn of its own"
         );
         let fourth = final_at(Source::You, 21_500, 23_000, SAID_REST);
         hear(&hub, &mut log, fourth.clone());
@@ -5724,12 +5837,12 @@ mod tests {
             final_at(Source::You, 6_000, 9_000, SAID),
             final_at(Source::You, 10_000, 11_000, "And I'd keep"),
             final_at(Source::You, 11_200, 12_000, "the counters in Redis."),
-            // Not turns: a partial, the interviewer, an echo retraction.
+            // Not turns: a partial, the other person, an echo retraction.
             Segment {
                 is_final: false,
                 ..final_at(Source::You, 13_000, 13_500, "Also")
             },
-            final_at(Source::Interviewer, 13_000, 14_000, "Go on."),
+            final_at(Source::Them, 13_000, 14_000, "Go on."),
             final_at(Source::You, 14_000, 14_500, ""),
         ] {
             hear(&hub, &mut log, seg.clone());
@@ -5936,11 +6049,11 @@ mod tests {
         for (n, turn) in turns.iter().enumerate() {
             let at = 6_000 + 20_000 * n as u64;
             if n > 0 {
-                // The interviewer between two turns, so each press speaks only its own.
+                // The other person between two turns, so each press speaks only its own.
                 hear(
                     &hub,
                     &mut log,
-                    final_at(Source::Interviewer, at - 3_000, at - 1_000, "Go on."),
+                    final_at(Source::Them, at - 3_000, at - 1_000, "Go on."),
                 );
             }
             hear(&hub, &mut log, final_at(Source::You, at, at + 5_000, turn));
@@ -6078,7 +6191,7 @@ mod tests {
             &paths,
             &Options {
                 input: Input::Files {
-                    interviewer: fixture.join("interviewer.wav"),
+                    them: fixture.join("interviewer.wav"),
                     candidate: fixture.join("candidate.wav"),
                 },
                 speed: 8.0,

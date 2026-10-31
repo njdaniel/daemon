@@ -25,6 +25,6 @@
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         So I'd split the numbers into two halves around the median.
+You       Sounds great.
+You       So I'd split the numbers into two halves around the median.
  ● mic  ● system  ● model                                                  p pin · s: hints · ⏎ ask

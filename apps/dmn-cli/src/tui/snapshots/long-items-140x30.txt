@@ -22,9 +22,9 @@
       enforces its share of the quota and reports usage to a reconciler, which      │
       moves any unused share to busy regions every few seconds, so a partition      │
       over-admits by one share at worst.                                            │
-      Failure: If Redis is unreachable the limiter fails open to a conservative     │Interviewer Hi, thanks for making the time today. This
-      per-instance limit held in its own memory, sends an alert and marks its       │            session is about an hour of system design.
-      decisions as degraded in the access log, so abuse during the outage can be    │You         Sounds great.
-      found and billed afterwards.                                                  │You         Okay, so first I'd want to know what we're
-      ↑ 2                                                                           │            limiting on.
+      Failure: If Redis is unreachable the limiter fails open to a conservative     │Them      Hi, thanks for making the time today. This
+      per-instance limit held in its own memory, sends an alert and marks its       │          session is about an hour of system design.
+      decisions as degraded in the access log, so abuse during the outage can be    │You       Sounds great.
+      found and billed afterwards.                                                  │You       Okay, so first I'd want to know what we're
+      ↑ 2                                                                           │          limiting on.
  ● mic  ● system  ● model                                                                                         ↑↓ scroll · p pin · ⏎ ask

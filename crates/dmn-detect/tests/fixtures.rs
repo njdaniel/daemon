@@ -1,6 +1,6 @@
 //! Recall and precision on the scripted fixture text.
 //!
-//! This is the detector alone: it reads what the interviewer was scripted to say, so a miss here
+//! This is the detector alone: it reads what the other person was scripted to say, so a miss here
 //! is the rule scorer's fault and not whisper's. `eval/run.py` runs the same comparison over real
 //! transcripts from `dmn replay`, where STT errors also count; the two numbers together say
 //! whether a miss came from the rules or from the audio.
@@ -48,7 +48,7 @@ fn secs(s: f64) -> Duration {
     Duration::from_secs_f64(s)
 }
 
-/// Score every interviewer turn, giving the detector the truth about what followed it.
+/// Score every Them turn, giving the detector the truth about what followed it.
 fn candidates(fixture: &str, cfg: DetectConfig) -> (Vec<Turn>, Vec<Option<Candidate>>) {
     let turns = load(fixture);
     let detector = Detector::new(cfg);
@@ -62,7 +62,7 @@ fn candidates(fixture: &str, cfg: DetectConfig) -> (Vec<Turn>, Vec<Option<Candid
             Some(next) => Following {
                 silence: Some(next.start.saturating_sub(turn.end)),
                 next_speaker: Some(if next.speaker == "interviewer" {
-                    Source::Interviewer
+                    Source::Them
                 } else {
                     Source::You
                 }),
@@ -70,7 +70,7 @@ fn candidates(fixture: &str, cfg: DetectConfig) -> (Vec<Turn>, Vec<Option<Candid
             None => Following::UNKNOWN,
         };
         let segment = Segment {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: turn.start,
             end: turn.end,
             text: turn.text.clone(),
@@ -211,7 +211,7 @@ fn scoring_a_line_is_far_inside_the_100_ms_budget() {
         .iter()
         .filter(|t| t.speaker == "interviewer")
         .map(|t| Segment {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: t.start,
             end: t.end,
             text: t.text.clone(),

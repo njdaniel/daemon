@@ -19,7 +19,7 @@ fn seg(speaker: Speaker, start: f64, end: f64, text: &str, is_final: bool) -> Ac
 fn candidate(id: u64, start: f64, text: &str) -> Action {
     Action::Candidate {
         id,
-        speaker: Speaker::Interviewer,
+        speaker: Speaker::Them,
         start,
         end: start + 4.0,
         text: text.into(),
@@ -67,17 +67,11 @@ fn interview() -> Vec<Action> {
             dot: Dot::Model,
             health: Health::Ok,
         },
-        seg(Speaker::Interviewer, 1.0, 3.0, "Hi, thanks for", false),
-        seg(
-            Speaker::Interviewer,
-            1.0,
-            5.0,
-            "Hi, thanks for joining.",
-            true,
-        ),
+        seg(Speaker::Them, 1.0, 3.0, "Hi, thanks for", false),
+        seg(Speaker::Them, 1.0, 5.0, "Hi, thanks for joining.", true),
         seg(Speaker::You, 5.5, 6.5, "Happy to be here.", true),
         seg(
-            Speaker::Interviewer,
+            Speaker::Them,
             8.0,
             12.0,
             "How would you design a rate limiter?",
@@ -92,7 +86,7 @@ fn interview() -> Vec<Action> {
     ));
     log.extend([
         seg(
-            Speaker::Interviewer,
+            Speaker::Them,
             30.0,
             33.0,
             "And what if Redis goes down?",
@@ -116,7 +110,7 @@ fn interview() -> Vec<Action> {
         },
         Action::Pin,
         seg(
-            Speaker::Interviewer,
+            Speaker::Them,
             50.0,
             54.0,
             "Next: design a URL shortener.",
@@ -126,20 +120,14 @@ fn interview() -> Vec<Action> {
     ]);
     log.extend(shown(3, "Design a URL shortener.", &["Clarify QPS."]));
     log.extend([
-        seg(Speaker::Interviewer, 70.0, 72.0, "Nice weather, huh?", true),
+        seg(Speaker::Them, 70.0, 72.0, "Nice weather, huh?", true),
         candidate(4, 70.0, "Nice weather, huh?"),
         Action::Ignored {
             candidate: 4,
             reason: IgnoreReason::SmallTalk,
             score: 3,
         },
-        seg(
-            Speaker::Interviewer,
-            90.0,
-            94.0,
-            "How do you test it?",
-            true,
-        ),
+        seg(Speaker::Them, 90.0, 94.0, "How do you test it?", true),
         candidate(5, 90.0, "How do you test it?"),
         Action::Failed {
             candidate: 5,
@@ -159,13 +147,7 @@ fn interview() -> Vec<Action> {
 fn a_question_fills_the_live_area_line_by_line() {
     let mut s = Session::default();
     let mut log = vec![
-        seg(
-            Speaker::Interviewer,
-            8.0,
-            12.0,
-            "How would you design it?",
-            true,
-        ),
+        seg(Speaker::Them, 8.0, 12.0, "How would you design it?", true),
         candidate(1, 8.0, "How would you design it?"),
     ];
     for a in &log {
@@ -365,10 +347,7 @@ fn partials_are_replaced_by_their_final_and_the_window_is_60_s() {
     assert!(s.partials.is_empty());
     assert_eq!(s.transcript.len(), 1);
 
-    reduce(
-        &mut s,
-        &seg(Speaker::Interviewer, 80.0, 82.0, "Okay.", true),
-    );
+    reduce(&mut s, &seg(Speaker::Them, 80.0, 82.0, "Okay.", true));
     assert_eq!(
         s.transcript.len(),
         1,
@@ -382,26 +361,23 @@ fn partials_are_replaced_by_their_final_and_the_window_is_60_s() {
 
 #[test]
 fn the_listening_line_follows_the_question_source() {
-    // The default: the interviewer's lane alone, as before #90.
+    // The default: the other person's lane alone, as before #90.
     let mut s = Session::default();
-    assert_eq!(s.question_source, QuestionSource::Interviewer);
+    assert_eq!(s.question_source, QuestionSource::Them);
     reduce(&mut s, &seg(Speaker::You, 1.0, 2.0, "Sure.", true));
     assert_eq!(s.last_heard, None);
-    reduce(&mut s, &seg(Speaker::Interviewer, 2.0, 3.0, "Okay.", true));
+    reduce(&mut s, &seg(Speaker::Them, 2.0, 3.0, "Okay.", true));
     assert_eq!(s.last_heard.as_deref(), Some("Okay."));
     // At its default the source is left out of the log, so a pre-#90 session reads the same.
     let json = serde_json::to_string(&s).unwrap();
     assert!(!json.contains("question_source"), "{json}");
-    assert!(json.contains("\"last_interviewer\""), "the wire name holds");
+    assert!(json.contains("\"last_them\""), "the wire name holds");
 
     let mut you = Session {
         question_source: QuestionSource::You,
         ..Session::default()
     };
-    reduce(
-        &mut you,
-        &seg(Speaker::Interviewer, 1.0, 2.0, "Okay.", true),
-    );
+    reduce(&mut you, &seg(Speaker::Them, 1.0, 2.0, "Okay.", true));
     assert_eq!(
         you.last_heard, None,
         "the lane that cannot ask is not shown"
@@ -413,7 +389,7 @@ fn the_listening_line_follows_the_question_source() {
     assert_eq!(you.last_heard.as_deref(), Some("What's the SLA?"));
     // Labels are untouched: both lines are in the transcript under their own speaker.
     assert_eq!(you.transcript.len(), 2);
-    assert_eq!(you.transcript[0].speaker, Speaker::Interviewer);
+    assert_eq!(you.transcript[0].speaker, Speaker::Them);
     assert_eq!(you.transcript[1].speaker, Speaker::You);
 
     let mut both = Session::default();
@@ -425,10 +401,7 @@ fn the_listening_line_follows_the_question_source() {
     );
     reduce(&mut both, &seg(Speaker::You, 1.0, 2.0, "Mine.", true));
     assert_eq!(both.last_heard.as_deref(), Some("Mine."));
-    reduce(
-        &mut both,
-        &seg(Speaker::Interviewer, 2.0, 3.0, "Theirs.", true),
-    );
+    reduce(&mut both, &seg(Speaker::Them, 2.0, 3.0, "Theirs.", true));
     assert_eq!(both.last_heard.as_deref(), Some("Theirs."));
     let json = serde_json::to_string(&both).unwrap();
     assert!(json.contains("\"question_source\":\"both\""), "{json}");
@@ -1516,11 +1489,11 @@ fn a_promise_shows_on_later_questions_until_the_candidate_covers_it() {
         [item, "Mention replication."]
     );
 
-    // Talking about something else keeps it, and so do the interviewer's words; the candidate
+    // Talking about something else keeps it, and so do the other person's words; the candidate
     // covering it closes it.
     log.push(seg(Speaker::You, 50.0, 55.0, "We hash the key.", true));
     log.push(seg(
-        Speaker::Interviewer,
+        Speaker::Them,
         56.0,
         58.0,
         "What about clock skew?",
@@ -2411,7 +2384,7 @@ fn a_press_that_played_marks_the_lines_it_spoke_with_the_translation_under_the_l
     let mut log = speak_on();
     log.push(voice(VoiceMode::Translate));
     log.extend([
-        seg(Speaker::Interviewer, 0.0, 4.0, "Go on.", true),
+        seg(Speaker::Them, 0.0, 4.0, "Go on.", true),
         seg(
             Speaker::You,
             6.0,

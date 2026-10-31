@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_full_channel_drops_and_counts_events_without_stalling_the_drain() {
-        let (mut sink, frames) = frame_channel(Source::Interviewer, 2000);
+        let (mut sink, frames) = frame_channel(Source::Them, 2000);
         // Ten 0.5 s utterances separated by 1 s of quiet: 30 events (start, pause, utterance).
         for _ in 0..10 {
             for _ in 0..25 {

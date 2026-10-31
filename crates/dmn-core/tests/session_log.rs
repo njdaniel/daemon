@@ -49,28 +49,16 @@ fn replies() -> Vec<serde_json::Value> {
     ]
 }
 
-/// The transcript of a tiny call: partials, finals from both speakers, three interviewer
+/// The transcript of a tiny call: partials, finals from both speakers, three Them
 /// questions (one a clarification, one small talk).
 fn call() -> Vec<Segment> {
     vec![
-        seg(Source::Interviewer, 1.0, 3.0, "Thanks for joining", false),
-        seg(
-            Source::Interviewer,
-            1.0,
-            4.0,
-            "Thanks for joining today.",
-            true,
-        ),
+        seg(Source::Them, 1.0, 3.0, "Thanks for joining", false),
+        seg(Source::Them, 1.0, 4.0, "Thanks for joining today.", true),
         seg(Source::You, 4.5, 5.5, "Glad to be here.", true),
+        seg(Source::Them, 8.0, 10.0, "How would you design", false),
         seg(
-            Source::Interviewer,
-            8.0,
-            10.0,
-            "How would you design",
-            false,
-        ),
-        seg(
-            Source::Interviewer,
+            Source::Them,
             8.0,
             13.0,
             "How would you design a rate limiter for a global API?",
@@ -84,7 +72,7 @@ fn call() -> Vec<Segment> {
             true,
         ),
         seg(
-            Source::Interviewer,
+            Source::Them,
             25.0,
             28.0,
             "And what if Redis goes down for a whole region?",
@@ -98,7 +86,7 @@ fn call() -> Vec<Segment> {
             true,
         ),
         seg(
-            Source::Interviewer,
+            Source::Them,
             40.0,
             42.0,
             "Where are you based these days, by the way?",
@@ -326,7 +314,7 @@ async fn remote_providers_keep_the_api_key_out_of_the_log_the_database_and_expor
         at: 1_700_000_000,
     });
     let question = seg(
-        Source::Interviewer,
+        Source::Them,
         1.0,
         4.0,
         "How would you design a rate limiter?",
@@ -407,6 +395,7 @@ async fn purge_removes_rows_and_files() {
             .session_id
             .unwrap();
         recorder::export(&paths, id).unwrap();
+        recorder::export_with_format(&paths, id, recorder::ExportFormat::Text).unwrap();
         ids.push(id);
     }
     // A recorded WAV of the first session, as privacy.record_audio would write it.
@@ -418,7 +407,7 @@ async fn purge_removes_rows_and_files() {
 
     let one = recorder::purge(&paths, PurgeTarget::One(ids[0])).unwrap();
     assert_eq!(one.sessions, [ids[0]]);
-    assert_eq!(one.files.len(), 2, "{:?}", one.files);
+    assert_eq!(one.files.len(), 3, "{:?}", one.files);
     let store = open_store(&paths).unwrap();
     assert_eq!(store.session_ids().unwrap(), [ids[1]]);
     assert!(store.questions(ids[0]).unwrap().is_empty());
@@ -437,7 +426,7 @@ async fn purge_removes_rows_and_files() {
 
     let all = recorder::purge(&paths, PurgeTarget::All).unwrap();
     assert_eq!(all.sessions, [ids[1]]);
-    assert_eq!(all.files.len(), 1);
+    assert_eq!(all.files.len(), 2);
     let store = open_store(&paths).unwrap();
     assert_eq!(store.counts().unwrap(), (0, 0, 0, 0));
     assert_eq!(std::fs::read_dir(&paths.sessions_dir).unwrap().count(), 0);
@@ -447,6 +436,81 @@ async fn purge_removes_rows_and_files() {
         !bytes.windows(text.len()).any(|w| w == text),
         "purged text is gone from the file, free pages included"
     );
+}
+
+#[test]
+fn text_export_recovers_an_open_session_and_can_be_retried_after_a_file_error() {
+    use dmn_store::{NewSegment, NewSession, Source as StoredSource};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let store = open_store(&paths).unwrap();
+    let id = store
+        .insert_session(&NewSession::new(1_700_000_000, "recovered"))
+        .unwrap();
+    store
+        .insert_segment(&NewSegment {
+            session_id: id,
+            source: StoredSource::You,
+            start_time: 95.0,
+            end_time: 97.0,
+            text: "The last saved words.".into(),
+            is_final: true,
+            avg_logprob: -0.2,
+            language: None,
+        })
+        .unwrap();
+    drop(store);
+
+    let path = paths.sessions_dir.join(format!("{id}.txt"));
+    // A directory at the destination makes rename fail on every user, including root.
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(recorder::export_with_format(&paths, id, recorder::ExportFormat::Text).is_err());
+    let store = open_store(&paths).unwrap();
+    assert_eq!(store.session(id).unwrap().unwrap().ended_at, None);
+    assert_eq!(store.segments(id).unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(&paths.sessions_dir).unwrap().count(), 1);
+    std::fs::remove_dir(&path).unwrap();
+
+    let (export, segments) =
+        recorder::export_with_format(&paths, id, recorder::ExportFormat::Text).unwrap();
+    assert_eq!(export, path);
+    assert_eq!(segments, 1);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with(&format!("Session #{id} — recovered\n")));
+    assert!(text.ends_with("[01:35] You: The last saved words.\n"));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        recorder::export_with_format(&paths, id, recorder::ExportFormat::Text)
+            .unwrap()
+            .1,
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    recorder::purge(&paths, PurgeTarget::One(id)).unwrap();
+    assert!(!path.exists());
+    assert!(store.session(id).unwrap().is_none());
+}
+
+#[test]
+fn text_export_of_a_missing_session_creates_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    for existing_database in [false, true] {
+        if existing_database {
+            drop(open_store(&paths).unwrap());
+        }
+        assert!(matches!(
+            recorder::export_with_format(&paths, 42, recorder::ExportFormat::Text),
+            Err(recorder::RecorderError::NoSuchSession(42))
+        ));
+        assert!(!paths.sessions_dir.exists());
+        assert_eq!(paths.db_file.exists(), existing_database);
+    }
 }
 
 #[test]
@@ -590,7 +654,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
             at: 1_700_000_000,
         },
         Action::Segment {
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.5,
             text: q.into(),
@@ -600,7 +664,7 @@ fn timing_cpu_and_overruns_reach_the_store() {
         },
         Action::Candidate {
             id: 1,
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.5,
             text: q.into(),
@@ -655,7 +719,7 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
     let asked = |id: u64, start: f64, text: &str| {
         [
             Action::Segment {
-                speaker: Speaker::Interviewer,
+                speaker: Speaker::Them,
                 start,
                 end: start + 4.0,
                 text: text.into(),
@@ -665,7 +729,7 @@ fn each_question_records_the_coding_solutions_mode_it_was_detected_under() {
             },
             Action::Candidate {
                 id,
-                speaker: Speaker::Interviewer,
+                speaker: Speaker::Them,
                 start,
                 end: start + 4.0,
                 text: text.into(),
@@ -720,7 +784,7 @@ fn a_question_from_the_you_lane_links_to_the_you_segment() {
         source: QuestionSource::Both,
     });
     let lines = [
-        (Speaker::Interviewer, "How would you shard the counters?"),
+        (Speaker::Them, "How would you shard the counters?"),
         (Speaker::You, "What is the SLA for the limiter?"),
     ];
     for (speaker, text) in lines {
@@ -750,7 +814,7 @@ fn a_question_from_the_you_lane_links_to_the_you_segment() {
     let sources: Vec<dmn_store::Source> = segments.iter().map(|s| s.source).collect();
     assert_eq!(
         sources,
-        [dmn_store::Source::Interviewer, dmn_store::Source::You],
+        [dmn_store::Source::Them, dmn_store::Source::You],
         "labels as captured"
     );
     let questions = store.questions(session).unwrap();
@@ -782,7 +846,7 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
     let asked = "How would you design a cache?";
     for a in [
         Action::Segment {
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.0,
             text: asked.into(),
@@ -792,7 +856,7 @@ async fn a_slow_phase_is_stored_as_one_slow_suggestion_row() {
         },
         Action::Candidate {
             id: 1,
-            speaker: Speaker::Interviewer,
+            speaker: Speaker::Them,
             start: 20.0,
             end: 24.0,
             text: asked.into(),

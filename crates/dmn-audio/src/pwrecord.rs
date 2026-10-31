@@ -200,7 +200,7 @@ mod tests {
     fn a_read_error_is_recorded_and_not_mistaken_for_eof() {
         // Copilot on PR #25: `Ok(0) | Err(_) => break` made a broken pipe look like a clean
         // finish, so the emergency fallback died silently.
-        let (mut sink, frames) = frame_channel(Source::Interviewer, 4);
+        let (mut sink, frames) = frame_channel(Source::Them, 4);
         let finished = AtomicBool::new(false);
         let stopping = AtomicBool::new(false);
         let err = Mutex::new(None);
@@ -219,7 +219,7 @@ mod tests {
         assert!(recorded.contains("pw-record went away"), "{recorded}");
 
         // The same failure during stop() is our own kill: not reported.
-        let (mut sink, _frames) = frame_channel(Source::Interviewer, 4);
+        let (mut sink, _frames) = frame_channel(Source::Them, 4);
         let stopping = AtomicBool::new(true);
         let err = Mutex::new(None);
         let mut src = FailAfter {
@@ -246,8 +246,8 @@ mod tests {
         // 10 frames of silence: 10 × 320 samples × 4 bytes.
         let mut cmd = Command::new("head");
         cmd.args(["-c", &(10 * FRAME_LEN * 4).to_string(), "/dev/zero"]);
-        let mut src = PwRecordSource::from_command(Source::Interviewer, cmd);
-        let (sink, mut frames) = frame_channel(Source::Interviewer, 16);
+        let mut src = PwRecordSource::from_command(Source::Them, cmd);
+        let (sink, mut frames) = frame_channel(Source::Them, 16);
         src.start(sink).unwrap();
         let t = Instant::now();
         while !src.is_finished() && t.elapsed() < Duration::from_secs(5) {

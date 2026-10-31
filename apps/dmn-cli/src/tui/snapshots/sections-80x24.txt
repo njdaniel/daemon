@@ -19,6 +19,6 @@
   2 ▸ Follow-up Questions               5 ▸ Things I Should Mention
   3 ▸ Tradeoffs                         6 ▸ Resume Context
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         Okay, so first I'd want to know what we're limiting on.
+You       Sounds great.
+You       Okay, so first I'd want to know what we're limiting on.
  ● mic  ● system  ● model                              1–6 more · p pin · ⏎ ask

@@ -19,6 +19,6 @@
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         Sounds great.
-You         …a token bucket per API key and keep the counters in regional Redis.
+You       Sounds great.
+You       …h a token bucket per API key and keep the counters in regional Redis.
  voice: you (en)  ● mic  ● system  ● model     p pin · r redo · ⏎ ask · t speak

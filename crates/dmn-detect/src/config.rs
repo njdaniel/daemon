@@ -7,12 +7,12 @@ use crate::cue::Cue;
 
 /// Whose questions the detector scores (`[detect].question_source` in config.toml, #90). It
 /// selects eligible lanes, not voice identities: the mic is always labelled You and the call's
-/// output always Interviewer, whoever is actually speaking on them.
+/// output always Them, whoever is actually speaking on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QuestionSource {
     /// The call's output lane only: the behaviour before #90.
     #[default]
-    Interviewer,
+    Them,
     /// The mic lane only. Lets the user ask Daemon directly, and lets a mock interview played
     /// from a phone into the microphone drive a whole session.
     You,
@@ -24,9 +24,9 @@ impl QuestionSource {
     /// Whether a final from `source` is scored at all.
     pub fn allows(self, source: Source) -> bool {
         match self {
-            QuestionSource::Interviewer => source == Source::Interviewer,
+            QuestionSource::Them => source == Source::Them,
             QuestionSource::You => source == Source::You,
-            QuestionSource::Both => matches!(source, Source::Interviewer | Source::You),
+            QuestionSource::Both => matches!(source, Source::Them | Source::You),
         }
     }
 
@@ -34,7 +34,8 @@ impl QuestionSource {
     /// config type and this keeps the crates apart.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
-            "interviewer" => Some(QuestionSource::Interviewer),
+            // `interviewer` is the name before #128.
+            "them" | "interviewer" => Some(QuestionSource::Them),
             "you" => Some(QuestionSource::You),
             "both" => Some(QuestionSource::Both),
             _ => None,
@@ -44,7 +45,7 @@ impl QuestionSource {
     /// The config-file spelling, for the status line and the replay header.
     pub fn as_str(self) -> &'static str {
         match self {
-            QuestionSource::Interviewer => "interviewer",
+            QuestionSource::Them => "them",
             QuestionSource::You => "you",
             QuestionSource::Both => "both",
         }
@@ -91,7 +92,7 @@ pub struct DetectConfig {
     pub question_mark: i32,
     pub question_opener: i32,
     pub hand_off: i32,
-    pub interviewer: i32,
+    pub them: i32,
     pub long: i32,
     pub followed: i32,
     pub rhetorical: i32,
@@ -99,26 +100,26 @@ pub struct DetectConfig {
     /// A line is a candidate at or above this score.
     pub threshold: i32,
     pub sensitivity: Sensitivity,
-    /// Whose finals are scored (#90). Default [`QuestionSource::Interviewer`], the SPEC's
-    /// "every final Interviewer segment".
+    /// Whose finals are scored (#90). Default [`QuestionSource::Them`], the SPEC's
+    /// "every final Them segment".
     pub question_source: QuestionSource,
     /// Require at least one question-form cue (`?`, an opener, or a hand-off phrase) before a line
     /// can be a candidate, whatever its score.
     ///
-    /// Without this, the corroborating cues alone reach the threshold: any interviewer line over
-    /// six words that the candidate answers scores interviewer + long + followed = 3, so "Okay,
+    /// Without this, the corroborating cues alone reach the threshold: any Them line over
+    /// six words that the candidate answers scores them + long + followed = 3, so "Okay,
     /// hold on one second, someone's at my door." is a candidate. See docs/SPEC.md § Question
     /// detector and the amendment this behaviour is recorded under.
     pub require_question_form: bool,
     /// Treat a rhetorical tag as a disqualifier rather than a discount.
     ///
     /// At the SPEC's -2 a rhetorical question still clears the bar: "that's a decent scale,
-    /// right?" scores `?` + interviewer + long - rhetorical = 2. It is not a question at all, so
+    /// right?" scores `?` + them + long - rhetorical = 2. It is not a question at all, so
     /// no amount of corroboration should make it one.
     pub rhetorical_vetoes: bool,
     /// Treat small-talk vocabulary as a disqualifier rather than a discount.
     ///
-    /// At the SPEC's -2, "Can you hear me okay?" still scores 4: `?` + opener + interviewer +
+    /// At the SPEC's -2, "Can you hear me okay?" still scores 4: `?` + opener + them +
     /// followed - small talk. The SPEC's own Tier-A step throws small talk away again
     /// (§ Extraction: `kind=small_talk` -> nothing changes on screen), so vetoing it here costs
     /// nothing and saves the LLM call.
@@ -132,14 +133,14 @@ impl Default for DetectConfig {
             question_mark: 2,
             question_opener: 2,
             hand_off: 1,
-            interviewer: 1,
+            them: 1,
             long: 1,
             followed: 1,
             rhetorical: -2,
             small_talk: -2,
             threshold: 2,
             sensitivity: Sensitivity::Balanced,
-            question_source: QuestionSource::Interviewer,
+            question_source: QuestionSource::Them,
             require_question_form: true,
             rhetorical_vetoes: true,
             small_talk_vetoes: true,
@@ -165,7 +166,7 @@ impl DetectConfig {
             Cue::QuestionMark => self.question_mark,
             Cue::QuestionOpener => self.question_opener,
             Cue::HandOff => self.hand_off,
-            Cue::Interviewer => self.interviewer,
+            Cue::Them => self.them,
             Cue::Long => self.long,
             Cue::Followed => self.followed,
             Cue::Rhetorical => self.rhetorical,
@@ -199,7 +200,7 @@ mod tests {
         assert_eq!(c.weight(Cue::QuestionMark), 2);
         assert_eq!(c.weight(Cue::QuestionOpener), 2);
         assert_eq!(c.weight(Cue::HandOff), 1);
-        assert_eq!(c.weight(Cue::Interviewer), 1);
+        assert_eq!(c.weight(Cue::Them), 1);
         assert_eq!(c.weight(Cue::Long), 1);
         assert_eq!(c.weight(Cue::Followed), 1);
         assert_eq!(c.weight(Cue::Rhetorical), -2);
@@ -239,10 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn the_default_question_source_is_the_interviewer_lane_alone() {
+    fn the_default_question_source_is_the_them_lane_alone() {
         let c = DetectConfig::default();
-        assert_eq!(c.question_source, QuestionSource::Interviewer);
-        assert!(c.question_source.allows(Source::Interviewer));
+        assert_eq!(c.question_source, QuestionSource::Them);
+        assert!(c.question_source.allows(Source::Them));
         assert!(!c.question_source.allows(Source::You));
         assert!(!c.question_source.allows(Source::Unknown));
     }
@@ -250,15 +251,15 @@ mod tests {
     #[test]
     fn question_source_selects_lanes_and_parses_its_three_names() {
         assert!(QuestionSource::You.allows(Source::You));
-        assert!(!QuestionSource::You.allows(Source::Interviewer));
+        assert!(!QuestionSource::You.allows(Source::Them));
         assert!(QuestionSource::Both.allows(Source::You));
-        assert!(QuestionSource::Both.allows(Source::Interviewer));
+        assert!(QuestionSource::Both.allows(Source::Them));
         // A single-stream fallback has no lane to select, so it is never scored.
         assert!(!QuestionSource::Both.allows(Source::Unknown));
 
         assert_eq!(
-            QuestionSource::from_name(" Interviewer "),
-            Some(QuestionSource::Interviewer)
+            QuestionSource::from_name(" Them "),
+            Some(QuestionSource::Them)
         );
         assert_eq!(QuestionSource::from_name("you"), Some(QuestionSource::You));
         assert_eq!(
@@ -267,7 +268,7 @@ mod tests {
         );
         assert_eq!(QuestionSource::from_name("everyone"), None);
         for s in [
-            QuestionSource::Interviewer,
+            QuestionSource::Them,
             QuestionSource::You,
             QuestionSource::Both,
         ] {

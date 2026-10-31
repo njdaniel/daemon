@@ -10,14 +10,14 @@
       "text": "Per-region quotas, reconciled asynchronously, so a partition only over-admits."
     },
     {
-      "speaker": "interviewer",
+      "speaker": "them",
       "start": 136.5,
       "end": 144.2,
       "text": "Where would you put the limiter in the request path?"
     }
   ],
   "partials": [],
-  "last_interviewer": "Where would you put the limiter in the request path?",
+  "last_them": "Where would you put the limiter in the request path?",
   "live": {
     "candidate": 1,
     "text": "How would you design a rate limiter for a globally distributed API, and how would you handle the case where the limiter itself goes down?",
@@ -64,7 +64,10 @@
     "model": {
       "state": "ok"
     },
-    "overruns": 0
+    "overruns": 0,
+    "stt": "",
+    "stt_fallback": false,
+    "language": ""
   },
   "counts": {
     "candidates": 2,

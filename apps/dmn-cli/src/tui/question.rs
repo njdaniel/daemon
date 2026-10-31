@@ -77,7 +77,7 @@ fn right_title(view: &View<'_>) -> Option<Line<'static>> {
 /// The LISTENING placeholder before anything has been heard, per `[detect].question_source` (#90).
 fn waiting(source: QuestionSource) -> &'static str {
     match source {
-        QuestionSource::Interviewer => "Waiting for the interviewer…",
+        QuestionSource::Them => "Waiting for their question…",
         QuestionSource::You => "Waiting for your question…",
         QuestionSource::Both => "Waiting for a question…",
     }

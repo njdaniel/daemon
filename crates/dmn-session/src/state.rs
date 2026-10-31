@@ -520,9 +520,9 @@ pub struct Session {
     /// The open utterance of each speaker, if any (its latest partial).
     pub partials: Vec<Line>,
     /// The last thing said on a lane [`Session::question_source`] selects, for the `LISTENING`
-    /// state before any question (#90). Keeps its `last_interviewer` wire name: with the default
-    /// source it is exactly the last Interviewer line, which is every session log before #90.
-    #[serde(rename = "last_interviewer")]
+    /// state before any question (#90). Keeps its `last_them` wire name: with the default
+    /// source it is exactly the last Them line, which is every session log before #90.
+    #[serde(rename = "last_them")]
     pub last_heard: Option<String>,
     /// The question on screen.
     pub live: Option<Question>,
@@ -553,7 +553,7 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assist_off: bool,
     /// Whose questions this session detects and answers (#90). Fixed for the session; left out
-    /// of the log at its default, so every session log from before #90 reads as `interviewer`.
+    /// of the log at its default, so every session log from before #90 reads as `them`.
     #[serde(default, skip_serializing_if = "is_default_source")]
     pub question_source: QuestionSource,
     /// #96: the candidates Enter sent whose reply is still on its way, oldest first. They are

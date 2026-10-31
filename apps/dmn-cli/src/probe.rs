@@ -198,9 +198,9 @@ fn capture_pipewire(
     target: CaptureTarget,
     dur: Duration,
 ) -> Result<Captured, String> {
-    let mut src = PipeWireSource::new(Arc::clone(ctx), Source::Interviewer, target);
+    let mut src = PipeWireSource::new(Arc::clone(ctx), Source::Them, target);
     let status = src.status();
-    let (sink, mut frames) = frame_channel(Source::Interviewer, 200);
+    let (sink, mut frames) = frame_channel(Source::Them, 200);
     src.start(sink).map_err(|e| e.to_string())?;
     let t = Instant::now();
     while status.state() != CaptureState::Streaming {
@@ -228,8 +228,8 @@ fn capture_pipewire(
 }
 
 fn capture_pw_record(target: &str, dur: Duration) -> Result<Tone, String> {
-    let mut src = PwRecordSource::new(Source::Interviewer, Some(target), false);
-    let (sink, mut frames) = frame_channel(Source::Interviewer, 200);
+    let mut src = PwRecordSource::new(Source::Them, Some(target), false);
+    let (sink, mut frames) = frame_channel(Source::Them, 200);
     src.start(sink).map_err(|e| e.to_string())?;
     // pw-record needs a moment to link; skip it rather than judging the start-up silence.
     let _ = collect(&mut frames, Duration::from_millis(200));

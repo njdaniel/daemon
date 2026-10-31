@@ -3,7 +3,7 @@
 //! Input: a PipeWire node (mic `Audio/Source` or an app's `Stream/Output/Audio`) or a WAV file;
 //! for the virtual microphone (#108), mono f32 speech at any rate (the TTS server's 24 kHz),
 //! and (#114) the user's own microphone, captured again at the graph rate for pass-through.
-//! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Interviewer); for the
+//! Output: 16 kHz mono f32 samples, one labelled stream per source (You / Them); for the
 //! virtual microphone, a PipeWire `Audio/Source` node named `dmn-voice` that plays that speech,
 //! and the microphone while pass-through is on and nothing is being spoken, at the graph rate
 //! to whatever selects it as its microphone.

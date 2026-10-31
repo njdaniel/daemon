@@ -19,6 +19,6 @@
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-You         …quotas, reconciled asynchronously, so a partition only over-admits.
-Interviewer Where would you put the limiter in the request path?
+You       …n quotas, reconciled asynchronously, so a partition only over-admits.
+Them      Where would you put the limiter in the request path?
  ● mic  ● system  ● model                              p unpin · r redo · ⏎ ask

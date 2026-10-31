@@ -19,6 +19,6 @@
   2 ▸ Follow-up Questions               6 ▸ Resume Context slow
   4 ▸ Example slow
  TRANSCRIPT ────────────────────────────────────────────────────────────────────
-Interviewer …ing the time today. This session is about an hour of system design.
-You         Sounds great.
+Them      …aking the time today. This session is about an hour of system design.
+You       Sounds great.
  ● mic  ● system  ● model                              1–6 more · p pin · ⏎ ask

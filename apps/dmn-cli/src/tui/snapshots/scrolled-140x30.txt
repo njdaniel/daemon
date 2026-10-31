@@ -22,9 +22,9 @@
           def _push_front(self, node):                                              │
               node.prev, node.next = self.head, self.head.next                      │
               self.head.next.prev = node                                            │
-              self.head.next = node                                                 │Interviewer Hi, thanks for making the time today. This
-                                                                                    │            session is about an hour of system design.
-          def get(self, key):                                                       │You         Sounds great.
-              node = self.items.get(key)                                            │You         I'd pair a dictionary with a doubly linked
-      ↑ 9 · ↓ 16 more                                                               │            list.
+              self.head.next = node                                                 │Them      Hi, thanks for making the time today. This
+                                                                                    │          session is about an hour of system design.
+          def get(self, key):                                                       │You       Sounds great.
+              node = self.items.get(key)                                            │You       I'd pair a dictionary with a doubly linked
+      ↑ 9 · ↓ 16 more                                                               │          list.
  ● mic  ● system  ● model                                                                                       ↑↓ scroll · s: full · ⏎ ask

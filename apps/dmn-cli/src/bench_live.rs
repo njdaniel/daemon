@@ -8,7 +8,7 @@
 //! the difference is the latency a person beside the call sees, minus the redraw.
 //!
 //! With a script (`--questions <questions.json>`, or the `questions.json` next to a replay's
-//! interviewer file, found from the session label) each scripted question is paired with the
+//! Them file, found from the session label) each scripted question is paired with the
 //! candidate that showed it first, exactly as `dmn run --replay --headless` does
 //! ([`latency::pair`]), so the two reports agree. Without one (a live call) every candidate is
 //! its own row, timed from the end of its segment; candidates the fast phase did not show (not a
@@ -82,12 +82,12 @@ pub fn load(store: &Store, session: Option<i64>) -> Result<Stored, String> {
     })
 }
 
-/// The script a replay session was made from: `questions.json` beside its interviewer file,
-/// read from the label `replay <interviewer> + <candidate>` the pipeline writes.
+/// The script a replay session was made from: `questions.json` beside its Them file,
+/// read from the label `replay <them> + <you>` the pipeline writes.
 pub fn script_for(label: &str) -> Option<PathBuf> {
     let files = label.strip_prefix("replay ")?;
-    let (interviewer, _) = files.split_once(" + ")?;
-    let path = Path::new(interviewer).parent()?.join("questions.json");
+    let (them, _) = files.split_once(" + ")?;
+    let path = Path::new(them).parent()?.join("questions.json");
     path.is_file().then_some(path)
 }
 
@@ -279,7 +279,7 @@ mod tests {
     use super::*;
     use dmn_store::{Mark, NewCpuSample, NewQuestion, NewSegment, NewSession, Source};
 
-    /// A stored session: two interviewer questions (one answered at 1.5 s, one at 2.5 s after
+    /// A stored session: two Them questions (one answered at 1.5 s, one at 2.5 s after
     /// its end), one candidate never shown, CPU sampled every 5 s over 60 s with the process
     /// busy (2 cores) while anyone speaks and idle (0.1 core) otherwise.
     fn session(store: &Store) -> i64 {
@@ -290,7 +290,7 @@ mod tests {
             let seg = store
                 .insert_segment(&NewSegment {
                     session_id: id,
-                    source: Source::Interviewer,
+                    source: Source::Them,
                     start_time: start,
                     end_time: end,
                     text: text.into(),

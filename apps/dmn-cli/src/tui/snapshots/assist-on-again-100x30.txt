@@ -25,6 +25,6 @@
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
  TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
-Interviewer Good. Let's talk about how you would test that.
-Interviewer And what about the▍
+Them      Good. Let's talk about how you would test that.
+Them      And what about the▍
  ● mic  ● system  ● model  es→en                                             p pin · r redo · ⏎ ask

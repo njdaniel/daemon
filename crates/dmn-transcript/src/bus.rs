@@ -84,7 +84,7 @@ mod tests {
 
     fn seg(text: &str) -> Segment {
         Segment {
-            source: Source::Interviewer,
+            source: Source::Them,
             start: Duration::ZERO,
             end: Duration::from_secs(1),
             text: text.to_owned(),

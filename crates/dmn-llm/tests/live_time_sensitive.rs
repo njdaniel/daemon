@@ -42,10 +42,10 @@ async fn provider() -> OllamaProvider {
 /// same request gets the same reply; a different lead-in each run is what makes five runs five
 /// samples rather than one.
 const LEAD_INS: [&str; 5] = [
-    "Interviewer: Thanks for walking me through that project.\nYou: Sure, happy to.",
-    "Interviewer: Great, let's move on to some quick technical questions.\nYou: Sounds good.",
-    "You: And that's how we cut the deploy time in half.\nInterviewer: Nice. Switching gears a bit.",
-    "Interviewer: We use a mix of languages on the team.\nYou: Makes sense, I've worked in a few.",
+    "Them: Thanks for walking me through that project.\nYou: Sure, happy to.",
+    "Them: Great, let's move on to some quick technical questions.\nYou: Sounds good.",
+    "You: And that's how we cut the deploy time in half.\nThem: Nice. Switching gears a bit.",
+    "Them: We use a mix of languages on the team.\nYou: Makes sense, I've worked in a few.",
     "",
 ];
 
@@ -53,7 +53,7 @@ async fn ask(p: &OllamaProvider, question: &str, run: usize) -> (Suggestion, f64
     let mut req = FastRequest::new(question, 6);
     req.today = TODAY.into();
     let lead = LEAD_INS[run % LEAD_INS.len()];
-    req.transcript = format!("{lead}\nInterviewer: {question}").trim().to_owned();
+    req.transcript = format!("{lead}\nThem: {question}").trim().to_owned();
     let started = Instant::now();
     let mut first_line = None;
     let outcome = run_fast_phase(p, &req, CancellationToken::new(), |e| {
