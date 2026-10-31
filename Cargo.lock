@@ -662,6 +662,7 @@ dependencies = [
  "dmn-tts",
  "dmn-vad",
  "hound",
+ "libc",
  "ratatui",
  "rusqlite",
  "serde_json",

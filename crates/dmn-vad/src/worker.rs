@@ -2,7 +2,7 @@
 //! sends events on a bounded channel without ever stalling the drain.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -22,6 +22,54 @@ pub enum VadError {
     Spawn(String),
     #[error("the VAD thread panicked")]
     Panicked,
+}
+
+/// #124: what a push-to-talk button says about the lane, set from the thread that reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PttState {
+    /// No push-to-talk: the VAD decides, as without a gate.
+    Off,
+    /// The button is down: every frame is speech, so the utterance stays open through pauses.
+    Held,
+    /// The button is up: every frame is silence, so nothing opens; going from `Held` to here
+    /// closes the open utterance at once ([`CloseReason::Released`](crate::CloseReason)).
+    Up,
+}
+
+/// #124: the push-to-talk gate in front of one lane's segmenter: shared between the thread that
+/// reads the button ([`PttGate::set`]) and the [`VadWorker`], which reads it once per frame.
+#[derive(Debug, Clone)]
+pub struct PttGate(Arc<AtomicU8>);
+
+impl Default for PttGate {
+    fn default() -> Self {
+        Self::new(PttState::Off)
+    }
+}
+
+impl PttGate {
+    pub fn new(state: PttState) -> Self {
+        let gate = Self(Arc::new(AtomicU8::new(0)));
+        gate.set(state);
+        gate
+    }
+
+    pub fn set(&self, state: PttState) {
+        let v = match state {
+            PttState::Off => 0,
+            PttState::Held => 1,
+            PttState::Up => 2,
+        };
+        self.0.store(v, Ordering::Release);
+    }
+
+    pub fn get(&self) -> PttState {
+        match self.0.load(Ordering::Acquire) {
+            1 => PttState::Held,
+            2 => PttState::Up,
+            _ => PttState::Off,
+        }
+    }
 }
 
 /// Counters a worker reports when it ends; the live values are readable while it runs.
@@ -81,10 +129,24 @@ impl VadWorker {
 
     /// Start with any [`Vad`] implementation (Silero in M2, fakes in tests).
     pub fn spawn_with(
+        frames: Frames,
+        vad: Box<dyn Vad>,
+        seg_cfg: &SegmenterConfig,
+        tx: Sender<VadEvent>,
+    ) -> Result<Self, VadError> {
+        Self::spawn_gated(frames, vad, seg_cfg, tx, PttGate::default())
+    }
+
+    /// #124: [`VadWorker::spawn_with`] behind a push-to-talk gate: while `gate` is
+    /// [`PttState::Off`] the VAD decides; otherwise the button does (module doc of
+    /// [`PttState`]), and a release closes the open utterance on the next frame. The VAD still
+    /// sees every frame, so its noise floor stays current.
+    pub fn spawn_gated(
         mut frames: Frames,
         mut vad: Box<dyn Vad>,
         seg_cfg: &SegmenterConfig,
         tx: Sender<VadEvent>,
+        gate: PttGate,
     ) -> Result<Self, VadError> {
         let source = frames.source();
         let stop = Arc::new(AtomicBool::new(false));
@@ -102,12 +164,28 @@ impl VadWorker {
             .spawn(move || {
                 let mut frame = [0.0f32; FRAME_LEN];
                 let mut events = Vec::new();
+                let mut was = gate.get();
                 loop {
                     if t_stop.load(Ordering::Acquire) {
                         break;
                     }
+                    // #124: a release closes the utterance before the next frame, so the
+                    // final pass starts at once instead of after the closing silence.
+                    let now = gate.get();
+                    if was == PttState::Held && now != PttState::Held {
+                        seg.close_now(&mut events);
+                        if !send_all(&tx, &mut events, &t_counters) {
+                            return;
+                        }
+                    }
+                    was = now;
                     if frames.pop_frame(&mut frame) {
-                        let speech = vad.is_speech(&frame);
+                        let heard = vad.is_speech(&frame);
+                        let speech = match now {
+                            PttState::Off => heard,
+                            PttState::Held => true,
+                            PttState::Up => false,
+                        };
                         seg.push(&frame, speech, &mut events);
                         t_counters.frames.fetch_add(1, Ordering::Relaxed);
                         t_counters
@@ -265,6 +343,114 @@ mod tests {
         let t = std::time::Instant::now();
         w.stop().unwrap();
         assert!(t.elapsed() < Duration::from_millis(200));
+    }
+
+    fn utterances(rx: &Receiver<VadEvent>) -> Vec<crate::Utterance> {
+        rx.try_iter()
+            .filter_map(|e| match e {
+                VadEvent::Utterance(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Wait until the worker has taken `n` frames off the ring.
+    fn drained(w: &VadWorker, n: u64) {
+        let t = std::time::Instant::now();
+        while w.stats().frames < n {
+            assert!(t.elapsed() < Duration::from_secs(5), "the worker stalled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// #124: held, speech with a 1 s pause in the middle is one utterance (the VAD would have
+    /// closed it after 0.7 s); the release closes it at once, before any trailing silence.
+    #[test]
+    fn a_held_button_keeps_one_utterance_through_a_pause_and_its_release_closes_it() {
+        let (mut sink, frames) = frame_channel(Source::You, 2000);
+        let (tx, rx) = event_channel(64);
+        let gate = PttGate::new(PttState::Up);
+        let w = VadWorker::spawn_gated(
+            frames,
+            Box::new(EnergyVad::new(VadConfig::default().energy)),
+            &SegmenterConfig {
+                partial_every: None,
+                ..SegmenterConfig::default()
+            },
+            tx,
+            gate.clone(),
+        )
+        .unwrap();
+        // Not held: speech opens nothing.
+        for _ in 0..50 {
+            sink.push_frame(&loud());
+        }
+        drained(&w, 50);
+        gate.set(PttState::Held);
+        for _ in 0..25 {
+            sink.push_frame(&loud());
+        }
+        for _ in 0..50 {
+            sink.push_frame(&[0.0005; FRAME_LEN]);
+        }
+        for _ in 0..25 {
+            sink.push_frame(&loud());
+        }
+        drained(&w, 150);
+        assert!(utterances(&rx).is_empty(), "nothing closes while held");
+        gate.set(PttState::Up);
+        let t = std::time::Instant::now();
+        let utt = loop {
+            let mut got = utterances(&rx);
+            if let Some(u) = got.pop() {
+                break u;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(1),
+                "the release closed nothing"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(utt.closed_by, crate::CloseReason::Released);
+        assert_eq!(utt.start, Duration::from_millis(1000), "from the press");
+        assert!(
+            utt.samples.len() >= 100 * FRAME_LEN,
+            "the whole held span, pause included"
+        );
+        // After the release, speech opens nothing again.
+        for _ in 0..50 {
+            sink.push_frame(&loud());
+        }
+        let stats = w.finish().unwrap();
+        assert_eq!(stats.utterances, 1);
+        assert!(utterances(&rx).is_empty());
+    }
+
+    /// #124: a gate left `Off` is the plain VAD.
+    #[test]
+    fn an_off_gate_changes_nothing() {
+        let gate = PttGate::default();
+        assert_eq!(gate.get(), PttState::Off);
+        let (mut sink, frames) = frame_channel(Source::You, 400);
+        for _ in 0..25 {
+            sink.push_frame(&[0.0005; FRAME_LEN]);
+        }
+        for _ in 0..50 {
+            sink.push_frame(&loud());
+        }
+        let (tx, rx) = event_channel(64);
+        let w = VadWorker::spawn_gated(
+            frames,
+            Box::new(EnergyVad::new(VadConfig::default().energy)),
+            &SegmenterConfig::default(),
+            tx,
+            gate,
+        )
+        .unwrap();
+        w.finish().unwrap();
+        let utts = utterances(&rx);
+        assert_eq!(utts.len(), 1);
+        assert_eq!(utts[0].closed_by, crate::CloseReason::EndOfStream);
     }
 
     #[test]

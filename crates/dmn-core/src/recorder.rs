@@ -455,6 +455,8 @@ impl StoreWriter {
             // #109: what `t` spoke is the user's own turn, already a segment row; the
             // translation, the tag and the notice are screen state, kept in the action log.
             | Action::SpeakEnabled { .. }
+            // #124: the push-to-talk button is screen state.
+            | Action::Ptt { .. }
             // #114: the voice mode and which lines a press spoke are screen state too; the
             // lines are already segment rows.
             | Action::Voice { .. }

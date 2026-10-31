@@ -55,6 +55,7 @@ impl QuestionSource {
 
 /// #114: what `dmn-voice` carries: the user's own voice, live, or every sentence they finish,
 /// translated and spoken in their cloned voice instead. `[speak].mode` at start, `l` toggles.
+/// #124: or push-to-talk: what is said while a button is held, translated once it is released.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceMode {
@@ -63,15 +64,31 @@ pub enum VoiceMode {
     Passthrough,
     /// The microphone is muted into `dmn-voice`; each finalized You turn goes out translated.
     Translate,
+    /// #124: the microphone is muted into `dmn-voice`; what the user says while the
+    /// push-to-talk button is held is one turn, translated the moment it is released.
+    Ptt,
 }
 
 impl VoiceMode {
-    /// The other mode: what `l` switches to.
+    /// The other mode: what `l` switches to without a push-to-talk button.
     pub fn toggled(self) -> Self {
+        self.next(false)
+    }
+
+    /// #124: what `l` switches to: own voice → translate → push-to-talk (when `ptt`, a button is
+    /// set up and readable) → own voice.
+    pub fn next(self, ptt: bool) -> Self {
         match self {
             VoiceMode::Passthrough => VoiceMode::Translate,
-            VoiceMode::Translate => VoiceMode::Passthrough,
+            VoiceMode::Translate if ptt => VoiceMode::Ptt,
+            VoiceMode::Translate | VoiceMode::Ptt => VoiceMode::Passthrough,
         }
+    }
+
+    /// #114, #124: whether every sentence goes out translated (the microphone muted into
+    /// `dmn-voice`): translate mode and push-to-talk.
+    pub fn translates(self) -> bool {
+        self != VoiceMode::Passthrough
     }
 
     /// The config-file spelling (`[speak].mode`).
@@ -79,6 +96,7 @@ impl VoiceMode {
         match self {
             VoiceMode::Passthrough => "passthrough",
             VoiceMode::Translate => "translate",
+            VoiceMode::Ptt => "ptt",
         }
     }
 }
@@ -509,6 +527,9 @@ pub enum Action {
     /// `t` speaks (#109) in this session: `[speak].enabled` with its target, dispatched once
     /// after `Started` by `dmn run`. The status line's keys offer `t speak` while it is on.
     SpeakEnabled { enabled: bool },
+    /// #124: the push-to-talk button: `None` when none is set up or it cannot be read (the
+    /// run goes on without it), else `Some(held)`, dispatched on each press and release.
+    Ptt { held: Option<bool> },
     /// #114: what `dmn-voice` carries from now on: `mode` with `target` (`[speak].target`,
     /// the language translate mode speaks) and `own`, the language the user is taken to speak
     /// when it is known (`[stt].language` fixed to a code). Dispatched once after

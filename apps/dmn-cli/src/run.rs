@@ -324,12 +324,18 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     if let Some(setup) = speak {
         // #115: the picker's list, and where its choice is saved.
         let languages = setup.languages.clone();
+        // #124: the push-to-talk button, when one is set up: checked first (opened and closed,
+        // nothing read), so the mode at start knows whether it is there; a device that cannot
+        // be opened is said on the status line and the run goes on without push-to-talk. The
+        // device is read only while push-to-talk is the mode.
+        let button = check_ptt_button(cfg, &pipeline.hub());
         pipeline.attach_speaker(
             Speaker::start(setup, pipeline.hub())?,
             cfg.speak.mode,
             cfg.speak.target.clone(),
             languages,
             Some(paths.config_file.clone()),
+            button.map(|b| Box::new(b) as Box<dyn crate::ptt::ButtonSource>),
         );
     }
     let audio = pipeline.info().audio;
@@ -613,6 +619,33 @@ fn headless(
     };
     Ok((report, rows))
 }
+
+/// #124: check `[speak].ptt_device` for `ptt_key` when both are set; `None` (with the reason on
+/// the status line for 5 s, and in the log) when the device cannot be opened or lacks the key.
+fn check_ptt_button(
+    cfg: &Config,
+    hub: &std::sync::Arc<dmn_session::SessionHub>,
+) -> Option<crate::ptt::Button> {
+    let s = &cfg.speak;
+    if s.ptt_device.is_empty() || s.ptt_key.is_empty() {
+        return None;
+    }
+    match crate::ptt::Button::check(&s.ptt_device, &s.ptt_key) {
+        Ok(button) => Some(button),
+        Err(e) => {
+            tracing::warn!(error = %e, "push-to-talk: off for this run");
+            hub.dispatch(dmn_session::Action::SpeakFailed {
+                id: crate::speaker::STARTUP_NOTICE,
+                reason: PTT_UNREADABLE.to_owned(),
+            });
+            None
+        }
+    }
+}
+
+/// #124: the status line when the push-to-talk button cannot be used at start (the device is
+/// missing or unreadable, or has no such key; the log and `dmn doctor` say which).
+const PTT_UNREADABLE: &str = "push-to-talk off: button not usable (dmn doctor)";
 
 #[cfg(test)]
 mod tests {

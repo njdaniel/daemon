@@ -31,6 +31,7 @@ dmn-transcript = { path = "../../crates/dmn-transcript" }
 dmn-tts = { path = "../../crates/dmn-tts" }
 dmn-vad = { path = "../../crates/dmn-vad" }
 hound = "3.5"
+libc = "0.2"
 ratatui = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

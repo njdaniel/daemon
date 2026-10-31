@@ -7,6 +7,9 @@
 //! [`VadEvent::Pause`] after 300 ms of silence inside an open utterance,
 //! [`VadEvent::SpeechStart`] at onset, and [`VadEvent::Partial`] every second while an utterance
 //! is open (the last 8 s of it), which is what `dmn-stt` re-runs to keep the transcript moving.
+//! #124: [`VadWorker::spawn_gated`] puts a push-to-talk [`PttGate`] in front of the segmenter:
+//! while the button is held every frame is speech, while it is up none is, and a release closes
+//! the utterance at once ([`CloseReason::Released`]).
 //! Owns: the per-source VAD thread, the [`Frames`](dmn_audio::Frames) consumer it drains, and the
 //! dropped-event counter the status bar reads alongside the ring's overrun counter.
 //!
@@ -31,7 +34,7 @@ mod worker;
 pub use energy::{EnergyVad, EnergyVadConfig, Vad, frame_dbfs};
 pub use segmenter::{CloseReason, Segmenter, SegmenterConfig, Utterance, VadEvent};
 pub use silero::{SileroError, SileroVad, SileroVadConfig};
-pub use worker::{VadError, VadWorker, WorkerStats, event_channel};
+pub use worker::{PttGate, PttState, VadError, VadWorker, WorkerStats, event_channel};
 
 /// Everything a [`VadWorker`] needs. `Default` is the SPEC's numbers.
 #[derive(Debug, Clone, PartialEq, Default)]

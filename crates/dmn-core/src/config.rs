@@ -523,7 +523,16 @@ pub struct Speak {
     /// #114: what `dmn-voice` carries when `dmn run` starts: `passthrough` (the default: your
     /// own voice, live; `t` speaks one turn translated over it) or `translate` (every turn you
     /// finish is translated into `target` and spoken instead). `l` switches during the run.
+    /// #124: or `ptt`: push-to-talk, which needs `ptt_device` and `ptt_key`.
     pub mode: VoiceMode,
+    /// #124: the input device the push-to-talk button is on, a `/dev/input/by-id/...-event-*`
+    /// path (`dmn speak ptt learn` writes it); "" = no button, and `l` never offers `ptt`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ptt_device: String,
+    /// #124: the button on it, an evdev key name (`KEY_F13`, `BTN_SIDE`; [`ptt_key_code`]) or
+    /// its number.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ptt_key: String,
     /// #115: the languages the picker offers in `dmn run`, each with the voice enrolled for it
     /// (`languages = [{ code = "de", voice = "voice-de" }, ...]`; `dmn speak enroll --language
     /// de` adds or updates an entry). With the list present `target` must be one of its codes
@@ -535,6 +544,70 @@ pub struct Speak {
         deserialize_with = "language_list"
     )]
     pub languages: Vec<SpeakLanguage>,
+}
+
+/// #124: evdev key names a push-to-talk button can have (linux/input-event-codes.h): the keys
+/// nothing else uses (F13-F24), a few that rarely matter in a call, and the mouse buttons.
+const PTT_KEYS: [(&str, u16); 34] = [
+    ("KEY_F13", 183),
+    ("KEY_F14", 184),
+    ("KEY_F15", 185),
+    ("KEY_F16", 186),
+    ("KEY_F17", 187),
+    ("KEY_F18", 188),
+    ("KEY_F19", 189),
+    ("KEY_F20", 190),
+    ("KEY_F21", 191),
+    ("KEY_F22", 192),
+    ("KEY_F23", 193),
+    ("KEY_F24", 194),
+    ("KEY_F1", 59),
+    ("KEY_F2", 60),
+    ("KEY_F3", 61),
+    ("KEY_F4", 62),
+    ("KEY_F5", 63),
+    ("KEY_F6", 64),
+    ("KEY_F7", 65),
+    ("KEY_F8", 66),
+    ("KEY_F9", 67),
+    ("KEY_F10", 68),
+    ("KEY_F11", 87),
+    ("KEY_F12", 88),
+    ("KEY_SCROLLLOCK", 70),
+    ("KEY_PAUSE", 119),
+    ("KEY_RIGHTCTRL", 97),
+    ("KEY_RIGHTALT", 100),
+    ("KEY_CAPSLOCK", 58),
+    ("BTN_MIDDLE", 0x112),
+    ("BTN_SIDE", 0x113),
+    ("BTN_EXTRA", 0x114),
+    ("BTN_FORWARD", 0x115),
+    ("BTN_BACK", 0x116),
+];
+
+/// #124: the evdev code of a push-to-talk key: a name from the table (`KEY_F13`, `BTN_SIDE`,
+/// any case) or a number (`183`, `0x113`). `None` for anything else.
+pub fn ptt_key_code(name: &str) -> Option<u16> {
+    let name = name.trim();
+    if let Some(hex) = name.strip_prefix("0x").or_else(|| name.strip_prefix("0X")) {
+        return u16::from_str_radix(hex, 16).ok();
+    }
+    if let Ok(n) = name.parse::<u16>() {
+        return Some(n);
+    }
+    PTT_KEYS
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, code)| *code)
+}
+
+/// #124: the name of an evdev key code, for `dmn speak ptt learn` and the screen; the number
+/// when the table has no name for it.
+pub fn ptt_key_name(code: u16) -> String {
+    PTT_KEYS
+        .iter()
+        .find(|(_, c)| *c == code)
+        .map_or_else(|| code.to_string(), |(k, _)| (*k).to_owned())
 }
 
 /// `[speak].temperature`'s default (#113).
@@ -671,6 +744,8 @@ impl Default for Speak {
             cfg_weight: None,
             exaggeration: None,
             mode: VoiceMode::Passthrough,
+            ptt_device: String::new(),
+            ptt_key: String::new(),
             languages: Vec::new(),
         }
     }
@@ -806,7 +881,9 @@ target = ""                          # dmn run: `t` speaks your last turn in thi
 temperature = 0.6                    # the TTS model's sampling temperature (server default 0.8); lower = fewer noise bursts after a sentence
 # cfg_weight = 0.5                   # the TTS model's pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # the TTS model's emotion intensity, 0.25-2.0; left out: the server's
-mode = "passthrough"                 # dmn run: passthrough = your own voice live into dmn-voice, `t` speaks one turn translated; translate = every turn you finish goes out translated (`l` toggles, #114)
+mode = "passthrough"                 # dmn run: passthrough = your own voice live into dmn-voice, `t` speaks one turn translated; translate = every turn you finish goes out translated (`l` toggles, #114); ptt = push-to-talk (#124)
+# ptt_device = ""                    # push-to-talk (#124, an option): the button's /dev/input/by-id/...-event-* device; `dmn speak ptt learn` writes it and ptt_key
+# ptt_key = ""                       # its evdev key name (KEY_F13, BTN_SIDE) or number
 # languages = [{ code = "de", voice = "voice-de" }, { code = "es", voice = "voice-es" }]   # dmn run: the languages `v` picks between, each with its enrolled voice (`enroll --language de` adds one); target must be one of them (#115)
 
 [ui]
@@ -866,8 +943,22 @@ impl Config {
                 listed.join(", ")
             ));
         }
-        // #113: the TTS server's own ranges; outside them it refuses every speech request.
+        // #124: push-to-talk needs its button; a key name must be one dmn knows.
         let s = &self.speak;
+        if !s.ptt_key.is_empty() && ptt_key_code(&s.ptt_key).is_none() {
+            return Err(format!(
+                "[speak].ptt_key = {:?} is not a key dmn knows: use a name such as \"KEY_F13\" or \"BTN_SIDE\", or its number; `dmn speak ptt learn` writes it for you",
+                s.ptt_key
+            ));
+        }
+        if s.mode == VoiceMode::Ptt && (s.ptt_device.is_empty() || s.ptt_key.is_empty()) {
+            return Err(
+                "[speak].mode = \"ptt\" needs a push-to-talk button: `ptt_device` and `ptt_key` \
+                 under [speak]; `dmn speak ptt learn` finds the button and writes both"
+                    .into(),
+            );
+        }
+        // #113: the TTS server's own ranges; outside them it refuses every speech request.
         for (key, value, lo, hi) in [
             ("temperature", Some(s.temperature), 0.05, 5.0),
             ("cfg_weight", s.cfg_weight, 0.0, 1.0),
@@ -1003,6 +1094,20 @@ impl Config {
             path,
             |_| vec![("target", value.clone())],
             |c| c.speak.target == code,
+        )
+    }
+
+    /// #124: set `[speak].ptt_device` and `ptt_key` in the config file at `path`, the same
+    /// in-place edit (`dmn speak ptt learn`).
+    pub fn write_speak_ptt(path: &Path, device: &str, key: &str) -> Result<(), ConfigError> {
+        let (d, k) = (
+            toml::Value::String(device.to_owned()).to_string(),
+            toml::Value::String(key.to_owned()).to_string(),
+        );
+        Self::edit_speak(
+            path,
+            |_| vec![("ptt_device", d.clone()), ("ptt_key", k.clone())],
+            |c| c.speak.ptt_device == device && c.speak.ptt_key == key,
         )
     }
 
@@ -1343,7 +1448,9 @@ target = ""                          # `t` (#109) speaks in this language (es, d
 temperature = 0.6                    # TTS sampling temperature (#113); lower = fewer noise bursts
 # cfg_weight = 0.5                   # TTS pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
-mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114)
+mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114) | ptt (push-to-talk, #124)
+# ptt_device = ""                    # push-to-talk's button device (#124); `dmn speak ptt learn` writes it and ptt_key
+# ptt_key = ""                       # its evdev key name (KEY_F13, BTN_SIDE) or number; a bad one is a config error
 # languages = [{ code = "de", voice = "voice-de" }]   # `v` picks between these (#115); `enroll --language` adds one; target must be one
 
 [ui]
@@ -1421,6 +1528,65 @@ keep_transcripts = true
         assert!(
             err.contains("elevenlabs") && err.contains("chatterbox") && err.contains("qwen3"),
             "{err}"
+        );
+    }
+
+    /// #124: push-to-talk is an option: off without its keys; `mode = "ptt"` needs both; a key
+    /// name dmn does not know is an error naming it; names and numbers both parse.
+    #[test]
+    fn push_to_talk_keys_parse_and_ptt_mode_needs_a_button() {
+        let c = Config::default();
+        assert!(c.speak.ptt_device.is_empty() && c.speak.ptt_key.is_empty());
+        assert!(
+            !c.to_toml().unwrap().contains("ptt_"),
+            "nothing written while unset"
+        );
+        let on = Config::from_toml(
+            "[speak]\nmode = \"ptt\"\nptt_device = \"/dev/input/by-id/kbd-event-kbd\"\nptt_key = \"KEY_F13\"\n",
+            "on",
+        )
+        .unwrap();
+        assert_eq!(on.speak.mode, VoiceMode::Ptt);
+        let toml = on.to_toml().unwrap();
+        assert!(
+            toml.contains("mode = \"ptt\"") && toml.contains("ptt_key = \"KEY_F13\""),
+            "{toml}"
+        );
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), on);
+        let err = Config::from_toml("[speak]\nmode = \"ptt\"\n", "bare")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ptt_device") && err.contains("dmn speak ptt learn"),
+            "{err}"
+        );
+        let err = Config::from_toml("[speak]\nptt_key = \"KEY_HYPER\"\n", "bad")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("KEY_HYPER"), "{err}");
+        assert_eq!(ptt_key_code("key_f13"), Some(183));
+        assert_eq!(ptt_key_code("BTN_SIDE"), Some(0x113));
+        assert_eq!(ptt_key_code("0x113"), Some(0x113));
+        assert_eq!(ptt_key_code("194"), Some(194));
+        assert_eq!(ptt_key_name(183), "KEY_F13");
+        assert_eq!(ptt_key_name(999), "999");
+    }
+
+    #[test]
+    fn write_speak_ptt_sets_both_keys_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n[speak]\nenabled = false\n").unwrap();
+        Config::write_speak_ptt(&path, "/dev/input/by-id/x-event-kbd", "KEY_F13").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# mine\n[speak]\nenabled = false\n"),
+            "{text}"
+        );
+        let c = Config::load(&path).unwrap();
+        assert_eq!(
+            (c.speak.ptt_device.as_str(), c.speak.ptt_key.as_str()),
+            ("/dev/input/by-id/x-event-kbd", "KEY_F13")
         );
     }
 
