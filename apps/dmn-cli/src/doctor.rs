@@ -517,14 +517,23 @@ pub fn speak(cfg: &Config, h: &dyn Http) -> Vec<Check> {
         return vec![Check::pass("speak", "off ([speak].enabled = false)").optional()];
     }
     let mut checks = vec![translator(cfg, h), tts_server(cfg, h)];
-    checks.extend(ptt_button(cfg, |p| std::fs::File::open(p).map(|_| ())));
+    checks.extend(ptt_button(
+        cfg,
+        |p| std::fs::File::open(p).map(|_| ()),
+        crate::ptt::has_key,
+    ));
     checks
 }
 
-/// #124: the push-to-talk button, when one is set up: the key is known and the device can be
-/// read (`open` is `File::open`, a fake in tests). Push-to-talk is an option: without a device
-/// there is no line, and an unreadable one is a warning, since the run goes on without it.
-fn ptt_button(cfg: &Config, open: impl Fn(&str) -> std::io::Result<()>) -> Option<Check> {
+/// #124: the push-to-talk button, when one is set up: the key is known, the device is there and
+/// can be read, and it has the key (`open` is `File::open` and `has_key` reads sysfs, fakes in
+/// tests). Push-to-talk is an option: without a device there is no line, and a device that is
+/// missing, unreadable or without the key is a warning, since the run goes on without it.
+fn ptt_button(
+    cfg: &Config,
+    open: impl Fn(&str) -> std::io::Result<()>,
+    has_key: impl Fn(&str, u16) -> Option<bool>,
+) -> Option<Check> {
     let s = &cfg.speak;
     if s.ptt_device.is_empty() {
         return None;
@@ -538,7 +547,25 @@ fn ptt_button(cfg: &Config, open: impl Fn(&str) -> std::io::Result<()>) -> Optio
     };
     let key = dmn_core::config::ptt_key_name(code);
     Some(match open(&s.ptt_device) {
+        Ok(()) if has_key(&s.ptt_device, code) == Some(false) => Check::fail(
+            "push-to-talk",
+            format!(
+                "{} has no {key}: `dmn run` goes on without push-to-talk",
+                s.ptt_device
+            ),
+            "pick the button again: dmn speak ptt learn",
+        )
+        .optional(),
         Ok(()) => Check::pass("push-to-talk", format!("{key} on {}", s.ptt_device)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::fail(
+            "push-to-talk",
+            format!(
+                "{} is not there (unplugged?): `dmn run` goes on without push-to-talk",
+                s.ptt_device
+            ),
+            "plug the device in, or pick the button again: dmn speak ptt learn",
+        )
+        .optional(),
         Err(e) => Check::fail(
             "push-to-talk",
             format!(
@@ -1457,23 +1484,48 @@ mod tests {
         );
     }
 
-    /// #122: with `engine = "qwen3"` doctor names the engine, its URL, the model vLLM-Omni
-    /// serves and the device; another model there, or nothing, is a failure with the way to
-    /// the sidecar.
     /// #124: no line without a button; the key and device with one; an unreadable device is a
-    /// warning with the way to the udev rule, and an unknown key a failure.
+    /// warning with the way to the udev rule, a missing one or one without the key a warning
+    /// with `dmn speak ptt learn`, and an unknown key a failure.
     #[test]
     fn doctor_reports_the_push_to_talk_button() {
+        let has = |_: &str, _: u16| Some(true);
         let mut cfg = Config::default();
-        assert!(ptt_button(&cfg, |_| Ok(())).is_none());
+        assert!(ptt_button(&cfg, |_| Ok(()), has).is_none());
         cfg.speak.ptt_device = "/dev/input/by-id/usb-UHK-event-kbd".into();
         cfg.speak.ptt_key = "183".into();
-        let ok = ptt_button(&cfg, |_| Ok(())).unwrap();
+        let ok = ptt_button(&cfg, |_| Ok(()), has).unwrap();
         assert!(ok.ok, "{ok:?}");
         assert_eq!(ok.detail, "KEY_F13 on /dev/input/by-id/usb-UHK-event-kbd");
-        let denied = ptt_button(&cfg, |_| {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-        })
+        let unknown = ptt_button(&cfg, |_| Ok(()), |_, _| None).unwrap();
+        assert!(unknown.ok, "no bitmap is not a failure: {unknown:?}");
+        let keyless = ptt_button(&cfg, |_| Ok(()), |_, _| Some(false)).unwrap();
+        assert!(!keyless.ok && !keyless.required, "{keyless:?}");
+        assert!(keyless.detail.contains("has no KEY_F13"), "{keyless:?}");
+        assert!(
+            keyless
+                .fix
+                .as_deref()
+                .unwrap_or("")
+                .contains("dmn speak ptt learn")
+        );
+        let missing = ptt_button(
+            &cfg,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            has,
+        )
+        .unwrap();
+        assert!(!missing.ok && !missing.required, "{missing:?}");
+        let fix = missing.fix.as_deref().unwrap_or("");
+        assert!(
+            fix.contains("plug") && fix.contains("dmn speak ptt learn"),
+            "{fix}"
+        );
+        let denied = ptt_button(
+            &cfg,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            has,
+        )
         .unwrap();
         assert!(!denied.ok && !denied.required, "{denied:?}");
         assert!(
@@ -1484,10 +1536,13 @@ mod tests {
                 .contains("dmn speak ptt devices")
         );
         cfg.speak.ptt_key = "KEY_NOPE".into();
-        let bad = ptt_button(&cfg, |_| Ok(())).unwrap();
+        let bad = ptt_button(&cfg, |_| Ok(()), has).unwrap();
         assert!(!bad.ok && bad.required, "{bad:?}");
     }
 
+    /// #122: with `engine = "qwen3"` doctor names the engine, its URL, the model vLLM-Omni
+    /// serves and the device; another model there, or nothing, is a failure with the way to
+    /// the sidecar.
     #[test]
     fn doctor_names_the_qwen3_engine_its_model_and_device() {
         let mut cfg = Config::default();

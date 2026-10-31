@@ -49,6 +49,10 @@ pub enum PttError {
         "cannot read the push-to-talk device {path}: {detail}; give your login access to it (README § Push-to-talk: `dmn speak ptt devices` prints the udev rule)"
     )]
     Open { path: String, detail: String },
+    #[error(
+        "the push-to-talk device {path} has no {key}: pick the button again with `dmn speak ptt learn`"
+    )]
+    NoSuchKey { path: String, key: String },
     #[error("cannot start the push-to-talk thread: {0}")]
     Spawn(String),
     #[error(
@@ -173,11 +177,39 @@ impl Button {
     pub fn check(device: &str, key: &str) -> Result<Self, PttError> {
         let code = ptt_key_code(key).ok_or_else(|| PttError::BadKey(key.to_owned()))?;
         open_device(device)?;
+        if has_key(device, code) == Some(false) {
+            return Err(PttError::NoSuchKey {
+                path: device.to_owned(),
+                key: ptt_key_name(code),
+            });
+        }
         Ok(Self {
             path: device.to_owned(),
             code,
         })
     }
+}
+
+/// Whether the input device `device` (a by-id path or an `eventN` node) has key `code`, from
+/// the kernel's key bitmap in sysfs (readable without access to the device); `None` when
+/// sysfs has no bitmap for it (not an input device, or no sysfs).
+pub fn has_key(device: &str, code: u16) -> Option<bool> {
+    let node = std::fs::canonicalize(device).ok()?;
+    let event = node.file_name()?.to_string_lossy().into_owned();
+    let caps = std::fs::read_to_string(format!("/sys/class/input/{event}/device/capabilities/key"))
+        .ok()?;
+    Some(key_bit(&caps, code))
+}
+
+/// Bit `code` of a sysfs key bitmap: hex words of a `long` each, the highest first.
+fn key_bit(caps: &str, code: u16) -> bool {
+    let bits = 8 * std::mem::size_of::<std::ffi::c_long>();
+    let (index, bit) = (usize::from(code) / bits, usize::from(code) % bits);
+    caps.split_whitespace()
+        .rev()
+        .nth(index)
+        .and_then(|word| u64::from_str_radix(word, 16).ok())
+        .is_some_and(|word| word >> bit & 1 == 1)
 }
 
 /// Open `device` for reading, non-blocking (module doc).
@@ -420,6 +452,23 @@ mod tests {
         assert!(matches!(err, PttError::Open { .. }), "{err}");
         assert!(err.to_string().contains("dmn speak ptt devices"), "{err}");
         assert!(Button::check("/dev/null", "BTN_SIDE").is_ok());
+    }
+
+    /// The kernel's key bitmaps, as sysfs prints them on the dev box: the G402's mouse has its
+    /// side buttons and no keys; the UHK has F13 and no mouse buttons.
+    #[test]
+    fn a_key_bitmap_says_which_keys_a_device_has() {
+        let g402_mouse = "ffff0000 0 0 0 0\n";
+        let uhk = "1000000000007 ff9f207ac14057ff febeffdfffefffff fffffffffffffffe\n";
+        let code = |k: &str| ptt_key_code(k).unwrap();
+        assert!(key_bit(g402_mouse, code("BTN_SIDE")));
+        assert!(key_bit(g402_mouse, 0x110), "BTN_LEFT");
+        assert!(!key_bit(g402_mouse, code("KEY_F13")));
+        assert!(key_bit(uhk, code("KEY_F13")));
+        assert!(key_bit(uhk, 58), "KEY_CAPSLOCK");
+        assert!(!key_bit(uhk, code("BTN_SIDE")), "past the bitmap's end");
+        assert!(!key_bit("", code("KEY_F13")));
+        assert_eq!(has_key("/dev/null", code("KEY_F13")), None);
     }
 
     /// A started button's reader stops, and its thread ends, when the reading is dropped; a

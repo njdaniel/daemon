@@ -655,7 +655,10 @@ whisper's 12 s segment goes out whole after the release. The log line for each s
 `released_to_first_audio_ms`, the time from letting go to the first sound in `dmn-voice`.
 `mode = "ptt"` without a button is a config error naming `dmn speak ptt learn`; a device dmn cannot
 read at start, or one unplugged mid-run, is said on the status line and the run goes on in
-translate mode. `dmn doctor` shows the button and, for an unreadable device, the way to the rule.
+translate mode. A device without the configured key (`BTN_SIDE` set on a keyboard, say) is refused
+the same way. `dmn doctor` shows the button, and warns with the fix when its device is missing
+(plug it in, or `dmn speak ptt learn`), unreadable (the udev rule) or has no such key
+(`dmn speak ptt learn`).
 
 With `[stt].language = "auto"` (or a code, for an interview in another language), whisper
 translates both lanes into English. With `[speak]` on, the **You** lane is the exception: it

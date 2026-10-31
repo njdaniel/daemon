@@ -621,7 +621,7 @@ fn headless(
 }
 
 /// #124: check `[speak].ptt_device` for `ptt_key` when both are set; `None` (with the reason on
-/// the status line for 5 s, and in the log) when the device cannot be opened.
+/// the status line for 5 s, and in the log) when the device cannot be opened or lacks the key.
 fn check_ptt_button(
     cfg: &Config,
     hub: &std::sync::Arc<dmn_session::SessionHub>,
@@ -643,8 +643,9 @@ fn check_ptt_button(
     }
 }
 
-/// #124: the status line when the push-to-talk device cannot be read at start.
-const PTT_UNREADABLE: &str = "push-to-talk off: cannot read the button (dmn doctor)";
+/// #124: the status line when the push-to-talk button cannot be used at start (the device is
+/// missing or unreadable, or has no such key; the log and `dmn doctor` say which).
+const PTT_UNREADABLE: &str = "push-to-talk off: button not usable (dmn doctor)";
 
 #[cfg(test)]
 mod tests {
