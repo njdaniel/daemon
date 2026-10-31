@@ -612,8 +612,11 @@ turn, and its translation starts the moment you let go. While the button is up t
 nothing from your microphone, only the translations. It is off unless you set it up, and nothing
 else changes without it.
 
-dmn reads the button straight from its input device, so it works while the call's window has
-focus. That needs read access to the one device, which by default only root has:
+dmn reads the button straight from its input device (the kernel's evdev), below the desktop, so
+it works while the call's window has focus on any Linux desktop: X11 or Wayland, GNOME, KDE,
+COSMIC, Sway. It reads the device only while push-to-talk is the voice mode; at start it only
+checks the device can be opened, and leaving push-to-talk closes it. That needs read access to
+the one device, which by default only root has:
 
 ```bash
 dmn speak ptt devices      # every input device, whether dmn can read it, and the udev rule for one it cannot
@@ -647,7 +650,8 @@ With a button set up, `l` cycles your own voice → translate → push-to-talk. 
 `voice: PTT → zh`, and `● talking → zh` in red while the button is held. Releasing it closes the
 sentence at once (no silence wait), whisper's final pass runs, and the turn goes to the
 translator; the echo guard's hold is skipped for it. Each press is one translation, even if the
-previous one is still playing. The log line for each spoken sentence adds
+previous one is still playing, and none starts while the button is held: a hold longer than
+whisper's 12 s segment goes out whole after the release. The log line for each spoken sentence adds
 `released_to_first_audio_ms`, the time from letting go to the first sound in `dmn-voice`.
 `mode = "ptt"` without a button is a config error naming `dmn speak ptt learn`; a device dmn cannot
 read at start, or one unplugged mid-run, is said on the status line and the run goes on in

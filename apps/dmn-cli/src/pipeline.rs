@@ -1450,10 +1450,16 @@ impl Pipeline {
         target: String,
         languages: Vec<Language>,
         config_file: Option<PathBuf>,
-        ptt_ready: bool,
+        button: Option<Box<dyn crate::ptt::ButtonSource>>,
     ) {
         let own = (self.info.language == "en").then(|| "en".to_owned());
-        self.speaking.ptt_ready = ptt_ready;
+        self.speaking.ptt_ready = button.is_some();
+        let controls = self.controls();
+        self.speaking.button = button.map(|source| PttButton {
+            source,
+            controls,
+            reading: None,
+        });
         self.speaking
             .attach(speaker, mode, target, own, languages, config_file);
     }
@@ -1564,7 +1570,10 @@ impl Pipeline {
             Command::Speak => self.speaking.press(&self.log),
             Command::Voice => self.speaking.toggle(),
             Command::SpeakTarget { index } => self.speaking.choose(index),
-            Command::Ptt { held, at } => self.speaking.button(held, at),
+            Command::Ptt { held, at } => {
+                let audio = Duration::from_secs_f64(self.audio.at(at).max(0.0));
+                self.speaking.button(held, at, audio);
+            }
             Command::PttLost => self.speaking.lost(),
             cmd => self.assist.command(cmd, &self.log),
         }
@@ -1984,9 +1993,40 @@ pub struct Speaking {
     /// #124: the push-to-talk link, and whether a button is there to drive it.
     ptt: PttLine,
     ptt_ready: bool,
-    /// #124: when the button was last released, for the speaker's release → first audio.
-    released: Option<Instant>,
+    /// #124: the button, read only while push-to-talk is the mode.
+    button: Option<PttButton>,
+    /// #124: presses whose turn is not complete yet, oldest first (each is one translation).
+    holds: VecDeque<Hold>,
 }
+
+/// #124: the push-to-talk button and its reader. The device is read only while push-to-talk is
+/// the voice mode: `reading` is `Some` exactly then, and dropping it stops the reader.
+struct PttButton {
+    source: Box<dyn crate::ptt::ButtonSource>,
+    /// Where the reader sends presses (the You lane's gate, then the pipeline thread).
+    controls: Controls,
+    reading: Option<crate::ptt::Reading>,
+}
+
+/// #124: one press of the button: the session seconds it spans and the You finals heard in it.
+/// Finals are matched to a press by their start, not by when they arrive, so a quick second
+/// press never takes the first one's late final.
+#[derive(Debug)]
+struct Hold {
+    from: Duration,
+    /// The release, in session seconds and as the instant the reader saw it.
+    until: Option<(Duration, Instant)>,
+    heard: Option<Utterance>,
+    /// Every final of the press is in: the one the release closed, or a later press's.
+    done: bool,
+}
+
+/// #124: how far a final's start may be before its press (the VAD's frame and pre-roll), and
+/// its end before the release, and still be the press's (the release-closed one).
+const HOLD_SLACK: Duration = Duration::from_millis(300);
+/// #124: how long a released press waits for its final before it goes as it is (a press too
+/// short for the VAD, or with nothing whisper could hear, has none).
+const HOLD_WAIT: Duration = Duration::from_secs(5);
 
 /// #114: one thing to speak: a turn's text and the session seconds of the You lines in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1997,6 +2037,8 @@ struct Utterance {
     /// The other person spoke after this turn was finalized (#114): a later You final is a new
     /// turn, not more of this one, as #109's `last_turn` grouping ends at the other speaker.
     sealed: bool,
+    /// #124: a push-to-talk turn's release, for the log's release → first audio.
+    released: Option<Instant>,
 }
 
 impl Speaking {
@@ -2016,7 +2058,8 @@ impl Speaking {
             config_file: None,
             ptt: PttLine::default(),
             ptt_ready: false,
-            released: None,
+            button: None,
+            holds: VecDeque::new(),
         }
     }
 
@@ -2040,7 +2083,6 @@ impl Speaking {
             mode
         };
         speaker.set_passthrough(mode == VoiceMode::Passthrough);
-        self.ptt.activate(mode == VoiceMode::Ptt);
         self.hub.dispatch(Action::Ptt {
             held: self.ptt_ready.then_some(false),
         });
@@ -2052,6 +2094,9 @@ impl Speaking {
         self.config_file = config_file;
         self.hub.dispatch(Action::SpeakEnabled { enabled: true });
         self.announce();
+        // After the announcement: a button that cannot be read now says so, and its marker
+        // (translate mode) comes after push-to-talk's.
+        self.set_ptt(mode == VoiceMode::Ptt);
         self.hub.dispatch(Action::SpeakLanguages {
             languages: self.languages.iter().map(Language::listed).collect(),
         });
@@ -2118,30 +2163,155 @@ impl Speaking {
         self.mode = self.mode.next(self.ptt_ready);
         if self.mode == VoiceMode::Passthrough {
             self.queue.clear();
+            self.holds.clear();
         }
         speaker.set_passthrough(self.mode == VoiceMode::Passthrough);
-        self.ptt.activate(self.mode == VoiceMode::Ptt);
         self.announce();
+        self.set_ptt(self.mode == VoiceMode::Ptt);
     }
 
-    /// #124: the push-to-talk button moved (the You lane's gate already has). The screen shows
-    /// it; in push-to-talk a press seals the turn that waits, so each press is one translation,
-    /// and a release is remembered for the speaker's release → first audio.
-    fn button(&mut self, held: bool, at: Instant) {
-        if !self.ptt_ready {
+    /// #124: push-to-talk on or off. On: the You lane waits for the button, and the button's
+    /// device is opened and read. Off: the reader stops and the device is closed first, so no
+    /// press lands once the lane is back with the VAD; presses still waiting for their finals
+    /// go out as they are. A device that cannot be opened now counts as lost.
+    fn set_ptt(&mut self, on: bool) {
+        if !on {
+            if let Some(button) = &mut self.button {
+                button.reading = None;
+            }
+            self.ptt.activate(false);
+            if self.ptt_ready {
+                self.hub.dispatch(Action::Ptt { held: Some(false) });
+            }
+            for hold in std::mem::take(&mut self.holds) {
+                if let Some(turn) = hold.heard {
+                    self.queue.push_back(turn);
+                }
+            }
+            return;
+        }
+        self.ptt.activate(true);
+        let Some(button) = &mut self.button else {
+            return;
+        };
+        if button.reading.is_some() {
+            return;
+        }
+        let (on, lost) = (button.controls.clone(), button.controls.clone());
+        match button.source.start(
+            Box::new(move |e| on.ptt_button(e == crate::ptt::Event::Pressed)),
+            Box::new(move |_| lost.ptt_lost()),
+        ) {
+            Ok(reading) => button.reading = Some(reading),
+            Err(e) => {
+                tracing::warn!(error = %e, "push-to-talk: cannot read the button");
+                self.lost();
+            }
+        }
+    }
+
+    /// #124: the push-to-talk button moved at `at`, `audio` in session seconds (the You lane's
+    /// gate already has). The screen shows it. A press opens a [`Hold`]; a release closes it,
+    /// and its turn goes to the speaker once its last final is in ([`Speaking::hold_heard`]),
+    /// so each press is one translation and none starts while the button is held.
+    fn button(&mut self, held: bool, at: Instant, audio: Duration) {
+        if !self.ptt_ready || self.mode != VoiceMode::Ptt {
             return;
         }
         self.hub.dispatch(Action::Ptt { held: Some(held) });
-        if self.mode != VoiceMode::Ptt {
-            return;
-        }
-        if held {
-            if let Some(waiting) = self.queue.back_mut() {
-                waiting.sealed = true;
+        let open = self.holds.back_mut().filter(|h| h.until.is_none());
+        match (held, open) {
+            (true, Some(_)) | (false, None) => {} // a repeat of the last edge
+            (true, None) => self.holds.push_back(Hold {
+                from: audio,
+                until: None,
+                heard: None,
+                done: false,
+            }),
+            (false, Some(hold)) => {
+                hold.until = Some((audio, at));
+                if let Some(turn) = &mut hold.heard {
+                    turn.released = Some(at);
+                    hold.done = turn.to + HOLD_SLACK >= audio;
+                }
+                self.settle(at);
             }
-        } else {
-            self.released = Some(at);
         }
+    }
+
+    /// #124: a final You line in push-to-talk: it joins the press it was said in (the last one
+    /// that began before it). It completes that press when the press is released and the line
+    /// runs to the release (the release closed it), and it completes every earlier press: the
+    /// lane's finals come in order, so theirs are all in. A line from before any press (said
+    /// in translate mode, finished after the switch) goes out as a turn of its own.
+    fn hold_heard(&mut self, seg: &Segment, now: Instant) {
+        let Some(i) = self
+            .holds
+            .iter()
+            .rposition(|h| h.from <= seg.start + HOLD_SLACK)
+        else {
+            if !seg.text.trim().is_empty() {
+                self.queue.push_back(Utterance {
+                    text: seg.text.trim().to_owned(),
+                    from: seg.start,
+                    to: seg.end,
+                    sealed: true,
+                    released: None,
+                });
+            }
+            self.start_next();
+            return;
+        };
+        for earlier in self.holds.iter_mut().take(i) {
+            earlier.done = true;
+        }
+        let hold = &mut self.holds[i];
+        let text = seg.text.trim();
+        if !text.is_empty() {
+            let released = hold.until.map(|(_, at)| at);
+            match &mut hold.heard {
+                Some(turn) => {
+                    turn.text.push(' ');
+                    turn.text.push_str(text);
+                    turn.to = turn.to.max(seg.end);
+                }
+                None => {
+                    hold.heard = Some(Utterance {
+                        text: text.to_owned(),
+                        from: seg.start,
+                        to: seg.end,
+                        sealed: true,
+                        released,
+                    })
+                }
+            }
+        }
+        if let Some((until, _)) = hold.until
+            && seg.end + HOLD_SLACK >= until
+        {
+            hold.done = true;
+        }
+        self.settle(now);
+    }
+
+    /// #124: hand the presses that are complete, oldest first, to the speaker's queue, in
+    /// order: a press waits behind an earlier one still waiting for its final. A released
+    /// press whose final has not come in [`HOLD_WAIT`] goes as it is.
+    fn settle(&mut self, now: Instant) {
+        while let Some(front) = self.holds.front() {
+            let waited = front
+                .until
+                .is_some_and(|(_, at)| now.saturating_duration_since(at) >= HOLD_WAIT);
+            if !front.done && !waited {
+                break;
+            }
+            if let Some(hold) = self.holds.pop_front()
+                && let Some(turn) = hold.heard
+            {
+                self.queue.push_back(turn);
+            }
+        }
+        self.start_next();
     }
 
     /// #124: the button's device went away (unplugged): the run goes on without it, in
@@ -2150,8 +2320,9 @@ impl Speaking {
         if !self.ptt_ready {
             return;
         }
+        self.set_ptt(false);
         self.ptt_ready = false;
-        self.ptt.activate(false);
+        self.button = None;
         self.hub.dispatch(Action::Ptt { held: None });
         self.hub.dispatch(Action::SpeakFailed {
             id: crate::speaker::STARTUP_NOTICE,
@@ -2188,6 +2359,7 @@ impl Speaking {
             from: turn.start,
             to: turn.end,
             sealed: false,
+            released: None,
         };
         match self.mode {
             VoiceMode::Passthrough => self.start(utterance),
@@ -2204,11 +2376,16 @@ impl Speaking {
     /// is in flight. A Them final with text seals the waiting turn: what the user says
     /// after the other person spoke is a turn of its own, as `last_turn` groups them (#109).
     fn heard(&mut self, seg: &Segment) {
-        if self.speaker.is_none()
-            || !self.mode.translates()
-            || !seg.is_final
-            || seg.text.trim().is_empty()
-        {
+        if self.speaker.is_none() || !self.mode.translates() || !seg.is_final {
+            return;
+        }
+        // #124: in push-to-talk a You final belongs to its press; even an empty one says the
+        // press's audio has been through whisper.
+        if self.mode == VoiceMode::Ptt && seg.source == Source::You {
+            self.hold_heard(seg, Instant::now());
+            return;
+        }
+        if seg.text.trim().is_empty() {
             return;
         }
         match seg.source {
@@ -2232,6 +2409,7 @@ impl Speaking {
                 from: seg.start,
                 to: seg.end,
                 sealed: false,
+                released: None,
             }),
         }
         self.start_next();
@@ -2262,13 +2440,8 @@ impl Speaking {
             to: utterance.to.as_secs_f64(),
         });
         self.pressed = Some((id, Instant::now()));
-        // #124: a push-to-talk turn carries its release, for the log's release → first audio.
-        let released = if self.mode == VoiceMode::Ptt {
-            self.released.take()
-        } else {
-            None
-        };
-        if !speaker.speak_released(id, utterance.text, released) {
+        // #124: a push-to-talk turn carries its own release, for the log's release → first audio.
+        if !speaker.speak_released(id, utterance.text, utterance.released) {
             self.hub.dispatch(Action::SpeakFailed {
                 id,
                 reason: "speak failed: the speaker stopped".to_owned(),
@@ -2313,10 +2486,12 @@ impl Speaking {
             SPEAK_FAILED_FOR,
             |id| Action::SpeakNoticeExpired { id },
         );
-        self.start_next();
+        self.settle(now);
     }
 
     fn finish(&mut self) {
+        self.button = None;
+        self.holds.clear();
         self.queue.clear();
         if let Some(speaker) = self.speaker.take() {
             speaker.stop();
@@ -4904,18 +5079,72 @@ mod tests {
         (s, played, gate, languages)
     }
 
-    /// #124: [`speaking_in`] with a push-to-talk button there.
+    /// #124: a button for tests: the test moves it itself; this keeps count of the readers it
+    /// has running, so a test can see when the device would be read. `fail` refuses to start.
+    #[derive(Clone, Default)]
+    struct FakeButton {
+        readers: Arc<std::sync::Mutex<Vec<Arc<AtomicBool>>>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl FakeButton {
+        /// A reader is running: one started and not dropped.
+        fn reading(&self) -> bool {
+            self.readers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|stopped| !stopped.load(Ordering::Acquire))
+        }
+
+        fn starts(&self) -> usize {
+            self.readers.lock().unwrap().len()
+        }
+    }
+
+    impl crate::ptt::ButtonSource for FakeButton {
+        fn start(
+            &self,
+            _on: Box<dyn FnMut(crate::ptt::Event) + Send>,
+            _lost: Box<dyn FnOnce(String) + Send>,
+        ) -> Result<crate::ptt::Reading, crate::ptt::PttError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(crate::ptt::PttError::Open {
+                    path: "fake".into(),
+                    detail: "unplugged".into(),
+                });
+            }
+            let stopped = Arc::new(AtomicBool::new(false));
+            self.readers.lock().unwrap().push(Arc::clone(&stopped));
+            Ok(crate::ptt::Reading::flag(stopped))
+        }
+    }
+
+    /// #124: [`speaking_in`] with a push-to-talk button there ([`FakeButton`]).
     fn speaking_ptt(
         hub: &Arc<SessionHub>,
         llm: &dmn_llm::MockProvider,
         tts: &dmn_tts::MockTtsProvider,
         mode: VoiceMode,
-    ) -> Speaking {
+    ) -> (Speaking, FakeButton) {
         let (setup, _played, _gate) =
             crate::speaker::setup_sink(Arc::new(llm.clone()), tts.clone(), true);
         let languages = setup.languages.clone();
         let mut s = Speaking::new(Arc::clone(hub));
+        let fake = FakeButton::default();
+        let (commands, _) = mpsc::channel();
         s.ptt_ready = true;
+        s.button = Some(PttButton {
+            source: Box::new(fake.clone()),
+            controls: Controls {
+                hub: Arc::clone(hub),
+                commands,
+                stop: Arc::new(AtomicBool::new(false)),
+                mic_muted: Arc::new(AtomicBool::new(false)),
+                ptt: s.ptt.clone(),
+            },
+            reading: None,
+        });
         s.attach(
             Speaker::start(setup, Arc::clone(hub)).unwrap(),
             mode,
@@ -4924,25 +5153,35 @@ mod tests {
             languages,
             None,
         );
-        s
+        (s, fake)
     }
 
-    /// #124: in push-to-talk each press is one translation: finals of one press join, a new
-    /// press seals the turn that waits. The You lane's gate is up until the button is held, the
-    /// screen shows the mode and the held button, and a release is kept for the speaker.
+    /// The translate requests the mock model got, oldest first.
+    fn asked(llm: &dmn_llm::MockProvider) -> Vec<String> {
+        llm.requests()
+            .iter()
+            .map(|r| r.messages[1].content.clone())
+            .collect()
+    }
+
+    /// #124: in push-to-talk each press is one translation, and it starts at the release, not
+    /// while the button is held: finals of one press (whisper split a long hold) join and wait
+    /// for the one the release closed. The You lane's gate is up until the button is held, and
+    /// the screen shows the mode and the held button.
     #[test]
-    fn push_to_talk_is_one_translation_per_press() {
+    fn push_to_talk_is_one_translation_per_press_started_at_the_release() {
         let hub = Arc::new(SessionHub::default());
         let llm = spanish().with_delay(Duration::from_millis(300));
         let tts = dmn_tts::MockTtsProvider::new();
-        let mut s = speaking_ptt(&hub, &llm, &tts, VoiceMode::Ptt);
+        let (mut s, _fake) = speaking_ptt(&hub, &llm, &tts, VoiceMode::Ptt);
         assert_eq!(s.ptt.gate.get(), PttState::Up, "nothing opens until held");
         assert!(screen(&hub.snapshot()).contains("voice: PTT → es"));
         let mut log = TranscriptLog::new();
         let t0 = Instant::now();
+        let ms = Duration::from_millis;
 
         s.ptt.button(true);
-        s.button(true, t0);
+        s.button(true, t0, ms(6_000));
         assert_eq!(s.ptt.gate.get(), PttState::Held);
         let snap = hub.snapshot();
         assert_eq!(snap.ptt, Some(true));
@@ -4951,57 +5190,107 @@ mod tests {
             "{}",
             screen(&snap)
         );
-        let first = final_at(Source::You, 6_000, 9_000, SAID);
+        // Held past whisper's segment limit: its first piece is final while still held.
+        let first = final_at(Source::You, 6_000, 18_000, SAID);
         hear(&hub, &mut log, first.clone());
         s.heard(&first);
-        let second = final_at(Source::You, 9_000, 12_000, SAID_REST);
-        hear(&hub, &mut log, second.clone());
-        s.heard(&second);
         s.ptt.button(false);
-        s.button(false, t0 + Duration::from_secs(6));
+        s.button(false, t0 + ms(13_000), ms(19_000));
         assert_eq!(s.ptt.gate.get(), PttState::Up);
         assert_eq!(hub.snapshot().ptt, Some(false));
-        assert_eq!(s.queue.len(), 1, "the second final waits behind the first");
-
-        // A new press: what it says is its own turn, not more of the one that waits.
-        s.ptt.button(true);
-        s.button(true, t0 + Duration::from_secs(8));
-        let third = final_at(Source::You, 14_000, 16_000, SAID);
-        hear(&hub, &mut log, third.clone());
-        s.heard(&third);
-        s.button(false, t0 + Duration::from_secs(10));
-        assert_eq!(
-            s.queue.len(),
-            2,
-            "two turns wait: the press sealed the first"
+        assert!(
+            llm.requests().is_empty() && hub.snapshot().speech.is_none(),
+            "nothing goes before the release-closed final is in"
         );
-        let _ = drive(&mut s, &hub, "all turns played", |snap| {
-            snap.speech.is_none() && tts.requests().len() == 3
+        let second = final_at(Source::You, 18_000, 19_000, SAID_REST);
+        hear(&hub, &mut log, second.clone());
+        s.heard(&second);
+        assert!(hub.snapshot().speech.is_some(), "the press went at once");
+        let _ = drive(&mut s, &hub, "the press played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 1
         });
-        let asked: Vec<String> = llm
-            .requests()
-            .iter()
-            .map(|r| r.messages[1].content.clone())
-            .collect();
-        assert_eq!(asked, [SAID, SAID_REST, SAID]);
+        assert_eq!(asked(&llm), [format!("{SAID} {SAID_REST}")]);
+        s.finish();
+    }
+
+    /// #124: a quick second press, made before the first press's final is in, does not take
+    /// that final: finals go to the press they were said in, and each press is its own turn, in
+    /// order. A press with no final (too short to hear) does not hold up the next one.
+    #[test]
+    fn a_quick_second_press_keeps_its_own_turn() {
+        let hub = Arc::new(SessionHub::default());
+        let llm = spanish().with_delay(Duration::from_millis(300));
+        let tts = dmn_tts::MockTtsProvider::new();
+        let (mut s, _fake) = speaking_ptt(&hub, &llm, &tts, VoiceMode::Ptt);
+        let mut log = TranscriptLog::new();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // A tap with nothing in it, then press, release and press again within 0.2 s.
+        s.button(true, t0, ms(1_000));
+        s.button(false, t0 + ms(100), ms(1_100));
+        s.button(true, t0 + ms(2_000), ms(3_000));
+        s.button(false, t0 + ms(4_000), ms(5_000));
+        s.button(true, t0 + ms(4_200), ms(5_200));
+        let first = final_at(Source::You, 3_000, 5_000, SAID);
+        hear(&hub, &mut log, first.clone());
+        s.heard(&first);
+        s.button(false, t0 + ms(6_000), ms(7_000));
+        let second = final_at(Source::You, 5_200, 7_000, SAID_REST);
+        hear(&hub, &mut log, second.clone());
+        s.heard(&second);
+        let _ = drive(&mut s, &hub, "both presses played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 2
+        });
+        assert_eq!(asked(&llm), [SAID, SAID_REST]);
+        s.finish();
+    }
+
+    /// #124: a released press whose release-closed final never comes (whisper heard nothing in
+    /// the last piece) goes with what it has once [`HOLD_WAIT`] is up.
+    #[test]
+    fn a_press_whose_last_final_never_comes_goes_after_the_wait() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, _fake) = speaking_ptt(&hub, &llm, &tts, VoiceMode::Ptt);
+        let mut log = TranscriptLog::new();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        s.button(true, t0, ms(1_000));
+        let piece = final_at(Source::You, 1_000, 13_000, SAID);
+        hear(&hub, &mut log, piece.clone());
+        s.heard(&piece);
+        s.button(false, t0 + ms(14_000), ms(15_000));
+        let mut echo = EchoGuard::new(true);
+        let clock = AudioClock::new(t0, 1.0);
+        s.tick(t0 + ms(14_000) + HOLD_WAIT / 2, &mut echo, &clock);
+        assert!(hub.snapshot().speech.is_none(), "still waiting");
+        s.tick(t0 + ms(14_000) + HOLD_WAIT, &mut echo, &clock);
+        assert!(hub.snapshot().speech.is_some(), "gone after the wait");
+        let _ = drive(&mut s, &hub, "the press played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 1
+        });
+        assert_eq!(asked(&llm), [SAID]);
         s.finish();
     }
 
     /// #124: `l` cycles own voice → translate → push-to-talk → own voice with a button, and
-    /// translate ↔ own voice without one; the gate follows; `mode = "ptt"` without a button
-    /// starts in translate mode; a lost button drops back to translate mode with a notice.
+    /// translate ↔ own voice without one; the gate follows; the button's device is read only
+    /// while push-to-talk is the mode; `mode = "ptt"` without a button starts in translate
+    /// mode; a lost button drops back to translate mode with a notice.
     #[test]
     fn l_offers_push_to_talk_only_with_a_button_and_a_lost_button_falls_back() {
         let hub = Arc::new(SessionHub::default());
         let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
-        let mut s = speaking_ptt(&hub, &llm, &tts, VoiceMode::Passthrough);
+        let (mut s, fake) = speaking_ptt(&hub, &llm, &tts, VoiceMode::Passthrough);
         assert_eq!(s.ptt.gate.get(), PttState::Off);
+        assert!(!fake.reading(), "own voice: the device is not read");
         assert!(screen(&hub.snapshot()).contains("l translate"));
         s.toggle();
         assert_eq!(
             (s.mode, s.ptt.gate.get()),
             (VoiceMode::Translate, PttState::Off)
         );
+        assert!(!fake.reading(), "translate: the device is not read");
         assert!(
             screen(&hub.snapshot()).contains("l push-to-talk"),
             "{}",
@@ -5009,6 +5298,7 @@ mod tests {
         );
         s.toggle();
         assert_eq!((s.mode, s.ptt.gate.get()), (VoiceMode::Ptt, PttState::Up));
+        assert!(fake.reading(), "push-to-talk: the device is read");
         assert!(
             hub.snapshot()
                 .transcript
@@ -5021,6 +5311,7 @@ mod tests {
             (s.mode, s.ptt.gate.get()),
             (VoiceMode::Passthrough, PttState::Off)
         );
+        assert!(!fake.reading(), "leaving push-to-talk stops the reader");
         s.ptt.button(true);
         assert_eq!(s.ptt.gate.get(), PttState::Off);
         s.ptt.button(false);
@@ -5028,11 +5319,13 @@ mod tests {
         s.toggle();
         s.toggle();
         assert_eq!(s.mode, VoiceMode::Ptt);
+        assert_eq!((fake.reading(), fake.starts()), (true, 2));
         s.lost();
         assert_eq!(
             (s.mode, s.ptt.gate.get()),
             (VoiceMode::Translate, PttState::Off)
         );
+        assert!(!fake.reading());
         let snap = hub.snapshot();
         assert_eq!(snap.ptt, None);
         assert_eq!(
@@ -5054,6 +5347,20 @@ mod tests {
             VoiceMode::Translate,
             "ptt without a button starts in translate"
         );
+        assert_eq!(hub.snapshot().ptt, None);
+        s.finish();
+
+        // Starting in push-to-talk reads the device from the start; one that cannot be opened
+        // any more when push-to-talk comes on counts as lost.
+        let hub = Arc::new(SessionHub::default());
+        let (mut s, fake) = speaking_ptt(&hub, &llm, &tts, VoiceMode::Ptt);
+        assert_eq!((s.mode, fake.reading()), (VoiceMode::Ptt, true));
+        s.toggle();
+        assert!(!fake.reading());
+        fake.fail.store(true, Ordering::Release);
+        s.toggle();
+        s.toggle();
+        assert_eq!(s.mode, VoiceMode::Translate, "the button is gone");
         assert_eq!(hub.snapshot().ptt, None);
         s.finish();
     }
@@ -6224,7 +6531,7 @@ mod tests {
             "es".into(),
             languages,
             None,
-            false,
+            None,
         );
         let worker = std::thread::spawn(move || {
             pipeline.run(&mut Quiet, true);
@@ -6278,6 +6585,139 @@ mod tests {
         assert!(
             yours.join(" ").contains(body.as_str()),
             "the body is the candidate's last turn: {body:?} in {yours:?}"
+        );
+        let synthesized = tts.requests();
+        assert_eq!(synthesized.len(), 1, "one synthesize request");
+        assert_eq!(synthesized[0].text, SPANISH);
+        assert!(!played.lock().unwrap().is_empty(), "playback started");
+    }
+
+    /// #124's third criterion end to end on a fixture: the real pipeline replays the English
+    /// sysdesign interview (whisper and all) in push-to-talk, and the button is held over ten
+    /// seconds of the candidate's answer, several sentences with pauses the VAD alone would
+    /// split at (with a 0.25 s close). The held span is one final; nothing outside it is heard; nothing is asked
+    /// before the release; and the mock model and mock TTS server see exactly one request
+    /// each. Run with `just probe` on a dev machine.
+    #[test]
+    #[ignore = "needs the fixture WAVs (just fixtures-fetch) and the whisper model (dmn doctor --fetch small.en)"]
+    fn replaying_with_push_to_talk_one_held_span_is_one_final_and_one_translation() {
+        const SPEED: f32 = 4.0;
+        // turns.json: the candidate's answer to the first question is voiced from 31.0 s.
+        const PRESS: f64 = 31.0;
+        const RELEASE: f64 = 41.0;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/sysdesign");
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            models_dir: Paths::from_xdg().unwrap().models_dir,
+            ..Paths::under(dir.path())
+        };
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "es".into();
+        // Nothing listens here: a request that slipped past the mocks would fail loudly.
+        cfg.llm.base_url = "http://127.0.0.1:9".into();
+        let mut pipeline = Pipeline::start(
+            &cfg,
+            &paths,
+            &Options {
+                input: Input::Files {
+                    them: fixture.join("interviewer.wav"),
+                    candidate: fixture.join("candidate.wav"),
+                },
+                speed: SPEED,
+                model: None,
+                threads: None,
+                // The answer's pauses between sentences in the held span are 0.33 and 0.39 s
+                // (31.6 s, 33.4 s): under the default 0.4 s close, so close sooner to make the
+                // VAD alone split there.
+                vad_close_ms: Some(250),
+                vad: None,
+                device: Some(dmn_core::config::SttDevice::Cpu),
+                language: None,
+                partials: Partials::Off,
+                spec_literal_detector: false,
+                question_source: None,
+                assist: Some(false),
+                no_llm: true,
+                no_store: true,
+                output: Output::Quiet,
+                policy: Policy::AnswerAll,
+                coding_solutions: None,
+            },
+        )
+        .unwrap();
+        let hub = pipeline.hub();
+        let controls = pipeline.controls();
+        let zero = pipeline.audio_zero;
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (setup, played) = crate::speaker::setup_with(llm.clone(), tts.clone(), true);
+        let languages = setup.languages.clone();
+        let fake = FakeButton::default();
+        pipeline.attach_speaker(
+            Speaker::start(setup, Arc::clone(&hub)).unwrap(),
+            VoiceMode::Ptt,
+            "es".into(),
+            languages,
+            None,
+            Some(Box::new(fake.clone())),
+        );
+        assert!(fake.reading(), "push-to-talk at start reads the button");
+        let worker = std::thread::spawn(move || {
+            pipeline.run(&mut Quiet, true);
+            pipeline.finish(&mut Quiet).unwrap()
+        });
+        struct QuitOnDrop(Controls);
+        impl Drop for QuitOnDrop {
+            fn drop(&mut self) {
+                self.0.quit();
+            }
+        }
+        let _quit = QuitOnDrop(controls.clone());
+        let at = |audio: f64| zero + Duration::from_secs_f64(audio / f64::from(SPEED));
+        let sleep_until =
+            |t: Instant| std::thread::sleep(t.saturating_duration_since(Instant::now()));
+
+        sleep_until(at(PRESS));
+        controls.ptt_button(true);
+        sleep_until(at(RELEASE));
+        assert!(llm.requests().is_empty(), "nothing is asked while held");
+        controls.ptt_button(false);
+        let wait = |what: &str, done: &dyn Fn(&Session) -> bool| -> Session {
+            let until = Instant::now() + Duration::from_secs(120);
+            loop {
+                let s = hub.snapshot();
+                if done(&s) {
+                    return s;
+                }
+                assert!(Instant::now() < until, "never: {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let after = wait("the press played", &|s| {
+            s.speech.is_none() && (!tts.requests().is_empty() || s.speak_failed.is_some())
+        });
+        // A little more of the candidate's answer plays unheard before the run ends.
+        sleep_until(at(RELEASE + 8.0));
+        controls.quit();
+        let report = worker.join().unwrap();
+        assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
+        let yours: Vec<&Segment> = report
+            .log
+            .finals()
+            .iter()
+            .filter(|s| s.source == Source::You)
+            .collect();
+        assert_eq!(yours.len(), 1, "one final for the held span: {yours:?}");
+        let held = yours[0];
+        let (start, end) = (held.start.as_secs_f64(), held.end.as_secs_f64());
+        assert!((start - PRESS).abs() < 0.5, "starts at the press: {start}");
+        assert!((end - RELEASE).abs() < 0.5, "ends at the release: {end}");
+        assert!(held.text.split_whitespace().count() > 15, "{:?}", held.text);
+        let asked = asked(&llm);
+        assert_eq!(
+            asked,
+            [held.text.trim()],
+            "one translate request, the whole press"
         );
         let synthesized = tts.requests();
         assert_eq!(synthesized.len(), 1, "one synthesize request");

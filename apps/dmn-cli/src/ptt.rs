@@ -5,17 +5,27 @@
 //! The device file (`/dev/input/by-id/...-event-*`) is read as a stream of `struct input_event`
 //! records: a `timeval` (two `long`s), then `u16 type`, `u16 code`, `i32 value`. A key event is
 //! type 1 (`EV_KEY`) with value 1 for a press, 0 for a release, 2 for auto-repeat. Plain
-//! `std::fs::File` reads, no ioctl, no `unsafe`, no new crate. The device is never grabbed, so
-//! the button keeps doing whatever else it does: a key nothing else uses (F13–F24 mapped on a
-//! programmable keyboard, a spare mouse button) is the one to pick.
+//! `std::fs::File` reads, no ioctl, no `unsafe`. The device is never grabbed, so the button
+//! keeps doing whatever else it does: a key nothing else uses (F13–F24 mapped on a programmable
+//! keyboard, a spare mouse button) is the one to pick.
+//!
+//! The device is read only while push-to-talk is the voice mode: [`Button::check`] opens it at
+//! start and closes it again, reading nothing, so `l` knows whether push-to-talk can be offered;
+//! [`ButtonSource::start`] opens it for reading when push-to-talk comes on, and dropping the
+//! [`Reading`] it returns closes it when push-to-talk goes off. The file is opened non-blocking
+//! (`libc::O_NONBLOCK`), so the reader notices the stop within [`POLL`] even when no key moves.
 //!
 //! Reading needs access to the device: by default only root and the `input` group have it. The
 //! README gives a udev rule that grants it to the logged-in user for that one device
 //! ([`udev_rule`]), rather than the `input` group, which would let every program read every key.
 
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dmn_core::config::{ptt_key_code, ptt_key_name};
@@ -27,6 +37,9 @@ const EVENT_SIZE: usize = 2 * std::mem::size_of::<isize>() + 8;
 /// Where udev puts stable names for input devices.
 const BY_ID: &str = "/dev/input/by-id";
 const BY_PATH: &str = "/dev/input/by-path";
+/// How often a reader with nothing to read looks again (and at its stop flag): the most a
+/// press or release can wait before it is seen.
+const POLL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PttError {
@@ -70,73 +83,142 @@ fn key_event(record: &[u8]) -> Option<(u16, i32)> {
     Some((code, value))
 }
 
-/// Read records from `r` and call `on` for each press or release of `code`, until the device
-/// goes away (unplugged, read error) or `on` returns false. Auto-repeat and other keys are
-/// skipped. Returns why it stopped.
-fn read_button(mut r: impl Read, code: u16, mut on: impl FnMut(Event) -> bool) -> String {
-    let mut record = [0u8; EVENT_SIZE];
+/// Read records from `r` and call `on` for each press or release of `code`, until `stop` is
+/// set (`None`) or the device goes away (unplugged, read error: `Some` with the reason).
+/// Auto-repeat and other keys are skipped. `r` may be non-blocking: with nothing to read it
+/// waits [`POLL`] and looks at `stop` again.
+fn read_button(
+    mut r: impl Read,
+    code: u16,
+    stop: &AtomicBool,
+    mut on: impl FnMut(Event),
+) -> Option<String> {
+    let mut buf = [0u8; EVENT_SIZE * 64];
+    let mut have = 0;
     loop {
-        if let Err(e) = r.read_exact(&mut record) {
-            return e.to_string();
+        if stop.load(Ordering::Acquire) {
+            return None;
         }
-        let event = match key_event(&record) {
-            Some((c, 1)) if c == code => Event::Pressed,
-            Some((c, 0)) if c == code => Event::Released,
-            _ => continue,
-        };
-        if !on(event) {
-            return "stopped".into();
+        match r.read(&mut buf[have..]) {
+            Ok(0) => return Some("end of file".into()),
+            Ok(n) => have += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(POLL);
+                continue;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Some(e.to_string()),
+        }
+        let whole = have - have % EVENT_SIZE;
+        for record in buf[..whole].chunks_exact(EVENT_SIZE) {
+            match key_event(record) {
+                Some((c, 1)) if c == code => on(Event::Pressed),
+                Some((c, 0)) if c == code => on(Event::Released),
+                _ => {}
+            }
+        }
+        buf.copy_within(whole..have, 0);
+        have -= whole;
+    }
+}
+
+/// Where button events come from: the device ([`Button`]), or a test's own presses.
+pub trait ButtonSource: Send {
+    /// Start reading: `on` gets each press and release, `lost` once with the reason if the
+    /// device goes away. Reading stops when the [`Reading`] is dropped (and `lost` is not
+    /// called then).
+    fn start(
+        &self,
+        on: Box<dyn FnMut(Event) + Send>,
+        lost: Box<dyn FnOnce(String) + Send>,
+    ) -> Result<Reading, PttError>;
+}
+
+/// A button being read. Dropping it stops the reader and closes the device.
+#[derive(Debug)]
+pub struct Reading {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Reading {
+    /// A reading with no thread behind it, for test sources: `stop` is set when it is dropped.
+    #[cfg(test)]
+    pub fn flag(stop: Arc<AtomicBool>) -> Self {
+        Self { stop, thread: None }
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
 
-/// The push-to-talk button, opened: the device is readable and the key is one dmn knows.
-#[derive(Debug)]
+/// The push-to-talk button: a device that could be opened and a key dmn knows. Nothing is
+/// read until [`ButtonSource::start`].
+#[derive(Debug, Clone)]
 pub struct Button {
-    file: File,
     path: String,
     code: u16,
 }
 
 impl Button {
-    /// Open `device` for `key` (`[speak].ptt_device`, `ptt_key`). Fails when the key is not
-    /// known or the device cannot be read, which `dmn run` says on the status line before
-    /// going on without push-to-talk.
-    pub fn open(device: &str, key: &str) -> Result<Self, PttError> {
+    /// Check `device` for `key` (`[speak].ptt_device`, `ptt_key`): the key is known and the
+    /// device opens. The file is closed again at once, unread. Fails when either is wrong,
+    /// which `dmn run` says on the status line before going on without push-to-talk.
+    pub fn check(device: &str, key: &str) -> Result<Self, PttError> {
         let code = ptt_key_code(key).ok_or_else(|| PttError::BadKey(key.to_owned()))?;
-        let file = File::open(device).map_err(|e| PttError::Open {
-            path: device.to_owned(),
-            detail: e.to_string(),
-        })?;
+        open_device(device)?;
         Ok(Self {
-            file,
             path: device.to_owned(),
             code,
         })
     }
+}
 
-    /// Read the button on its own thread: `on` gets each press and release, then `lost` once
-    /// with the reason when the device goes away.
-    pub fn spawn(
-        self,
-        on: impl FnMut(Event) + Send + 'static,
-        lost: impl FnOnce(String) + Send + 'static,
-    ) -> Result<(), PttError> {
-        let Self { file, path, code } = self;
-        std::thread::Builder::new()
+/// Open `device` for reading, non-blocking (module doc).
+fn open_device(device: &str) -> Result<File, PttError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(device)
+        .map_err(|e| PttError::Open {
+            path: device.to_owned(),
+            detail: e.to_string(),
+        })
+}
+
+impl ButtonSource for Button {
+    fn start(
+        &self,
+        mut on: Box<dyn FnMut(Event) + Send>,
+        lost: Box<dyn FnOnce(String) + Send>,
+    ) -> Result<Reading, PttError> {
+        let file = open_device(&self.path)?;
+        let (path, code) = (self.path.clone(), self.code);
+        let stop = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
             .name("dmn-ptt".to_owned())
             .spawn(move || {
-                let mut on = on;
                 tracing::info!(device = %path, key = %ptt_key_name(code), "push-to-talk: reading the button");
-                let why = read_button(file, code, |e| {
-                    on(e);
-                    true
-                });
-                tracing::warn!(device = %path, reason = %why, "push-to-talk: the button's device went away");
-                lost(why);
+                match read_button(file, code, &t_stop, &mut on) {
+                    None => tracing::info!(device = %path, "push-to-talk: stopped reading the button"),
+                    Some(why) => {
+                        tracing::warn!(device = %path, reason = %why, "push-to-talk: the button's device went away");
+                        lost(why);
+                    }
+                }
             })
-            .map(|_| ())
-            .map_err(|e| PttError::Spawn(e.to_string()))
+            .map_err(|e| PttError::Spawn(e.to_string()))?;
+        Ok(Reading {
+            stop,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -284,37 +366,112 @@ mod tests {
         ]
         .concat();
         let mut got = Vec::new();
-        let why = read_button(std::io::Cursor::new(stream), f13, |e| {
-            got.push(e);
-            true
-        });
+        let stop = AtomicBool::new(false);
+        let why = read_button(std::io::Cursor::new(stream), f13, &stop, |e| got.push(e));
         assert_eq!(got, [Event::Pressed, Event::Released, Event::Pressed]);
-        assert!(
-            why.contains("fill whole buffer") || !why.is_empty(),
-            "{why}"
-        );
+        assert_eq!(why.as_deref(), Some("end of file"));
     }
 
+    /// A record split across two reads still comes through whole.
     #[test]
-    fn a_caller_can_stop_the_read() {
+    fn a_record_split_across_reads_is_put_back_together() {
+        struct Dribble(Vec<u8>, usize);
+        impl Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = 5.min(buf.len()).min(self.0.len() - self.1);
+                buf[..n].copy_from_slice(&self.0[self.1..self.1 + n]);
+                self.1 += n;
+                Ok(n)
+            }
+        }
         let f13 = ptt_key_code("KEY_F13").unwrap();
         let stream = [record(EV_KEY, f13, 1), record(EV_KEY, f13, 0)].concat();
-        let mut n = 0;
-        let why = read_button(std::io::Cursor::new(stream), f13, |_| {
-            n += 1;
-            false
-        });
-        assert_eq!((n, why.as_str()), (1, "stopped"));
+        let mut got = Vec::new();
+        let stop = AtomicBool::new(false);
+        read_button(Dribble(stream, 0), f13, &stop, |e| got.push(e));
+        assert_eq!(got, [Event::Pressed, Event::Released]);
     }
 
+    /// With nothing to read (a quiet non-blocking device), the reader still stops when asked.
     #[test]
-    fn opening_names_a_bad_key_and_an_unreadable_device() {
-        let err = Button::open("/dev/null", "KEY_NOPE").unwrap_err();
+    fn a_quiet_reader_stops_when_asked() {
+        struct Quiet;
+        impl Read for Quiet {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(ErrorKind::WouldBlock.into())
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let t_stop = Arc::clone(&stop);
+        let t = std::thread::spawn(move || read_button(Quiet, 1, &t_stop, |_| {}));
+        std::thread::sleep(Duration::from_millis(20));
+        let asked = Instant::now();
+        stop.store(true, Ordering::Release);
+        assert_eq!(t.join().unwrap(), None);
+        assert!(asked.elapsed() < Duration::from_millis(200));
+    }
+
+    /// Checking names a bad key and an unreadable device, and reads nothing.
+    #[test]
+    fn checking_names_a_bad_key_and_an_unreadable_device() {
+        let err = Button::check("/dev/null", "KEY_NOPE").unwrap_err();
         assert!(matches!(err, PttError::BadKey(_)), "{err}");
-        let err = Button::open("/nonexistent/dmn-ptt-test", "KEY_F13").unwrap_err();
+        let err = Button::check("/nonexistent/dmn-ptt-test", "KEY_F13").unwrap_err();
         assert!(matches!(err, PttError::Open { .. }), "{err}");
         assert!(err.to_string().contains("dmn speak ptt devices"), "{err}");
-        assert!(Button::open("/dev/null", "BTN_SIDE").is_ok());
+        assert!(Button::check("/dev/null", "BTN_SIDE").is_ok());
+    }
+
+    /// A started button's reader stops, and its thread ends, when the reading is dropped; a
+    /// device that ends (here `/dev/null`) is reported as lost.
+    #[test]
+    fn dropping_the_reading_stops_the_reader_and_an_ended_device_is_lost() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let reading = Button::check("/dev/null", "KEY_F13")
+            .unwrap()
+            .start(
+                Box::new(|_| {}),
+                Box::new(move |why| {
+                    let _ = tx.send(why);
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).as_deref(),
+            Ok("end of file")
+        );
+        drop(reading);
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("events");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        // A writer keeps the fifo open, so the reader sees "nothing yet", not the end.
+        let _writer = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<String>();
+        let reading = Button::check(fifo.to_str().unwrap(), "KEY_F13")
+            .unwrap()
+            .start(
+                Box::new(|_| {}),
+                Box::new(move |why| {
+                    let _ = tx.send(why);
+                }),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let asked = Instant::now();
+        drop(reading);
+        assert!(
+            asked.elapsed() < Duration::from_millis(200),
+            "joined at once"
+        );
+        assert!(rx.try_recv().is_err(), "a stop is not a lost button");
     }
 
     /// The real button, by hand: `DMN_PTT_DEVICE=/dev/input/by-id/... DMN_PTT_KEY=KEY_F13
@@ -330,13 +487,13 @@ mod tests {
             return;
         };
         let (tx, rx) = crossbeam_channel::unbounded();
-        Button::open(&device, &key)
+        let _reading = Button::check(&device, &key)
             .unwrap()
-            .spawn(
-                move |e| {
+            .start(
+                Box::new(move |e| {
                     let _ = tx.send(e);
-                },
-                |_| {},
+                }),
+                Box::new(|_| {}),
             )
             .unwrap();
         println!("press and release {key} within 10 s");

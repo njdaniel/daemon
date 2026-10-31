@@ -324,28 +324,19 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
     if let Some(setup) = speak {
         // #115: the picker's list, and where its choice is saved.
         let languages = setup.languages.clone();
-        // #124: the push-to-talk button, when one is set up: opened first, so the mode at
-        // start knows whether it is there; a device that cannot be read is said on the status
-        // line and the run goes on without push-to-talk.
-        let button = open_ptt_button(cfg, &pipeline.hub());
+        // #124: the push-to-talk button, when one is set up: checked first (opened and closed,
+        // nothing read), so the mode at start knows whether it is there; a device that cannot
+        // be opened is said on the status line and the run goes on without push-to-talk. The
+        // device is read only while push-to-talk is the mode.
+        let button = check_ptt_button(cfg, &pipeline.hub());
         pipeline.attach_speaker(
             Speaker::start(setup, pipeline.hub())?,
             cfg.speak.mode,
             cfg.speak.target.clone(),
             languages,
             Some(paths.config_file.clone()),
-            button.is_some(),
+            button.map(|b| Box::new(b) as Box<dyn crate::ptt::ButtonSource>),
         );
-        if let Some(button) = button {
-            let (on, lost) = (pipeline.controls(), pipeline.controls());
-            if let Err(e) = button.spawn(
-                move |event| on.ptt_button(event == crate::ptt::Event::Pressed),
-                move |_| lost.ptt_lost(),
-            ) {
-                tracing::warn!(error = %e, "push-to-talk: cannot read the button");
-                pipeline.controls().ptt_lost();
-            }
-        }
     }
     let audio = pipeline.info().audio;
     let live = pipeline.info().live;
@@ -629,9 +620,9 @@ fn headless(
     Ok((report, rows))
 }
 
-/// #124: open `[speak].ptt_device` for `ptt_key` when both are set; `None` (with the reason on
-/// the status line for 5 s, and in the log) when the device cannot be read.
-fn open_ptt_button(
+/// #124: check `[speak].ptt_device` for `ptt_key` when both are set; `None` (with the reason on
+/// the status line for 5 s, and in the log) when the device cannot be opened.
+fn check_ptt_button(
     cfg: &Config,
     hub: &std::sync::Arc<dmn_session::SessionHub>,
 ) -> Option<crate::ptt::Button> {
@@ -639,7 +630,7 @@ fn open_ptt_button(
     if s.ptt_device.is_empty() || s.ptt_key.is_empty() {
         return None;
     }
-    match crate::ptt::Button::open(&s.ptt_device, &s.ptt_key) {
+    match crate::ptt::Button::check(&s.ptt_device, &s.ptt_key) {
         Ok(button) => Some(button),
         Err(e) => {
             tracing::warn!(error = %e, "push-to-talk: off for this run");
