@@ -1450,6 +1450,7 @@ temperature = 0.6                    # TTS sampling temperature (#113); lower = 
 # exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
 mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114) | ptt (push-to-talk, #124)
 # ptt_device = ""                    # push-to-talk's button device (#124); `dmn speak ptt learn` writes it and ptt_key
+# ptt_key = ""                       # its evdev key name (KEY_F13, BTN_SIDE) or number; a bad one is a config error
 # languages = [{ code = "de", voice = "voice-de" }]   # `v` picks between these (#115); `enroll --language` adds one; target must be one
 
 [ui]
