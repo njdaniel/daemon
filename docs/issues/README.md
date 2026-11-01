@@ -30,4 +30,10 @@ Proposed 2026-10-18 by the owner, since dmn now runs on ordinary calls (translat
 
 Proposed 2026-10-18 by the owner ("different voices … a girls voice, and funny impressions"; "I dont want to lose my own voice"): #130 (speak: `o` in `dmn run` picks the voice, your own first and the default, saved as `[speak].voice`; `dmn speak design --name <n> --describe "<traits>"` makes a voice with Qwen3-TTS VoiceDesign, a sidecar service started only for that, and enrolls the sample into the Base model, so calls need no extra VRAM; a `revoice` voice mode speaks your own words, untranslated, in the chosen voice; L, with a three-way split if one run cannot finish it).
 
+Proposed 2026-10-24 during a translation-only Discord call in WezTerm: #138 (ui: scroll the current session's transcript with keyboard or mouse, keep the view anchored while new speech arrives, and return to live) and #139 (stt: distinguish remote speakers in the mixed Them audio with stable session-local labels, also saved and exported; optional local diarization).
+
+Proposed 2026-10-24 during an English-only Discord transcription session: #141 (audio: an app-only transcription option excludes microphone speech from live and saved transcripts; microphone capture may remain open for other features).
+
+Found 2026-11-01 while merging main into PR #131: #143 (test: `lookup_while_pinned_the_search_and_the_second_request_complete` asserts the mock search server already has the request right after `Done`, which races the lookup thread under load; wait for it with a bounded loop as the neighbouring test does).
+
 Created on GitHub only, with no file here: #34 (replay `--speed`), #39 (whisper `no_context`), #50 (coding-solutions switch), and the process issues #44, #45, #46, which carry the `backlog` label.
