@@ -282,6 +282,10 @@ enum Command {
         /// Write the synthesized speech to this WAV file instead of playing it into dmn-voice
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Speak in this voice from the TTS server's library (`dmn speak voices`) instead of
+        /// your own; with --out, a way to hear a designed voice
+        #[arg(long)]
+        voice: Option<String>,
     },
     /// Add, list or remove context sources: resume, job description, notes, stories
     Sources {
@@ -596,7 +600,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Some(Command::Sessions { action }) => sessions(&paths, action),
         Some(Command::Sources { action }) => Ok(sources::run(&paths, action)?),
-        Some(Command::Speak { action, text, out }) => {
+        Some(Command::Speak {
+            action,
+            text,
+            out,
+            voice,
+        }) => {
             let cfg = Config::load(&paths.config_file)?;
             match action {
                 Some(SpeakAction::Enroll {
@@ -635,6 +644,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     };
                     let base = speak::tts_provider(&cfg, false);
                     let designer = dmn_tts::Qwen3Designer::new(&cfg.speak.design_url);
+                    let interrupt = std::sync::Arc::new(design::Interrupt::default());
+                    design::watch_signals(std::sync::Arc::clone(&interrupt))?;
                     print!(
                         "{}",
                         design::design(
@@ -643,7 +654,8 @@ fn run(cli: Cli) -> Result<(), CliError> {
                             &args,
                             &design::Docker,
                             base.as_ref(),
-                            &designer
+                            &designer,
+                            &interrupt
                         )?
                     );
                 }
@@ -656,7 +668,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     let provider = speak::tts_provider(&cfg, out.is_none());
                     print!(
                         "{}",
-                        speak::speak(&cfg, &paths, &text, out.as_deref(), provider.as_ref())?
+                        speak::speak(
+                            &cfg,
+                            &paths,
+                            &text,
+                            out.as_deref(),
+                            voice.as_deref(),
+                            provider.as_ref()
+                        )?
                     );
                 }
             }

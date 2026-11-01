@@ -5187,7 +5187,6 @@ mod tests {
 
     // --- #114: your own voice through dmn-voice by default; `l` makes every turn go out translated
 
-    /// Wait for the speaker's thread to set the sink's microphone gate to `want`.
     /// #130, the issue's criterion: in re-voice mode a finished You turn goes to the TTS
     /// server word for word, in the turn's detected language, and the model is asked nothing
     /// (the mock counts zero requests, so no #117 check either); the line is marked with the
@@ -5299,6 +5298,7 @@ mod tests {
         s.finish();
     }
 
+    /// Wait for the speaker's thread to set the sink's microphone gate to `want`.
     fn gate_settles(gate: &AtomicBool, want: bool) {
         let t = Instant::now();
         while gate.load(Ordering::Acquire) != want {

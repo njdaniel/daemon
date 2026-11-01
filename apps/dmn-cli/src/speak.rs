@@ -60,6 +60,10 @@ pub enum SpeakError {
     )]
     VoiceGone { voice: String, clip: String },
     #[error(
+        "the TTS server at {url} has no voice {voice:?}; `dmn speak voices` lists the ones it has"
+    )]
+    NoSuchVoice { voice: String, url: String },
+    #[error(
         "no voice enrolled ([speak].voice_ref is empty in {config}); run `dmn speak enroll --wav <clip>` first"
     )]
     NotEnrolled { config: String },
@@ -494,20 +498,23 @@ pub fn voices(
     Ok(out)
 }
 
-/// Speak: synthesize `text` in the enrolled voice and play it into the virtual microphone
-/// `dmn-voice`, or with `out` write it there as a 16-bit mono WAV. For playback `provider`
-/// should be the streaming one (`ChatterboxProvider::streaming`), so the first sentence plays
-/// while the server renders the next.
+/// Speak: synthesize `text` in the enrolled voice, or with `voice` (#130, `--voice`) in that
+/// voice from the server's library, and play it into the virtual microphone `dmn-voice`, or
+/// with `out` write it there as a 16-bit mono WAV. For playback `provider` should be the
+/// streaming one (`ChatterboxProvider::streaming`), so the first sentence plays while the
+/// server renders the next.
 pub fn speak(
     cfg: &Config,
     paths: &Paths,
     text: &str,
     out: Option<&Path>,
+    voice: Option<&str>,
     provider: &dyn TtsProvider,
 ) -> Result<String, SpeakError> {
     let started = Instant::now();
     check_gates(cfg, paths)?;
-    if cfg.speak.voice_ref.is_empty() {
+    let chosen = voice.map(str::trim).filter(|v| !v.is_empty());
+    if chosen.is_none() && cfg.speak.voice_ref.is_empty() {
         return Err(SpeakError::NotEnrolled {
             config: paths.config_file.display().to_string(),
         });
@@ -515,17 +522,26 @@ pub fn speak(
     if text.trim().is_empty() {
         return Err(SpeakError::EmptyText);
     }
+    // A named voice is looked up first: Chatterbox speaks an unknown name in its default
+    // voice without an error.
+    let voice = match chosen {
+        None => voice_name(&cfg.speak.voice_ref),
+        Some(name) => library_voice(cfg, paths, name, provider)?,
+    };
     // The microphone first: a missing PipeWire is reported before any speech is asked for,
     // and the node is in the graph while the server renders, so the call can select it.
     let mic = match out {
         Some(_) => None,
         None => Some(open_vmic()?),
     };
-    let voice = voice_name(&cfg.speak.voice_ref);
     let req = SpeakRequest::new(text.trim(), voice.clone()).with_tuning(tuning(cfg));
     let stream = rt()?
         .block_on(provider.synthesize(req))
         .map_err(|e| match e {
+            TtsError::UnknownVoice { voice, .. } if chosen.is_some() => SpeakError::NoSuchVoice {
+                voice,
+                url: cfg.speak.tts_url.clone(),
+            },
             TtsError::UnknownVoice { voice, .. } => SpeakError::VoiceGone {
                 voice,
                 clip: cfg.speak.voice_ref.clone(),
@@ -564,6 +580,30 @@ pub fn speak(
         (None, None) => Err(SpeakError::Playback(AudioError::VirtualMic(
             "not opened".into(),
         ))),
+    }
+}
+
+/// `name` as the server's library knows it (a voice or one of its aliases), or
+/// [`SpeakError::NoSuchVoice`]. A server with no library to list gets the name as given.
+fn library_voice(
+    cfg: &Config,
+    paths: &Paths,
+    name: &str,
+    provider: &dyn TtsProvider,
+) -> Result<String, SpeakError> {
+    let library = rt()?
+        .block_on(provider.voices())
+        .map_err(|e| tts_error(e, paths))?;
+    match library {
+        None => Ok(name.to_owned()),
+        Some(library) => library
+            .iter()
+            .find(|v| v.answers_to(name))
+            .map(|v| v.name.clone())
+            .ok_or_else(|| SpeakError::NoSuchVoice {
+                voice: name.to_owned(),
+                url: cfg.speak.tts_url.clone(),
+            }),
     }
 }
 
@@ -862,7 +902,7 @@ target = \"es\"           # #109
         );
 
         let out = dir.path().join("x.wav");
-        let err = speak(&cfg, &paths, "hola", Some(&out), &mock).unwrap_err();
+        let err = speak(&cfg, &paths, "hola", Some(&out), None, &mock).unwrap_err();
         assert!(matches!(err, SpeakError::Disabled { .. }), "{err}");
         assert!(mock.requests().is_empty() && mock.enrollments().is_empty());
         assert!(!out.exists() && !paths.data_dir.exists() && !paths.config_file.exists());
@@ -874,7 +914,7 @@ target = \"es\"           # #109
         cfg.speak.voice_ref = "/v/voice.wav".into();
         let mock = MockTtsProvider::new();
         let out = dir.path().join("x.wav");
-        let err = speak(&cfg, &paths, "hola", Some(&out), &mock).unwrap_err();
+        let err = speak(&cfg, &paths, "hola", Some(&out), None, &mock).unwrap_err();
         assert!(matches!(err, SpeakError::NotLocal { .. }), "{err}");
         assert!(err.to_string().contains("gpu-box.lan"), "{err}");
         let wav = dir.path().join("me.wav");
@@ -1373,16 +1413,49 @@ mouse = false
         assert!(msg.contains("--out <file.wav>"), "{msg}");
     }
 
+    /// #130: `--voice` speaks one line in a library voice, a designed one included, with no
+    /// voice of your own needed; a name the server lacks is refused
+    /// before anything is synthesized (Chatterbox would speak it in its default voice).
+    #[test]
+    fn speak_with_voice_uses_that_library_voice_and_refuses_one_the_server_lacks() {
+        let (dir, paths, cfg) = setup("http://localhost:4124");
+        assert!(cfg.speak.voice_ref.is_empty());
+        let mock = MockTtsProvider::new()
+            .cross_lingual()
+            .with_voices(Some(&[("voice", None), ("pirate", None)]));
+        let out = dir.path().join("pirate.wav");
+        let msg = speak(
+            &cfg,
+            &paths,
+            "Arr, hello",
+            Some(&out),
+            Some(" pirate "),
+            &mock,
+        )
+        .unwrap();
+        assert!(msg.contains("in voice \"pirate\""), "{msg}");
+        assert!(out.exists());
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].voice, "pirate");
+        assert_eq!(requests[0].text, "Arr, hello");
+
+        let err = speak(&cfg, &paths, "hola", Some(&out), Some("gran"), &mock).unwrap_err();
+        assert!(matches!(err, SpeakError::NoSuchVoice { .. }), "{err}");
+        assert!(err.to_string().contains("dmn speak voices"), "{err}");
+        assert_eq!(mock.requests().len(), 1, "nothing synthesized");
+    }
+
     #[test]
     fn speak_without_an_enrolled_voice_or_text_says_so() {
         let (dir, paths, mut cfg) = setup("http://localhost:4123");
         let mock = MockTtsProvider::new();
         let out = dir.path().join("x.wav");
-        let err = speak(&cfg, &paths, "hola", Some(&out), &mock).unwrap_err();
+        let err = speak(&cfg, &paths, "hola", Some(&out), None, &mock).unwrap_err();
         assert!(matches!(err, SpeakError::NotEnrolled { .. }), "{err}");
         assert!(err.to_string().contains("dmn speak enroll --wav"), "{err}");
         cfg.speak.voice_ref = "/data/voice.wav".into();
-        let err = speak(&cfg, &paths, "  ", Some(&out), &mock).unwrap_err();
+        let err = speak(&cfg, &paths, "  ", Some(&out), None, &mock).unwrap_err();
         assert!(matches!(err, SpeakError::EmptyText), "{err}");
         assert!(mock.requests().is_empty());
     }
@@ -1401,7 +1474,7 @@ mouse = false
         cfg.speak.voice_ref = paths.data_dir.join("voice.wav").display().to_string();
         let out = dir.path().join("speech.wav");
         let p = dmn_tts::ChatterboxProvider::new(&server.url);
-        let msg = speak(&cfg, &paths, " hola ", Some(&out), &p).unwrap();
+        let msg = speak(&cfg, &paths, " hola ", Some(&out), None, &p).unwrap();
         assert!(msg.contains("wrote 0.5 s of speech at 24000 Hz"), "{msg}");
 
         let reader = hound::WavReader::open(&out).unwrap();
@@ -1437,7 +1510,7 @@ mouse = false
         cfg.speak.voice_ref = "/data/voice.wav".into();
         let out = dir.path().join("x.wav");
         let p = dmn_tts::ChatterboxProvider::new(&url);
-        let err = speak(&cfg, &paths, "hola", Some(&out), &p).unwrap_err();
+        let err = speak(&cfg, &paths, "hola", Some(&out), None, &p).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, SpeakError::ServerDown { .. }), "{msg}");
         assert!(
@@ -1458,7 +1531,7 @@ mouse = false
         let out = dir.path().join("keep.wav");
         std::fs::write(&out, "earlier output").unwrap();
         let p = dmn_tts::ChatterboxProvider::new(&server.url);
-        let err = speak(&cfg, &paths, "hola", Some(&out), &p).unwrap_err();
+        let err = speak(&cfg, &paths, "hola", Some(&out), None, &p).unwrap_err();
         assert!(matches!(err, SpeakError::VoiceGone { .. }), "{err}");
         assert!(
             err.to_string()
@@ -1481,7 +1554,7 @@ mouse = false
         let out = dir.path().join("keep.wav");
         std::fs::write(&out, "earlier output").unwrap();
         let p = dmn_tts::ChatterboxProvider::new(&server.url);
-        let err = speak(&cfg, &paths, "hola", Some(&out), &p).unwrap_err();
+        let err = speak(&cfg, &paths, "hola", Some(&out), None, &p).unwrap_err();
         assert!(
             matches!(err, SpeakError::Tts(TtsError::Decode { .. })),
             "{err}"

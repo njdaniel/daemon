@@ -1335,9 +1335,6 @@ fn set_speak_key(text: &str, key: &str, quoted: &str) -> String {
     joined
 }
 
-/// Split a TOML line into (code, comment) at the first `#` outside a quoted string; the
-/// returned comment includes its `#`. Knows basic strings (`"..."`, with `\"` escapes) and
-/// literal strings (`'...'`, no escapes).
 /// #130: comment out every `key = ...` line under `[speak]` (`# key = ...`, its own comment
 /// kept), so the key takes its default and [`set_speak_key`] reuses the line later.
 fn unset_speak_key(text: &str, key: &str) -> String {
@@ -1367,6 +1364,9 @@ fn unset_speak_key(text: &str, key: &str) -> String {
     joined
 }
 
+/// Split a TOML line into (code, comment) at the first `#` outside a quoted string; the
+/// returned comment includes its `#`. Knows basic strings (`"..."`, with `\"` escapes) and
+/// literal strings (`'...'`, no escapes).
 fn split_comment(line: &str) -> (&str, &str) {
     let mut quote: Option<u8> = None;
     let mut escaped = false;

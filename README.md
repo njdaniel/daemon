@@ -117,6 +117,7 @@ dmn speak voices                          # the TTS server's voices: designed or
 dmn speak design --name N --describe "TEXT" [--line T] [--language de] [--out F.wav] [--yes]   # make a voice from a description (Qwen3-TTS VoiceDesign)
 dmn speak "TEXT"                          # speak TEXT in your cloned voice into the virtual mic dmn-voice
 dmn speak "TEXT" --out FILE.wav           # or write it to a WAV file instead
+dmn speak "TEXT" --voice N --out F.wav    # in a library voice (`dmn speak voices`), e.g. one you designed
 ```
 
 `dmn sources` (context documents) arrives with M2.
@@ -640,7 +641,17 @@ what holds the GPU, by process and container (a Chatterbox container you no long
 never stops anything itself. Measured 2026-10-19 beside a running `dmn run`, Chatterbox and the
 Base sidecar: ready about a minute after the start, a 13 s sample rendered in 3.0 s, 78 s for the
 whole command. If the service exits while starting (too small a share of the GPU, say), the
-command says vLLM's reason at once.
+command says vLLM's reason at once. Ctrl+C (at the `keep?` question, or while it waits for the
+server) stops the design service and deletes the sample before dmn exits; a service left running
+anyway (`kill -9`) is found at the next `dmn speak design`, used and stopped.
+
+To hear a voice again after it is kept, speak a line in it to a file and play that:
+
+```bash
+dmn speak "Arr, welcome aboard." --voice pirate --out /tmp/pirate.wav && pw-play /tmp/pirate.wav
+```
+
+Without `--out`, `--voice` speaks into `dmn-voice` like any `dmn speak` line.
 
 **`o` in `dmn run`** opens the voice picker: the same box and keys as `v`, with `your voice`
 first and then the server's other voices. The choice speaks from the next sentence on (one

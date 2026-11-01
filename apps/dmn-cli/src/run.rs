@@ -862,9 +862,6 @@ mod tests {
         assert_eq!(controls.hub().snapshot(), before);
     }
 
-    /// #115: `v` opens the picker (the reducer owns it, so the session changes at once); while
-    /// it is open `↑ ↓` move, Enter closes it and sends the choice to the pipeline thread, Esc
-    /// and `v` close it with nothing sent, `q` still quits, and the other keys do nothing.
     /// #130: `o` opens the voice picker (`your voice` first) and asks the pipeline thread to
     /// fetch the server's voices; while it is open the arrows move it, Enter chooses a voice
     /// (not a language), and Esc, `o` or `v` close it with nothing chosen.
@@ -911,6 +908,9 @@ mod tests {
         assert!(commands.try_recv().is_err());
     }
 
+    /// #115: `v` opens the picker (the reducer owns it, so the session changes at once); while
+    /// it is open `↑ ↓` move, Enter closes it and sends the choice to the pipeline thread, Esc
+    /// and `v` close it with nothing sent, `q` still quits, and the other keys do nothing.
     #[test]
     fn v_opens_the_picker_whose_keys_move_choose_and_close_it() {
         assert_eq!(key(press_key('v')), Some(Key::Language));

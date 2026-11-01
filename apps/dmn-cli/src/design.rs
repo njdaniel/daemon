@@ -6,9 +6,13 @@
 //! The VoiceDesign server is the `design` profile of `sidecars/qwen3-tts/compose.yaml` (the
 //! file is compiled in, so an installed `dmn` needs no checkout). It runs only while a voice
 //! is made: this command starts it, waits for `/health`, and stops it again on every way out,
-//! when it was the one that started it. Before starting it, the GPU's free memory is checked:
-//! with too little, the command stops and names the processes holding the GPU (a forgotten
-//! Chatterbox container, say). It never stops anything of the user's.
+//! when it was the one that started it. Ctrl+C (and a closed terminal) is one of those ways out:
+//! [`watch_signals`] stops the server and deletes the sample not yet kept before the process
+//! ends, since a destructor does not run on a signal. A server left running anyway (`kill -9`)
+//! is found by its container name at the next run, said, and stopped at that run's end. Before
+//! starting it, the GPU's free memory is checked: with too little, the command stops and names
+//! the processes holding the GPU (a forgotten Chatterbox container, say). It never stops
+//! anything of the user's: a server at `design_url` that is not dmn's container is left alone.
 //!
 //! Audio on disk: the sample is not the call. It is written where the command line names
 //! (`--out`) or under the data dir as `<name>.wav`, the clip a re-enrollment needs, as
@@ -17,6 +21,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dmn_core::Paths;
@@ -78,6 +83,9 @@ pub trait DesignHost {
     fn start(&self) -> Result<(), String>;
     /// Stop it again.
     fn stop(&self) -> Result<(), String>;
+    /// Whether dmn's own design container is running: a server left by an earlier run that
+    /// was killed, as opposed to one the user runs at `design_url` themselves.
+    fn ours_running(&self) -> bool;
     /// Why the service has stopped, when it has (its container exited while starting): the
     /// error it logged. `None` while it runs, or when that cannot be told.
     fn exited(&self) -> Option<String>;
@@ -91,25 +99,113 @@ pub trait DesignHost {
 /// it.
 struct Started<'a> {
     host: &'a dyn DesignHost,
+    interrupt: &'a Interrupt,
     stopped: bool,
 }
 
 impl Started<'_> {
     fn stop(&mut self) -> Result<(), String> {
         self.stopped = true;
+        self.interrupt.set_started(false);
         self.host.stop()
     }
 }
 
 impl Drop for Started<'_> {
     fn drop(&mut self) {
-        if !self.stopped
-            && let Err(e) = self.host.stop()
-        {
+        if self.stopped {
+            return;
+        }
+        self.interrupt.set_started(false);
+        if let Err(e) = self.host.stop() {
             tracing::warn!(error = %e, "cannot stop the VoiceDesign server");
             eprintln!("dmn: could not stop the VoiceDesign server: {e}");
         }
     }
+}
+
+/// What a signal must undo while `dmn speak design` runs: the server this command started (or
+/// took over) and the sample not yet kept. [`design`] keeps it current; [`watch_signals`]
+/// acts on it.
+#[derive(Default)]
+pub struct Interrupt {
+    undo: Mutex<Undo>,
+}
+
+#[derive(Default)]
+struct Undo {
+    started: bool,
+    pending: Option<PathBuf>,
+}
+
+impl Interrupt {
+    fn with<R>(&self, f: impl FnOnce(&mut Undo) -> R) -> R {
+        // A panic while the lock was held leaves plain data behind; keep using it.
+        let mut undo = self.undo.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut undo)
+    }
+
+    fn set_started(&self, started: bool) {
+        self.with(|u| u.started = started);
+    }
+
+    fn set_pending(&self, pending: Option<PathBuf>) {
+        self.with(|u| u.pending = pending);
+    }
+
+    /// Stop the server if this command started it and delete the sample not kept; says what
+    /// was done, a line each. Each is done once, however often this is called.
+    pub fn undo(&self, host: &dyn DesignHost) -> Vec<String> {
+        let (started, pending) = self.with(|u| (std::mem::take(&mut u.started), u.pending.take()));
+        let mut said = Vec::new();
+        if let Some(path) = pending
+            && std::fs::remove_file(&path).is_ok()
+        {
+            said.push(format!("deleted the sample not kept ({})", path.display()));
+        }
+        if started {
+            said.push(match host.stop() {
+                Ok(()) => "stopped the VoiceDesign server".to_owned(),
+                Err(e) => format!(
+                    "could not stop the VoiceDesign server ({e}); stop it with `docker stop {DESIGN_CONTAINER}`"
+                ),
+            });
+        }
+        said
+    }
+}
+
+/// Catch Ctrl+C, SIGTERM and SIGHUP for the rest of the process: on the first, undo what
+/// `interrupt` holds on the real machine and exit with 130. Registered before this returns, so
+/// no signal can slip in between.
+pub fn watch_signals(interrupt: Arc<Interrupt>) -> Result<(), SpeakError> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let rt = speak::rt()?;
+    let listen = |kind| {
+        let _entered = rt.enter();
+        signal(kind).map_err(|e| SpeakError::Runtime(format!("cannot catch signals: {e}")))
+    };
+    let mut int = listen(SignalKind::interrupt())?;
+    let mut term = listen(SignalKind::terminate())?;
+    let mut hup = listen(SignalKind::hangup())?;
+    std::thread::Builder::new()
+        .name("dmn-design-signals".into())
+        .spawn(move || {
+            rt.block_on(async {
+                tokio::select! {
+                    _ = int.recv() => {}
+                    _ = term.recv() => {}
+                    _ = hup.recv() => {}
+                }
+            });
+            eprintln!("\ninterrupted");
+            for line in interrupt.undo(&Docker) {
+                eprintln!("{line}");
+            }
+            std::process::exit(130);
+        })
+        .map_err(|e| SpeakError::Runtime(format!("cannot start the signal thread: {e}")))?;
+    Ok(())
 }
 
 /// The holders of the GPU, one line each, for [`SpeakError::LowVram`].
@@ -139,6 +235,7 @@ pub fn design(
     host: &dyn DesignHost,
     base: &dyn TtsProvider,
     designer: &Qwen3Designer,
+    interrupt: &Interrupt,
 ) -> Result<String, SpeakError> {
     let config = paths.config_file.display().to_string();
     speak::check_gates(cfg, paths)?;
@@ -172,9 +269,22 @@ pub fn design(
     let rt = speak::rt()?;
     let mut out = String::new();
 
-    // The server: already up (someone started it), or started here and stopped at the end.
+    // The server: already up (the user's own, left alone; or dmn's, left by a run that was
+    // killed, stopped at the end), or started here and stopped at the end.
     let mut started = None;
-    if !rt.block_on(designer.healthy()) {
+    if rt.block_on(designer.healthy()) {
+        if host.ours_running() {
+            eprintln!(
+                "the VoiceDesign server ({DESIGN_CONTAINER}) was still running from an earlier run; using it and stopping it when done"
+            );
+            interrupt.set_started(true);
+            started = Some(Started {
+                host,
+                interrupt,
+                stopped: false,
+            });
+        }
+    } else {
         let free = host
             .free_vram_mib()
             .map_err(|detail| SpeakError::NoGpu { detail })?;
@@ -189,11 +299,14 @@ pub fn design(
             "starting the VoiceDesign server ({SERVICE} on {}; the first start downloads ~4.3 GB)…",
             cfg.speak.design_url
         );
-        host.start().map_err(SpeakError::Docker)?;
+        // Marked before the start, so a Ctrl+C during `compose up` still stops it.
+        interrupt.set_started(true);
         started = Some(Started {
             host,
+            interrupt,
             stopped: false,
         });
+        host.start().map_err(SpeakError::Docker)?;
         let t = Instant::now();
         while !rt.block_on(designer.healthy()) {
             // A start that failed (too little memory for its KV cache, say) ends the container
@@ -257,10 +370,14 @@ pub fn design(
             detail: e.to_string(),
         })
     };
+    if args.out.is_none() {
+        interrupt.set_pending(Some(pending.clone()));
+    }
     write(&sample)?;
     let cleanup = || {
         if args.out.is_none() {
             let _ = std::fs::remove_file(&pending);
+            interrupt.set_pending(None);
         }
     };
     match &args.out {
@@ -400,6 +517,18 @@ impl DesignHost for Docker {
 
     fn stop(&self) -> Result<(), String> {
         Self::compose(&["stop", SERVICE])
+    }
+
+    fn ours_running(&self) -> bool {
+        Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                DESIGN_CONTAINER,
+            ])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
     }
 
     fn exited(&self) -> Option<String> {
@@ -546,6 +675,9 @@ mod tests {
         processes: Vec<GpuProcess>,
         keep: bool,
         exited: Option<String>,
+        ours: bool,
+        /// A Ctrl+C at the question: `ask` undoes what this holds, as the signal thread would.
+        ctrl_c_at_ask: Option<Arc<Interrupt>>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -556,6 +688,8 @@ mod tests {
                 processes: Vec::new(),
                 keep,
                 exited: None,
+                ours: false,
+                ctrl_c_at_ask: None,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -584,6 +718,9 @@ mod tests {
             self.log("stop".into());
             Ok(())
         }
+        fn ours_running(&self) -> bool {
+            self.ours
+        }
         fn exited(&self) -> Option<String> {
             self.exited.clone()
         }
@@ -594,6 +731,10 @@ mod tests {
         }
         fn ask(&self, question: &str) -> bool {
             self.log(format!("ask {question}"));
+            if let Some(interrupt) = &self.ctrl_c_at_ask {
+                let said = interrupt.undo(self);
+                self.log(format!("undo: {}", said.join("; ")));
+            }
             self.keep
         }
     }
@@ -660,7 +801,16 @@ mod tests {
         let host = FakeHost::new(12_000, true);
         let base = dmn_tts::Qwen3Provider::new(&base_server.url);
         let designer = Qwen3Designer::new(&design_server.url);
-        let out = design(&cfg, &paths, &args(false), &host, &base, &designer).unwrap();
+        let out = design(
+            &cfg,
+            &paths,
+            &args(false),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             host.calls(),
@@ -732,7 +882,16 @@ mod tests {
         ];
         let base = dmn_tts::MockTtsProvider::new().cross_lingual();
         let designer = Qwen3Designer::new(&design_server.url);
-        let err = design(&cfg, &paths, &args(true), &host, &base, &designer).unwrap_err();
+        let err = design(
+            &cfg,
+            &paths,
+            &args(true),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, SpeakError::LowVram { .. }), "{msg}");
         assert!(msg.contains("3000 MiB are free"), "{msg}");
@@ -753,7 +912,16 @@ mod tests {
         let host = FakeHost::new(12_000, false);
         let base = dmn_tts::MockTtsProvider::new().cross_lingual();
         let designer = Qwen3Designer::new(&design_server.url);
-        let out = design(&cfg, &paths, &args(false), &host, &base, &designer).unwrap();
+        let out = design(
+            &cfg,
+            &paths,
+            &args(false),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap();
         assert!(out.contains("not kept"), "{out}");
         assert!(base.enrollments().is_empty());
         assert_eq!(host.calls().last().map(String::as_str), Some("stop"));
@@ -767,7 +935,16 @@ mod tests {
         host.free = Err("no GPU".into());
         let designer = Qwen3Designer::new(&design_server.url);
         let base = dmn_tts::MockTtsProvider::new().cross_lingual();
-        let out = design(&cfg, &paths, &args(true), &host, &base, &designer).unwrap();
+        let out = design(
+            &cfg,
+            &paths,
+            &args(true),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap();
         assert!(!out.contains("stopped"), "{out}");
         assert_eq!(
             host.calls().len(),
@@ -776,6 +953,115 @@ mod tests {
             host.calls()
         );
         assert_eq!(base.enrollments()[0].consent, "dmn-designed");
+        assert_eq!(base.enrollments()[0].name, "pirate");
+    }
+
+    /// The review's blocking finding on PR #131: Ctrl+C at `keep? [y/N]` must not leave the
+    /// server (6.6 GB of VRAM) running or the sample behind. What the signal thread undoes
+    /// there: the sample is deleted and the server stopped, each once.
+    #[test]
+    fn ctrl_c_at_the_question_stops_the_server_and_deletes_the_sample() {
+        let design_server =
+            serve(vec![stopped(), Reply::json("{}"), Reply::wav(sample(8.0))]).unwrap();
+        let (_dir, paths, cfg) = qwen3_cfg("http://localhost:4124", &design_server.url);
+        let interrupt = Arc::new(Interrupt::default());
+        let mut host = FakeHost::new(12_000, false);
+        host.ctrl_c_at_ask = Some(Arc::clone(&interrupt));
+        let base = dmn_tts::MockTtsProvider::new().cross_lingual();
+        let designer = Qwen3Designer::new(&design_server.url);
+        design(
+            &cfg,
+            &paths,
+            &args(false),
+            &host,
+            &base,
+            &designer,
+            &interrupt,
+        )
+        .unwrap();
+        let pending = paths.data_dir.join("pirate.wav.dmn-design");
+        let calls = host.calls();
+        let at = calls.iter().position(|c| c.starts_with("undo:")).unwrap();
+        assert_eq!(
+            calls[at],
+            format!(
+                "undo: deleted the sample not kept ({}); stopped the VoiceDesign server",
+                pending.display()
+            )
+        );
+        assert_eq!(
+            calls[at - 1],
+            "stop",
+            "stopped before the process would exit"
+        );
+        assert!(!pending.exists());
+        assert!(base.enrollments().is_empty());
+        // Nothing is left for a second signal.
+        assert!(interrupt.undo(&host).is_empty());
+    }
+
+    /// Before the server is up and after it is stopped there is nothing to undo; while it
+    /// starts, a signal stops it.
+    #[test]
+    fn a_signal_stops_the_server_only_while_this_command_holds_it() {
+        let host = FakeHost::new(12_000, true);
+        let interrupt = Interrupt::default();
+        assert!(interrupt.undo(&host).is_empty());
+        interrupt.set_started(true);
+        assert_eq!(interrupt.undo(&host), ["stopped the VoiceDesign server"]);
+        assert!(interrupt.undo(&host).is_empty(), "once");
+        assert_eq!(host.calls(), ["stop"]);
+
+        // A whole run leaves nothing behind for a late signal.
+        let design_server =
+            serve(vec![stopped(), Reply::json("{}"), Reply::wav(sample(8.0))]).unwrap();
+        let (_dir, paths, cfg) = qwen3_cfg("http://localhost:4124", &design_server.url);
+        let host = FakeHost::new(12_000, true);
+        let base = dmn_tts::MockTtsProvider::new().cross_lingual();
+        let designer = Qwen3Designer::new(&design_server.url);
+        let interrupt = Interrupt::default();
+        design(
+            &cfg,
+            &paths,
+            &args(false),
+            &host,
+            &base,
+            &designer,
+            &interrupt,
+        )
+        .unwrap();
+        assert!(interrupt.undo(&host).is_empty());
+        assert_eq!(host.calls().iter().filter(|c| *c == "stop").count(), 1);
+    }
+
+    /// dmn's own design container still running (an earlier run killed with `kill -9`) is
+    /// taken over: used without a start, and stopped at the end.
+    #[test]
+    fn a_design_server_left_by_a_killed_run_is_used_and_stopped() {
+        let design_server = serve(vec![Reply::json("{}"), Reply::wav(sample(7.0))]).unwrap();
+        let (_dir, paths, cfg) = qwen3_cfg("http://localhost:4124", &design_server.url);
+        let mut host = FakeHost::new(0, true);
+        host.ours = true;
+        let base = dmn_tts::MockTtsProvider::new().cross_lingual();
+        let designer = Qwen3Designer::new(&design_server.url);
+        let out = design(
+            &cfg,
+            &paths,
+            &args(true),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap();
+        assert!(out.contains("stopped the VoiceDesign server"), "{out}");
+        assert_eq!(
+            host.calls(),
+            [
+                format!("play {} bytes", sample(7.0).len()),
+                "stop".to_owned()
+            ]
+        );
         assert_eq!(base.enrollments()[0].name, "pirate");
     }
 
@@ -791,7 +1077,16 @@ mod tests {
         let designer = Qwen3Designer::new(&design_server.url);
         let mut a = args(true);
         a.out = Some(dir.path().join("sample.wav"));
-        let out = design(&cfg, &paths, &a, &host, &base, &designer).unwrap();
+        let out = design(
+            &cfg,
+            &paths,
+            &a,
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap();
         assert!(out.contains("wrote the sample to"), "{out}");
         assert!(dir.path().join("sample.wav").is_file());
         assert!(paths.data_dir.join("pirate.wav").is_file());
@@ -806,7 +1101,16 @@ mod tests {
         let (_dir, paths, cfg) = qwen3_cfg("http://localhost:4124", &design_server.url);
         let host = FakeHost::new(12_000, true);
         let designer = Qwen3Designer::new(&design_server.url);
-        let err = design(&cfg, &paths, &args(true), &host, &base, &designer).unwrap_err();
+        let err = design(
+            &cfg,
+            &paths,
+            &args(true),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, SpeakError::DesignSampleLength { .. }),
             "{err}"
@@ -817,15 +1121,42 @@ mod tests {
         let designer = Qwen3Designer::new("http://localhost:1");
         let mut own = args(true);
         own.name = "voice".into();
-        let err = design(&cfg, &paths, &own, &host, &base, &designer).unwrap_err();
+        let err = design(
+            &cfg,
+            &paths,
+            &own,
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, SpeakError::DesignOwnName { .. }), "{err}");
         let mut chatterbox = cfg.clone();
         chatterbox.speak.engine = SpeakEngine::Chatterbox;
-        let err = design(&chatterbox, &paths, &args(true), &host, &base, &designer).unwrap_err();
+        let err = design(
+            &chatterbox,
+            &paths,
+            &args(true),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, SpeakError::DesignNeedsQwen3 { .. }), "{err}");
         let mut far = cfg.clone();
         far.speak.design_url = "http://gpu.lan:4125".into();
-        let err = design(&far, &paths, &args(true), &host, &base, &designer).unwrap_err();
+        let err = design(
+            &far,
+            &paths,
+            &args(true),
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, SpeakError::NotLocal { .. }), "{err}");
         assert!(host.calls().is_empty());
     }
@@ -843,7 +1174,16 @@ mod tests {
         let mut a = args(true);
         a.ready_within = Duration::from_secs(600);
         let t = Instant::now();
-        let err = design(&cfg, &paths, &a, &host, &base, &designer).unwrap_err();
+        let err = design(
+            &cfg,
+            &paths,
+            &a,
+            &host,
+            &base,
+            &designer,
+            &Interrupt::default(),
+        )
+        .unwrap_err();
         assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
         assert!(matches!(err, SpeakError::DesignExited { .. }), "{err}");
         assert!(err.to_string().contains("No available memory"), "{err}");
