@@ -198,9 +198,13 @@ pub fn watch_signals(interrupt: Arc<Interrupt>) -> Result<(), SpeakError> {
                     _ = hup.recv() => {}
                 }
             });
-            eprintln!("\ninterrupted");
-            for line in interrupt.undo(&Docker) {
-                eprintln!("{line}");
+            // Undo first, then say so: after a hangup the terminal is gone, and a write to it
+            // must neither panic nor come before the stop.
+            let said = interrupt.undo(&Docker);
+            let mut err = std::io::stderr();
+            let _ = writeln!(err, "\ninterrupted");
+            for line in said {
+                let _ = writeln!(err, "{line}");
             }
             std::process::exit(130);
         })
@@ -1228,5 +1232,7 @@ mod tests {
         assert!(COMPOSE.contains(dmn_tts::QWEN3_DESIGN_MODEL));
         assert!(COMPOSE.contains(&format!("image: {IMAGE}")));
         assert!(COMPOSE.contains(&format!("container_name: {BASE_CONTAINER}\n")));
+        // `ours_running` and `exited` find the design service by this name.
+        assert!(COMPOSE.contains(&format!("container_name: {DESIGN_CONTAINER}\n")));
     }
 }
