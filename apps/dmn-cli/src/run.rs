@@ -7,7 +7,7 @@
 //! interview assistance on ↔ off (#79, a chord so it is not hit by accident), Enter ask about
 //! what the asking lane last said (the other person, by default) when the detector missed the
 //! question (#96), `←` / `→` step back to an earlier question and forward again, `↑` / `↓` and
-//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `l` switch `dmn-voice` between your own voice live and every turn translated (#114), `v` open the language picker, where `↑ ↓` move, Enter chooses the language from the next utterance on and Esc closes (#115), `q` (or Ctrl-C) quit. Nothing
+//! PgUp / PgDn scroll an open section taller than its rows (#94), the mouse wheel does the same and a left click on a section row toggles it (#95, `[ui].mouse`), `t` speak what you last said in `[speak].target` in your own voice into `dmn-voice` (#109), `l` switch `dmn-voice` between your own voice live and every turn translated (#114), `v` open the language picker, where `↑ ↓` move, Enter chooses the language from the next utterance on and Esc closes (#115), `o` open the voice picker the same way, `your voice` first and then the TTS server's voices, the choice speaking from the next sentence on (#130), `q` (or Ctrl-C) quit. Nothing
 //! else writes to the terminal while the TUI is up: the fast phase is [`Output::Quiet`], warnings go to the log file, and
 //! errors show only as the status dots. The terminal, mouse capture included, is restored on the
 //! way out, on an error, and (through ratatui's panic hook and ours) on a panic.
@@ -125,6 +125,10 @@ pub enum Key {
     /// mode toggle, which must not be hit blind; the picker changes nothing until Enter, and
     /// Enter on the entry it opens on, the current one, changes nothing either).
     Language,
+    /// `o` (#130): open the voice picker: `your voice`, then the TTS server's other voices
+    /// (`dmn speak voices`); the same keys as `v`'s. `o` for "other voice"; `v` was the
+    /// language picker's already.
+    Voices,
     /// Esc: close the picker while it is open (#115); otherwise quit, as it always has.
     Escape,
     Quit,
@@ -152,6 +156,7 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('t' | 'T') => Some(Key::Speak),
         KeyCode::Char('l' | 'L') => Some(Key::Voice),
         KeyCode::Char('v' | 'V') => Some(Key::Language),
+        KeyCode::Char('o' | 'O') => Some(Key::Voices),
         // SPEC § Terminal MVP: `1`–`6` toggle one section, in the fixed on-screen order.
         KeyCode::Char(c @ '1'..='6') => c
             .to_digit(10)
@@ -175,14 +180,16 @@ pub fn key(ev: KeyEvent) -> Option<Key> {
 ///
 /// While the language picker is open (#115) the keys are its own: `↑ ↓` move its cursor,
 /// Enter chooses, Esc and `v` close it, `q` (and Ctrl+C) still quit, and every other key does
-/// nothing, so a stray press cannot pin, ask or speak behind the overlay.
+/// nothing, so a stray press cannot pin, ask or speak behind the overlay. #130: the voice
+/// picker (`o`) the same, Enter choosing a voice; `v` or `o` close either.
 pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
     if controls.picker_open() {
         match k {
             Key::Scroll(tui::Scroll::Up) => controls.picker(PickerOp::Up),
             Key::Scroll(tui::Scroll::Down) => controls.picker(PickerOp::Down),
+            Key::Ask if controls.voice_picker_open() => controls.choose_voice(),
             Key::Ask => controls.choose_language(),
-            Key::Escape | Key::Language => controls.picker(PickerOp::Close),
+            Key::Escape | Key::Language | Key::Voices => controls.picker(PickerOp::Close),
             Key::Quit => {
                 controls.quit();
                 return true;
@@ -206,6 +213,7 @@ pub fn press(k: Key, controls: &Controls, pane: Rect) -> bool {
         Key::Speak => controls.speak(),
         Key::Voice => controls.toggle_voice(),
         Key::Language => controls.picker(PickerOp::Open),
+        Key::Voices => controls.open_voices(),
         Key::Escape | Key::Quit => {
             controls.quit();
             return true;
@@ -330,6 +338,7 @@ pub fn run(cfg: &Config, paths: &Paths, args: &Args) -> Result<(), Box<dyn Error
             cfg.speak.target.clone(),
             languages,
             Some(paths.config_file.clone()),
+            cfg.speak.voice.clone(),
         );
     }
     let audio = pipeline.info().audio;
@@ -853,6 +862,52 @@ mod tests {
         assert_eq!(controls.hub().snapshot(), before);
     }
 
+    /// #130: `o` opens the voice picker (`your voice` first) and asks the pipeline thread to
+    /// fetch the server's voices; while it is open the arrows move it, Enter chooses a voice
+    /// (not a language), and Esc, `o` or `v` close it with nothing chosen.
+    #[test]
+    fn tui_o_opens_the_voice_picker_whose_enter_chooses_a_voice() {
+        use crate::pipeline::Command;
+        assert_eq!(key(press_key('o')), Some(Key::Voices));
+        assert_eq!(key(press_key('O')), Some(Key::Voices));
+        let (controls, commands) = Controls::for_test();
+        let hub = controls.hub();
+        // `[speak]` off: nothing opens, nothing is fetched.
+        press(Key::Voices, &controls);
+        assert_eq!(hub.snapshot().picker, None);
+        assert!(commands.try_recv().is_err());
+        hub.dispatch(Action::SpeakEnabled { enabled: true });
+        hub.dispatch(Action::Voice {
+            mode: dmn_session::VoiceMode::Revoice,
+            target: "de".into(),
+            own: Some("en".into()),
+            chosen: None,
+        });
+        hub.dispatch(Action::SpeakVoices {
+            voices: vec!["pirate".into(), "robot".into()],
+        });
+        assert!(!press(Key::Voices, &controls));
+        assert_eq!(hub.snapshot().picker, Some(dmn_session::Picker::voices(0)));
+        assert_eq!(commands.try_recv(), Ok(Command::Voices), "a fresh list");
+        // Esc closes it, nothing chosen; `o` and `v` again do too.
+        for close in [Key::Escape, Key::Voices, Key::Language] {
+            assert!(hub.snapshot().picker.is_some());
+            assert!(!press(close, &controls), "{close:?} does not quit");
+            assert_eq!(hub.snapshot().picker, None, "{close:?}");
+            assert!(commands.try_recv().is_err(), "{close:?} chose nothing");
+            press(Key::Voices, &controls);
+            assert_eq!(commands.try_recv(), Ok(Command::Voices));
+        }
+        // Down twice, Enter: the robot, as a voice row, not a language.
+        press(Key::Scroll(tui::Scroll::Down), &controls);
+        press(Key::Scroll(tui::Scroll::Down), &controls);
+        press(Key::Scroll(tui::Scroll::Down), &controls);
+        assert!(!press(Key::Ask, &controls));
+        assert_eq!(hub.snapshot().picker, None, "closed at once");
+        assert_eq!(commands.try_recv(), Ok(Command::SpeakVoice { index: 2 }));
+        assert!(commands.try_recv().is_err());
+    }
+
     /// #115: `v` opens the picker (the reducer owns it, so the session changes at once); while
     /// it is open `↑ ↓` move, Enter closes it and sends the choice to the pipeline thread, Esc
     /// and `v` close it with nothing sent, `q` still quits, and the other keys do nothing.
@@ -870,6 +925,7 @@ mod tests {
             mode: dmn_session::VoiceMode::Translate,
             target: "de".into(),
             own: Some("en".into()),
+            chosen: None,
         });
         hub.dispatch(Action::SpeakLanguages {
             languages: ["de", "es", "ru"]
@@ -887,7 +943,7 @@ mod tests {
         press(Key::Language, &controls);
         assert_eq!(
             hub.snapshot().picker,
-            Some(dmn_session::Picker { cursor: 0 }),
+            Some(dmn_session::Picker::languages(0)),
             "open on the current language"
         );
         assert!(controls.picker_open());

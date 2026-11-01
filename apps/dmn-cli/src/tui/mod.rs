@@ -52,7 +52,7 @@
 //!
 //! The voice mode (#114) opens the status line, wide and coloured: `voice: you (en)` while your
 //! own voice passes through `dmn-voice`, `voice: → de` in translate mode (amber while a turn is
-//! in flight); `l translate` / `l own voice` ends the keys. A transcript line the call heard
+//! in flight); `l translate` / `l revoice` / `l own voice` ends the keys. A transcript line the call heard
 //! translated is labelled `You → de` with the translation dim under it, and a mode change is a
 //! dim marker row in the transcript. The same on the transcript-first screen.
 //!

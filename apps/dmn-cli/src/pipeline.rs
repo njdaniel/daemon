@@ -84,7 +84,7 @@ use dmn_vad::{
 use tokio::sync::watch;
 
 use crate::context::ContextSource;
-use crate::speaker::{Language, Speaker, Window};
+use crate::speaker::{Language, Say, Speaker, Window};
 use crate::suggest::{Answered, Output, Policy, Suggester, Tally};
 
 /// Bounded queue from each VAD thread to its whisper worker. A live call needs only a few slots,
@@ -715,6 +715,12 @@ pub enum Command {
     /// Enter on the picker (#115): speak the language at `index` in the session's list from
     /// the next utterance on, and save it to `[speak].target`.
     SpeakTarget { index: usize },
+    /// `o` (#130): the voice picker opened; fetch the server's voices for it.
+    Voices,
+    /// Enter on the voice picker (#130): speak in the voice at row `index` of
+    /// [`Session::voice_rows`] from the next sentence on (0 is the user's own), and save it
+    /// as `[speak].voice`.
+    SpeakVoice { index: usize },
 }
 
 /// The TUI's handle on a running pipeline. Cheap to clone; safe from any thread.
@@ -769,11 +775,52 @@ impl Controls {
     }
 
     /// `l` (#114): switch `dmn-voice` between pass-through (your own voice, live) and translate
-    /// mode (every turn you finish, translated and spoken in your cloned voice). The pipeline
-    /// thread owns the mode and the queue of turns, so the key only tells it; it does nothing
-    /// while `[speak]` is off.
+    /// mode (every turn you finish, translated and spoken in your cloned voice); #130: and on
+    /// to re-voice mode (every turn you finish, as said, in the chosen voice), then back. The
+    /// pipeline thread owns the mode and the queue of turns, so the key only tells it; it does
+    /// nothing while `[speak]` is off.
     pub fn toggle_voice(&self) {
         let _ = self.commands.send(Command::Voice);
+    }
+
+    /// `o` (#130): open the voice picker on the voices the session has, and have the pipeline
+    /// thread fetch the server's list again, which replaces them when it arrives.
+    pub fn open_voices(&self) {
+        self.hub.dispatch(Action::Picker {
+            op: PickerOp::OpenVoices,
+        });
+        if self.picker_open() {
+            let _ = self.commands.send(Command::Voices);
+        }
+    }
+
+    /// #130: whether the open picker is the voice picker (Enter chooses a voice, not a
+    /// language).
+    pub fn voice_picker_open(&self) -> bool {
+        self.hub
+            .snapshot()
+            .picker
+            .is_some_and(|p| p.list == dmn_session::PickerList::Voices)
+    }
+
+    /// #130: Enter on the voice picker: the voice under the cursor speaks from the next
+    /// sentence on. The overlay closes at once; the pipeline thread tells the speaker and
+    /// saves the choice. Nothing while the voice picker is closed.
+    pub fn choose_voice(&self) {
+        let snap = self.hub.snapshot();
+        let Some(index) = snap
+            .picker
+            .filter(|p| p.list == dmn_session::PickerList::Voices)
+            .map(|p| p.cursor)
+        else {
+            return;
+        };
+        self.hub.dispatch(Action::Picker {
+            op: PickerOp::Close,
+        });
+        if index < snap.voice_rows().len() {
+            let _ = self.commands.send(Command::SpeakVoice { index });
+        }
     }
 
     /// #115: whether the language picker is open, which gives `↑ ↓`, Enter and Esc to it.
@@ -1384,10 +1431,11 @@ impl Pipeline {
         target: String,
         languages: Vec<Language>,
         config_file: Option<PathBuf>,
+        voice: Option<String>,
     ) {
         let own = (self.info.language == "en").then(|| "en".to_owned());
         self.speaking
-            .attach(speaker, mode, target, own, languages, config_file);
+            .attach(speaker, mode, target, own, languages, config_file, voice);
     }
 
     pub fn controls(&self) -> Controls {
@@ -1489,6 +1537,8 @@ impl Pipeline {
             Command::Speak => self.speaking.press(&self.log),
             Command::Voice => self.speaking.toggle(),
             Command::SpeakTarget { index } => self.speaking.choose(index),
+            Command::Voices => self.speaking.refresh_voices(),
+            Command::SpeakVoice { index } => self.speaking.choose_voice(index),
             cmd => self.assist.command(cmd, &self.log),
         }
     }
@@ -1798,7 +1848,9 @@ impl Assistance {
             Command::Assist { .. }
             | Command::Speak
             | Command::Voice
-            | Command::SpeakTarget { .. } => {}
+            | Command::SpeakTarget { .. }
+            | Command::Voices
+            | Command::SpeakVoice { .. } => {}
             Command::Ask => self.ask(log),
             Command::Regenerate => {
                 let Some(s) = &self.suggester else {
@@ -1878,7 +1930,10 @@ impl Assistance {
 /// spoken in order, one at a time (the next starts when the session says the last is done); a
 /// final that arrives while one waits joins it (the `last_turn` grouping: a sentence the VAD
 /// split is one utterance), and `t` queues the last turn again. `l` switches: leaving translate
-/// mode drops what waits (not what plays) and opens the gate again.
+/// mode drops what waits (not what plays) and opens the gate again. #130: re-voice mode queues
+/// turns the same way, and each goes out as said, in the language said, with no model asked;
+/// `l` cycles own voice → translate → re-voice. The voice picker's choice is here too: told to
+/// the speaker (from its next job), shown in the session, saved as `[speak].voice`.
 pub struct Speaking {
     hub: Arc<SessionHub>,
     session: watch::Receiver<Session>,
@@ -1901,7 +1956,10 @@ pub struct Speaking {
     /// #115: the languages the picker offers, in the config's order, with their voices.
     languages: Vec<Language>,
     /// #115: where a chosen language is saved (`[speak].target`); `None` saves nothing.
+    /// #130: and a chosen voice (`[speak].voice`).
     config_file: Option<PathBuf>,
+    /// #130: the library voice at start (`[speak].voice`), for the first announcement.
+    voice: Option<String>,
 }
 
 /// #114: one thing to speak: a turn's text and the session seconds of the You lines in it.
@@ -1910,6 +1968,8 @@ struct Utterance {
     text: String,
     from: Duration,
     to: Duration,
+    /// #130: the language whisper detected in it (#77), for re-voice; the first that says.
+    language: Option<String>,
     /// The other person spoke after this turn was finalized (#114): a later You final is a new
     /// turn, not more of this one, as #109's `last_turn` grouping ends at the other speaker.
     sealed: bool,
@@ -1930,12 +1990,16 @@ impl Speaking {
             queue: VecDeque::new(),
             languages: Vec::new(),
             config_file: None,
+            voice: None,
         }
     }
 
     /// `[speak]` on: `t` speaks through `speaker`; `dmn-voice` carries `mode` from now (#114),
     /// translating into `target`; `own` is the user's own language when known. #115: the
-    /// session gets `languages` for the picker; a choice is saved to `config_file`.
+    /// session gets `languages` for the picker; a choice is saved to `config_file`. #130:
+    /// `voice` speaks at start (`[speak].voice`), and the speaker fetches the server's voices
+    /// for the picker once the session has all this.
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         &mut self,
         speaker: Speaker,
@@ -1944,19 +2008,24 @@ impl Speaking {
         own: Option<String>,
         languages: Vec<Language>,
         config_file: Option<PathBuf>,
+        voice: Option<String>,
     ) {
-        speaker.set_passthrough(mode == VoiceMode::Passthrough);
+        speaker.set_passthrough(!mode.speaks_turns());
         self.speaker = Some(speaker);
         self.mode = mode;
         self.target = target;
         self.own = own;
         self.languages = languages;
         self.config_file = config_file;
+        self.voice = voice;
         self.hub.dispatch(Action::SpeakEnabled { enabled: true });
         self.announce();
         self.hub.dispatch(Action::SpeakLanguages {
             languages: self.languages.iter().map(Language::listed).collect(),
         });
+        if let Some(speaker) = &self.speaker {
+            speaker.refresh_voices();
+        }
     }
 
     fn announce(&self) {
@@ -1964,7 +2033,62 @@ impl Speaking {
             mode: self.mode,
             target: self.target.clone(),
             own: self.own.clone(),
+            chosen: self.voice.clone(),
         });
+    }
+
+    /// #130: `o` opened the picker: the speaker fetches the server's voices again, after a job
+    /// in flight, and the session's list follows.
+    fn refresh_voices(&self) {
+        if let Some(speaker) = &self.speaker {
+            speaker.refresh_voices();
+        }
+    }
+
+    /// #130: the voice picker chose row `index` of the session's [`Session::voice_rows`] (0,
+    /// `None`, is the user's own): the speaker takes it from its next job (one in flight
+    /// finishes in its own voice), the session shows it, and it is saved as `[speak].voice`
+    /// (choosing the user's own comments the key out). The same voice again changes nothing;
+    /// a file that cannot be written is the usual 5 s notice.
+    fn choose_voice(&mut self, index: usize) {
+        let Some(speaker) = &self.speaker else {
+            return;
+        };
+        let (voice, current) = {
+            let s = self.session.borrow();
+            let Some(row) = s.voice_rows().get(index).copied() else {
+                return;
+            };
+            (row.map(str::to_owned), s.chosen_voice().map(str::to_owned))
+        };
+        if voice == current {
+            return;
+        }
+        speaker.set_voice(voice.clone());
+        self.voice.clone_from(&voice);
+        self.hub.dispatch(Action::SpeakVoice {
+            voice: voice.clone(),
+        });
+        let Some(path) = &self.config_file else {
+            return;
+        };
+        match Config::write_speak_voice(path, voice.as_deref()) {
+            Ok(()) => tracing::info!(
+                voice = voice.as_deref().unwrap_or(dmn_session::YOUR_VOICE),
+                config = %path.display(),
+                "speak: voice saved as [speak].voice"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, config = %path.display(), "speak: cannot save the voice to the config");
+                self.hub.dispatch(Action::SpeakFailed {
+                    id: crate::speaker::STARTUP_NOTICE,
+                    reason: format!(
+                        "{VOICE_NOT_SAVED}: {}",
+                        e.to_string().chars().take(40).collect::<String>()
+                    ),
+                });
+            }
+        }
     }
 
     /// #115: the picker chose the language at `index`: the speaker takes it from its next
@@ -2009,19 +2133,17 @@ impl Speaking {
         }
     }
 
-    /// #114: `l`: pass-through ↔ translate. Leaving translate mode drops the turns that wait
-    /// (the one playing finishes) and opens the microphone's gate again; entering it shuts the
-    /// gate. The session gets the mode (and writes the marker line). Nothing while `[speak]`
-    /// is off.
+    /// #114: `l`: pass-through → translate; #130: → re-voice → pass-through. A change drops
+    /// the turns that wait (the one playing finishes in its own mode); pass-through opens the
+    /// microphone's gate again, the other two shut it. The session gets the mode (and writes
+    /// the marker line). Nothing while `[speak]` is off.
     fn toggle(&mut self) {
         let Some(speaker) = &self.speaker else {
             return;
         };
-        self.mode = self.mode.toggled();
-        if self.mode == VoiceMode::Passthrough {
-            self.queue.clear();
-        }
-        speaker.set_passthrough(self.mode == VoiceMode::Passthrough);
+        self.mode = self.mode.next();
+        self.queue.clear();
+        speaker.set_passthrough(!self.mode.speaks_turns());
         self.announce();
     }
 
@@ -2049,11 +2171,18 @@ impl Speaking {
             text: turn.text,
             from: turn.start,
             to: turn.end,
+            // #130: the last You final's detected language, for re-voice.
+            language: log
+                .finals()
+                .iter()
+                .rev()
+                .find(|f| f.source == Source::You && !f.text.trim().is_empty())
+                .and_then(|f| f.language.clone()),
             sealed: false,
         };
         match self.mode {
             VoiceMode::Passthrough => self.start(utterance),
-            VoiceMode::Translate => {
+            VoiceMode::Translate | VoiceMode::Revoice => {
                 self.queue.push_back(utterance);
                 self.start_next();
             }
@@ -2067,7 +2196,7 @@ impl Speaking {
     /// after the other person spoke is a turn of its own, as `last_turn` groups them (#109).
     fn heard(&mut self, seg: &Segment) {
         if self.speaker.is_none()
-            || self.mode != VoiceMode::Translate
+            || !self.mode.speaks_turns()
             || !seg.is_final
             || seg.text.trim().is_empty()
         {
@@ -2088,11 +2217,15 @@ impl Speaking {
                 waiting.text.push(' ');
                 waiting.text.push_str(seg.text.trim());
                 waiting.to = waiting.to.max(seg.end);
+                if waiting.language.is_none() {
+                    waiting.language.clone_from(&seg.language);
+                }
             }
             _ => self.queue.push_back(Utterance {
                 text: seg.text.trim().to_owned(),
                 from: seg.start,
                 to: seg.end,
+                language: seg.language.clone(),
                 sealed: false,
             }),
         }
@@ -2124,7 +2257,15 @@ impl Speaking {
             to: utterance.to.as_secs_f64(),
         });
         self.pressed = Some((id, Instant::now()));
-        if !speaker.speak(id, utterance.text) {
+        // #130: re-voice speaks the words as said, in the language whisper heard (else the
+        // one the config says the user speaks; else the model tells).
+        let say = match self.mode {
+            VoiceMode::Revoice => Say::Revoice {
+                language: utterance.language.or_else(|| self.own.clone()),
+            },
+            VoiceMode::Passthrough | VoiceMode::Translate => Say::Translate,
+        };
+        if !speaker.speak(id, utterance.text, say) {
             self.hub.dispatch(Action::SpeakFailed {
                 id,
                 reason: "speak failed: the speaker stopped".to_owned(),
@@ -2186,6 +2327,9 @@ pub const NOTHING_TO_SPEAK: &str = "nothing to speak";
 /// #115: what the status line says for 5 s when the picker's choice could not be written to
 /// the config file (the run speaks the chosen language all the same).
 pub const NOT_SAVED: &str = "language not saved";
+
+/// #130: the same for the voice picker's choice.
+pub const VOICE_NOT_SAVED: &str = "voice not saved";
 
 /// #109: the language whisper runs one lane in. With `[speak]` on, the You lane keeps the
 /// user's own words: under `[stt].language = "auto"` or a code (#77), whisper's translate task
@@ -4602,7 +4746,7 @@ mod tests {
             crate::speaker::setup_on(provider, dmn_tts::MockTtsProvider::new(), true);
         let speaker = Speaker::start(setup, Arc::clone(&hub)).unwrap();
         hub.dispatch(Action::SpeakStarted { id: 1 });
-        assert!(speaker.speak(1, SAID.into()));
+        assert!(speaker.speak(1, SAID.into(), Say::Translate));
         let after = crate::speaker::tests::settled(&hub);
         assert_eq!(after.speak_failed, None, "{:?}", after.speak_failed);
         assert!(
@@ -4751,6 +4895,7 @@ mod tests {
             Some("en".into()),
             languages.clone(),
             config_file,
+            None,
         );
         (s, played, gate, languages)
     }
@@ -5042,6 +5187,117 @@ mod tests {
 
     // --- #114: your own voice through dmn-voice by default; `l` makes every turn go out translated
 
+    /// #130, the issue's criterion: in re-voice mode a finished You turn goes to the TTS
+    /// server word for word, in the turn's detected language, and the model is asked nothing
+    /// (the mock counts zero requests, so no #117 check either); the line is marked with the
+    /// voice and nothing under it; `[speak].mode = "revoice"` starts in it with the gate shut.
+    #[test]
+    fn revoice_mode_speaks_each_finished_turn_as_said_and_asks_the_model_nothing() {
+        let hub = Arc::new(SessionHub::default());
+        let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
+        let (mut s, played, gate) = speaking_in(&hub, &llm, &tts, VoiceMode::Revoice);
+        assert_eq!(mode_of(&hub), Some(VoiceMode::Revoice), "starts in it");
+        gate_settles(&gate, false);
+        let mut log = TranscriptLog::new();
+        hear(&hub, &mut log, final_at(Source::Them, 0, 5_000, FIRST));
+        let mut first = final_at(Source::You, 6_000, 9_000, SAID);
+        first.language = Some("de".into());
+        hear(&hub, &mut log, first.clone());
+        s.heard(&first);
+        let second = final_at(Source::You, 9_400, 12_000, SAID_REST);
+        hear(&hub, &mut log, second.clone());
+        s.heard(&second);
+        let after = drive(&mut s, &hub, "both played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 2
+        });
+        assert!(llm.requests().is_empty(), "no translator request");
+        let requests = tts.requests();
+        let spoken: Vec<(&str, Option<&str>)> = requests
+            .iter()
+            .map(|r| (r.text.as_str(), r.language.as_deref()))
+            .collect();
+        // The second was finalized while the first was in flight: its own turn, in the
+        // language the config says the user speaks.
+        assert_eq!(spoken, [(SAID, Some("de")), (SAID_REST, Some("en"))]);
+        assert!(played.lock().unwrap().iter().all(|(_, _, mic)| !mic));
+        let marks: Vec<(Option<&str>, Option<&str>)> = after
+            .transcript
+            .iter()
+            .filter(|l| l.speaker == dmn_session::Speaker::You)
+            .map(|l| (l.spoken_as.as_deref(), l.translation.as_deref()))
+            .collect();
+        assert_eq!(
+            marks,
+            [
+                (Some(dmn_session::YOUR_VOICE), None),
+                (Some(dmn_session::YOUR_VOICE), None)
+            ]
+        );
+        // `t` in re-voice mode re-speaks the last turn (both finals, #109's grouping) as said.
+        s.press(&log);
+        drive(&mut s, &hub, "t played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 3
+        });
+        assert_eq!(tts.requests()[2].text, format!("{SAID} {SAID_REST}"));
+        assert!(llm.requests().is_empty());
+        s.finish();
+    }
+
+    /// #130: the voice picker's choice reaches the speaker from the next turn, shows in the
+    /// session and is saved as `[speak].voice`; `your voice` clears it again.
+    #[test]
+    fn revoice_in_a_chosen_voice_and_the_choice_is_saved_and_cleared_in_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "[speak]\ntarget = \"es\"\n").unwrap();
+        let hub = Arc::new(SessionHub::default());
+        let llm = spanish();
+        let tts = dmn_tts::MockTtsProvider::new()
+            .cross_lingual()
+            .with_voices(Some(&[("me", None), ("pirate", None)]));
+        let (mut s, _, _, _) =
+            speaking_saved_to(&hub, &llm, &tts, VoiceMode::Revoice, Some(config.clone()));
+        let snap = drive(&mut s, &hub, "the list", |snap| !snap.voices.is_empty());
+        assert_eq!(snap.voice_rows(), [None, Some("pirate")]);
+        s.choose_voice(1);
+        let snap = hub.snapshot();
+        assert_eq!(snap.chosen_voice(), Some("pirate"));
+        assert!(
+            screen(&snap).contains("revoice: pirate"),
+            "{}",
+            screen(&snap)
+        );
+        assert_eq!(
+            Config::load(&config).unwrap().speak.voice.as_deref(),
+            Some("pirate")
+        );
+        let mut log = TranscriptLog::new();
+        let said = final_at(Source::You, 6_000, 9_000, SAID);
+        hear(&hub, &mut log, said.clone());
+        s.heard(&said);
+        let after = drive(&mut s, &hub, "played", |snap| {
+            snap.speech.is_none() && tts.requests().len() == 1
+        });
+        assert_eq!(tts.requests()[0].voice, "pirate");
+        assert!(llm.requests().is_empty());
+        let line = after
+            .transcript
+            .iter()
+            .find(|l| l.speaker == dmn_session::Speaker::You)
+            .unwrap();
+        assert_eq!(line.spoken_as.as_deref(), Some("pirate"));
+
+        s.choose_voice(0);
+        assert_eq!(hub.snapshot().chosen_voice(), None);
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("# voice = \"pirate\""), "{text}");
+        assert_eq!(Config::load(&config).unwrap().speak.voice, None);
+        // A row past the list changes nothing.
+        s.choose_voice(9);
+        assert_eq!(hub.snapshot().chosen_voice(), None);
+        s.finish();
+    }
+
     /// Wait for the speaker's thread to set the sink's microphone gate to `want`.
     fn gate_settles(gate: &AtomicBool, want: bool) {
         let t = Instant::now();
@@ -5080,7 +5336,7 @@ mod tests {
     }
 
     #[test]
-    fn l_switches_passthrough_and_translate_and_the_microphones_gate_follows() {
+    fn l_cycles_passthrough_translate_and_revoice_and_the_microphones_gate_follows() {
         let hub = Arc::new(SessionHub::default());
         let (llm, tts) = (spanish(), dmn_tts::MockTtsProvider::new());
         let (mut s, _, gate) = speaking_in(&hub, &llm, &tts, VoiceMode::Passthrough);
@@ -5092,6 +5348,7 @@ mod tests {
                 mode: VoiceMode::Passthrough,
                 target: "es".into(),
                 own: Some("en".into()),
+                chosen: None,
             })
         );
         let shown = screen(&snap);
@@ -5110,7 +5367,7 @@ mod tests {
         let snap = hub.snapshot();
         let shown = screen(&snap);
         assert!(
-            shown.contains("voice: → es") && shown.contains("l own voice"),
+            shown.contains("voice: → es") && shown.contains("l revoice"),
             "{shown}"
         );
         assert_eq!(snap.transcript.len(), 1);
@@ -5118,12 +5375,24 @@ mod tests {
         assert_eq!(snap.transcript[0].text, "— translate mode on: → es —");
         gate_settles(&gate, false);
 
+        // #130: then re-voice, the gate still shut.
+        s.toggle();
+        assert_eq!(mode_of(&hub), Some(VoiceMode::Revoice));
+        let snap = hub.snapshot();
+        let shown = screen(&snap);
+        assert!(
+            shown.contains("revoice: you") && shown.contains("l own voice"),
+            "{shown}"
+        );
+        assert_eq!(snap.transcript[1].text, "— re-voice on: your voice —");
+        gate_settles(&gate, false);
+
         s.toggle();
         assert_eq!(mode_of(&hub), Some(VoiceMode::Passthrough));
         let snap = hub.snapshot();
-        assert_eq!(snap.transcript.len(), 2);
+        assert_eq!(snap.transcript.len(), 3);
         assert_eq!(
-            snap.transcript[1].text,
+            snap.transcript[2].text,
             "— translate mode off: your own voice —"
         );
         assert!(screen(&snap).contains("voice: you (en)"));
@@ -5433,8 +5702,12 @@ mod tests {
         s.heard(&second);
         assert_eq!(s.queue.len(), 1);
 
+        // #130: `l` goes on to re-voice first, which drops the waiting turn too; then back to
+        // pass-through.
         s.toggle();
         assert_eq!(s.queue.len(), 0, "the waiting turn is dropped");
+        assert_eq!(mode_of(&hub), Some(VoiceMode::Revoice));
+        s.toggle();
         assert_eq!(mode_of(&hub), Some(VoiceMode::Passthrough));
         assert!(hub.snapshot().speech.is_some(), "the one speaking goes on");
         let after = drive(&mut s, &hub, "the first played", |snap| {
@@ -5576,8 +5849,11 @@ mod tests {
         assert!(snap.transcript.is_empty());
         assert!(screen(&snap).contains("voice: → es"), "{}", screen(&snap));
         gate_settles(&gate, false);
-        // Pass-through mode ignores finals: nothing is spoken without `t`.
+        // Pass-through mode (#130: two presses on, past re-voice) ignores finals: nothing is
+        // spoken without `t`.
         s.toggle();
+        s.toggle();
+        assert_eq!(mode_of(&hub), Some(VoiceMode::Passthrough));
         let first = final_at(Source::You, 6_000, 9_000, SAID);
         s.heard(&first);
         assert!(hub.snapshot().speech.is_none() && s.queue.is_empty());
@@ -5692,6 +5968,7 @@ mod tests {
             target.into(),
             Some("en".into()),
             languages,
+            None,
             None,
         );
 
@@ -5910,6 +6187,7 @@ mod tests {
             VoiceMode::Passthrough,
             "es".into(),
             languages,
+            None,
             None,
         );
         let worker = std::thread::spawn(move || {

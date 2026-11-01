@@ -11,6 +11,7 @@
 mod bench;
 mod bench_live;
 mod context;
+mod design;
 mod devices;
 mod doctor;
 mod latency;
@@ -281,6 +282,10 @@ enum Command {
         /// Write the synthesized speech to this WAV file instead of playing it into dmn-voice
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Speak in this voice from the TTS server's library (`dmn speak voices`) instead of
+        /// your own; with --out, a way to hear a designed voice
+        #[arg(long)]
+        voice: Option<String>,
     },
     /// Add, list or remove context sources: resume, job description, notes, stories
     Sources {
@@ -362,6 +367,34 @@ enum SpeakAction {
         /// chatterbox-tts-api speaks each voice in the language it was enrolled with
         #[arg(long)]
         language: Option<String>,
+    },
+    /// List the TTS server's voices: name, designed or enrolled, the language each speaks
+    /// under Chatterbox, which are your own and which is [speak].voice (#130)
+    Voices,
+    /// Make a voice from a description (#130): start the Qwen3-TTS VoiceDesign server
+    /// (sidecars/qwen3-tts, profile design), render a sample line, play it, ask whether to
+    /// keep it, enroll it into the Base server under --name for the `o` picker, and stop the
+    /// design server again. Needs [speak].engine = "qwen3"
+    Design {
+        /// The new voice's name (letters, digits, - and _); not one of your own voices
+        #[arg(long)]
+        name: String,
+        /// The voice in words, its audible traits: "grumpy old pirate, gravelly, slow"
+        #[arg(long)]
+        describe: String,
+        /// What the sample says; default: a few sentences in English (8-10 s of speech, enough
+        /// to clone from). The Base model clones the voice from this sample
+        #[arg(long)]
+        line: Option<String>,
+        /// The sample's language (en, de, zh, ...); default: the model's guess from the line
+        #[arg(long)]
+        language: Option<String>,
+        /// Write the sample to this WAV instead of playing it
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Keep the sample without asking (for scripts)
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -567,7 +600,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Some(Command::Sessions { action }) => sessions(&paths, action),
         Some(Command::Sources { action }) => Ok(sources::run(&paths, action)?),
-        Some(Command::Speak { action, text, out }) => {
+        Some(Command::Speak {
+            action,
+            text,
+            out,
+            voice,
+        }) => {
             let cfg = Config::load(&paths.config_file)?;
             match action {
                 Some(SpeakAction::Enroll {
@@ -583,6 +621,44 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     let provider = speak::tts_provider(&cfg, false);
                     print!("{}", speak::enroll(&cfg, &paths, &args, provider.as_ref())?);
                 }
+                Some(SpeakAction::Voices) => {
+                    let provider = speak::tts_provider(&cfg, false);
+                    print!("{}", speak::voices(&cfg, &paths, provider.as_ref())?);
+                }
+                Some(SpeakAction::Design {
+                    name,
+                    describe,
+                    line,
+                    language,
+                    out,
+                    yes,
+                }) => {
+                    let args = design::DesignArgs {
+                        name,
+                        describe,
+                        line,
+                        language,
+                        out,
+                        yes,
+                        ready_within: design::READY_WITHIN,
+                    };
+                    let base = speak::tts_provider(&cfg, false);
+                    let designer = dmn_tts::Qwen3Designer::new(&cfg.speak.design_url);
+                    let interrupt = std::sync::Arc::new(design::Interrupt::default());
+                    design::watch_signals(std::sync::Arc::clone(&interrupt))?;
+                    print!(
+                        "{}",
+                        design::design(
+                            &cfg,
+                            &paths,
+                            &args,
+                            &design::Docker,
+                            base.as_ref(),
+                            &designer,
+                            &interrupt
+                        )?
+                    );
+                }
                 None => {
                     let text = text.ok_or(CliError::Usage(
                         "speak needs the text to synthesize: dmn speak \"text\" [--out <file.wav>] (or `dmn speak enroll --wav <clip>`)".into(),
@@ -592,7 +668,14 @@ fn run(cli: Cli) -> Result<(), CliError> {
                     let provider = speak::tts_provider(&cfg, out.is_none());
                     print!(
                         "{}",
-                        speak::speak(&cfg, &paths, &text, out.as_deref(), provider.as_ref())?
+                        speak::speak(
+                            &cfg,
+                            &paths,
+                            &text,
+                            out.as_deref(),
+                            voice.as_deref(),
+                            provider.as_ref()
+                        )?
                     );
                 }
             }

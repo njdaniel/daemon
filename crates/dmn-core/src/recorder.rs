@@ -470,6 +470,10 @@ impl StoreWriter {
             | Action::SpeakLanguages { .. }
             | Action::Picker { .. }
             | Action::SpeakTarget { .. }
+            // #130: the voice list and the chosen voice likewise (the choice is saved as
+            // `[speak].voice`).
+            | Action::SpeakVoices { .. }
+            | Action::SpeakVoice { .. }
             | Action::Status { .. } => {}
         }
         Ok(())

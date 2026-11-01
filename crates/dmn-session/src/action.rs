@@ -54,7 +54,8 @@ impl QuestionSource {
 }
 
 /// #114: what `dmn-voice` carries: the user's own voice, live, or every sentence they finish,
-/// translated and spoken in their cloned voice instead. `[speak].mode` at start, `l` toggles.
+/// translated and spoken in their cloned voice instead; #130: or every sentence they finish,
+/// word for word, re-spoken in the chosen voice. `[speak].mode` at start, `l` cycles.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceMode {
@@ -63,14 +64,18 @@ pub enum VoiceMode {
     Passthrough,
     /// The microphone is muted into `dmn-voice`; each finalized You turn goes out translated.
     Translate,
+    /// #130: the microphone is muted into `dmn-voice`; each finalized You turn goes out as
+    /// said, in the language said, in the chosen voice (`o`). No model is asked anything.
+    Revoice,
 }
 
 impl VoiceMode {
-    /// The other mode: what `l` switches to.
-    pub fn toggled(self) -> Self {
+    /// The mode `l` switches to: your own voice → translate → re-voice → your own voice.
+    pub fn next(self) -> Self {
         match self {
             VoiceMode::Passthrough => VoiceMode::Translate,
-            VoiceMode::Translate => VoiceMode::Passthrough,
+            VoiceMode::Translate => VoiceMode::Revoice,
+            VoiceMode::Revoice => VoiceMode::Passthrough,
         }
     }
 
@@ -79,7 +84,14 @@ impl VoiceMode {
         match self {
             VoiceMode::Passthrough => "passthrough",
             VoiceMode::Translate => "translate",
+            VoiceMode::Revoice => "revoice",
         }
+    }
+
+    /// #130: every finished You turn is queued and spoken (translate and re-voice): the
+    /// microphone is shut off from `dmn-voice`.
+    pub fn speaks_turns(self) -> bool {
+        matches!(self, VoiceMode::Translate | VoiceMode::Revoice)
     }
 }
 
@@ -107,6 +119,20 @@ pub enum PickerOp {
     Down,
     /// Esc (or the picker key again): the overlay closes, nothing chosen.
     Close,
+    /// #130: `o`: the voice picker opens with the cursor on the current voice (`your voice`
+    /// first, then [`Action::SpeakVoices`]'s list).
+    OpenVoices,
+}
+
+/// #130: which list the picker shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PickerList {
+    /// `v` (#115): the languages, each with its voice.
+    #[default]
+    Languages,
+    /// `o` (#130): `your voice`, then the TTS server's other voices.
+    Voices,
 }
 
 /// A status dot (SPEC § Transcript & status): mic, system audio, model.
@@ -519,6 +545,11 @@ pub enum Action {
         target: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         own: Option<String>,
+        /// #130: the library voice speaking at start (`[speak].voice`). Read from the first
+        /// `Voice` only, with no marker row; later changes are [`Action::SpeakVoice`]'s, and a
+        /// change of mode keeps the session's choice whatever this says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chosen: Option<String>,
     },
     /// #115: the languages the session can speak (`[speak].languages`, or the one `target` +
     /// `voice_ref` pair when the list is left out), dispatched once after [`Action::Voice`] by
@@ -534,6 +565,19 @@ pub enum Action {
     /// closes. A change writes one marker line into the transcript (`— language: → es —`); a
     /// code not in [`Action::SpeakLanguages`]'s list is ignored.
     SpeakTarget { target: String },
+    /// #130: the TTS server's voices the voice picker offers after `your voice`, in its order:
+    /// the library less the user's own voices (`[speak].languages`, `voice_ref`), and under
+    /// Chatterbox only those enrolled for the current target. Dispatched at start and again
+    /// each time the picker opens; an open picker keeps its cursor on the list.
+    SpeakVoices { voices: Vec<String> },
+    /// #130: the voice every sentence is spoken in from the next one on: a library voice, or
+    /// `None` for the user's own (each language's voice). Chosen on the picker, set at start
+    /// from `[speak].voice`, or dropped when `v` picks a language the voice cannot speak. A
+    /// change writes one marker row (`— voice: pirate —`); the picker closes.
+    SpeakVoice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice: Option<String>,
+    },
     /// `t` (#109): press `id` (numbered by the pipeline, from 1) took the user's last turn and
     /// sent it to be translated. The status line says `translating…` with the seconds since.
     /// #114: in translate mode every finalized You turn is a press too, numbered the same way.

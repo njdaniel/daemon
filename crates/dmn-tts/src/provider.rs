@@ -98,12 +98,45 @@ pub struct Voice {
     /// The language it was enrolled with, and so the only one it speaks; `None` when the
     /// listing does not say.
     pub language: Option<String>,
+    /// #130: the consent id the server stores with the clip (Qwen3-TTS: [`Consent::as_str`]);
+    /// `None` when the listing has none (chatterbox-tts-api).
+    pub consent: Option<String>,
 }
 
 impl Voice {
     /// Whether `name` is this voice's name or one of its aliases.
     pub fn answers_to(&self, name: &str) -> bool {
         self.name == name || self.aliases.iter().any(|a| a == name)
+    }
+
+    /// #130: made by `dmn speak design` from a description, not cloned from anyone's clip.
+    pub fn designed(&self) -> bool {
+        self.consent.as_deref() == Some(Consent::Designed.as_str())
+    }
+}
+
+/// #130: whose voice a clip is, stored with it on servers that keep a consent id (Qwen3-TTS).
+/// The out-of-scope rule (no recognisable real people) is why it is recorded at all: a clip
+/// is the user's own, a consenting speaker's, or designed from a description.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consent {
+    /// The user's own voice (`dmn speak enroll` without `--name`, or with `--language`).
+    Own,
+    /// A library voice from a clip (`dmn speak enroll --name`): the user's or a consenting
+    /// speaker's.
+    Speaker,
+    /// Rendered by VoiceDesign from a description (`dmn speak design`).
+    Designed,
+}
+
+impl Consent {
+    /// The id the server stores.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Consent::Own => "dmn-self",
+            Consent::Speaker => "dmn-consented",
+            Consent::Designed => "dmn-designed",
+        }
     }
 }
 
@@ -171,6 +204,20 @@ pub trait TtsProvider: Send + Sync {
         wav: &'a Path,
         language: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Enrolled, TtsError>>;
+
+    /// #130: [`TtsProvider::enroll`] with the clip's [`Consent`], stored with it on a server
+    /// that keeps one; the default ignores it (chatterbox-tts-api has no field for it).
+    /// `enroll` itself enrolls the user's own voice.
+    fn enroll_as<'a>(
+        &'a self,
+        name: &'a str,
+        wav: &'a Path,
+        language: Option<&'a str>,
+        consent: Consent,
+    ) -> BoxFuture<'a, Result<Enrolled, TtsError>> {
+        let _ = consent;
+        self.enroll(name, wav, language)
+    }
 
     /// The server's voice library (#109: `dmn run` checks at start that the enrolled voice
     /// speaks `[speak].target`). `None` when the server has no library to list.

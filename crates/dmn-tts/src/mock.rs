@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::future::BoxFuture;
 
-use crate::provider::{Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice};
+use crate::provider::{
+    Consent, Enrolled, PcmChunk, PcmStream, SpeakRequest, TtsError, TtsProvider, Voice,
+};
 use crate::tail::decode_cut;
 
 /// One enrollment the mock received.
@@ -18,6 +20,8 @@ pub struct MockEnrollment {
     pub language: Option<String>,
     /// The clip's size in bytes.
     pub bytes: usize,
+    /// #130: whose voice it is ([`Consent::as_str`]).
+    pub consent: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +33,10 @@ pub struct MockTtsProvider {
     /// The library [`TtsProvider::voices`] lists before any enrollment; `None` for a server
     /// without one.
     library: Option<Vec<Voice>>,
+    /// #130: the engine's [`TtsProvider::cross_lingual`] and [`TtsProvider::languages`], so
+    /// the mock can stand in for Qwen3-TTS as well as Chatterbox (the default).
+    cross_lingual: bool,
+    languages: Option<&'static [&'static str]>,
 }
 
 impl Default for MockTtsProvider {
@@ -51,7 +59,16 @@ impl MockTtsProvider {
             requests: Arc::new(Mutex::new(Vec::new())),
             enrollments: Arc::new(Mutex::new(Vec::new())),
             library: Some(Vec::new()),
+            cross_lingual: false,
+            languages: None,
         }
+    }
+
+    /// #130: answer like Qwen3-TTS: one voice speaks every language in its list.
+    pub fn cross_lingual(mut self) -> Self {
+        self.cross_lingual = true;
+        self.languages = Some(&crate::qwen3::CODES);
+        self
     }
 
     /// Synthesize `samples` (mono, at `rate`, as a 16-bit WAV) on every request: speech,
@@ -69,6 +86,7 @@ impl MockTtsProvider {
                     name: (*name).to_owned(),
                     aliases: Vec::new(),
                     language: language.map(str::to_owned),
+                    consent: None,
                 })
                 .collect()
         });
@@ -133,6 +151,16 @@ impl TtsProvider for MockTtsProvider {
         wav: &'a Path,
         language: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Enrolled, TtsError>> {
+        self.enroll_as(name, wav, language, Consent::Own)
+    }
+
+    fn enroll_as<'a>(
+        &'a self,
+        name: &'a str,
+        wav: &'a Path,
+        language: Option<&'a str>,
+        consent: Consent,
+    ) -> BoxFuture<'a, Result<Enrolled, TtsError>> {
         Box::pin(async move {
             let bytes = std::fs::read(wav).map_err(|e| TtsError::VoiceRead {
                 path: wav.display().to_string(),
@@ -145,6 +173,7 @@ impl TtsProvider for MockTtsProvider {
                     name: name.to_owned(),
                     language: language.map(str::to_owned),
                     bytes: bytes.len(),
+                    consent: consent.as_str(),
                 });
             }
             Ok(Enrolled {
@@ -165,10 +194,19 @@ impl TtsProvider for MockTtsProvider {
                     name: e.name,
                     aliases: Vec::new(),
                     language: e.language,
+                    consent: Some(e.consent.to_owned()),
                 });
             }
             Ok(Some(voices))
         })
+    }
+
+    fn cross_lingual(&self) -> bool {
+        self.cross_lingual
+    }
+
+    fn languages(&self) -> Option<&'static [&'static str]> {
+        self.languages
     }
 }
 
@@ -258,7 +296,8 @@ mod tests {
             MockEnrollment {
                 name: "narrator".into(),
                 language: Some("es".into()),
-                bytes: bytes.len()
+                bytes: bytes.len(),
+                consent: "dmn-self",
             }
         );
         let err = mock

@@ -1,0 +1,30 @@
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+                         ┌ VOICE ────────────────────────────────────────┐
+                         │ ▸ your voice   ← now                          │
+                         │ no other voices yet; make one with            │
+Them      Let's move on. │ dmn speak design --name <name> --describe "…" │ments migration.
+You       There were five│ ↑↓ move · ⏎ choose · esc close                │ product manager and me
+          leading the cut└───────────────────────────────────────────────┘
+Them      How long did the migration take?
+You       About four months, with the last three weeks running both systems side by side and
+          comparing every ledger entry.
+Them      And did anything go wrong on the day?
+You       One batch job still pointed at the old database, so we paused it and replayed its writes.
+Them      Good. Let's talk about how you would test that.
+Them      And what about the▍
+— translate mode on: → de —
+You → de  I'd start with a token bucket per API key and keep the counters in regional Redis.
+          » Ich würde mit einem Token-Bucket pro API-Schlüssel anfangen und die Zähler in einem
+          regionalen Redis halten.
+ voice: → de  ● mic  ● system  ● model  es→en           assist off · C-S-a on · t speak · l revoice

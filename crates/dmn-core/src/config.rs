@@ -535,6 +535,19 @@ pub struct Speak {
         deserialize_with = "language_list"
     )]
     pub languages: Vec<SpeakLanguage>,
+    /// #130: a voice from the TTS server's library (`dmn speak voices`) that speaks in place of
+    /// the user's own: every language under Qwen3-TTS, and every re-voiced turn. Left out (or
+    /// blank), each language's own voice (`languages`, else `voice_ref`) speaks, as before.
+    /// `o` in `dmn run` picks it and writes it here; picking `your voice` comments it out.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_name"
+    )]
+    pub voice: Option<String>,
+    /// #130: the Qwen3-TTS VoiceDesign server `dmn speak design` starts, renders a sample on,
+    /// and stops again (`sidecars/qwen3-tts`, compose profile `design`). On this machine only.
+    pub design_url: String,
 }
 
 /// `[speak].temperature`'s default (#113).
@@ -614,6 +627,12 @@ fn language_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<SpeakLang
     Ok(list)
 }
 
+/// #130: `[speak].voice`: trimmed, and blank is unset.
+fn optional_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let raw: Option<String> = Option::deserialize(d)?;
+    Ok(raw.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty()))
+}
+
 /// The voice name the TTS server knows a `voice_ref` clip by: its file stem (#107: the
 /// clip is stored as `<data dir>/<name>.wav`), `voice` when the path has none.
 pub fn voice_ref_name(voice_ref: &str) -> String {
@@ -655,7 +674,28 @@ impl Speak {
             .find(|l| l.code == code)
             .map(|l| l.voice)
     }
+
+    /// #130: the user's own voices: each language's (`languages`) and `voice_ref`'s. The
+    /// voice picker lists them as one row, `your voice`, and the library after it.
+    pub fn own_voices(&self) -> Vec<String> {
+        let mut own: Vec<String> = self.languages.iter().map(|l| l.voice.clone()).collect();
+        if !self.voice_ref.is_empty() {
+            let name = voice_ref_name(&self.voice_ref);
+            if !own.contains(&name) {
+                own.push(name);
+            }
+        }
+        own
+    }
+
+    /// #130: `design_url` is on this machine, as `tts_url` must be.
+    pub fn design_is_local(&self) -> bool {
+        is_loopback_url(self.design_url.trim())
+    }
 }
+
+/// #130: `[speak].design_url`'s default: the VoiceDesign service in `sidecars/qwen3-tts`.
+pub const DESIGN_URL: &str = "http://localhost:4125";
 
 impl Default for Speak {
     fn default() -> Self {
@@ -672,6 +712,8 @@ impl Default for Speak {
             exaggeration: None,
             mode: VoiceMode::Passthrough,
             languages: Vec::new(),
+            voice: None,
+            design_url: DESIGN_URL.into(),
         }
     }
 }
@@ -806,8 +848,10 @@ target = ""                          # dmn run: `t` speaks your last turn in thi
 temperature = 0.6                    # the TTS model's sampling temperature (server default 0.8); lower = fewer noise bursts after a sentence
 # cfg_weight = 0.5                   # the TTS model's pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # the TTS model's emotion intensity, 0.25-2.0; left out: the server's
-mode = "passthrough"                 # dmn run: passthrough = your own voice live into dmn-voice, `t` speaks one turn translated; translate = every turn you finish goes out translated (`l` toggles, #114)
+mode = "passthrough"                 # dmn run: passthrough = your own voice live into dmn-voice, `t` speaks one turn translated; translate = every turn you finish goes out translated; revoice = every turn you finish goes out as said, in `voice` (`l` cycles, #114, #130)
 # languages = [{ code = "de", voice = "voice-de" }, { code = "es", voice = "voice-es" }]   # dmn run: the languages `v` picks between, each with its enrolled voice (`enroll --language de` adds one); target must be one of them (#115)
+# voice = "pirate"                   # dmn run: a library voice (`dmn speak voices`) that speaks in place of yours; `o` picks it; left out: your own voice (#130)
+design_url = "http://localhost:4125" # `dmn speak design`: the Qwen3-TTS VoiceDesign server it starts and stops (sidecars/qwen3-tts, profile design; #130)
 
 [ui]
 always_on_top = true
@@ -989,8 +1033,21 @@ impl Config {
         let value = toml::Value::String(voice_ref.to_owned()).to_string();
         Self::edit_speak(
             path,
-            |_| vec![("voice_ref", value.clone())],
+            |_| vec![("voice_ref", Some(value.clone()))],
             |c| c.speak.voice_ref == voice_ref,
+        )
+    }
+
+    /// #130: set `[speak].voice` to `voice` in the config file at `path`, the same in-place
+    /// edit as [`Config::write_voice_ref`] (the voice picker saves its choice here); `None`
+    /// comments the line out (`# voice = "pirate"`), so the next run starts in the user's own
+    /// voice and a later choice reuses the line.
+    pub fn write_speak_voice(path: &Path, voice: Option<&str>) -> Result<(), ConfigError> {
+        let value = voice.map(|v| toml::Value::String(v.to_owned()).to_string());
+        Self::edit_speak(
+            path,
+            |_| vec![("voice", value.clone())],
+            |c| c.speak.voice.as_deref() == voice,
         )
     }
 
@@ -1001,7 +1058,7 @@ impl Config {
         let value = toml::Value::String(code.to_owned()).to_string();
         Self::edit_speak(
             path,
-            |_| vec![("target", value.clone())],
+            |_| vec![("target", Some(value.clone()))],
             |c| c.speak.target == code,
         )
     }
@@ -1027,9 +1084,12 @@ impl Config {
             path,
             |current| {
                 let list = wanted(current);
-                let mut edits = vec![("languages", inline_languages(&list))];
+                let mut edits = vec![("languages", Some(inline_languages(&list)))];
                 if current.speak.target.is_empty() {
-                    edits.push(("target", toml::Value::String(code.to_owned()).to_string()));
+                    edits.push((
+                        "target",
+                        Some(toml::Value::String(code.to_owned()).to_string()),
+                    ));
                 }
                 edits
             },
@@ -1037,12 +1097,12 @@ impl Config {
         )
     }
 
-    /// The in-place edit behind the three writers above: `edits` gives the `[speak]` keys to
-    /// set (each as its TOML value text) from the file as it is now, and `check` says whether
-    /// the edited file parses to what was meant.
+    /// The in-place edit behind the writers above: `edits` gives the `[speak]` keys to set
+    /// (each as its TOML value text, or `None` to comment the key out) from the file as it is
+    /// now, and `check` says whether the edited file parses to what was meant.
     fn edit_speak(
         path: &Path,
-        edits: impl Fn(&Config) -> Vec<(&'static str, String)>,
+        edits: impl Fn(&Config) -> Vec<(&'static str, Option<String>)>,
         check: impl Fn(&Config) -> bool,
     ) -> Result<(), ConfigError> {
         let shown = path.display().to_string();
@@ -1061,8 +1121,16 @@ impl Config {
         let mut edited = text.clone();
         let mut keys = Vec::new();
         for (key, value) in edits(&current) {
-            edited = set_speak_key(&edited, key, &value);
-            keys.push(format!("{key} = {value}"));
+            match value {
+                Some(value) => {
+                    edited = set_speak_key(&edited, key, &value);
+                    keys.push(format!("{key} = {value}"));
+                }
+                None => {
+                    edited = unset_speak_key(&edited, key);
+                    keys.push(format!("no `{key}`"));
+                }
+            }
         }
         let parsed = Self::from_toml(&edited, &shown)?;
         if !check(&parsed) {
@@ -1267,6 +1335,35 @@ fn set_speak_key(text: &str, key: &str, quoted: &str) -> String {
     joined
 }
 
+/// #130: comment out every `key = ...` line under `[speak]` (`# key = ...`, its own comment
+/// kept), so the key takes its default and [`set_speak_key`] reuses the line later.
+fn unset_speak_key(text: &str, key: &str) -> String {
+    let mut in_speak = false;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('[') {
+                in_speak = split_comment(trimmed).0.trim_end() == "[speak]";
+                return line.to_owned();
+            }
+            let is_key = trimmed
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.trim_start().starts_with('='));
+            if in_speak && is_key {
+                format!("# {trimmed}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    let mut joined = lines.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
 /// Split a TOML line into (code, comment) at the first `#` outside a quoted string; the
 /// returned comment includes its `#`. Knows basic strings (`"..."`, with `\"` escapes) and
 /// literal strings (`'...'`, no escapes).
@@ -1343,8 +1440,10 @@ target = ""                          # `t` (#109) speaks in this language (es, d
 temperature = 0.6                    # TTS sampling temperature (#113); lower = fewer noise bursts
 # cfg_weight = 0.5                   # TTS pace, 0.0-1.0; left out: the server's
 # exaggeration = 0.5                 # TTS emotion, 0.25-2.0; left out: the server's
-mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated; `l` toggles, #114)
+mode = "passthrough"                 # passthrough (your voice live into dmn-voice) | translate (every turn translated) | revoice (every turn as said, in `voice`); `l` cycles (#114, #130)
 # languages = [{ code = "de", voice = "voice-de" }]   # `v` picks between these (#115); `enroll --language` adds one; target must be one
+# voice = "pirate"                   # a library voice in place of yours (#130); `o` picks it; left out: your own
+design_url = "http://localhost:4125" # `dmn speak design`'s VoiceDesign server (#130); this machine only
 
 [ui]
 always_on_top = true
@@ -1389,6 +1488,94 @@ keep_transcripts = true
             err.contains("passthrough") && err.contains("translate"),
             "{err}"
         );
+    }
+
+    /// #130: `[speak].mode = "revoice"` parses and round-trips.
+    #[test]
+    fn speak_mode_parses_revoice() {
+        let c = Config::from_toml("[speak]\nmode = \"revoice\"\n", "m").unwrap();
+        assert_eq!(c.speak.mode, VoiceMode::Revoice);
+        let toml = c.to_toml().unwrap();
+        assert!(toml.contains("mode = \"revoice\""), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), c);
+    }
+
+    /// #130: `[speak].voice` is optional, trimmed, blank is unset, and round-trips; unset, every
+    /// language's voice is what it was. `design_url` defaults to the VoiceDesign service.
+    #[test]
+    fn speak_voice_parses_round_trips_and_unset_leaves_the_languages_voices() {
+        let d = Config::default().speak;
+        assert_eq!(d.voice, None);
+        assert_eq!(d.design_url, "http://localhost:4125");
+        assert!(d.design_is_local());
+        let base = "[speak]\nvoice_ref = \"/d/voice.wav\"\nlanguages = [{ code = \"de\", voice = \"voice-de\" }, { code = \"ru\", voice = \"voice\" }]\ntarget = \"de\"\n";
+        let unset = Config::from_toml(base, "unset").unwrap();
+        assert_eq!(unset.speak.voice, None);
+        assert_eq!(unset.speak.voice_for("de").as_deref(), Some("voice-de"));
+        assert_eq!(unset.speak.voice_for("ru").as_deref(), Some("voice"));
+        assert_eq!(unset.speak.own_voices(), ["voice-de", "voice"]);
+        let blank = Config::from_toml(&format!("{base}voice = \"  \"\n"), "blank").unwrap();
+        assert_eq!(blank.speak.voice, None);
+        let set = Config::from_toml(&format!("{base}voice = \" pirate \"\n"), "set").unwrap();
+        assert_eq!(set.speak.voice.as_deref(), Some("pirate"));
+        // The language list is untouched by it.
+        assert_eq!(set.speak.voices(), unset.speak.voices());
+        let toml = set.to_toml().unwrap();
+        assert!(toml.contains("voice = \"pirate\""), "{toml}");
+        assert_eq!(Config::from_toml(&toml, "again").unwrap(), set);
+        let unset_toml = unset.to_toml().unwrap();
+        assert_eq!(Config::from_toml(&unset_toml, "again").unwrap(), unset);
+        let far =
+            Config::from_toml("[speak]\ndesign_url = \"http://gpu.lan:4125\"\n", "f").unwrap();
+        assert!(!far.speak.design_is_local());
+    }
+
+    /// #130: the voice picker's writer sets `voice` in place, comments it out for `your voice`,
+    /// and reuses that line for the next choice; everything else stays as it was.
+    #[test]
+    fn write_speak_voice_sets_clears_and_sets_again_in_place() {
+        let user =
+            "# mine\n[speak]\nenabled = true    # on\ntarget = \"de\"\n\n[ui]\nmouse = false\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, user).unwrap();
+        Config::write_speak_voice(&path, Some("pirate")).unwrap();
+        let set = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            set,
+            "# mine\n[speak]\nenabled = true    # on\ntarget = \"de\"\nvoice = \"pirate\"\n\n[ui]\nmouse = false\n"
+        );
+        assert_eq!(
+            Config::load(&path).unwrap().speak.voice.as_deref(),
+            Some("pirate")
+        );
+        Config::write_speak_voice(&path, None).unwrap();
+        let cleared = std::fs::read_to_string(&path).unwrap();
+        assert!(cleared.contains("\n# voice = \"pirate\"\n"), "{cleared}");
+        assert_eq!(cleared.lines().count(), set.lines().count());
+        assert_eq!(Config::load(&path).unwrap().speak.voice, None);
+        Config::write_speak_voice(&path, Some("robot")).unwrap();
+        let again = std::fs::read_to_string(&path).unwrap();
+        assert!(again.contains("\nvoice = \"robot\"\n"), "{again}");
+        assert!(
+            !again.contains("pirate"),
+            "the commented line was reused: {again}"
+        );
+        assert_eq!(again.lines().count(), set.lines().count());
+
+        // From the template: its commented line is the one set, its comment kept.
+        let fresh = dir.path().join("fresh.toml");
+        Config::write_speak_voice(&fresh, Some("pirate")).unwrap();
+        let text = std::fs::read_to_string(&fresh).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("voice = "))
+            .expect("the voice line");
+        assert!(line.starts_with("voice = \"pirate\" "), "{line}");
+        assert!(line.contains("# dmn run: a library voice"), "{line}");
+        assert_eq!(text.lines().count(), TEMPLATE.lines().count());
+        Config::write_speak_voice(&fresh, None).unwrap();
+        assert_eq!(Config::load(&fresh).unwrap().speak.voice, None);
     }
 
     /// #125: the echo guard is off unless the file turns it on.
@@ -1507,7 +1694,7 @@ keep_transcripts = true
                     .map(move |k| format!("{section}.{k}"))
             })
             .collect();
-        assert_eq!(keys.len(), 42, "spec example has 42 keys: {keys:?}");
+        assert_eq!(keys.len(), 43, "spec example has 43 keys: {keys:?}");
         Config::from_toml(SPEC_EXAMPLE, "spec").unwrap();
     }
 

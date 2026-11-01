@@ -1,0 +1,30 @@
+┌ LIVE QUESTION ──────────────────────────────────────────────────────────────────── system design ┐
+│ How would you design a rate limiter for a globally distributed API, and how would you handle the │
+│ case where the limiter itself goes down?                                                         │
+│ Focus: architecture, consistency tradeoffs, distributed state, failure handling                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ APPROACH ────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1  Clarify scope: per user, per API key or per IP, and the limits per tier.                      │
+│ 2  Use a token bucket per key; sliding-window counters if bursts matter.                         │
+│ 3  Keep counters in regional Redis with a local in-process cache in front.                       │
+│ 4  Accept small over-admission across regions; reconcile quotas asynchronously.                  │
+│ 5  If Redis is down, fail open to a conservative local limit and alert.                          │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ TRANSCRIPT ────────────────────────────────────────────────────────────────────────────────────────
+You → pirate If Redis goes down, I'd fail open with a local limit.
+You       Then I'd shard the counters by key.
+ revoice: pirate  ● mic  ● system  ● model  speaking… 1s           p pin · r redo · ⏎ ask · t speak

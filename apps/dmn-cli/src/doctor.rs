@@ -516,7 +516,133 @@ pub fn speak(cfg: &Config, h: &dyn Http) -> Vec<Check> {
     if !cfg.speak.enabled {
         return vec![Check::pass("speak", "off ([speak].enabled = false)").optional()];
     }
-    vec![translator(cfg, h), tts_server(cfg, h)]
+    let mut checks = vec![translator(cfg, h), tts_server(cfg, h)];
+    checks.extend(chosen_voice(cfg, h));
+    checks
+}
+
+/// #130: `[speak].voice`, when set, is in the TTS server's library. Missing, `dmn run` speaks
+/// in the user's own voice with a notice, so this is a warning, not a failure.
+fn chosen_voice(cfg: &Config, h: &dyn Http) -> Option<Check> {
+    let voice = cfg.speak.voice.as_deref()?;
+    let at = cfg.speak.tts_url.trim().trim_end_matches('/');
+    let route = match cfg.speak.engine {
+        SpeakEngine::Chatterbox => "/v1/voices",
+        SpeakEngine::Qwen3 => "/v1/audio/voices",
+    };
+    let names = h.get(&format!("{at}{route}")).ok().map(|body| {
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let entries = match cfg.speak.engine {
+            SpeakEngine::Chatterbox => v["voices"].as_array().cloned(),
+            SpeakEngine::Qwen3 => v["uploaded_voices"].as_array().cloned(),
+        };
+        entries
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|e| {
+                let aliases = e["aliases"].as_array().cloned().unwrap_or_default();
+                std::iter::once(e["name"].clone()).chain(aliases)
+            })
+            .filter_map(|n| n.as_str().map(str::to_lowercase))
+            .collect::<Vec<_>>()
+    });
+    let check = match names {
+        None => Check::fail(
+            "voice",
+            format!("[speak].voice = {voice:?}: cannot list the TTS server's voices"),
+            "start the TTS server (see the line above)",
+        ),
+        Some(names) if names.contains(&voice.to_lowercase()) => Check::pass(
+            "voice",
+            format!("[speak].voice = {voice:?} is on the TTS server"),
+        ),
+        Some(_) => Check::fail(
+            "voice",
+            format!(
+                "[speak].voice = {voice:?} is not on the TTS server: dmn run speaks in your own voice"
+            ),
+            format!(
+                "dmn speak voices lists what is there; enroll it again (dmn speak enroll --wav <clip> --name {voice}) or pick another with `o`"
+            ),
+        ),
+    };
+    Some(check.optional())
+}
+
+/// #130: `dmn speak design`'s VoiceDesign server, under `engine = "qwen3"`: the image is
+/// pulled and the model is in the sidecar's cache volume (looked at through the running Base
+/// sidecar, which mounts it). Informational: only making a voice needs it.
+pub fn voice_design(cfg: &Config, r: &dyn Runner) -> Option<Check> {
+    if !cfg.speak.enabled || cfg.speak.engine != SpeakEngine::Qwen3 {
+        return None;
+    }
+    let at = cfg.speak.design_url.trim();
+    let image = crate::design::IMAGE;
+    if r.run(
+        "docker",
+        &["image", "inspect", "--format", "{{.Id}}", image],
+    )
+    .is_none()
+    {
+        return Some(
+            Check::fail(
+                "voice design",
+                format!("{at}: the image {image} is not pulled (or docker is not running)"),
+                format!("docker pull {image}"),
+            )
+            .optional(),
+        );
+    }
+    let model = dmn_tts::QWEN3_DESIGN_MODEL;
+    let dir = format!(
+        "/root/.cache/huggingface/hub/models--{}/snapshots",
+        model.replace('/', "--")
+    );
+    let listing = r.run(
+        "docker",
+        &[
+            "exec",
+            crate::design::BASE_CONTAINER,
+            "sh",
+            "-c",
+            &format!("ls -L {dir}/*/"),
+        ],
+    );
+    let check = match listing {
+        Some(files) if files.lines().any(|f| f.trim() == "model.safetensors") => Check::pass(
+            "voice design",
+            format!("{at}: {image} and {model} are on this machine (dmn speak design starts it)"),
+        ),
+        Some(_) | None
+            if r.run(
+                "docker",
+                &[
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    crate::design::BASE_CONTAINER,
+                ],
+            )
+            .is_some_and(|o| o.trim() == "true") =>
+        {
+            Check::fail(
+                "voice design",
+                format!(
+                    "{at}: {model} is not downloaded; the first `dmn speak design` fetches ~4.3 GB"
+                ),
+                format!(
+                    "docker exec {} hf download {model}",
+                    crate::design::BASE_CONTAINER
+                ),
+            )
+        }
+        _ => Check::fail(
+            "voice design",
+            format!("{at}: cannot look for {model}: the Qwen3-TTS sidecar is not running"),
+            "start it: docker compose -f sidecars/qwen3-tts/compose.yaml up -d",
+        ),
+    };
+    Some(check.optional())
 }
 
 /// The translator model: `[speak].model`, or `[llm].model` when it is left out.
@@ -927,6 +1053,7 @@ pub fn run_all(
     }
     checks.push(web_lookup(cfg, h, |name| std::env::var(name).ok()));
     checks.extend(speak(cfg, h));
+    checks.extend(voice_design(cfg, r));
     checks.push(echo_guard(cfg));
     checks.push(gpu_backend(r));
     checks.push(whisper_device(cfg.stt.device, &dmn_stt::gpu_devices()));
@@ -1423,6 +1550,120 @@ mod tests {
             "{:?}",
             checks[1]
         );
+    }
+
+    /// #130: `[speak].voice` is looked up in the server's library (case-insensitively, as the
+    /// server matches); missing is a warning, never a failure of the run's required checks.
+    #[test]
+    fn doctor_checks_the_chosen_voice_is_on_the_server() {
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "de".into();
+        cfg.speak.engine = SpeakEngine::Qwen3;
+        cfg.speak.tts_url = "http://localhost:4124".into();
+        let tags = r#"{"models":[{"name":"qwen3.6:35b-a3b"}]}"#;
+        let listing =
+            r#"{"voices":["default"],"uploaded_voices":[{"name":"voice"},{"name":"Pirate"}]}"#;
+        let http = RoutedHttp(vec![
+            ("/api/tags", Ok(tags.into())),
+            ("/v1/audio/voices", Ok(listing.into())),
+        ]);
+        assert_eq!(speak(&cfg, &http).len(), 2, "no line while it is unset");
+        cfg.speak.voice = Some("pirate".into());
+        let checks = speak(&cfg, &http);
+        assert_eq!(checks[2].name, "voice");
+        assert!(checks[2].ok, "{:?}", checks[2]);
+        assert!(checks[2].detail.contains("\"pirate\" is on the TTS server"));
+        cfg.speak.voice = Some("robot".into());
+        let checks = speak(&cfg, &http);
+        assert!(!checks[2].ok && !checks[2].required, "{:?}", checks[2]);
+        assert!(
+            checks[2].detail.contains("your own voice"),
+            "{:?}",
+            checks[2]
+        );
+        // Chatterbox's listing, by alias.
+        cfg.speak.engine = SpeakEngine::Chatterbox;
+        cfg.speak.tts_url = "http://localhost:4123".into();
+        let chatterbox = RoutedHttp(vec![(
+            "/v1/voices",
+            Ok(r#"{"voices":[{"name":"r","aliases":["robot"],"language":"de"}]}"#.into()),
+        )]);
+        assert!(speak(&cfg, &chatterbox)[2].ok);
+    }
+
+    /// #130: under Qwen3 doctor says whether `dmn speak design` has its image and model;
+    /// informational either way, and nothing under Chatterbox.
+    #[test]
+    fn doctor_says_whether_the_voice_design_image_and_model_are_here() {
+        let mut cfg = Config::default();
+        cfg.speak.enabled = true;
+        cfg.speak.target = "de".into();
+        assert!(
+            voice_design(
+                &cfg,
+                &FakeRunner {
+                    outputs: HashMap::new(),
+                    path: vec![]
+                }
+            )
+            .is_none()
+        );
+        cfg.speak.engine = SpeakEngine::Qwen3;
+        let image = [
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            crate::design::IMAGE,
+        ];
+        let ls = [
+            "exec",
+            crate::design::BASE_CONTAINER,
+            "sh",
+            "-c",
+            "ls -L /root/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-VoiceDesign/snapshots/*/",
+        ];
+        let running = [
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+            crate::design::BASE_CONTAINER,
+        ];
+        let none = FakeRunner {
+            outputs: HashMap::new(),
+            path: vec![],
+        };
+        let c = voice_design(&cfg, &none).unwrap();
+        assert!(!c.ok && !c.required, "{c:?}");
+        assert!(c.detail.contains("not pulled"), "{c:?}");
+        let here = FakeRunner {
+            outputs: HashMap::new(),
+            path: vec![],
+        }
+        .with("docker", &image, "sha256:x\n")
+        .with("docker", &ls, "config.json\nmodel.safetensors\n");
+        let c = voice_design(&cfg, &here).unwrap();
+        assert!(c.ok, "{c:?}");
+        assert!(
+            c.detail.contains("Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
+            "{c:?}"
+        );
+        let no_model = FakeRunner {
+            outputs: HashMap::new(),
+            path: vec![],
+        }
+        .with("docker", &image, "sha256:x\n")
+        .with("docker", &running, "true\n");
+        let c = voice_design(&cfg, &no_model).unwrap();
+        assert!(!c.ok && c.detail.contains("not downloaded"), "{c:?}");
+        let no_sidecar = FakeRunner {
+            outputs: HashMap::new(),
+            path: vec![],
+        }
+        .with("docker", &image, "sha256:x\n");
+        let c = voice_design(&cfg, &no_sidecar).unwrap();
+        assert!(!c.ok && c.detail.contains("not running"), "{c:?}");
     }
 
     /// #122: with `engine = "qwen3"` doctor names the engine, its URL, the model vLLM-Omni
