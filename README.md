@@ -1,22 +1,28 @@
 # Daemon (`dmn`)
 
-**A Linux-native, local-first interview copilot for software engineers.**
+**A Linux-native, local-first assistant for live calls: translation, your own voice in another language, and advice you can read at a glance.**
 
-Daemon listens to a live interview call, transcribes the conversation, detects interviewer questions, and surfaces a short answer scaffold designed to be understood in a few seconds.
+Daemon listens to a live call (Discord, Telegram, Meet, a video, anything that plays through PipeWire), transcribes both sides, and helps in whichever ways you switch on:
 
-The project is built for **mock interviews and interviews where AI assistance is permitted**. It does not join calls as a bot, does not type on the user's behalf, and does not attempt to hide itself from screen sharing. It never speaks unprompted and never speaks words the user did not say or ask for: with `[speak]` on, it speaks the user's own words (or their translation, #109) in the user's own cloned voice, only when the user asks (`dmn speak`, `t` in `dmn run`, or, in translate mode (#114), every sentence the user finishes while they have the mode on).
+- **Live translation.** The other side's speech is transcribed as they talk and, with a multilingual whisper model, translated into English (§ Calls in another language).
+- **Speak their language.** With `[speak]` on, each sentence you say is translated and spoken in your own cloned voice into a virtual microphone the call uses, about a second after you finish it (`l` turns translate mode on, `v` picks the language; § Speak).
+- **Advice at a glance.** With assistance on, Daemon picks out the question being asked and shows a 3–5 line approach you can take in within a few seconds, with deeper sections on request. Today the advice is built for technical interviews (coding, system design, behavioral). Planned: a game-master helper for running D&D sessions (#140) and a general-purpose advice mode for everyday conversations.
 
-> **Status:** early development. The foundation CLI is working; the live TUI pipeline and desktop UI are under active development.
+Use them alone or together: a translated call with no AI advice at all (`dmn run --no-assist`), interview help in English, or both at once.
+
+Daemon does not join calls as a bot, does not type on your behalf, and does not hide itself from screen sharing. It never speaks unprompted and never speaks words you did not say or ask for: with `[speak]` on, it speaks your own words (or their translation, #109) in your own cloned voice, only when you ask (`dmn speak`, `t` in `dmn run`, or, in translate mode (#114), every sentence you finish while the mode is on). For interviews it is meant for **mock interviews and interviews where AI assistance is permitted**.
+
+> **Status:** early development. The live terminal UI works end to end (transcription, translation, speech, interview advice); the desktop UI and the other advice modes are planned.
 
 ## Why Daemon?
 
-Most interview assistants are browser-first, cloud-first, or built around Windows and macOS. Daemon is designed around Linux from the start:
+Most live assistants and call translators are browser-first, cloud-first, or built around Windows and macOS. Daemon is designed around Linux from the start:
 
 - **Linux-native audio** via PipeWire
-- **Local-first** transcription and inference
+- **Local-first** transcription, translation, speech and inference: nothing has to leave the machine
 - **Wayland-first**, with X11 support planned
 - **Glanceable output** instead of a scrolling chatbot
-- **Low-latency target:** visible guidance within ~2 seconds of a completed question
+- **Low-latency targets:** visible guidance within ~2 seconds of a completed question; translated speech starting about a second after you finish a sentence
 - **Terminal-first development:** the first live UI is a `ratatui` TUI
 - **Desktop UI later:** Tauri 2 over the same Rust session state
 - **Provider-agnostic LLM layer:** local Ollama by default, with remote providers optional
@@ -93,7 +99,7 @@ Keys in `dmn run`:
 | `t` | With `[speak]` on: translate what you last said into `[speak].target` and speak it in your cloned voice into `dmn-voice` (below, § Speak) |
 | `l` | With `[speak]` on: switch `dmn-voice` between your own voice, live (the default), and translate mode, where every sentence you finish goes out translated (#114, below) |
 | `v` | With `[speak]` on: open the language picker over the screen; `↑` `↓` move, Enter makes that language (and its voice) the one the next sentence goes out in and saves it to the config, Esc closes (#115, below) |
-| Ctrl+Shift+A | Interview assistance on ↔ off |
+| Ctrl+Shift+A | Assistance (the advice) on ↔ off; the transcript, translation and speech keep running |
 | `q`, Esc, Ctrl+C | Quit (Esc closes the picker first while it is open) |
 
 ## Current CLI
@@ -213,7 +219,7 @@ num_ctx = 8192       # Ollama context dmn asks for; frees the VRAM whisper needs
 on a 24 GB card). Changing `num_ctx` makes Ollama reload the model (about 6 s), and any other
 tool that uses Ollama's default context reloads it again (about 11 s).
 
-#### Interviews in another language
+#### Calls in another language (live translation)
 
 Whisper's `.en` models only transcribe English. For a call held in another language, fetch a
 multilingual model and switch the language mode:
@@ -235,7 +241,7 @@ replay` and `dmn bench` overrides the config for one run. Keep `language = "en"`
 for English calls: the multilingual `small` is a little less accurate on English and pays a
 detection step per utterance.
 
-To follow a call (or a video) in another language without the interview aid, run
+To follow a call (or a video) in another language without the advice, run
 `dmn run --no-assist --language auto --model small`: the screen is the translated transcript
 alone. With a local Ollama the model is unloaded at start, so a GPU build can give whisper the
 whole card (`--model medium` runs at about 0.14 s per utterance on a 4090). Pressing
@@ -789,6 +795,8 @@ The project is being built in stages:
 - **Terminal MVP** — live capture, VAD, transcription, question detection, TUI
 - **Context + quality** — resume/job context, retrieval, better detection, evaluation
 - **Desktop** — Tauri 2 floating window using the same Rust session state
+- **Speech and voices** — translated speech in your cloned voice (done: #109, #114, #115, #122); more voices and a re-voice mode (#130); push-to-talk (#124)
+- **More advice modes** — a game-master helper for D&D (#140) and general-purpose advice beside the interview helper
 
 See [docs/SPEC.md](docs/SPEC.md) for the detailed design and build plan.
 
