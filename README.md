@@ -801,4 +801,4 @@ See [docs/SPEC.md](docs/SPEC.md) for the detailed design and build plan.
 
 ## License
 
-MIT.
+MIT, see [LICENSE](LICENSE).
